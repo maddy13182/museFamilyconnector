@@ -120,6 +120,7 @@ function publicEntry(row: Row): Record<string, unknown> {
 function publicMember(row: Row): Record<string, unknown> {
   return {
     id: row['id'],
+    family_id: row['family_id'],
     name: row['name'],
     email: row['email'],
     role: row['role'],

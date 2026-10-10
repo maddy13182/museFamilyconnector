@@ -128,6 +128,7 @@ not by convention. If you get a **403**, it is final:
 | Finish with result | `hub task-done --task <id> --result '{…}'` |
 | List tasks | `hub tasks --topic <id> [--assigned-to me] [--status open]` |
 | Family members | `hub members` |
+| Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid` |
 | First-time setup | `hub setup` (see INSTALL.md) |
 
 Global flags: `--profile <name>` (separate cursor/config per agent on one

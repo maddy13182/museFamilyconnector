@@ -501,5 +501,56 @@ class TestCommands(HubTestBase):
         self.assertIn("hub setup", err)
 
 
+class TestCloudflareAndInvite(HubTestBase):
+    def test_user_agent_identifies_client(self):
+        # Regression: Cloudflare Error 1010 blocks Python-urllib's default UA.
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        rc, _out, _err = self.run_cli(["topics"])
+        self.assertEqual(rc, 0)
+        ua = self.fake.calls[0]["headers"].get("User-Agent", "")
+        self.assertTrue(ua.startswith("family-hub-agent/"),
+                        "User-Agent must identify the client, got %r" % ua)
+        self.assertNotIn("Python-urllib", ua)
+
+    def test_cloudflare_1010_detected(self):
+        payload = {
+            "cloudflare_error": True,
+            "error_code": 1010,
+            "title": "Error 1010: Access denied",
+            "detail": "blocked based on your browser's signature.",
+        }
+        exc = hub._friendly_from_http(403, payload)
+        self.assertEqual(exc.code, "connection")
+        self.assertIn("Cloudflare", str(exc))
+
+    def test_invite_member_posts_code(self):
+        self.seed_config(family_id="fam1")
+        self.fake.add("POST", "/v1/families/fam1/invites", 201,
+                      {"invite_code": "inv_abc", "expires_at": "t"})
+        rc, out, _err = self.run_cli(
+            ["invite-member", "--email", "lakshmi@example.com", "--role", "parent"])
+        self.assertEqual(rc, 0)
+        self.assertIn("/v1/families/fam1/invites", self.fake.last_url())
+        body = json.loads(self.fake.calls[0]["body"])
+        self.assertEqual(body, {"email": "lakshmi@example.com", "role": "parent"})
+        self.assertIn("inv_abc", out)
+
+    def test_invite_member_needs_family_id(self):
+        self.seed_config()  # no family_id
+        rc, _out, err = self.run_cli(
+            ["invite-member", "--email", "x@example.com", "--role", "kid"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("family_id", err)
+
+    def test_invite_member_bad_email(self):
+        self.seed_config(family_id="fam1")
+        rc, _out, err = self.run_cli(
+            ["invite-member", "--email", "not-an-email", "--role", "kid"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.fake.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

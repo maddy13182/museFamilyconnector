@@ -278,6 +278,23 @@ class HubError(Exception):
 
 
 def _friendly_from_http(status, payload):
+    # Cloudflare bot protection (Error 1010) can reject the request before it
+    # ever reaches the hub. Detect its unmistakable shape and say so plainly
+    # instead of misreporting it as a hub permission error.
+    if isinstance(payload, dict) and (
+        payload.get("cloudflare_error") is True
+        or payload.get("error_code") == 1010
+        or "Error 1010" in str(payload.get("title", ""))
+    ):
+        return HubError(
+            "connection",
+            "Blocked by Cloudflare bot protection before reaching the hub "
+            "(Error 1010, browser_signature_banned). The hub never saw this "
+            "request. If you are the family owner, check the zone's Bot Fight "
+            "Mode / WAF settings; agents should identify with a proper "
+            "User-Agent (this tool does).",
+            http_status=status,
+        )
     code = "error"
     message = "request failed"
     if isinstance(payload, dict):
@@ -549,6 +566,7 @@ def cmd_setup(args, transport):
             "role": member.get("role"),
             "email": member.get("email"),
         },
+        "family_id": member.get("family_id"),
         "agent_label": agent_label,
         "token_id": resp.get("token_id"),
         "auth_method": store,
@@ -692,6 +710,31 @@ def cmd_invite(args, transport):
         "POST",
         "/v1/topics/%s/invite" % urlparse.quote(args.topic, safe=""),
         json_body={"member_ids": members, "history_from": args.history},
+    )
+    emit_json(resp or {"ok": True})
+    return 0
+
+
+def cmd_invite_member(args, transport):
+    """Mint a family invite code for a new member (owner/parent only)."""
+    ctx = _ctx(args, transport)
+    cfg = load_config(args.profile)
+    family_id = cfg.get("family_id")
+    if not family_id:
+        raise HubError(
+            "config",
+            "No family_id in this profile — re-run `hub setup` to refresh it.",
+        )
+    role = (args.role or "").strip().lower()
+    if role not in ("owner", "parent", "kid"):
+        raise HubError("bad_request", "--role must be one of: owner, parent, kid.")
+    email = (args.email or "").strip()
+    if not email or "@" not in email:
+        raise HubError("bad_request", "A valid --email is required.")
+    resp = ctx.client.call(
+        "POST",
+        "/v1/families/%s/invites" % urlparse.quote(family_id, safe=""),
+        json_body={"email": email, "role": role},
     )
     emit_json(resp or {"ok": True})
     return 0
@@ -905,6 +948,12 @@ def build_parser():
     p.add_argument("--history", choices=["full", "from-join"], default="full",
                    help="What history the new members see")
     p.set_defaults(func=cmd_invite)
+
+    p = sub.add_parser("invite-member", help="Mint a family invite code for a new member (owner/parent only)")
+    p.add_argument("--email", required=True, help="New member's email address")
+    p.add_argument("--role", required=True, choices=["owner", "parent", "kid"],
+                   help="Role for the new member")
+    p.set_defaults(func=cmd_invite_member)
 
     p = sub.add_parser("spawn", help="Spawn a linked child topic with a briefing")
     p.add_argument("--topic", required=True, help="Parent topic ID")

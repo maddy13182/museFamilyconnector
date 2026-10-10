@@ -96,13 +96,24 @@ database_id = "<paste-the-id>"
 
 ### 4. Set the pepper secret (one time, never in git)
 
+Run these from `server/` (wrangler needs the project config there):
+
 ```bash
+cd server
 openssl rand -hex 32   # copy the output
 wrangler secret put TOKEN_PEPPER   # paste it when prompted
 ```
 
 This value is mixed into every token/invite hash. If it ever leaks, pick a
 new one — all agent tokens invalidate and everyone re-enrolls (by design).
+
+### 4b. Apply the database schema (one time)
+
+```bash
+wrangler d1 migrations apply family-hub --remote
+```
+
+Skip this and the bootstrap call in step 6 will fail — the tables won't exist.
 
 ### 5. Deploy
 
@@ -129,8 +140,9 @@ curl -s -X POST https://<your-worker>/v1/families \
 ```
 
 Save the response: it contains your owner member record and a **one-time
-provisioning code** for your agent. Run your agent's setup with it now
-(step 8) — the code is single-use.
+provisioning code** (`fhp_...`, not to be confused with the `fh_...` agent
+tokens) for your agent. Run your agent's setup with it now (step 9) — the
+code is single-use and expires in 24 hours.
 
 ### 7. Lock the bootstrap
 
@@ -157,8 +169,9 @@ cp -r agent-skill ~/workspace/skills/family-hub
 
 Then, in your Muse chat: tell your agent to read
 `~/workspace/skills/family-hub/SKILL.md` and run `hub setup`, giving it the
-provisioning code from step 6. The agent stores its credential in its secure
-vault — **it will never see the raw token**, by design.
+provisioning code from step 6. The agent stores its credential in its
+configured credential store (secure vault, environment, or a locked-down
+file) — **it will never see the raw token**, by design.
 
 Set up the poll (so the agent checks for new messages/tasks regularly):
 
@@ -171,18 +184,16 @@ Verify: `hub sync` and `hub topics` should work without errors.
 
 ### 10. Invite your family
 
-Create an invite for each member (owner/parent only). As your agent, or:
+Create an invite for each member (owner/parent only) — ask your agent, or:
 
 ```bash
-curl -s -X POST https://<your-worker>/v1/families/<family_id>/invites \
-  -H "Authorization: Bearer <YOUR_AGENT_TOKEN>" \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"<member@example.com>","role":"parent"}'   # or "kid"
+hub invite-member --email "<member@example.com>" --role parent   # or "kid"
 ```
 
-Send each person their invite code through a channel you trust (text, email).
-Invite codes are single-use and expire in 7 days — they're *meant* to be
-shared, unlike agent tokens.
+This prints an invite code. Send each person **two things** through a channel
+you trust (text, email): your hub's URL (`https://<your-worker>`) and their
+invite code. Invite codes are single-use and expire in 7 days — they're
+*meant* to be shared, unlike agent tokens.
 
 ### 11. Each member's agent joins
 
@@ -190,8 +201,9 @@ Each family member, in their own Muse chat:
 
 1. Install the skill: copy `agent-skill/` from this repo to their
    `~/workspace/skills/family-hub/` and read its `SKILL.md`.
-2. Run `hub setup` and paste their invite code when asked. The agent gets its
-   own token, stored in *their* vault.
+2. Run `hub setup`: paste the hub URL when asked for the server, then paste
+   their invite code. The agent gets its own token, stored in *their*
+   credential store — it never sees the raw value.
 3. Run `hub sync` / `hub topics` to confirm it's live, and set up the
    15-minute poll.
 
