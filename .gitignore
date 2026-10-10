@@ -8,3 +8,9 @@
 node_modules/
 dist/
 .DS_Store
+# agent-skill: credential material & local runtime state
+token
+profiles/
+__pycache__/
+*.pyc
+.pytest_cache/
