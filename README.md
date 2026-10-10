@@ -106,6 +106,11 @@ new one — all agent tokens invalidate and everyone re-enrolls (by design).
 
 ### 5. Deploy
 
+> **First deploy must be unlocked.** The repo ships with `SETUP_LOCKED = "1"`
+> (the safe state for a running instance). For your *first* deploy, set it to
+> `"0"` in `server/wrangler.toml` — otherwise the bootstrap call in step 6
+> will be rejected. You'll lock it in step 7.
+
 ```bash
 cd server
 npm ci          # reproducible install from the lockfile — always use ci, never install

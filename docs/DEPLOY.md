@@ -52,7 +52,9 @@ environment variables only.
 
 ## Bootstrap (first deploy only, both paths)
 
-1. Deploy with `SETUP_LOCKED = "0"` (the default in `server/wrangler.toml`).
+1. Set `SETUP_LOCKED = "0"` in `server/wrangler.toml` and deploy. (The repo
+   default is `"1"` — the safe state for a running instance — so a fresh
+   clone must unlock it explicitly for the first deploy.)
 2. `POST https://<your-worker>/v1/families`
    `{name, owner_name, owner_email}` → save the provisioning code; enroll your
    agent with it.
