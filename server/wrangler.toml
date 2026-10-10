@@ -1,0 +1,21 @@
+# Family Hub — Cloudflare Worker config.
+# NEVER put secrets in this file. TOKEN_PEPPER is set via:
+#   wrangler secret put TOKEN_PEPPER
+# (generate with: openssl rand -hex 32)
+
+name = "family-hub"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+# One deployment per family (SPEC §1: no shared platform).
+
+[[d1_databases]]
+binding = "DB"
+database_name = "family-hub"
+# Fill in after `wrangler d1 create family-hub`:
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+# "0" during first bootstrap, then set to "1" and redeploy to lock
+# POST /v1/families forever (SPEC §6).
+SETUP_LOCKED = "0"

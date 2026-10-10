@@ -1,0 +1,10 @@
+# No secrets in the repo. Ever.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+.dev.vars
+.wrangler/
+node_modules/
+dist/
+.DS_Store
