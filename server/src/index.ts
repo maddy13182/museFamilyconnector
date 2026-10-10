@@ -649,6 +649,17 @@ async function handleListMembers(db: DbClient, auth: AuthContext): Promise<Respo
   return json({ members: rows.map(publicMember) });
 }
 
+// GET /v1/me — identity bound to the calling token. Lets clients verify
+// which circle a token belongs to before storing it (fail-closed paste flow).
+async function handleGetSelf(db: DbClient, auth: AuthContext): Promise<Response> {
+  const row = await db.queryOne(
+    `SELECT * FROM members WHERE id = ? AND family_id = ?`,
+    [auth.member_id, auth.family_id],
+  );
+  if (!row) throw new HttpError(401, 'unauthorized', 'Invalid token');
+  return json({ ...publicMember(row), agent_label: auth.agent_label });
+}
+
 // POST /v1/topics
 async function handleCreateTopic(
   db: DbClient,
@@ -1294,6 +1305,7 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
     if (path === '/v1/auth/revoke' && method === 'POST') return await handleRevoke(db, env, req, auth);
     if (path === '/v1/families' && method === 'GET') return await handleListFamilies(db, auth);
     if (path === '/v1/members' && method === 'GET') return await handleListMembers(db, auth);
+    if (path === '/v1/me' && method === 'GET') return await handleGetSelf(db, auth);
     if (path === '/v1/provisioning-codes' && method === 'POST') {
       return await handleMintProvisioning(db, env, req, auth);
     }

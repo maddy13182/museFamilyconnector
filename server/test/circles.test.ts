@@ -244,3 +244,17 @@ test('bootstrap while unlocked is unchanged (no kind in response)', async () => 
   assert.deepEqual(Object.keys(fam.body.family).sort(), ['created_at', 'id', 'name']);
   assert.ok(fam.body.provisioning_code);
 });
+
+test('GET /v1/me returns the token-bound identity (circle binding check)', async () => {
+  const { app, ownerToken, famA } = await lockedSetup();
+  const me = await app.call('GET', '/v1/me', { token: ownerToken });
+  assert.equal(me.status, 200);
+  assert.equal(me.body.family_id, famA);
+  assert.equal(me.body.email, 'mahesh@a.dev');
+  assert.equal(me.body.role, 'owner');
+  assert.ok(me.body.id);
+  assert.ok(me.body.agent_label);
+
+  const anon = await app.call('GET', '/v1/me');
+  assert.equal(anon.status, 401);
+});
