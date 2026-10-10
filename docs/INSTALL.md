@@ -93,7 +93,7 @@ Response (save the provisioning code somewhere safe — password manager, not ch
 ```json
 {
   "family": {"id": "f_…", "name": "Ramamurthy family", "created_at": "…"},
-  "owner_member": {"id": "m_…", "role": "owner", …},
+  "member": {"id": "m_…", "role": "owner", …},
   "provisioning_code": "…",          // single-use — redeem it now
   "provisioning_expires_at": "…"
 }
@@ -132,9 +132,8 @@ only time a human touches a provisioning code; the resulting token goes
 straight into the Secure Vault.
 
 ```bash
-curl -s -X POST $HUB/v1/provision/<provisioning_code>/accept \
-  -H 'Content-Type: application/json' \
-  -d '{"agent_label":"mahesh-main-agent"}'
+curl -s -X POST $HUB/v1/provisioning-codes/<provisioning_code>/redeem
+# (no body needed — the agent label comes from the minted code)
 # → {"member":{…},"token":"fh_…","token_id":"tok_…"}   ← token shown ONCE
 ```
 

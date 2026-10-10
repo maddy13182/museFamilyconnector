@@ -13,9 +13,12 @@ info:
     - Auth: `Authorization: Bearer <token>` on every request except the ones
       marked "Public" below. The token is per-agent (`fh_` + 256-bit random).
     - Error shape is always `{ "error": { "code": "<string>", "message": "<string>" } }`
-      with HTTP semantics: 400 validation, 401 bad/unknown/revoked token,
-      403 not-a-participant or wrong role, 404 unknown id, 409 state conflict,
-      422 PII detected, 429 rate limited.
+      with HTTP semantics: 400 bad_request, 401 bad/unknown/revoked token,
+      403 not-a-participant or wrong role, 404 unknown id/code, 409 state
+      conflict (subtasks_open, already_member, invite_used, code_used),
+      410 expired code (invite_expired, code_expired), 422 PII detected,
+      429 rate limited (enforced by the Cloudflare edge ruleset in front of
+      the worker, per SPEC section 7 — not in-worker).
     - `seq` is per-topic ordering; `gseq` is global family ordering (for /sync).
     - Entries are append-only. The writer's actor_member_id / agent_label /
       token_id are stamped server-side from the token, never from the client.
@@ -90,15 +93,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [family, owner_member, provisioning_code, provisioning_expires_at]
+                required: [family, member, provisioning_code, provisioning_expires_at]
                 properties:
                   family: { $ref: '#/components/schemas/Family' }
-                  owner_member: { $ref: '#/components/schemas/Member' }
+                  member: { $ref: '#/components/schemas/Member' }
                   provisioning_code:
                     type: string
                     description: 128-bit random, single-use. Redeem at POST /v1/provision/{code}/accept. Shown once.
                   provisioning_expires_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403':
           description: Setup is locked (endpoint disabled after bootstrap)
           content:
@@ -115,8 +118,10 @@ paths:
       operationId: createInvite
       summary: Invite a family member
       description: |
-        Caller must have role `owner` or `parent`. Returns a 128-bit random
-        invite code (single-use, 7-day expiry). Only the hash is stored.
+        Caller must have role `owner` or `parent`. Owners may invite any role;
+        parents may invite `parent`/`kid` only (a parent inviting `owner` → 403).
+        An email already in the family → 409 `already_member`. Returns a 128-bit
+        random invite code (single-use, 7-day expiry). Only the hash is stored.
         The code is meant to be shared via an already-trusted channel; it grants
         no read access by itself.
       parameters:
@@ -144,10 +149,11 @@ paths:
                     type: string
                     description: Single-use code. The invitee's agent redeems it at POST /v1/invites/{code}/accept.
                   expires_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/invites/{code}/accept:
     post:
@@ -157,8 +163,9 @@ paths:
       description: |
         Public — the invite code is the credential. Creates the member record
         and issues a per-agent bearer token, RETURNED ONCE and never again.
-        The agent must store it in its Secure Vault immediately. Reuse of a code
-        returns 404 (codes are single-use; do not leak whether a code existed).
+        The agent must store it in its Secure Vault immediately. Unknown codes
+        return 404; reuse returns 409 `invite_used`; expired codes (7-day TTL)
+        return 410 `invite_expired`.
       security: []
       parameters:
         - name: code
@@ -192,11 +199,19 @@ paths:
                   token_id:
                     type: string
                     description: Stable id for this credential (used for revoke/rotate and audit).
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Invite already used
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: invite_used, message: "Invite already used." }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # -------------------------------------------------------------------- auth
-        '429': { $ref: '#/components/responses/RateLimited' }
   /v1/auth/rotate:
     post:
       tags: [auth]
@@ -255,7 +270,7 @@ paths:
                 properties:
                   revoked: { type: boolean, example: true }
                   token_id: { type: string }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -284,27 +299,26 @@ paths:
                     items: { $ref: '#/components/schemas/TokenInfo' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /v1/auth/provision:
+  /v1/provisioning-codes:
     post:
       tags: [auth]
       operationId: mintProvisioningCode
-      summary: Mint a provisioning code for an additional agent (proposed)
-      x-spec-note: PROPOSED — not in SPEC §13. Required by SPEC §6.4 ("mint another provisioning code for an additional agent label").
+      summary: Mint a provisioning code for an additional agent
+      x-spec-note: Gap-fill implemented by WS-1 — not in SPEC §13. Required by SPEC §6.4.
       description: |
-        Mints a single-use, expiring provisioning code. Defaults to the caller's
-        own member; `owner`/`parent` may specify another member_id in the family.
+        Mints a single-use provisioning code (24h TTL) for the given member.
+        member_id is required: callers mint for their own member, or
+        (`owner`/`parent` only) for another member of the family.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [agent_label]
+              required: [member_id, agent_label]
               properties:
-                member_id:
-                  type: string
-                  description: Defaults to the caller's member. Owner/parent may target another family member.
-                agent_label: { type: string, minLength: 1, maxLength: 100 }
+                member_id: { type: string }
+                agent_label: { type: string, minLength: 1, maxLength: 80 }
       responses:
         '201':
           description: Provisioning code minted
@@ -312,40 +326,34 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [provisioning_code, expires_at, member_id]
+                required: [provisioning_code, expires_at]
                 properties:
-                  provisioning_code: { type: string, description: '128-bit random, single-use. Shown once.' }
+                  provisioning_code: { type: string, description: 'Single-use, 24h TTL. Shown once.' }
                   expires_at: { type: string, format: date-time }
-                  member_id: { type: string }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
-  /v1/provision/{code}/accept:
+  /v1/provisioning-codes/{code}/redeem:
     post:
       tags: [auth]
-      operationId: acceptProvisioningCode
-      summary: Redeem a provisioning code for an agent token (proposed)
-      x-spec-note: PROPOSED — not in SPEC §13. Required by SPEC §6.1/§6.4; without it the bootstrap provisioning code cannot be redeemed and no owner token can ever be issued.
+      operationId: redeemProvisioningCode
+      summary: Redeem a provisioning code for an agent token
+      x-spec-note: Gap-fill implemented by WS-1 — not in SPEC §13. Required by SPEC §6.1/§6.4.
       description: |
-        Public — the provisioning code is the credential. Issues a per-agent
-        bearer token for the existing member the code was minted for.
-        Token RETURNED ONCE. Single-use codes; reuse returns 404.
+        Public — the provisioning code is the credential. Issues the per-agent
+        bearer token for the member the code was minted for (the agent_label
+        comes from the minted code; no request body needed). Token RETURNED
+        ONCE. Reuse returns 409 `code_used`; expired codes return 410
+        `code_expired`.
       security: []
       parameters:
         - name: code
           in: path
           required: true
           schema: { type: string, minLength: 16 }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [agent_label]
-              properties:
-                agent_label: { type: string, minLength: 1, maxLength: 100 }
       responses:
         '201':
           description: Token issued (once)
@@ -358,9 +366,16 @@ paths:
                   member: { $ref: '#/components/schemas/Member' }
                   token: { type: string, description: 'Bearer token, shown once.' }
                   token_id: { type: string }
-        '400': { $ref: '#/components/responses/ValidationError' }
         '404': { $ref: '#/components/responses/NotFound' }
-
+        '409':
+          description: Code already used
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: { code: code_used, message: "Provisioning code already used." }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/RateLimited' }
   # ------------------------------------------------------------------ members
   /v1/members:
     get:
@@ -388,7 +403,9 @@ paths:
       operationId: createTopic
       summary: Create a topic
       description: |
-        `kind: direct` requires exactly 2 participant_member_ids.
+        `kind: direct` requires exactly 2 participant_member_ids, and the caller
+        must be one of them (400 otherwise). For `group`, the caller is
+        auto-added as a participant if not listed.
         `parents_only: true` auto-includes all parent-role members (and the
         owner) and rejects any kid-role member id; participant_member_ids may
         be omitted in that case. All participants must be family members.
@@ -398,14 +415,19 @@ paths:
           application/json:
             schema:
               type: object
-              required: [subject, kind]
+              required: [subject, kind, participant_member_ids]
               properties:
                 subject: { type: string, minLength: 1, maxLength: 200 }
                 kind: { $ref: '#/components/schemas/TopicKind' }
                 participant_member_ids:
                   type: array
+                  minItems: 0
+                  maxItems: 20
                   items: { type: string }
-                  description: Required unless parents_only is true.
+                  description: >
+                    Required (may be empty). When parents_only is true the
+                    owner+parent roles are auto-included regardless of this list
+                    (kid-role ids are rejected with 403).
                 parents_only: { type: boolean, default: false }
       responses:
         '201':
@@ -417,7 +439,7 @@ paths:
                 required: [topic]
                 properties:
                   topic: { $ref: '#/components/schemas/Topic' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/RateLimited' }
     get:
@@ -459,9 +481,12 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic]
+                required: [topic, participants]
                 properties:
                   topic: { $ref: '#/components/schemas/Topic' }
+                  participants:
+                    type: array
+                    items: { $ref: '#/components/schemas/TopicParticipantView' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -474,7 +499,8 @@ paths:
       description: |
         Entries in per-topic `seq` order. Only entries with
         `seq >=` the caller's `history_from_seq` are returned (invite-time
-        visibility). 403 unless the caller is a participant.
+        visibility). 403 unless the caller is a participant. Page with
+        `after_seq`; more entries exist while the last returned seq < max_seq.
       parameters:
         - $ref: '#/components/parameters/TopicId'
         - name: after_seq
@@ -493,17 +519,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic_id, entries, next_after_seq, has_more]
+                required: [entries, max_seq]
                 properties:
-                  topic_id: { type: string }
                   entries:
                     type: array
                     items: { $ref: '#/components/schemas/Entry' }
-                  next_after_seq:
+                  max_seq:
                     type: integer
-                    description: Pass as after_seq for the next page.
-                  has_more: { type: boolean }
-        '400': { $ref: '#/components/responses/ValidationError' }
+                    description: Highest seq in the topic (visible range).
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -523,18 +547,19 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic, participants, entries, tasks]
+                required: [topic, participants, entries, tasks, exported_at]
                 properties:
                   topic: { $ref: '#/components/schemas/Topic' }
                   participants:
                     type: array
-                    items: { $ref: '#/components/schemas/TopicParticipant' }
+                    items: { $ref: '#/components/schemas/TopicParticipantView' }
                   entries:
                     type: array
                     items: { $ref: '#/components/schemas/Entry' }
                   tasks:
                     type: array
                     items: { $ref: '#/components/schemas/Task' }
+                  exported_at: { type: string, format: date-time }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -571,13 +596,13 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [invited_member_ids, topic]
+                required: [added]
                 properties:
-                  invited_member_ids:
+                  added:
                     type: array
                     items: { type: string }
-                  topic: { $ref: '#/components/schemas/Topic' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+                    description: Member ids added to the topic.
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -591,7 +616,8 @@ paths:
         Caller must be a participant of the parent. Creates a new topic with
         `parent_topic_id` set; its first entry is the `briefing` (curated
         context — the ONLY thing carried over). A `topic_spawned` entry is
-        appended to the parent. Child participants who cannot read the parent
+        appended to the parent. The briefing becomes entry seq 1 of the child —
+        read it back via history. Child participants who cannot read the parent
         get 403 on the parent; the child shows a "linked private parent
         discussion" placeholder unless link_visibility is "hidden".
       parameters:
@@ -622,12 +648,11 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic, parent_topic_id, briefing_entry]
+                required: [topic, parent_topic_id]
                 properties:
                   topic: { $ref: '#/components/schemas/Topic' }
                   parent_topic_id: { type: string }
-                  briefing_entry: { $ref: '#/components/schemas/Entry' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -678,21 +703,21 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entry, deduplicated]
+                required: [entry, deduped]
                 properties:
                   entry: { $ref: '#/components/schemas/Entry' }
-                  deduplicated: { type: boolean, example: false }
+                  deduped: { type: boolean, example: false }
         '200':
           description: Idempotent replay — original entry returned, no duplicate created
           content:
             application/json:
               schema:
                 type: object
-                required: [entry, deduplicated]
+                required: [entry, deduped]
                 properties:
                   entry: { $ref: '#/components/schemas/Entry' }
-                  deduplicated: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/ValidationError' }
+                  deduped: { type: boolean, example: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -734,7 +759,7 @@ paths:
                 required: [task]
                 properties:
                   task: { $ref: '#/components/schemas/Task' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -784,7 +809,7 @@ paths:
                   trail:
                     type: array
                     items: { $ref: '#/components/schemas/Entry' }
-                    description: All entries in the topic referencing this task, in seq order.
+                    description: All entries in the topic referencing this task, in seq order (capped at 5000).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -823,7 +848,7 @@ paths:
                 required: [task]
                 properties:
                   task: { $ref: '#/components/schemas/Task' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -856,7 +881,7 @@ paths:
                 required: [entry]
                 properties:
                   entry: { $ref: '#/components/schemas/Entry' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -892,7 +917,7 @@ paths:
                 required: [task]
                 properties:
                   task: { $ref: '#/components/schemas/Task' }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -929,14 +954,19 @@ paths:
                   entries:
                     type: array
                     items: { $ref: '#/components/schemas/Entry' }
+                  max_gseq:
+                    type: integer
+                    description: Highest gseq visible to the caller in this response window.
                   next_after_gseq:
                     type: integer
                     description: >
-                      Pass as after_gseq on the next poll. Optional — omitted
-                      when the cursor is already at the head (clients fall back
-                      to the max gseq seen, or the after_gseq they sent).
+                      Pass as after_gseq on the next poll. The server sends the
+                      same value in max_gseq and next_after_gseq; clients should
+                      prefer next_after_gseq and fall back to max_gseq. Optional —
+                      omitted when the cursor is already at the head (fall back
+                      to the max gseq seen, or the after_gseq sent).
                   has_more: { type: boolean }
-        '400': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
@@ -947,9 +977,10 @@ paths:
       summary: Redact an entry body (owner only)
       description: |
         PII escape hatch. Replaces `body` with `[redacted by owner, <ts>]`;
-        seq, actor, and timestamp are preserved, and a `redaction` entry is
-        appended. Note: clients that already synced the entry keep their copy —
-        see the incident runbook in docs/SECURITY.md.
+        seq, actor, and timestamp are preserved, and a `redaction` entry
+        (body `Entry #<seq> redacted by owner`, data.redacted_gseq) is appended
+        to the same topic. Note: clients that already synced the entry keep
+        their copy — see the incident runbook in docs/SECURITY.md.
       parameters:
         - name: eid
           in: path
@@ -968,9 +999,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entry]
+                required: [ok]
                 properties:
-                  entry: { $ref: '#/components/schemas/Entry' }
+                  ok: { type: boolean, example: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -992,6 +1024,7 @@ paths:
                 required: [ok]
                 properties:
                   ok: { type: boolean, example: true }
+                  version: { type: string, example: "0.1.0" }
 
 components:
   securitySchemes:
@@ -1040,7 +1073,7 @@ components:
       enum: [open, in_progress, blocked, done, cancelled]
     ErrorCode:
       type: string
-      enum: [validation_error, unauthorized, forbidden, not_found, conflict, pii_detected, rate_limited, setup_locked]
+      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, internal]
 
     Error:
       type: object
@@ -1063,10 +1096,10 @@ components:
 
     Member:
       type: object
-      required: [id, family_id, name, email, role, created_at]
+      description: Single-family deployment — the family is implicit, so member objects carry no family_id.
+      required: [id, name, email, role, created_at]
       properties:
         id: { type: string }
-        family_id: { type: string }
         name: { type: string }
         email: { type: string, format: email }
         role: { $ref: '#/components/schemas/Role' }
@@ -1084,16 +1117,26 @@ components:
         last_used_at: { type: ["string", "null"], format: date-time }
       description: Token metadata. The token VALUE is never returned by any endpoint after issuance.
 
-    TopicParticipant:
+    TopicParticipantView:
       type: object
-      required: [member_id, joined_at, history_from_seq]
+      description: >
+        Participant as returned by the topic detail and export endpoints — a
+        separate top-level array, not nested in the topic. history_from_seq is
+        present on export; the detail endpoint omits it.
+      required: [member_id, name, role, joined_at]
       properties:
         member_id: { type: string }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
         joined_at: { type: string, format: date-time }
         history_from_seq: { type: integer, minimum: 1 }
 
     Topic:
       type: object
+      description: >
+        Note: the SQLite-backed server encodes booleans as integers, so
+        parents_only may arrive as true/false or 1/0 — clients MUST accept
+        both. (Server-side coercion to true booleans is a recommended cleanup.)
       required: [id, family_id, subject, kind, parents_only, created_by, created_at]
       properties:
         id: { type: string }
@@ -1105,13 +1148,10 @@ components:
         link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
         created_by: { type: string }
         created_at: { type: string, format: date-time }
-        participants:
-          type: array
-          items: { $ref: '#/components/schemas/TopicParticipant' }
 
     Entry:
       type: object
-      required: [gseq, topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body]
+      required: [gseq, topic_id, seq, ts, actor_member_id, agent_label, kind, body]
       properties:
         gseq:
           type: integer
@@ -1123,11 +1163,16 @@ components:
         ts: { type: string, format: date-time }
         actor_member_id: { type: string, description: Stamped server-side from the token. }
         agent_label: { type: string }
-        token_id: { type: string }
+        token_id:
+          type: string
+          description: >
+            Credential attribution. Required by SPEC section 3 but currently
+            omitted by the server — clients MUST NOT require it. (Recommended
+            server cleanup: include it in the serialized entry.)
         kind: { $ref: '#/components/schemas/EntryKind' }
         body: { type: string }
         data:
-          type: object
+          type: ["object", "null"]
           description: Free-form JSON machine payload.
         reply_to_seq:
           type: ["integer", "null"]
@@ -1153,13 +1198,13 @@ components:
         updated_at: { type: string, format: date-time }
 
   responses:
-    ValidationError:
-      description: Input failed validation (400)
+    BadRequest:
+      description: Bad request — input failed validation (400)
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example:
-            error: { code: validation_error, message: "subject: must be 1..200 characters" }
+            error: { code: bad_request, message: "subject: must be 1..200 characters" }
     Unauthorized:
       description: Missing, unknown, or revoked token (401)
       content:
@@ -1182,12 +1227,19 @@ components:
           example:
             error: { code: not_found, message: "Topic not found." }
     Conflict:
-      description: State conflict, e.g. done with open subtasks (409)
+      description: State conflict — subtasks_open, already_member, invite_used, code_used (409)
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example:
-            error: { code: conflict, message: "Task has open subtasks." }
+            error: { code: subtasks_open, message: "Task has open subtasks." }
+    Gone:
+      description: Expired single-use code — invite_expired, code_expired (410)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: invite_expired, message: "Invite expired." }
     PiiError:
       description: Possible PII detected — rejected, nothing stored (422)
       content:

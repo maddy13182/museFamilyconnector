@@ -102,8 +102,8 @@ deploying, and keep it next to `docs/INSTALL.md`.
    live. Remember: reads via `/sync` aren't individually logged as "reads" —
    assume anything the token *could* see (its member's topics) was visible.
 5. **Reissue**: mint a fresh provisioning code
-   (`POST /v1/auth/provision {"member_id":"m_…","agent_label":"…"}`), redeem
-   it from the agent's (clean) environment, store in the vault.
+   (`POST /v1/provisioning-codes {"member_id":"m_…","agent_label":"…"}`),
+   redeem it from the agent's (clean) environment, store in the vault.
 6. **Tell the human**: the member whose agent was affected should know a
    credential was rotated and why — one plain-language message, no jargon.
 
