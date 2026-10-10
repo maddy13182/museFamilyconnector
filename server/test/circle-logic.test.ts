@@ -14,17 +14,23 @@ interface Circle {
   created_at: string;
 }
 
+type TokenMap = Record<string, string>;
+
 interface CircleLogic {
   circleShouldShowSwitcher: (families: Circle[]) => boolean;
   circleResolveActive: (families: Circle[], storedId: string | null) => Circle | null;
-  circleScopedPath: (path: string, familyId: string | null) => string;
+  circleTokenMapParse: (raw: string | null) => TokenMap;
+  circleHasToken: (map: TokenMap | null, circleId: string | null) => boolean;
+  circleTokenFor: (map: TokenMap | null, circleId: string | null, defaultToken: string) => string;
+  circleTokenMapSet: (map: TokenMap | null, circleId: string, token: string) => TokenMap;
   circleLabel: (f: Circle) => string;
 }
 
 function loadLogic(): CircleLogic {
   const factory = new Function(
     CIRCLE_LOGIC_SRC +
-      '\nreturn { circleShouldShowSwitcher, circleResolveActive, circleScopedPath, circleLabel };'
+      '\nreturn { circleShouldShowSwitcher, circleResolveActive, ' +
+      'circleTokenMapParse, circleHasToken, circleTokenFor, circleTokenMapSet, circleLabel };'
   );
   return factory() as CircleLogic;
 }
@@ -55,16 +61,50 @@ test('active circle resolution: stored id honored, stale id falls back to first'
   assert.equal(L.circleResolveActive(list, 'gone')?.id, 'a');
 });
 
-test('scoped paths append family_id without breaking existing queries', () => {
+test('token map parse: valid JSON kept, garbage and non-strings dropped', () => {
   const L = loadLogic();
-  assert.equal(L.circleScopedPath('/v1/topics', 'fid'), '/v1/topics?family_id=fid');
-  assert.equal(
-    L.circleScopedPath('/v1/topics/abc/history?limit=100', 'fid'),
-    '/v1/topics/abc/history?limit=100&family_id=fid'
-  );
-  assert.equal(L.circleScopedPath('/v1/topics', null), '/v1/topics');
-  assert.equal(L.circleScopedPath('/v1/topics', ''), '/v1/topics');
-  assert.equal(L.circleScopedPath('/v1/f', 'a b'), '/v1/f?family_id=a%20b');
+  assert.deepEqual(L.circleTokenMapParse('{"a":"fh_x","b":"fh_y"}'), { a: 'fh_x', b: 'fh_y' });
+  assert.deepEqual(L.circleTokenMapParse(null), {});
+  assert.deepEqual(L.circleTokenMapParse(''), {});
+  assert.deepEqual(L.circleTokenMapParse('not json'), {});
+  assert.deepEqual(L.circleTokenMapParse('[1,2]'), {});
+  assert.deepEqual(L.circleTokenMapParse('"str"'), {});
+  // non-string values are dropped, empty strings are dropped
+  assert.deepEqual(L.circleTokenMapParse('{"a":42,"b":"","c":"fh_z"}'), { c: 'fh_z' });
+});
+
+test('hasToken: true only for a stored non-empty string', () => {
+  const L = loadLogic();
+  const map = { a: 'fh_x' };
+  assert.equal(L.circleHasToken(map, 'a'), true);
+  assert.equal(L.circleHasToken(map, 'b'), false);
+  assert.equal(L.circleHasToken(map, null), false);
+  assert.equal(L.circleHasToken(null, 'a'), false);
+  assert.equal(L.circleHasToken({ a: '' }, 'a'), false);
+});
+
+test('tokenFor: circle token wins, default token is the fallback', () => {
+  const L = loadLogic();
+  const map = { a: 'fh_circle_a' };
+  assert.equal(L.circleTokenFor(map, 'a', 'fh_default'), 'fh_circle_a');
+  assert.equal(L.circleTokenFor(map, 'b', 'fh_default'), 'fh_default');
+  assert.equal(L.circleTokenFor(map, null, 'fh_default'), 'fh_default');
+  assert.equal(L.circleTokenFor({}, 'a', 'fh_default'), 'fh_default');
+  assert.equal(L.circleTokenFor(null, 'a', 'fh_default'), 'fh_default');
+  assert.equal(L.circleTokenFor({}, 'a', ''), '');
+});
+
+test('tokenMapSet: sets, overwrites, and removes without mutating input', () => {
+  const L = loadLogic();
+  const before = { a: 'fh_x' };
+  const added = L.circleTokenMapSet(before, 'b', 'fh_y');
+  assert.deepEqual(added, { a: 'fh_x', b: 'fh_y' });
+  assert.deepEqual(before, { a: 'fh_x' }, 'input not mutated');
+  const overwritten = L.circleTokenMapSet(added, 'a', 'fh_new');
+  assert.deepEqual(overwritten, { a: 'fh_new', b: 'fh_y' });
+  const removed = L.circleTokenMapSet(overwritten, 'a', '');
+  assert.deepEqual(removed, { b: 'fh_y' });
+  assert.deepEqual(L.circleTokenMapSet(null, 'a', 'fh_x'), { a: 'fh_x' });
 });
 
 test('circle labels include name, kind and role', () => {
@@ -72,10 +112,15 @@ test('circle labels include name, kind and role', () => {
   assert.equal(L.circleLabel(fam('a', 'Alpha')), 'Alpha [family] · owner');
 });
 
-test('served page embeds the switcher logic and wiring', () => {
-  assert.ok(UI_HTML.includes('circleShouldShowSwitcher'), 'logic source embedded');
-  assert.ok(UI_HTML.includes('circleResolveActive'), 'resolver embedded');
+test('served page embeds the token logic and wiring, not query-param scoping', () => {
+  assert.ok(UI_HTML.includes('circleTokenFor'), 'token selection embedded');
+  assert.ok(UI_HTML.includes('circleHasToken'), 'token presence check embedded');
+  assert.ok(UI_HTML.includes('circleTokenMapSet'), 'token map update embedded');
+  assert.ok(UI_HTML.includes('fh_circle_tokens'), 'per-circle token map in localStorage');
+  assert.ok(UI_HTML.includes('fh_circle_id'), 'selection persisted to localStorage');
+  assert.ok(UI_HTML.includes('dashboard-token'), 'onboarding hint wired');
   assert.ok(UI_HTML.includes('id="circleBox"'), 'switcher container present');
   assert.ok(UI_HTML.includes("api('/v1/families'"), 'families endpoint wired');
-  assert.ok(UI_HTML.includes('fh_circle_id'), 'selection persisted to localStorage');
+  assert.ok(!UI_HTML.includes('circleScopedPath'), 'query-param scoping removed');
+  assert.ok(!UI_HTML.includes('family_id='), 'no family_id query params emitted');
 });
