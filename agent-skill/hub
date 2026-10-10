@@ -30,14 +30,14 @@ import re
 import shlex
 import socket
 import stat
-import subprocess
+import subprocess  # nosec B404 -- used only for the operator-configured vault helper (shell=False)
 import sys
 import uuid
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -140,9 +140,9 @@ def load_token(cfg, profile):
     vault_cmd = os.environ.get("FAMILY_HUB_VAULT_CMD") or cfg.get("vault_cmd")
     if vault_cmd:
         try:
-            # nosec B603: vault_cmd is the operator's own configured helper
-            # command (env var or local config file) — never remote input —
-            # and runs with shell=False via shlex.split (no shell injection).
+            # NOTE: vault_cmd is the operator's own configured helper command
+            # (env var or local config file) -- never remote input -- and runs
+            # with shell=False via shlex.split (no shell injection).
             proc = subprocess.run(  # nosec B603
                 shlex.split(vault_cmd),
                 capture_output=True,
