@@ -383,7 +383,12 @@ class HubClient:
         url = self.base_url + path
         if query:
             url += "?" + urlparse.urlencode(query)
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            # Cloudflare bot protection (Error 1010) blocks Python-urllib's
+            # default UA. Identify honestly as the family-hub agent client.
+            "User-Agent": "family-hub-agent/1.0",
+        }
         if auth:
             if not self.token:
                 raise HubError("auth", "No credential available for this request.")
