@@ -12,8 +12,8 @@ compatibility_date = "2026-10-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "family-hub"
-# Fill in after `wrangler d1 create family-hub`:
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+# Created 2026-10-09 via `wrangler d1 create family-hub` (not a secret).
+database_id = "38625921-e60b-41de-af8e-da90ba8b41a8"
 
 [vars]
 # "0" during first bootstrap, then set to "1" and redeploy to lock
