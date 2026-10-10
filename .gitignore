@@ -1,0 +1,16 @@
+# No secrets in the repo. Ever.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+.dev.vars
+.wrangler/
+node_modules/
+dist/
+.DS_Store
+# agent-skill: credential material & local runtime state
+token
+profiles/
+__pycache__/
+*.pyc
+.pytest_cache/
