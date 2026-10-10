@@ -165,3 +165,24 @@ so the blast radius is small:
   deps the update surface is the toolchain itself.
 - The audit log is your detective control — when in doubt, export the topic
   and read the sequence. That's what it's for.
+
+## Supply-chain posture
+
+- The worker has **zero runtime dependencies**. The only npm package is
+  `typescript@5.9.3` (dev-only, build-time — never shipped in the worker
+  bundle): pinned exact in `server/package.json`, `save-exact=true` in
+  `server/.npmrc`, integrity hash in `server/package-lock.json`.
+- Always install with `npm ci` (never `npm install`) so the lockfile is the
+  source of truth and ranges can't drift at build time.
+- Verified 2026-10-09: the pinned typescript tarball declares **no install
+  hooks** (no `postinstall`/`preinstall`) — the classic preinstall-malware
+  vector (cf. the Shai-Hulud/Tensorlake campaign) is absent, and there are
+  zero transitive dependencies to hide behind.
+- The agent CLI (`agent-skill/hub`) is **Python stdlib only** — no third-party
+  packages at all: nothing to pin, nothing to typosquat.
+- At deploy time, pin the toolchain too: `npm i -g wrangler@<exact-version>`
+  (record the version in the deploy log). Never deploy from a floating
+  `latest`.
+- Run `npm audit` wherever the registry permits it. In sandboxes where the
+  audit endpoint is policy-blocked, the fallback is the posture above:
+  minimal surface + exact pins + integrity hashes + hook inspection.

@@ -140,7 +140,10 @@ def load_token(cfg, profile):
     vault_cmd = os.environ.get("FAMILY_HUB_VAULT_CMD") or cfg.get("vault_cmd")
     if vault_cmd:
         try:
-            proc = subprocess.run(
+            # nosec B603: vault_cmd is the operator's own configured helper
+            # command (env var or local config file) — never remote input —
+            # and runs with shell=False via shlex.split (no shell injection).
+            proc = subprocess.run(  # nosec B603
                 shlex.split(vault_cmd),
                 capture_output=True,
                 text=True,
@@ -313,6 +316,25 @@ def _friendly_from_http(status, payload):
 # ---------------------------------------------------------------------------
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    """Refuse all HTTP redirects: fail closed instead of following them.
+
+    urllib follows redirects automatically and honors non-HTTP schemes
+    (e.g. file://) found in a Location header. The hub API never
+    legitimately redirects, so any redirect is treated as hostile.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HubError(
+            "connection",
+            "Refusing to follow redirect from hub server (code %d)" % code,
+        )
+
+
+# Module-level opener shared by all requests: no redirects, ever.
+_opener = urlrequest.build_opener(_NoRedirect)
+
+
 class HubClient:
     def __init__(self, base_url, token=None, timeout=20, debug=False, transport=None):
         self.base_url = base_url.rstrip("/")
@@ -325,9 +347,16 @@ class HubClient:
 
     # -- low level ------------------------------------------------------
     def _urllib_transport(self, method, url, headers, body_bytes):
+        # SECURITY: only http(s) is ever requested. The base URL comes from
+        # the operator's own config, but defense in depth costs one line.
+        if urlparse.urlsplit(url).scheme.lower() not in ("http", "https"):
+            raise HubError(
+                "config",
+                "Refusing non-HTTP(S) request URL — check your hub server URL",
+            )
         req = urlrequest.Request(url, data=body_bytes, headers=headers, method=method)
         try:
-            with urlrequest.urlopen(req, timeout=self.timeout) as resp:
+            with _opener.open(req, timeout=self.timeout) as resp:
                 return resp.status, resp.read().decode("utf-8", "replace")
         except urlerror.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8", "replace")
