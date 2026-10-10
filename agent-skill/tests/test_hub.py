@@ -537,12 +537,12 @@ class TestCloudflareAndInvite(HubTestBase):
         self.assertIn("inv_abc", out)
 
     def test_invite_member_needs_family_id(self):
-        self.seed_config()  # no family_id
+        self.seed_config()  # no active circle at all
         rc, _out, err = self.run_cli(
             ["invite-member", "--email", "x@example.com", "--role", "kid"])
         self.assertEqual(rc, 1)
         self.assertEqual(self.fake.calls, [])
-        self.assertIn("family_id", err)
+        self.assertIn("No active circle", err)
 
     def test_invite_member_bad_email(self):
         self.seed_config(family_id="fam1")
@@ -550,6 +550,151 @@ class TestCloudflareAndInvite(HubTestBase):
             ["invite-member", "--email", "not-an-email", "--role", "kid"])
         self.assertEqual(rc, 1)
         self.assertEqual(self.fake.calls, [])
+
+
+# ---------------------------------------------------------------------------
+# Circles (v0.2.0): list / create / use / --circle override
+# ---------------------------------------------------------------------------
+
+CIRCLES = [
+    {"id": "c111", "name": "Family", "kind": "family",
+     "my_role": "owner", "created_at": "t"},
+    {"id": "c222", "name": "Friends", "kind": "general",
+     "my_role": "member", "created_at": "t"},
+]
+
+
+class TestCircles(HubTestBase):
+    def call_paths(self):
+        return [(c["method"], urlparse.urlparse(c["url"]).path)
+                for c in self.fake.calls]
+
+    def test_circles_lists_with_active_marked(self):
+        self.seed_config(active_circle_id="c222")
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, out, _ = self.run_cli(["circles"])
+        self.assertEqual(rc, 0)
+        self.assertIn("* Friends", out)
+        self.assertIn("(active)", out)
+        self.assertIn("  Family", out)  # inactive: blank marker
+        self.assertNotIn("c111 (active)", out)
+        self.assertTokenAbsent(out)
+
+    def test_circles_empty(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/families", 200, {"families": []})
+        rc, out, _ = self.run_cli(["circles"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no circles", out)
+
+    def test_circle_create_posts_name_kind(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/families", 201,
+                      {"id": "c333", "name": "Gym", "kind": "general",
+                       "created_at": "t"})
+        rc, out, _ = self.run_cli(
+            ["circle", "create", "--name", "Gym", "--kind", "general"])
+        self.assertEqual(rc, 0)
+        body = json.loads(self.fake.calls[0]["body"])
+        self.assertEqual(body, {"name": "Gym", "kind": "general"})
+        self.assertIn("c333", out)
+        self.assertTokenAbsent(out)
+
+    def test_circle_create_rejects_blank_name(self):
+        self.seed_config()
+        rc, _out, err = self.run_cli(
+            ["circle", "create", "--name", "   "])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("non-empty", err)
+
+    def test_circle_use_by_name(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, out, _ = self.run_cli(["circle", "use", "Friends"])
+        self.assertEqual(rc, 0)
+        self.assertIn("c222", out)
+        cfg = hub.load_config("default")
+        self.assertEqual(cfg["active_circle_id"], "c222")
+
+    def test_circle_use_by_id_prefix(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, _ = self.run_cli(["circle", "use", "c22"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(hub.load_config("default")["active_circle_id"],
+                         "c222")
+
+    def test_circle_use_ambiguous_prefix(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(["circle", "use", "c"])
+        self.assertEqual(rc, 1)
+        self.assertIn("Ambiguous", err)
+        self.assertNotIn("active_circle_id", hub.load_config("default"))
+
+    def test_circle_use_no_match(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(["circle", "use", "Nope"])
+        self.assertEqual(rc, 1)
+        self.assertIn("No circle matches", err)
+        self.assertIn("Family", err)  # candidates listed
+
+    def test_circle_use_duplicate_names(self):
+        self.seed_config()
+        dupes = [
+            {"id": "d1", "name": "Dup", "kind": "family", "my_role": "owner"},
+            {"id": "d2", "name": "Dup", "kind": "family", "my_role": "owner"},
+        ]
+        self.fake.add("GET", "/v1/families", 200, {"families": dupes})
+        rc, _out, err = self.run_cli(["circle", "use", "Dup"])
+        self.assertEqual(rc, 1)
+        self.assertIn("Multiple circles named", err)
+
+    def test_resolve_prefers_active_over_legacy(self):
+        self.seed_config(active_circle_id="c222", family_id="c111")
+        self.fake.add("POST", "/v1/families/c222/invites", 201,
+                      {"invite_code": "inv_x"})
+        rc, _out, _ = self.run_cli(
+            ["invite-member", "--email", "a@example.com", "--role", "kid"])
+        self.assertEqual(rc, 0)
+        # no discovery call needed: the stored id is used directly
+        self.assertEqual(self.call_paths(),
+                         [("POST", "/v1/families/c222/invites")])
+
+    def test_legacy_family_id_fallback(self):
+        self.seed_config(family_id="c111")  # pre-circles profile
+        self.fake.add("POST", "/v1/families/c111/invites", 201,
+                      {"invite_code": "inv_y"})
+        rc, _out, _ = self.run_cli(
+            ["invite-member", "--email", "a@example.com", "--role", "kid"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("POST", "/v1/families/c111/invites")])
+
+    def test_circle_override_flag(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add("POST", "/v1/families/c222/invites", 201,
+                      {"invite_code": "inv_z"})
+        rc, _out, _ = self.run_cli(
+            ["invite-member", "--circle", "Friends",
+             "--email", "a@example.com", "--role", "kid"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("GET", "/v1/families"),
+                          ("POST", "/v1/families/c222/invites")])
+
+    def test_override_no_match_makes_no_post(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(
+            ["invite-member", "--circle", "Nope",
+             "--email", "a@example.com", "--role", "kid"])
+        self.assertEqual(rc, 1)
+        self.assertIn("No circle matches", err)
+        self.assertEqual(self.call_paths(), [("GET", "/v1/families")])
 
 
 if __name__ == "__main__":

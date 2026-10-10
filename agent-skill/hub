@@ -508,6 +508,85 @@ def _write_cursor(profile, value):
 
 
 # ---------------------------------------------------------------------------
+# Circles (v0.2.0: a profile can belong to many circles; one is active)
+# ---------------------------------------------------------------------------
+
+
+def _active_circle_id(cfg):
+    """Effective circle id: explicit active_circle_id, else legacy family_id."""
+    return cfg.get("active_circle_id") or cfg.get("family_id")
+
+
+def _list_circles(client):
+    """GET /v1/families -> the circles this agent belongs to."""
+    return _as_list(client.call("GET", "/v1/families"), "families")
+
+
+def _match_circle(circles, spec):
+    """Resolve a circle name or id/prefix to a circle id. Never guesses.
+
+    Exact name match wins; otherwise an id prefix must match exactly one
+    circle. Ambiguity or no match raises HubError listing the candidates.
+    """
+    by_name = [
+        c for c in circles if isinstance(c, dict) and c.get("name") == spec
+    ]
+    if len(by_name) == 1:
+        return by_name[0].get("id")
+    if len(by_name) > 1:
+        raise HubError(
+            "bad_request",
+            "Multiple circles named %r; use an id instead: %s"
+            % (spec, ", ".join(str(c.get("id")) for c in by_name)),
+        )
+    by_id = [
+        c
+        for c in circles
+        if isinstance(c, dict) and str(c.get("id") or "").startswith(spec)
+    ]
+    if len(by_id) == 1:
+        return by_id[0].get("id")
+    if len(by_id) > 1:
+        raise HubError(
+            "bad_request",
+            "Ambiguous circle %r; matches: %s"
+            % (
+                spec,
+                ", ".join(
+                    "%s (%s)" % (c.get("id"), c.get("name")) for c in by_id
+                ),
+            ),
+        )
+    available = ", ".join(
+        repr(c.get("name")) for c in circles if isinstance(c, dict)
+    )
+    raise HubError(
+        "not_found",
+        "No circle matches %r. Available: %s" % (spec, available or "(none)"),
+    )
+
+
+def _resolve_circle(args, ctx):
+    """Central circle resolution for every command.
+
+    `--circle <name-or-id>` wins; otherwise the profile's active circle
+    (active_circle_id, falling back to legacy family_id). Raises HubError
+    when nothing resolves — callers never see a bare None.
+    """
+    override = getattr(args, "circle", None)
+    if override:
+        return _match_circle(_list_circles(ctx.client), override)
+    cid = _active_circle_id(ctx.cfg)
+    if not cid:
+        raise HubError(
+            "config",
+            "No active circle in this profile — run `hub circle use <name>` "
+            "or re-run `hub setup` to refresh it.",
+        )
+    return cid
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -716,15 +795,9 @@ def cmd_invite(args, transport):
 
 
 def cmd_invite_member(args, transport):
-    """Mint a family invite code for a new member (owner/parent only)."""
+    """Mint a circle invite code for a new member (owner/parent only)."""
     ctx = _ctx(args, transport)
-    cfg = load_config(args.profile)
-    family_id = cfg.get("family_id")
-    if not family_id:
-        raise HubError(
-            "config",
-            "No family_id in this profile — re-run `hub setup` to refresh it.",
-        )
+    family_id = _resolve_circle(args, ctx)
     role = (args.role or "").strip().lower()
     if role not in ("owner", "parent", "kid"):
         raise HubError("bad_request", "--role must be one of: owner, parent, kid.")
@@ -861,6 +934,58 @@ def cmd_me(args, _transport):
     )
     return 0
 
+
+def cmd_circles(args, transport):
+    ctx = _ctx(args, transport)
+    circles = _list_circles(ctx.client)
+    active = _active_circle_id(ctx.cfg)
+    if not circles:
+        emit("no circles — create one with `hub circle create --name ...`.")
+        return 0
+    for c in circles:
+        if not isinstance(c, dict):
+            continue
+        is_active = c.get("id") == active
+        emit(
+            "%s %s — kind: %s, role: %s, id: %s%s"
+            % (
+                "*" if is_active else " ",
+                c.get("name"),
+                c.get("kind"),
+                c.get("my_role"),
+                c.get("id"),
+                " (active)" if is_active else "",
+            )
+        )
+    return 0
+
+
+def cmd_circle_create(args, transport):
+    ctx = _ctx(args, transport)
+    name = (args.name or "").strip()
+    if not name:
+        raise HubError("bad_request", "A non-empty --name is required.")
+    check_pii(name)
+    circle = ctx.client.call(
+        "POST",
+        "/v1/families",
+        json_body={"name": name, "kind": args.kind},
+    ) or {}
+    cid = circle.get("id")
+    emit('created circle "%s" (id=%s)' % (circle.get("name", name), cid))
+    if cid:
+        emit("select it with: hub circle use %s" % cid)
+    return 0
+
+
+def cmd_circle_use(args, transport):
+    ctx = _ctx(args, transport)
+    cid = _match_circle(_list_circles(ctx.client), args.target)
+    ctx.cfg["active_circle_id"] = cid
+    save_config(ctx.profile, ctx.cfg)
+    emit("active circle set to %s" % cid)
+    return 0
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -949,7 +1074,9 @@ def build_parser():
                    help="What history the new members see")
     p.set_defaults(func=cmd_invite)
 
-    p = sub.add_parser("invite-member", help="Mint a family invite code for a new member (owner/parent only)")
+    p = sub.add_parser("invite-member", help="Mint a circle invite code for a new member (owner/parent only)")
+    p.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
     p.add_argument("--email", required=True, help="New member's email address")
     p.add_argument("--role", required=True, choices=["owner", "parent", "kid"],
                    help="Role for the new member")
@@ -999,6 +1126,22 @@ def build_parser():
 
     p = sub.add_parser("members", help="List members of your family")
     p.set_defaults(func=cmd_members)
+
+    p = sub.add_parser("circles", help="List circles you belong to (active marked)")
+    p.set_defaults(func=cmd_circles)
+
+    p = sub.add_parser("circle", help="Manage circles")
+    csub = p.add_subparsers(dest="circle_action", required=True,
+                            metavar="<action>")
+    c = csub.add_parser("create", help="Create a new circle")
+    c.add_argument("--name", required=True, help="Circle name")
+    c.add_argument("--kind", choices=["family", "general"], default="family",
+                   help="Circle kind (default: %(default)s)")
+    c.set_defaults(func=cmd_circle_create)
+    c = csub.add_parser("use", help="Set the active circle for this profile")
+    c.add_argument("target", metavar="NAME_OR_ID",
+                   help="Circle name or id (id prefix ok if unambiguous)")
+    c.set_defaults(func=cmd_circle_use)
 
     p = sub.add_parser("me", help="Show this agent's identity (never the credential)")
     p.set_defaults(func=cmd_me)
