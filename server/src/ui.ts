@@ -80,7 +80,7 @@ async function api(path, opts = {}) {
   const token = tokenForCircle(circleId === undefined ? activeCircleId : circleId);
   const res = await fetch(base + path, {
     ...fetchOpts,
-    headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + token, ...(opts.headers || {}) }
+    headers: { ...(opts.headers || {}), 'content-type': 'application/json', 'authorization': 'Bearer ' + token }
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
@@ -184,23 +184,37 @@ function renderTokenNotice() {
   tokenUI.appendChild(hint);
 }
 
-function saveCircleToken() {
+async function saveCircleToken() {
   const input = $('circleTokenInput');
   const t = input ? input.value.trim() : '';
   if (!t) { alert('Paste a token first.'); return; }
   if (t.slice(0, 3) !== 'fh_') { alert('That does not look like a hub token (expected fh_...).'); return; }
+  // Verify the token is accepted before storing it: fail fast on typos,
+  // expired, or revoked tokens instead of 403ing every later call.
+  try {
+    const res = await fetch(cfg().base + '/v1/members', {
+      headers: { 'authorization': 'Bearer ' + t }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (e) {
+    alert('That token was rejected (' + e.message + '). Not saved.');
+    return;
+  }
   const map = circleTokenMapSet(readTokenMap(), activeCircleId, t);
   try {
     localStorage.setItem('fh_circle_tokens', JSON.stringify(map));
   } catch (e) { alert('Could not save token: ' + e.message); return; }
+  input.value = '';
   renderTokenNotice();
   loadTopics();
 }
 
 // Data calls may proceed only when we hold the active circle's token.
-// Single-circle setups fall back to the default token, which provably
-// belongs to that one circle. With several circles we never guess: the
-// token notice stays up until a token is pasted.
+// Single-circle setups fall back to the default token. The server binds
+// each token to exactly one circle and ignores client-supplied scoping, so
+// a stale fallback fails closed (401) or returns that token's own circle's
+// data — it can never leak another circle's data. With several circles we
+// never guess: the token notice stays up until a token is pasted.
 function canLoadCircleData() {
   if (!activeCircleId) return true;
   if (circleHasToken(readTokenMap(), activeCircleId)) return true;
@@ -243,7 +257,7 @@ async function loadTopic(id, subject) {
     const { entries } = await api('/v1/topics/' + encodeURIComponent(id) + '/history?limit=100');
     $('entries').innerHTML = entries.map(e =>
       '<div class="entry"><span class="kind">' + esc(e.kind) + '</span> ' +
-      '<span class="meta">#' + e.seq + ' · ' + esc(e.ts) + ' · ' + esc(e.agent_label) + '</span><br>' +
+      '<span class="meta">#' + esc(e.seq) + ' · ' + esc(e.ts) + ' · ' + esc(e.agent_label) + '</span><br>' +
       esc(e.body) + '</div>'
     ).join('');
   } catch (e) {
@@ -256,7 +270,13 @@ $('save').onclick = () => {
   $('app').style.display = 'block';
   loadCircles().then(() => loadTopics()).catch(e => alert('Connect failed: ' + e.message));
 };
-$('forget').onclick = () => { localStorage.removeItem('fh_token'); $('token').value = ''; $('app').style.display = 'none'; };
+$('forget').onclick = () => {
+  localStorage.removeItem('fh_token');
+  localStorage.removeItem('fh_circle_tokens');
+  localStorage.removeItem('fh_circle_id');
+  $('token').value = '';
+  $('app').style.display = 'none';
+};
 $('post').onclick = async () => {
   if (!currentTopic) return alert('Pick a topic first');
   try {
