@@ -18,4 +18,4 @@ database_id = "38625921-e60b-41de-af8e-da90ba8b41a8"
 [vars]
 # "0" during first bootstrap, then set to "1" and redeploy to lock
 # POST /v1/families forever (SPEC §6).
-SETUP_LOCKED = "0"
+SETUP_LOCKED = "1"
