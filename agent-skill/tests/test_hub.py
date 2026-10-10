@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -653,7 +654,11 @@ class TestCircles(HubTestBase):
         self.assertIn("Multiple circles named", err)
 
     def test_resolve_prefers_active_over_legacy(self):
-        self.seed_config(active_circle_id="c222", family_id="c111")
+        # Active circle wins for resolution; its own token is used (the
+        # server binds each token to one family, so the legacy token for
+        # c111 could not act on c222).
+        self.seed_config(active_circle_id="c222", family_id="c111",
+                         circle_tokens={"c222": "fh_C222_tok"})
         self.fake.add("POST", "/v1/families/c222/invites", 201,
                       {"invite_code": "inv_x"})
         rc, _out, _ = self.run_cli(
@@ -662,6 +667,8 @@ class TestCircles(HubTestBase):
         # no discovery call needed: the stored id is used directly
         self.assertEqual(self.call_paths(),
                          [("POST", "/v1/families/c222/invites")])
+        auth = self.fake.calls[0]["headers"]["Authorization"]
+        self.assertEqual(auth, "Bearer fh_C222_tok")
 
     def test_legacy_family_id_fallback(self):
         self.seed_config(family_id="c111")  # pre-circles profile
@@ -674,7 +681,10 @@ class TestCircles(HubTestBase):
                          [("POST", "/v1/families/c111/invites")])
 
     def test_circle_override_flag(self):
-        self.seed_config(family_id="c111")
+        # --circle switches target AND token: c222's own token is used,
+        # since the legacy c111 token is bound to its own family.
+        self.seed_config(family_id="c111",
+                         circle_tokens={"c222": "fh_C222_tok"})
         self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
         self.fake.add("POST", "/v1/families/c222/invites", 201,
                       {"invite_code": "inv_z"})
@@ -685,6 +695,10 @@ class TestCircles(HubTestBase):
         self.assertEqual(self.call_paths(),
                          [("GET", "/v1/families"),
                           ("POST", "/v1/families/c222/invites")])
+        post = [c for c in self.fake.calls
+                if urlparse.urlparse(c["url"]).path.endswith("/invites")][0]
+        self.assertEqual(post["headers"]["Authorization"],
+                         "Bearer fh_C222_tok")
 
     def test_override_no_match_makes_no_post(self):
         self.seed_config(family_id="c111")
@@ -695,6 +709,265 @@ class TestCircles(HubTestBase):
         self.assertEqual(rc, 1)
         self.assertIn("No circle matches", err)
         self.assertEqual(self.call_paths(), [("GET", "/v1/families")])
+
+
+# ---------------------------------------------------------------------------
+# Per-circle tokens (v0.2.0): one token per circle, active-circle auth,
+# legacy fallback, multi-circle sync, dashboard-token
+# ---------------------------------------------------------------------------
+
+
+class TestCircleTokens(HubTestBase):
+    TOK_A = "fh_CIRCLE_A_token123456"
+    TOK_B = "fh_CIRCLE_B_token789012"
+
+    def seed_multi(self, **over):
+        cfg = {
+            "active_circle_id": "c111",
+            "circle_tokens": {"c111": self.TOK_A, "c222": self.TOK_B},
+            "circle_members": {
+                "c111": {"id": "m1", "name": "Tester", "role": "owner"},
+                "c222": {"id": "m9", "name": "Tester", "role": "member"},
+            },
+        }
+        cfg.update(over)
+        self.seed_config(**cfg)
+
+    def sync_paths(self):
+        return [
+            (urlparse.urlparse(c["url"]).path, c["headers"].get("Authorization"))
+            for c in self.fake.calls
+            if urlparse.urlparse(c["url"]).path == "/v1/sync"
+        ]
+
+    # -- circle create auto-redeem --------------------------------------
+
+    def test_create_auto_redeem_stores_token_and_activates(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/families", 201,
+                      {"id": "c333", "name": "Gym", "kind": "general",
+                       "created_at": "t",
+                       "provisioning_code": "fhp_NEWCODE123",
+                       "provisioning_expires_at": "t2"})
+        self.fake.add("POST", "/v1/provisioning-codes/fhp_NEWCODE123/redeem",
+                      201,
+                      {"token": "fh_NEWCIRCLE_tok999", "token_id": "tok9",
+                       "member": {"id": "m9", "family_id": "c333",
+                                  "name": "Tester", "role": "owner",
+                                  "email": "t@example.com"}})
+        rc, out, err = self.run_cli(
+            ["circle", "create", "--name", "Gym", "--kind", "general"])
+        self.assertEqual(rc, 0)
+        cfg = hub.load_config("default")
+        self.assertEqual(cfg["circle_tokens"]["c333"], "fh_NEWCIRCLE_tok999")
+        self.assertEqual(cfg["active_circle_id"], "c333")
+        self.assertEqual(cfg["circle_members"]["c333"]["id"], "m9")
+        self.assertIn("now active", out)
+        self.assertIn("c333", out)
+        # token never appears in output...
+        self.assertNotIn("fh_NEWCIRCLE_tok999", out + err)
+        self.assertTokenAbsent(out, err)
+        # ...but IS persisted in the 0600 config
+        with open(hub.config_path("default")) as fh:
+            self.assertIn("fh_NEWCIRCLE_tok999", fh.read())
+        mode = stat.S_IMODE(os.stat(hub.config_path("default")).st_mode)
+        self.assertEqual(mode, 0o600)
+        # redeem used no Authorization header (the code is the credential)
+        redeem = [c for c in self.fake.calls if "redeem" in c["url"]][0]
+        self.assertNotIn("Authorization", redeem["headers"])
+
+    def test_create_redeem_mismatch_refuses_to_store(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/families", 201,
+                      {"id": "c333", "name": "Gym", "kind": "general",
+                       "created_at": "t",
+                       "provisioning_code": "fhp_NEWCODE123",
+                       "provisioning_expires_at": "t2"})
+        self.fake.add("POST", "/v1/provisioning-codes/fhp_NEWCODE123/redeem",
+                      201,
+                      {"token": "fh_WRONG_tok", "token_id": "tok9",
+                       "member": {"id": "m9", "family_id": "c999",
+                                  "name": "Tester", "role": "owner"}})
+        rc, _out, err = self.run_cli(["circle", "create", "--name", "Gym"])
+        self.assertEqual(rc, 1)
+        self.assertIn("different circle", err)
+        cfg = hub.load_config("default")
+        self.assertNotIn("circle_tokens", cfg)
+        self.assertNotIn("fh_WRONG_tok", err)
+
+    # -- circle join -----------------------------------------------------
+
+    def test_join_with_provisioning_code(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/provisioning-codes/fhp_JOIN123/redeem",
+                      201,
+                      {"token": "fh_JOINED_tok111", "token_id": "tokJ",
+                       "member": {"id": "m7", "family_id": "c777",
+                                  "name": "Tester", "role": "member"}})
+        self.fake.add("GET", "/v1/families", 200, {"families": [
+            {"id": "c777", "name": "Book Club", "kind": "general",
+             "my_role": "member"}]})
+        rc, out, err = self.run_cli(["circle", "join", "--code", "fhp_JOIN123"])
+        self.assertEqual(rc, 0)
+        cfg = hub.load_config("default")
+        self.assertEqual(cfg["circle_tokens"]["c777"], "fh_JOINED_tok111")
+        self.assertEqual(cfg["active_circle_id"], "c777")
+        self.assertIn("Book Club", out)
+        self.assertIn("now active", out)
+        self.assertNotIn("fh_JOINED_tok111", out + err)
+
+    def test_join_with_invite_code_sends_name_label(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/invites/fhi_INV123/accept", 201,
+                      {"token": "fh_INVITED_tok222", "token_id": "tokI",
+                       "member": {"id": "m8", "family_id": "c888",
+                                  "name": "Tester", "role": "kid"}})
+        self.fake.add("GET", "/v1/families", 200, {"families": [
+            {"id": "c888", "name": "Gym", "kind": "general",
+             "my_role": "kid"}]})
+        rc, out, err = self.run_cli(["circle", "join", "--code", "fhi_INV123"])
+        self.assertEqual(rc, 0)
+        accept = [c for c in self.fake.calls if "accept" in c["url"]][0]
+        body = json.loads(accept["body"])
+        self.assertEqual(body, {"display_name": "Tester",
+                               "agent_label": "test-agent"})
+        cfg = hub.load_config("default")
+        self.assertEqual(cfg["circle_tokens"]["c888"], "fh_INVITED_tok222")
+        self.assertEqual(cfg["active_circle_id"], "c888")
+        self.assertNotIn("fh_INVITED_tok222", out + err)
+
+    def test_join_invite_code_needs_name_label(self):
+        os.environ.pop("FAMILY_HUB_TOKEN", None)
+        hub.save_config("default", {"server_url": "https://hub.example"})
+        rc, _out, err = self.run_cli(["circle", "join", "--code", "fhi_X"])
+        self.assertEqual(rc, 1)
+        self.assertIn("--name and --label", err)
+        self.assertEqual(self.fake.calls, [])
+
+    # -- per-circle auth --------------------------------------------------
+
+    def test_request_uses_active_circle_token(self):
+        self.seed_multi()  # active c111
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        rc, _out, _ = self.run_cli(["topics"])
+        self.assertEqual(rc, 0)
+        auth = self.fake.calls[0]["headers"]["Authorization"]
+        self.assertEqual(auth, "Bearer " + self.TOK_A)
+        self.assertTokenAbsent(self.fake.calls[0]["headers"].get("X-X", ""))
+
+    def test_request_falls_back_to_legacy_token(self):
+        self.seed_config(family_id="c111")  # no circle_tokens at all
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        rc, _out, _ = self.run_cli(["topics"])
+        self.assertEqual(rc, 0)
+        auth = self.fake.calls[0]["headers"]["Authorization"]
+        self.assertEqual(auth, "Bearer " + FAKE_TOKEN)
+
+    def test_circle_override_switches_token(self):
+        self.seed_multi()  # active c111 (TOK_A)
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add("POST", "/v1/families/c222/invites", 201,
+                      {"invite_code": "inv_z"})
+        rc, _out, _ = self.run_cli(
+            ["invite-member", "--circle", "Friends",
+             "--email", "a@example.com", "--role", "kid"])
+        self.assertEqual(rc, 0)
+        posts = [c for c in self.fake.calls
+                 if urlparse.urlparse(c["url"]).path.endswith("/invites")]
+        self.assertEqual(len(posts), 1)
+        # the POST went out with circle B's token, not the active circle's
+        self.assertEqual(posts[0]["headers"]["Authorization"],
+                         "Bearer " + self.TOK_B)
+
+    def test_circle_override_tokenless_hints_join(self):
+        self.seed_config(active_circle_id="c111",
+                         circle_tokens={"c111": self.TOK_A})
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(
+            ["invite-member", "--circle", "Friends",
+             "--email", "a@example.com", "--role", "kid"])
+        self.assertEqual(rc, 1)
+        self.assertIn("hub circle join --code", err)
+
+    # -- sync --------------------------------------------------------------
+
+    def test_sync_labels_entries_per_circle(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add("GET", "/v1/sync", 200, {"entries": [
+            {"gseq": 3, "seq": 1, "body": "hello"}]})
+        rc, out, _ = self.run_cli(["sync"])
+        self.assertEqual(rc, 0)
+        entries = json.loads(out)
+        self.assertEqual(len(entries), 2)  # one per circle
+        by_circle = {e["circle_id"]: e for e in entries}
+        self.assertEqual(by_circle["c111"]["circle_name"], "Family")
+        self.assertEqual(by_circle["c222"]["circle_name"], "Friends")
+        # each circle synced with its own token...
+        auths = {p for _, p in self.sync_paths()}
+        self.assertEqual(auths, {"Bearer " + self.TOK_A,
+                                 "Bearer " + self.TOK_B})
+        # ...and its own cursor
+        for cid in ("c111", "c222"):
+            with open(hub.cursor_path("default", cid)) as fh:
+                self.assertEqual(fh.read().strip(), "3")
+        self.assertFalse(os.path.exists(hub.cursor_path("default")))
+
+    def test_sync_multi_circle_no_entries(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add("GET", "/v1/sync", 200, {"entries": []})
+        rc, out, err = self.run_cli(["sync"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [])
+        self.assertIn("no new entries", err)
+
+    # -- circle use warnings ---------------------------------------------------
+
+    def test_use_warns_when_tokenless(self):
+        self.seed_config(active_circle_id="c111",
+                         circle_tokens={"c111": self.TOK_A})
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, out, err = self.run_cli(["circle", "use", "Friends"])  # c222
+        self.assertEqual(rc, 0)
+        self.assertEqual(hub.load_config("default")["active_circle_id"], "c222")
+        self.assertIn("no token stored", err)
+        self.assertIn("hub circle join --code", err)
+
+    def test_use_no_warning_when_token_present(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(["circle", "use", "Friends"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("no token stored", err)
+
+    def test_use_no_warning_for_legacy_bootstrap(self):
+        # Single-token profile: the bootstrap circle works via fallback.
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(["circle", "use", "Family"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("no token stored", err)
+
+    # -- dashboard-token --------------------------------------------------------
+
+    def test_dashboard_token_prints_with_warning(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, out, _ = self.run_cli(["dashboard-token", "--circle", "Friends"])
+        self.assertEqual(rc, 0)
+        self.assertIn("WARNING", out)
+        self.assertIn(self.TOK_B, out)
+        # warning precedes the token
+        self.assertLess(out.index("WARNING"), out.index(self.TOK_B))
+
+    def test_dashboard_token_no_token_stored(self):
+        self.seed_config(active_circle_id="c111",
+                         circle_tokens={"c111": self.TOK_A})
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        rc, _out, err = self.run_cli(["dashboard-token", "--circle", "Friends"])
+        self.assertEqual(rc, 1)
+        self.assertIn("No token stored", err)
 
 
 if __name__ == "__main__":
