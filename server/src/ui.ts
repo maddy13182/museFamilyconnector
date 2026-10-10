@@ -189,15 +189,25 @@ async function saveCircleToken() {
   const t = input ? input.value.trim() : '';
   if (!t) { alert('Paste a token first.'); return; }
   if (t.slice(0, 3) !== 'fh_') { alert('That does not look like a hub token (expected fh_...).'); return; }
-  // Verify the token is accepted before storing it: fail fast on typos,
-  // expired, or revoked tokens instead of 403ing every later call.
+  const active = lastFamilies.filter(function (f) { return f.id === activeCircleId; })[0];
+  const name = active ? active.name : activeCircleId;
+  // Verify the token before storing it: fail fast on typos, expired, or
+  // revoked tokens instead of 403ing every later call. GET /v1/me also
+  // proves the token is bound to THIS circle, so a token pasted for the
+  // wrong circle is rejected instead of mislabeling its data as ours.
+  let me;
   try {
-    const res = await fetch(cfg().base + '/v1/members', {
+    const res = await fetch(cfg().base + '/v1/me', {
       headers: { 'authorization': 'Bearer ' + t }
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
+    me = await res.json();
   } catch (e) {
     alert('That token was rejected (' + e.message + '). Not saved.');
+    return;
+  }
+  if (!me || me.family_id !== activeCircleId) {
+    alert('That token belongs to a different circle and was not saved. Run the hinted command for "' + name + '" and paste that token.');
     return;
   }
   const map = circleTokenMapSet(readTokenMap(), activeCircleId, t);
