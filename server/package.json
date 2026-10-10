@@ -1,12 +1,13 @@
 {
   "name": "family-hub-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Family Hub API \u2014 Cloudflare Worker, zero runtime dependencies",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "pretest": "rm -rf dist",
     "test": "npm run build && rm -rf dist/migrations && cp -r migrations dist/migrations && node --test 'dist/test/*.test.js'"
   },
   "devDependencies": {
