@@ -75,11 +75,13 @@ test('1. bootstrap two families; lock setup afterwards', async () => {
   ctx.ownerToken = a.token;
   ctx.ownerId = a.memberId;
   app.env.SETUP_LOCKED = '1';
+  // v0.2.0+: locked creation requires auth now — no token is 401, and a
+  // non-hub-owner token is 403. (Old behavior was a blanket 403.)
   const locked = await app.call('POST', '/v1/families', {
     body: { name: 'X', owner_name: 'X', owner_email: 'x@x.dev' },
   });
-  assert.equal(locked.status, 403);
-  assert.equal(locked.body.error.code, 'setup_locked');
+  assert.equal(locked.status, 401);
+  assert.equal(locked.body.error.code, 'unauthorized');
 });
 
 test('2. invite parent + kid; parent cannot invite an owner; invite reuse denied', async () => {
