@@ -47,7 +47,7 @@ wrangler secret put TOKEN_PEPPER
 # 3. Bootstrap (SETUP_LOCKED=0 in wrangler.toml), deploy, create the family ONCE:
 wrangler deploy
 curl -s https://<your-worker>.workers.dev/v1/families \
-  -d '{"name":"Ramamurthy family","owner_name":"Mahesh Ramamurthy","owner_email":"harshika.mahesh@gmail.com"}'
+  -d '{"name":"<Family name>","owner_name":"<Your name>","owner_email":"<you@example.com>"}'
 #    -> save the provisioning_code; the owner's agent redeems it at
 #       POST /v1/provisioning-codes/:code/redeem to get its bearer token.
 

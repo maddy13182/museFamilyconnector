@@ -3,7 +3,10 @@
 # Needs GitHub Actions secrets (repo Settings → Secrets and variables → Actions):
 #   CLOUDFLARE_API_TOKEN   — API token from the "Edit Cloudflare Workers" template
 #   CLOUDFLARE_ACCOUNT_ID  — from the Cloudflare dashboard overview page
-# The job skips gracefully when they aren't set (forks, local-deploy users).
+# The deploy job skips gracefully when they aren't set (forks, local-deploy
+# users). NOTE: secrets may not be referenced in `if:` conditions per GitHub
+# docs, so a small `check` job maps the secret to an output and the deploy
+# job gates on `needs.check` (an allowed context) instead.
 #
 # One-time manual setup first (see docs/DEPLOY.md):
 #   1. D1 database created, database_id filled into server/wrangler.toml
@@ -16,8 +19,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.creds.outputs.enabled }}
+    steps:
+      - name: Check deploy credentials
+        id: creds
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No CLOUDFLARE_API_TOKEN secret set — skipping Cloudflare deploy (local deploy is the primary path; see README)."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
   deploy:
-    if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
