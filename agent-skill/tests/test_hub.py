@@ -291,6 +291,52 @@ class TestRedaction(HubTestBase):
         self.assertNotIn("Bearer " + FAKE_TOKEN, err)
         self.assertIn("[redacted]", err)  # the header value is scrubbed
 
+    def test_debug_redacts_redeem_token_and_code(self):
+        # The redeem request URL carries the bearer code and the redeem
+        # response carries the fresh token; --debug must expose neither.
+        # (The token cannot be note_secret()-registered yet at dump time,
+        # so the scrub has to be structural.)
+        self.seed_config()
+        secret_tok = "fh_DEBUGMINTED999"
+        code = "fhp_DEBUGCODE999"
+        self.fake.add("POST", "/v1/provisioning-codes/%s/redeem" % code,
+                      201,
+                      {"token": secret_tok, "token_id": "tokD",
+                       "member": {"id": "mD", "family_id": "cD9",
+                                  "name": "Tester", "role": "member"}})
+        self.fake.add("GET", "/v1/families", 200, {"families": []})
+        rc, out, err = self.run_cli(["--debug", "circle", "join",
+                                     "--code", code])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(secret_tok, out + err)
+        self.assertNotIn(code, out + err)
+        self.assertIn("[redacted]", err)  # scrub markers present
+
+    def test_scrub_sensitive_text(self):
+        body = json.dumps({"token": "fh_X", "member": {"id": "m1"},
+                           "provisioning_code": "fhp_Y"})
+        scrubbed = hub._scrub_sensitive_text(body)
+        self.assertNotIn("fh_X", scrubbed)
+        self.assertNotIn("fhp_Y", scrubbed)
+        self.assertIn("[redacted]", scrubbed)
+        nested = json.dumps({"a": [{"token": "fh_Z"}]})
+        self.assertNotIn("fh_Z", hub._scrub_sensitive_text(nested))
+        self.assertEqual(hub._scrub_sensitive_text("plain text"), "plain text")
+        self.assertEqual(hub._scrub_sensitive_text(""), "")
+
+    def test_scrub_url(self):
+        url = "https://hub.example/v1/provisioning-codes/fhp_ABC123/redeem"
+        scrubbed = hub._scrub_url(url)
+        self.assertNotIn("fhp_ABC123", scrubbed)
+        self.assertIn("fhp_[redacted]", scrubbed)
+        self.assertEqual(hub._scrub_url("https://hub.example/v1/sync"),
+                         "https://hub.example/v1/sync")
+
+    def test_save_config_is_0600(self):
+        self.seed_config(circle_tokens={"c1": "fh_XYZ"})
+        mode = stat.S_IMODE(os.stat(hub.config_path("default")).st_mode)
+        self.assertEqual(mode, 0o600)
+
     def test_post_redacted(self):
         self.seed_config()
         self.fake.add("POST", "/v1/topics/t1/entries", 200,

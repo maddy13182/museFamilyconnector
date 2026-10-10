@@ -88,6 +88,62 @@ def emit_json(obj):
 
 
 # ---------------------------------------------------------------------------
+# Debug-output scrubbing. _debug_dump runs *inside* client.call, i.e. before
+# a freshly minted token (redeem response) can be registered with
+# note_secret(), so redact() alone cannot protect it. These scrubs are
+# structural and need no registration.
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_JSON_KEYS = frozenset({"token", "provisioning_code", "provisioningCode"})
+
+
+def _scrub_sensitive_value(obj):
+    """Recursively replace sensitive JSON values with [redacted]."""
+    if isinstance(obj, dict):
+        return {
+            k: ("[redacted]" if k in _SENSITIVE_JSON_KEYS
+                else _scrub_sensitive_value(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_scrub_sensitive_value(v) for v in obj]
+    return obj
+
+
+def _scrub_sensitive_text(text):
+    """Scrub secrets from a debug-dump payload.
+
+    JSON bodies get sensitive fields redacted structurally. Non-JSON text
+    passes through unchanged (redact() still applies to registered values).
+    Never raises.
+    """
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    if isinstance(parsed, (dict, list)):
+        try:
+            return json.dumps(_scrub_sensitive_value(parsed))
+        except (TypeError, ValueError):
+            return "[unprintable]"
+    return text
+
+
+_CODE_IN_URL = re.compile(r"(fhp_|fhi_)[^/?#\s]*")
+
+
+def _scrub_url(url):
+    """Redact bearer codes embedded in URL paths.
+
+    note_secret() covers the literal code, but URL-quoting can alter its
+    bytes; the regex covers that edge.
+    """
+    return _CODE_IN_URL.sub(r"\1[redacted]", url or "")
+
+
+# ---------------------------------------------------------------------------
 # Config / profiles
 # ---------------------------------------------------------------------------
 
@@ -138,7 +194,10 @@ def save_config(profile, cfg):
     # this file is already 0600. Tokens are never printed (see redact()).
     scrubbed = {k: v for k, v in cfg.items() if k not in ("token", "bearer_token")}
     tmp = config_path(profile) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    # Create 0600 from the first byte: circle_tokens live in this file, and a
+    # post-write chmod would leave a world-readable window on strict umasks.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(scrubbed, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, config_path(profile))
@@ -401,12 +460,15 @@ class HubClient:
             for k, v in headers.items()
         }
         emit_err("--- hub debug ---")
-        emit_err("%s %s" % (method, url))
+        emit_err("%s %s" % (method, _scrub_url(url)))
         emit_err("request headers: %s" % json.dumps(safe_headers))
         if body_bytes:
-            emit_err("request body: %s" % body_bytes.decode("utf-8", "replace")[:2000])
+            emit_err("request body: %s"
+                     % _scrub_sensitive_text(
+                         body_bytes.decode("utf-8", "replace"))[:2000])
         emit_err("response status: %s" % status)
-        emit_err("response body: %s" % (resp_text or "")[:2000])
+        emit_err("response body: %s"
+                 % _scrub_sensitive_text(resp_text or "")[:2000])
         emit_err("--- end debug ---")
 
     # -- public ---------------------------------------------------------
@@ -736,6 +798,7 @@ def cmd_setup(args, transport):
     code = args.invite or getpass.getpass("Invite or provisioning code: ").strip()
     if not code:
         raise HubError("bad_request", "An invite or provisioning code is required.")
+    note_secret(code)  # bearer code: keep it out of --debug URL dumps etc.
     if code.startswith("fhp_"):
         # Owner bootstrap flow: the member already exists; the provisioning
         # code mints this agent's token directly (label set at bootstrap).
@@ -1156,8 +1219,10 @@ def _redeem_code(server, transport, debug, code, display_name="",
                  agent_label=""):
     """Redeem a provisioning (fhp_) or invite (fhi_) code; no auth needed.
 
-    Returns (token, member dict). The raw code is never logged.
+    Returns (token, member dict). The raw code is registered as a secret so
+    it can never appear in output (e.g. the --debug URL dump).
     """
+    note_secret(code)
     client = HubClient(server, token=None, debug=debug, transport=transport)
     if code.startswith("fhp_"):
         path = "/v1/provisioning-codes/%s/redeem" % urlparse.quote(code, safe="")
@@ -1238,7 +1303,11 @@ def cmd_circle_join(args, transport):
     ctx = _ctx(args, transport, need_auth=False)
     code = (args.code or "").strip()
     if not code:
-        raise HubError("bad_request", "--code is required.")
+        # Prompt rather than require argv: codes in argv land in shell
+        # history and ps output.
+        code = getpass.getpass("Invite or provisioning code: ").strip()
+    if not code:
+        raise HubError("bad_request", "An invite or provisioning code is required.")
     member = ctx.cfg.get("member") or {}
     display_name = (args.name or member.get("name") or "").strip()
     agent_label = (args.label or ctx.cfg.get("agent_label") or "").strip()
@@ -1468,8 +1537,10 @@ def build_parser():
                    help="Circle name or id (id prefix ok if unambiguous)")
     c.set_defaults(func=cmd_circle_use)
     c = csub.add_parser("join", help="Join a circle with an invite/provisioning code")
-    c.add_argument("--code", required=True,
-                   help="Invite (fhi_) or provisioning (fhp_) code")
+    c.add_argument("--code", required=False, default=None,
+                   help="Invite (fhi_) or provisioning (fhp_) code "
+                        "(prompted securely if omitted, so it stays out of "
+                        "shell history)")
     c.add_argument("--name", default=None,
                    help="Display name for invite codes (default: profile member name)")
     c.add_argument("--label", default=None,

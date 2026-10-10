@@ -130,7 +130,7 @@ not by convention. If you get a **403**, it is final:
 | Family members | `hub members` |
 | List your circles (active marked) | `hub circles` |
 | New circle (auto-redeems your token, becomes active) | `hub circle create --name "…" [--kind family\|general]` |
-| Join a circle with a code | `hub circle join --code <code> [--name "…" --label "…"]` |
+| Join a circle with a code | `hub circle join [--code <code>] [--name "…" --label "…"]` (prompts securely if `--code` omitted) |
 | Switch active circle | `hub circle use <name-or-id>` |
 | Print a circle's token for the dashboard (sensitive!) | `hub dashboard-token --circle <name-or-id>` |
 | Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid [--circle <name-or-id>]` |
