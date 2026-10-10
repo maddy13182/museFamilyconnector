@@ -501,22 +501,32 @@ def cmd_setup(args, transport):
     )
     if not server:
         raise HubError("bad_request", "A server URL is required.")
-    code = args.invite or getpass.getpass("Invite code: ").strip()
+    code = args.invite or getpass.getpass("Invite or provisioning code: ").strip()
     if not code:
-        raise HubError("bad_request", "An invite code is required.")
-    display_name = args.name or input("Your display name: ").strip()
-    if not display_name:
-        raise HubError("bad_request", "A display name is required.")
-    default_label = "%s-agent" % socket.gethostname().split(".")[0]
-    agent_label = args.label or input(
-        "Agent label [%s]: " % default_label
-    ).strip() or default_label
+        raise HubError("bad_request", "An invite or provisioning code is required.")
+    if code.startswith("fhp_"):
+        # Owner bootstrap flow: the member already exists; the provisioning
+        # code mints this agent's token directly (label set at bootstrap).
+        accept_path = "/v1/provisioning-codes/%s/redeem" % urlparse.quote(code, safe="")
+        accept_body = {}
+        display_name = ""
+        agent_label = "owner-agent"
+    else:
+        display_name = args.name or input("Your display name: ").strip()
+        if not display_name:
+            raise HubError("bad_request", "A display name is required.")
+        default_label = "%s-agent" % socket.gethostname().split(".")[0]
+        agent_label = args.label or input(
+            "Agent label [%s]: " % default_label
+        ).strip() or default_label
+        accept_path = "/v1/invites/%s/accept" % urlparse.quote(code, safe="")
+        accept_body = {"display_name": display_name, "agent_label": agent_label}
 
     client = HubClient(server, token=None, debug=args.debug, transport=transport)
     resp = client.call(
         "POST",
-        "/v1/invites/%s/accept" % urlparse.quote(code, safe=""),
-        json_body={"display_name": display_name, "agent_label": agent_label},
+        accept_path,
+        json_body=accept_body,
         auth=False,
     )
     if not isinstance(resp, dict) or "token" not in resp or "member" not in resp:
@@ -834,9 +844,9 @@ def build_parser():
     parser.add_argument("--version", action="version", version="hub " + VERSION)
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    p = sub.add_parser("setup", help="Accept an invite and configure this agent")
+    p = sub.add_parser("setup", help="Accept an invite (or owner provisioning code) and configure this agent")
     p.add_argument("--server", dest="setup_server", default=None)
-    p.add_argument("--invite", default=None, help="Invite code (else prompted)")
+    p.add_argument("--invite", default=None, help="Invite or provisioning code (else prompted)")
     p.add_argument("--name", default=None, help="Display name (else prompted)")
     p.add_argument("--label", default=None, help="Agent label (else prompted)")
     p.add_argument(
