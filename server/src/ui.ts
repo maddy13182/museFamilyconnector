@@ -2,6 +2,8 @@
 // Single self-contained HTML page, no external assets. The human pastes their
 // agent token once; it is kept in localStorage of their own browser only.
 
+import { CIRCLE_LOGIC_SRC } from './circle-logic.js';
+
 export const UI_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -29,6 +31,8 @@ export const UI_HTML = `<!DOCTYPE html>
   <div class="meta">Your token stays in this browser's localStorage only. Never share screenshots of it.</div>
 </div>
 <div id="app" style="display:none">
+  <div id="circleBox" style="display:none; margin-bottom: 1rem;"></div>
+  <div id="circleError" class="meta" style="color: #a00;"></div>
   <h2>Topics</h2>
   <div id="topics"></div>
   <h3>New topic</h3>
@@ -41,8 +45,10 @@ export const UI_HTML = `<!DOCTYPE html>
   <button id="post">Post message</button>
 </div>
 <script>
+${CIRCLE_LOGIC_SRC}
 const $ = (id) => document.getElementById(id);
 let currentTopic = null;
+let activeCircleId = localStorage.getItem('fh_circle_id') || null;
 
 function cfg() {
   return {
@@ -52,13 +58,76 @@ function cfg() {
 }
 async function api(path, opts = {}) {
   const { base, token } = cfg();
-  const res = await fetch(base + path, {
-    ...opts,
+  const { unscoped, ...fetchOpts } = opts;
+  const finalPath = unscoped ? path : circleScopedPath(path, activeCircleId);
+  const res = await fetch(base + finalPath, {
+    ...fetchOpts,
     headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + token, ...(opts.headers || {}) }
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
   return data;
+}
+
+async function loadCircles() {
+  const box = $('circleBox');
+  const errBox = $('circleError');
+  let families = [];
+  try {
+    const data = await api('/v1/families', { unscoped: true });
+    families = Array.isArray(data.families) ? data.families : [];
+  } catch (e) {
+    if (/HTTP 404/.test(e.message)) {
+      // Server predates multi-circle support: single-circle mode, stay quiet.
+      box.style.display = 'none';
+      errBox.textContent = '';
+      activeCircleId = null;
+      return;
+    }
+    errBox.textContent = 'Could not load circles: ' + e.message;
+    return;
+  }
+  errBox.textContent = '';
+  const active = circleResolveActive(families, activeCircleId);
+  activeCircleId = active ? active.id : null;
+  if (activeCircleId) localStorage.setItem('fh_circle_id', activeCircleId);
+  else localStorage.removeItem('fh_circle_id');
+  if (families.length === 0) {
+    box.style.display = 'block';
+    box.innerHTML = '<span class="meta">You are not a member of any circle yet.</span>';
+    return;
+  }
+  if (!circleShouldShowSwitcher(families)) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+  box.style.display = 'block';
+  box.innerHTML = '';
+  const label = document.createElement('label');
+  label.textContent = 'Circle: ';
+  const sel = document.createElement('select');
+  sel.id = 'circleSel';
+  families.forEach(function (f) {
+    const o = document.createElement('option');
+    o.value = f.id;
+    o.textContent = circleLabel(f);
+    if (f.id === activeCircleId) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.onchange = function () { switchCircle(sel.value); };
+  label.appendChild(sel);
+  box.appendChild(label);
+}
+async function switchCircle(id) {
+  activeCircleId = id;
+  localStorage.setItem('fh_circle_id', id);
+  currentTopic = null;
+  $('topicTitle').textContent = '';
+  $('entries').innerHTML = '';
+  try {
+    await loadTopics();
+  } catch (e) { alert('Could not load topics: ' + e.message); }
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
@@ -86,7 +155,7 @@ $('save').onclick = () => {
   localStorage.setItem('fh_base', $('base').value.trim() || location.origin);
   localStorage.setItem('fh_token', $('token').value.trim());
   $('app').style.display = 'block';
-  loadTopics().catch(e => alert('Connect failed: ' + e.message));
+  loadCircles().then(() => loadTopics()).catch(e => alert('Connect failed: ' + e.message));
 };
 $('forget').onclick = () => { localStorage.removeItem('fh_token'); $('token').value = ''; $('app').style.display = 'none'; };
 $('post').onclick = async () => {
@@ -115,7 +184,7 @@ if (localStorage.getItem('fh_token')) {
   $('base').value = localStorage.getItem('fh_base') || '';
   $('token').value = localStorage.getItem('fh_token');
   $('app').style.display = 'block';
-  loadTopics().catch(() => {});
+  loadCircles().then(() => loadTopics()).catch(() => {});
 }
 </script>
 </body>
