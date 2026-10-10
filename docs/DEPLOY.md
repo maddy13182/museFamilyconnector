@@ -1,69 +1,66 @@
-# Family Hub — Deploy & CD setup
+# Family Hub — Deploy guide
 
-Every push to `main` deploys automatically: build → test → D1 migrations →
-`wrangler deploy`. PRs run build + test only (no deploy, no secrets).
+Two ways to deploy. **A** is the primary path (your agent deploys from your
+machine, following the README). **B** is optional.
 
-## One-time setup (about 10 minutes, all yours)
+## A. Deploy from your machine (recommended)
 
-### 1. Cloudflare account
-Create a free account at dash.cloudflare.com if you don't have one.
+You need:
 
-### 2. API token (least privilege)
-- Top-right profile → **My Profile** → **API Tokens** → **Create Token**
-- Use the **Edit Cloudflare Workers** template (Workers Scripts:Edit,
-  Workers Routes:Edit, D1:Edit, Account Settings:Read — nothing more)
-- Copy the token. You'll paste it into GitHub in the next step, then you can
-  forget it — it lives only as a GitHub secret afterwards.
+1. A free Cloudflare account (dash.cloudflare.com).
+2. Deploy credentials — either:
+   - `wrangler login` (browser OAuth — nothing to copy), **or**
+   - An API token + account ID, for agent-driven deploys with no browser:
+     - Dashboard → profile → **My Profile** → **API Tokens** → **Create Token**
+       → **Edit Cloudflare Workers** template → copy the token.
+     - Dashboard overview → right sidebar → copy the **Account ID**.
+     - Export them in your shell:
+       ```bash
+       export CLOUDFLARE_API_TOKEN="<paste>"
+       export CLOUDFLARE_ACCOUNT_ID="<paste>"
+       ```
+3. Then follow the README steps 3–8: D1 create → pepper secret → `wrangler
+   deploy` → bootstrap family → lock setup → test the dashboard.
 
-### 3. Account ID
-Dashboard overview page → right sidebar → **Account ID** → copy it.
+No GitHub secrets involved. Nothing leaves your machine except the deploy
+itself.
 
-### 4. GitHub secrets
-Repo → **Settings** → **Secrets and variables** → **Actions** →
-**New repository secret** (add both):
-- `CLOUDFLARE_API_TOKEN` → the token from step 2
-- `CLOUDFLARE_ACCOUNT_ID` → the ID from step 3
+## B. Deploy from GitHub Actions (optional)
 
-Neither secret ever appears in logs; the workflows only pass them as
-environment variables to wrangler.
+Push-to-`main` auto-deploys: build → test → D1 migrations → deploy.
+PRs only run build + test.
 
-### 5. D1 database (one time)
-- Cloudflare dashboard → **Workers & Pages** → **D1 SQL Database** →
-  **Create** → name it `family-hub` → copy the **database ID**.
-- Put that ID into `server/wrangler.toml` (`database_id = "..."`), commit,
-  push. The CD run will apply `server/migrations/` automatically from then on.
+Setup (one time):
 
-### 6. TOKEN_PEPPER (one time, never in git)
+1. Same Cloudflare account as above.
+2. Repo → **Settings** → **Secrets and variables** → **Actions** → add:
+   - `CLOUDFLARE_API_TOKEN`
+   - `CLOUDFLARE_ACCOUNT_ID`
+3. That's it. The workflow skips gracefully when the secrets aren't set, so
+   forks without them just don't deploy (no failing runs).
+
+Secrets never appear in logs; the workflow passes them to wrangler as
+environment variables only.
+
+## TOKEN_PEPPER (one time, both paths, never in git)
+
 - Workers & Pages → `family-hub` → **Settings** → **Variables and Secrets** →
   **Add** → type **Secret** → name `TOKEN_PEPPER`.
-- Value: 64 random hex chars. Generate with `openssl rand -hex 32` on any
-  machine (or ask your agent to generate one for you to paste).
-- This pepper is mixed into every token/invite hash. If it ever leaks,
-  generate a new one — note this invalidates all existing tokens, so every
-  agent re-enrolls (by design: one bad day, clean recovery).
+- Value: 64 random hex chars (`openssl rand -hex 32`).
+- Mixed into every token/invite hash. If it ever leaks, generate a new one —
+  all agent tokens invalidate and everyone re-enrolls (by design).
 
-## Bootstrap (first deploy only)
+## Bootstrap (first deploy only, both paths)
 
-1. Push to `main` with `SETUP_LOCKED = "0"` (the default in wrangler.toml).
-   CD deploys the worker.
-2. Call `POST https://<your-worker>.workers.dev/v1/families`
-   `{name, owner_name, owner_email}` → save the returned provisioning code.
-   This creates the family and your owner member.
-3. Set `SETUP_LOCKED = "1"` in `server/wrangler.toml`, commit, push.
-   CD redeploys and the bootstrap endpoint is locked forever. A second
-   family = a second deployment, never a second call.
-
-## What CD does on every push to main
-
-1. `npm ci` (lockfile only — reproducible)
-2. `npm test` (build + 39 server tests; deploy stops here on failure)
-3. `wrangler d1 migrations apply family-hub --remote` (idempotent)
-4. `wrangler deploy` (pinned `wrangler@4.149.0`, pinned Node 22)
-
-Manual re-deploy anytime: repo → **Actions** → **Deploy** → **Run workflow**.
+1. Deploy with `SETUP_LOCKED = "0"` (the default in `server/wrangler.toml`).
+2. `POST https://<your-worker>/v1/families`
+   `{name, owner_name, owner_email}` → save the provisioning code; enroll your
+   agent with it.
+3. Set `SETUP_LOCKED = "1"`, redeploy. The bootstrap endpoint is locked
+   forever. (A second family = a second deployment.)
 
 ## Rotating the Cloudflare token
 
-If the API token ever leaks: Cloudflare dashboard → API Tokens → roll/delete
-it, create a new one from the same template, update the
-`CLOUDFLARE_API_TOKEN` GitHub secret. No code changes needed.
+Dashboard → API Tokens → roll/delete it, create a new one from the same
+template, update wherever you kept it (shell env or the GitHub secret).
+No code changes needed.
