@@ -1,0 +1,1204 @@
+openapi: 3.1.0
+info:
+  title: Family Hub API
+  version: 0.1.0
+  license:
+    name: Proprietary — family use only
+  description: |
+    Family Hub v0.1 — family-owned agent coordination service.
+    Machine-readable contract for SPEC.md §13. One deployment per family.
+
+    Conventions (all from SPEC.md):
+    - All paths are under `/v1`. JSON in/out. Timestamps are ISO-8601 UTC strings.
+    - Auth: `Authorization: Bearer <token>` on every request except the ones
+      marked "Public" below. The token is per-agent (`fh_` + 256-bit random).
+    - Error shape is always `{ "error": { "code": "<string>", "message": "<string>" } }`
+      with HTTP semantics: 400 validation, 401 bad/unknown/revoked token,
+      403 not-a-participant or wrong role, 404 unknown id, 409 state conflict,
+      422 PII detected, 429 rate limited.
+    - `seq` is per-topic ordering; `gseq` is global family ordering (for /sync).
+    - Entries are append-only. The writer's actor_member_id / agent_label /
+      token_id are stamped server-side from the token, never from the client.
+    - Endpoints tagged `x-spec-note: PROPOSED` are NOT in SPEC §13 but are
+      required to implement SPEC §6 (provisioning) and the incident runbook.
+      They are proposed contracts pending owner confirmation.
+    - Canonical list shapes (pinned per WS-2): every list endpoint returns a
+      JSON *object envelope*, never a bare array — `{"members": [...]}`,
+      `{"topics": [...]}`, `{"tokens": [...]}`, `{"tasks": [...]}`,
+      `{"entries": [...]}`. History and sync wrap the array with cursor
+      fields. Clients MUST NOT rely on bare arrays; servers MUST NOT emit them.
+    - Client notes: clients SHOULD send `Idempotency-Key` (a UUID,
+      auto-generated when the caller has none; the server treats it as opaque)
+      on entry POSTs. All path parameters (invite/provisioning codes, ids)
+      MUST be URL-encoded by the client before interpolation.
+
+servers:
+  - url: https://REPLACE-WITH-YOUR-WORKER.workers.dev
+    description: Your family's deployment (set after `wrangler deploy`).
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: families
+    description: One-time family bootstrap.
+  - name: invites
+    description: Member invitations (single-use codes).
+  - name: auth
+    description: Token rotate / revoke / provision (agent credentials).
+  - name: members
+    description: Family roster.
+  - name: topics
+    description: Conversations — create, invite, spawn linked children, read, export.
+  - name: entries
+    description: Append-only log writes (messages).
+  - name: tasks
+    description: Task lifecycle and delegation.
+  - name: sync
+    description: Poll loop — new entries across all visible topics.
+  - name: ops
+    description: Health and privileged redaction.
+
+paths:
+  # ---------------------------------------------------------------- families
+  /v1/families:
+    post:
+      tags: [families]
+      operationId: bootstrapFamily
+      summary: Bootstrap a family (one-time)
+      description: |
+        Public. Creates the family, the owner member, and returns a one-time
+        provisioning code for the owner's first agent. After setup this endpoint
+        MUST be disabled via env `SETUP_LOCKED=1`; further calls return 403
+        `setup_locked`. A second family = a second deployment.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, owner_name, owner_email]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100, example: "Ramamurthy family" }
+                owner_name: { type: string, minLength: 1, maxLength: 100, example: "Mahesh Ramamurthy" }
+                owner_email: { type: string, format: email, maxLength: 254 }
+      responses:
+        '201':
+          description: Family created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [family, owner_member, provisioning_code, provisioning_expires_at]
+                properties:
+                  family: { $ref: '#/components/schemas/Family' }
+                  owner_member: { $ref: '#/components/schemas/Member' }
+                  provisioning_code:
+                    type: string
+                    description: 128-bit random, single-use. Redeem at POST /v1/provision/{code}/accept. Shown once.
+                  provisioning_expires_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: Setup is locked (endpoint disabled after bootstrap)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: { code: setup_locked, message: "Family bootstrap is disabled on this instance." }
+
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/families/{fid}/invites:
+    post:
+      tags: [invites]
+      operationId: createInvite
+      summary: Invite a family member
+      description: |
+        Caller must have role `owner` or `parent`. Returns a 128-bit random
+        invite code (single-use, 7-day expiry). Only the hash is stored.
+        The code is meant to be shared via an already-trusted channel; it grants
+        no read access by itself.
+      parameters:
+        - $ref: '#/components/parameters/FamilyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email, maxLength: 254 }
+                role: { $ref: '#/components/schemas/Role' }
+      responses:
+        '201':
+          description: Invite created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invite_code, expires_at]
+                properties:
+                  invite_code:
+                    type: string
+                    description: Single-use code. The invitee's agent redeems it at POST /v1/invites/{code}/accept.
+                  expires_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/invites/{code}/accept:
+    post:
+      tags: [invites]
+      operationId: acceptInvite
+      summary: Accept an invite (new member enrollment)
+      description: |
+        Public — the invite code is the credential. Creates the member record
+        and issues a per-agent bearer token, RETURNED ONCE and never again.
+        The agent must store it in its Secure Vault immediately. Reuse of a code
+        returns 404 (codes are single-use; do not leak whether a code existed).
+      security: []
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string, minLength: 16 }
+          description: The invite code from POST /v1/families/{fid}/invites.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name, agent_label]
+              properties:
+                display_name: { type: string, minLength: 1, maxLength: 100 }
+                agent_label: { type: string, minLength: 1, maxLength: 100, example: "lakshmi-phone-agent" }
+      responses:
+        '201':
+          description: Member created, token issued (once)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [member, token, token_id]
+                properties:
+                  member: { $ref: '#/components/schemas/Member' }
+                  token:
+                    type: string
+                    description: "Bearer token, format fh_<256-bit random base62>. Shown once — never returned again."
+                  token_id:
+                    type: string
+                    description: Stable id for this credential (used for revoke/rotate and audit).
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # -------------------------------------------------------------------- auth
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/rotate:
+    post:
+      tags: [auth]
+      operationId: rotateToken
+      summary: Rotate my agent token
+      description: |
+        Issues a new token for the calling agent. The old token stays valid for
+        a 24-hour grace period, then is revoked automatically. Both the rotation
+        and the eventual expiry are audit-logged.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: {} }
+      responses:
+        '200':
+          description: New token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, token_id, old_token_valid_until]
+                properties:
+                  token: { type: string, description: 'New bearer token, shown once.' }
+                  token_id: { type: string }
+                  old_token_valid_until: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/revoke:
+    post:
+      tags: [auth]
+      operationId: revokeToken
+      summary: Revoke an agent token
+      description: |
+        Revokes `token_id` immediately. A member may revoke their own agents'
+        tokens; `owner`/`parent` may revoke any token in the family.
+        Revoking the token used for this call is allowed; subsequent calls 401.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token_id]
+              properties:
+                token_id: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: Token revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked, token_id]
+                properties:
+                  revoked: { type: boolean, example: true }
+                  token_id: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/tokens:
+    get:
+      tags: [auth]
+      operationId: listTokens
+      summary: List agent tokens (proposed)
+      x-spec-note: PROPOSED — not in SPEC §13. Required so owners can find token_ids for the revoke runbook (SPEC §12 incident response).
+      description: |
+        Returns token metadata (never token values). A member sees their own
+        agents' tokens; `owner`/`parent` see all tokens in the family.
+      responses:
+        '200':
+          description: Token list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens]
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: '#/components/schemas/TokenInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/auth/provision:
+    post:
+      tags: [auth]
+      operationId: mintProvisioningCode
+      summary: Mint a provisioning code for an additional agent (proposed)
+      x-spec-note: PROPOSED — not in SPEC §13. Required by SPEC §6.4 ("mint another provisioning code for an additional agent label").
+      description: |
+        Mints a single-use, expiring provisioning code. Defaults to the caller's
+        own member; `owner`/`parent` may specify another member_id in the family.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_label]
+              properties:
+                member_id:
+                  type: string
+                  description: Defaults to the caller's member. Owner/parent may target another family member.
+                agent_label: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '201':
+          description: Provisioning code minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provisioning_code, expires_at, member_id]
+                properties:
+                  provisioning_code: { type: string, description: '128-bit random, single-use. Shown once.' }
+                  expires_at: { type: string, format: date-time }
+                  member_id: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/provision/{code}/accept:
+    post:
+      tags: [auth]
+      operationId: acceptProvisioningCode
+      summary: Redeem a provisioning code for an agent token (proposed)
+      x-spec-note: PROPOSED — not in SPEC §13. Required by SPEC §6.1/§6.4; without it the bootstrap provisioning code cannot be redeemed and no owner token can ever be issued.
+      description: |
+        Public — the provisioning code is the credential. Issues a per-agent
+        bearer token for the existing member the code was minted for.
+        Token RETURNED ONCE. Single-use codes; reuse returns 404.
+      security: []
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string, minLength: 16 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_label]
+              properties:
+                agent_label: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '201':
+          description: Token issued (once)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [member, token, token_id]
+                properties:
+                  member: { $ref: '#/components/schemas/Member' }
+                  token: { type: string, description: 'Bearer token, shown once.' }
+                  token_id: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ members
+  /v1/members:
+    get:
+      tags: [members]
+      operationId: listMembers
+      summary: List members of my family
+      responses:
+        '200':
+          description: Member list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/Member' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------------------- topics
+  /v1/topics:
+    post:
+      tags: [topics]
+      operationId: createTopic
+      summary: Create a topic
+      description: |
+        `kind: direct` requires exactly 2 participant_member_ids.
+        `parents_only: true` auto-includes all parent-role members (and the
+        owner) and rejects any kid-role member id; participant_member_ids may
+        be omitted in that case. All participants must be family members.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, kind]
+              properties:
+                subject: { type: string, minLength: 1, maxLength: 200 }
+                kind: { $ref: '#/components/schemas/TopicKind' }
+                participant_member_ids:
+                  type: array
+                  items: { type: string }
+                  description: Required unless parents_only is true.
+                parents_only: { type: boolean, default: false }
+      responses:
+        '201':
+          description: Topic created (caller is added as participant if not listed)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic]
+                properties:
+                  topic: { $ref: '#/components/schemas/Topic' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [topics]
+      operationId: listTopics
+      summary: Search / list visible topics
+      description: Returns only topics the caller participates in, optionally filtered by subject substring (case-insensitive).
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: Visible topics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topics]
+                properties:
+                  topics:
+                    type: array
+                    items: { $ref: '#/components/schemas/Topic' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/topics/{tid}:
+    get:
+      tags: [topics]
+      operationId: getTopic
+      summary: Get topic metadata + participants
+      description: 403 unless the caller is a participant.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      responses:
+        '200':
+          description: Topic detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic]
+                properties:
+                  topic: { $ref: '#/components/schemas/Topic' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/history:
+    get:
+      tags: [topics]
+      operationId: getTopicHistory
+      summary: Read topic history
+      description: |
+        Entries in per-topic `seq` order. Only entries with
+        `seq >=` the caller's `history_from_seq` are returned (invite-time
+        visibility). 403 unless the caller is a participant.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+        - name: after_seq
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: Return entries with seq > after_seq.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: History page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic_id, entries, next_after_seq, has_more]
+                properties:
+                  topic_id: { type: string }
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entry' }
+                  next_after_seq:
+                    type: integer
+                    description: Pass as after_seq for the next page.
+                  has_more: { type: boolean }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/export:
+    get:
+      tags: [topics]
+      operationId: exportTopic
+      summary: Export full topic as JSON
+      description: Topic + participants + all visible entries + tasks. For offline copies and migration. 403 unless participant.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      responses:
+        '200':
+          description: Full topic export
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic, participants, entries, tasks]
+                properties:
+                  topic: { $ref: '#/components/schemas/Topic' }
+                  participants:
+                    type: array
+                    items: { $ref: '#/components/schemas/TopicParticipant' }
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entry' }
+                  tasks:
+                    type: array
+                    items: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/invite:
+    post:
+      tags: [topics]
+      operationId: inviteToTopic
+      summary: Invite members into a topic
+      description: |
+        Caller must be a participant AND have role owner/parent. The join is
+        logged as a `member_joined` entry (visible to existing readers).
+        `history_from: from_join` sets the new participant's history_from_seq to
+        current_max_seq + 1 (they see only what comes after joining).
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [member_ids, history_from]
+              properties:
+                member_ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+                history_from: { $ref: '#/components/schemas/HistoryFrom' }
+      responses:
+        '200':
+          description: Members invited
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invited_member_ids, topic]
+                properties:
+                  invited_member_ids:
+                    type: array
+                    items: { type: string }
+                  topic: { $ref: '#/components/schemas/Topic' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/spawn:
+    post:
+      tags: [topics]
+      operationId: spawnTopic
+      summary: Spawn a linked child topic
+      description: |
+        Caller must be a participant of the parent. Creates a new topic with
+        `parent_topic_id` set; its first entry is the `briefing` (curated
+        context — the ONLY thing carried over). A `topic_spawned` entry is
+        appended to the parent. Child participants who cannot read the parent
+        get 403 on the parent; the child shows a "linked private parent
+        discussion" placeholder unless link_visibility is "hidden".
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, participant_member_ids, briefing]
+              properties:
+                subject: { type: string, minLength: 1, maxLength: 200 }
+                participant_member_ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+                briefing:
+                  type: string
+                  minLength: 1
+                  maxLength: 20000
+                  description: Curated context for the new participants; becomes entry seq 1 (kind=briefing).
+                link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
+      responses:
+        '201':
+          description: Child topic created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic, parent_topic_id, briefing_entry]
+                properties:
+                  topic: { $ref: '#/components/schemas/Topic' }
+                  parent_topic_id: { type: string }
+                  briefing_entry: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/PiiError' }
+
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/topics/{tid}/entries:
+    post:
+      tags: [entries]
+      operationId: postEntry
+      summary: Post an entry (message)
+      description: |
+        Caller must be a participant. Only `kind: message` is client-settable;
+        all other kinds are server-generated. Supports `Idempotency-Key` header:
+        retries with the same key return the original entry (`deduplicated: true`)
+        instead of creating a duplicate. Body is PII-scanned before insert.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, maxLength: 128 }
+          description: Opaque client key; same key + same topic returns the original entry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                kind:
+                  type: string
+                  enum: [message]
+                  default: message
+                body: { type: string, minLength: 1, maxLength: 20000 }
+                reply_to_seq:
+                  type: integer
+                  minimum: 1
+                  description: Must reference an existing seq in this topic.
+                data:
+                  type: object
+                  description: Free-form JSON machine payload.
+      responses:
+        '201':
+          description: Entry created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entry, deduplicated]
+                properties:
+                  entry: { $ref: '#/components/schemas/Entry' }
+                  deduplicated: { type: boolean, example: false }
+        '200':
+          description: Idempotent replay — original entry returned, no duplicate created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entry, deduplicated]
+                properties:
+                  entry: { $ref: '#/components/schemas/Entry' }
+                  deduplicated: { type: boolean, example: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/PiiError' }
+
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/topics/{tid}/tasks:
+    post:
+      tags: [tasks]
+      operationId: createTask
+      summary: Create a task in a topic
+      description: |
+        Caller must be a participant. The assignee (if set) must already be a
+        participant of the topic (400 otherwise). Appends a `task_created` entry.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                description: { type: string, maxLength: 20000 }
+                assignee_member_id: { type: string }
+                parent_task_id:
+                  type: string
+                  description: Must belong to the same topic.
+                due_at: { type: string, format: date-time }
+      responses:
+        '201':
+          description: Task created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task]
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    get:
+      tags: [tasks]
+      operationId: listTopicTasks
+      summary: List tasks in a topic
+      x-spec-note: Added at WS-1/WS-2 request — not in SPEC §13. Needed by the agent CLI to list a topic's tasks.
+      description: Caller must be a participant of the topic. Returns tasks in creation order.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      responses:
+        '200':
+          description: Topic tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tasks]
+                properties:
+                  tasks:
+                    type: array
+                    items: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/tasks/{tid}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: Get a task + its entry trail
+      description: Caller must be a participant of the task's topic.
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: Task detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task, trail]
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+                  trail:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entry' }
+                    description: All entries in the topic referencing this task, in seq order.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [tasks]
+      operationId: updateTask
+      summary: Update a task
+      description: |
+        Caller must be a participant of the task's topic. Changing status
+        appends `task_status`; changing assignee appends `task_assigned` (new
+        assignee must be a topic participant). Transition to `done` is rejected
+        with 409 while any subtask is not in done/cancelled (use
+        POST /v1/tasks/{tid}/done for completion with a result payload).
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                status: { $ref: '#/components/schemas/TaskStatus' }
+                assignee_member_id: { type: string }
+                title: { type: string, minLength: 1, maxLength: 200 }
+                description: { type: string, maxLength: 20000 }
+                due_at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Task updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task]
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/tasks/{tid}/notes:
+    post:
+      tags: [tasks]
+      operationId: addTaskNote
+      summary: Add a progress note to a task
+      description: Appends a `task_note` entry to the task's topic. Body is PII-scanned.
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 1, maxLength: 20000 }
+      responses:
+        '201':
+          description: Note appended
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entry]
+                properties:
+                  entry: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/PiiError' }
+
+  /v1/tasks/{tid}/done:
+    post:
+      tags: [tasks]
+      operationId: completeTask
+      summary: Complete a task with a structured result
+      description: |
+        Sets status to done, stores the `result` JSON, appends `task_done`.
+        Rejected with 409 while any subtask is not in done/cancelled.
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                result:
+                  type: object
+                  description: 'Machine-readable handoff payload, e.g. {"conflicts": [...]}.'
+      responses:
+        '200':
+          description: Task completed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [task]
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/sync:
+    get:
+      tags: [sync]
+      operationId: syncEntries
+      summary: Poll for new entries across all visible topics
+      description: |
+        The agent's main poll loop. Returns entries with gseq > after_gseq, in
+        global order, across every topic the caller participates in (and with
+        seq >= their history_from_seq per topic). One call per poll keeps a
+        local cursor (`next_after_gseq`).
+      parameters:
+        - name: after_gseq
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: New entries page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries, has_more]
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entry' }
+                  next_after_gseq:
+                    type: integer
+                    description: >
+                      Pass as after_gseq on the next poll. Optional — omitted
+                      when the cursor is already at the head (clients fall back
+                      to the max gseq seen, or the after_gseq they sent).
+                  has_more: { type: boolean }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/entries/{eid}/redact:
+    post:
+      tags: [ops]
+      operationId: redactEntry
+      summary: Redact an entry body (owner only)
+      description: |
+        PII escape hatch. Replaces `body` with `[redacted by owner, <ts>]`;
+        seq, actor, and timestamp are preserved, and a `redaction` entry is
+        appended. Note: clients that already synced the entry keep their copy —
+        see the incident runbook in docs/SECURITY.md.
+      parameters:
+        - name: eid
+          in: path
+          required: true
+          schema: { type: integer, minimum: 1 }
+          description: The entry's gseq.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: {} }
+      responses:
+        '200':
+          description: Entry redacted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entry]
+                properties:
+                  entry: { $ref: '#/components/schemas/Entry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/health:
+    get:
+      tags: [ops]
+      operationId: healthCheck
+      summary: Liveness check
+      description: Public. Returns ok only — no data.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean, example: true }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "fh_<token>"
+      description: 'Per-agent bearer token issued at invite/provision accept. Sent as `Authorization: Bearer <token>`.'
+
+  parameters:
+    FamilyId:
+      name: fid
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+    TopicId:
+      name: tid
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+    TaskId:
+      name: tid
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+
+  schemas:
+    Role:
+      type: string
+      enum: [owner, parent, kid]
+    TopicKind:
+      type: string
+      enum: [direct, group]
+    LinkVisibility:
+      type: string
+      enum: [placeholder, hidden]
+      default: placeholder
+    HistoryFrom:
+      type: string
+      enum: [full, from_join]
+    EntryKind:
+      type: string
+      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction]
+    TaskStatus:
+      type: string
+      enum: [open, in_progress, blocked, done, cancelled]
+    ErrorCode:
+      type: string
+      enum: [validation_error, unauthorized, forbidden, not_found, conflict, pii_detected, rate_limited, setup_locked]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message: { type: string }
+
+    Family:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Member:
+      type: object
+      required: [id, family_id, name, email, role, created_at]
+      properties:
+        id: { type: string }
+        family_id: { type: string }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/Role' }
+        created_at: { type: string, format: date-time }
+
+    TokenInfo:
+      type: object
+      required: [token_id, member_id, agent_label, created_at]
+      properties:
+        token_id: { type: string }
+        member_id: { type: string }
+        agent_label: { type: string }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: ["string", "null"], format: date-time }
+        last_used_at: { type: ["string", "null"], format: date-time }
+      description: Token metadata. The token VALUE is never returned by any endpoint after issuance.
+
+    TopicParticipant:
+      type: object
+      required: [member_id, joined_at, history_from_seq]
+      properties:
+        member_id: { type: string }
+        joined_at: { type: string, format: date-time }
+        history_from_seq: { type: integer, minimum: 1 }
+
+    Topic:
+      type: object
+      required: [id, family_id, subject, kind, parents_only, created_by, created_at]
+      properties:
+        id: { type: string }
+        family_id: { type: string }
+        subject: { type: string }
+        kind: { $ref: '#/components/schemas/TopicKind' }
+        parents_only: { type: boolean }
+        parent_topic_id: { type: ["string", "null"] }
+        link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/TopicParticipant' }
+
+    Entry:
+      type: object
+      required: [gseq, topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body]
+      properties:
+        gseq:
+          type: integer
+          description: Global family ordering (drives /sync cursors). Equals the entry id.
+        topic_id: { type: string }
+        seq:
+          type: integer
+          description: Per-topic ordering (drives history/threads).
+        ts: { type: string, format: date-time }
+        actor_member_id: { type: string, description: Stamped server-side from the token. }
+        agent_label: { type: string }
+        token_id: { type: string }
+        kind: { $ref: '#/components/schemas/EntryKind' }
+        body: { type: string }
+        data:
+          type: object
+          description: Free-form JSON machine payload.
+        reply_to_seq:
+          type: ["integer", "null"]
+
+    Task:
+      type: object
+      required: [id, topic_id, title, status, owner_member_id, created_by, created_at, updated_at]
+      properties:
+        id: { type: string }
+        topic_id: { type: string }
+        title: { type: string }
+        description: { type: ["string", "null"] }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        owner_member_id: { type: string }
+        assignee_member_id: { type: ["string", "null"] }
+        parent_task_id: { type: ["string", "null"] }
+        due_at: { type: ["string", "null"], format: date-time }
+        result:
+          type: ["object", "null"]
+          description: Structured handoff payload, set on done.
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+  responses:
+    ValidationError:
+      description: Input failed validation (400)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: validation_error, message: "subject: must be 1..200 characters" }
+    Unauthorized:
+      description: Missing, unknown, or revoked token (401)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: unauthorized, message: "Invalid or revoked token." }
+    Forbidden:
+      description: Valid token, but not a participant / wrong role (403)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: forbidden, message: "You are not a participant of this topic." }
+    NotFound:
+      description: Unknown id / code (404)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: not_found, message: "Topic not found." }
+    Conflict:
+      description: State conflict, e.g. done with open subtasks (409)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: conflict, message: "Task has open subtasks." }
+    PiiError:
+      description: Possible PII detected — rejected, nothing stored (422)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: pii_detected, message: "Possible card number detected in body; rephrase without the number and retry." }
+    RateLimited:
+      description: Too many requests (429)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: rate_limited, message: "Slow down." }
