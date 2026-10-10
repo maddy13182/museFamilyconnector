@@ -13,6 +13,7 @@ import {
   AuthContext,
   TASK_STATUSES,
   MEMBER_ROLES,
+  FAMILY_KINDS,
 } from './types.js';
 import {
   sha256hex,
@@ -279,10 +280,11 @@ async function handleHealth(): Promise<Response> {
   return json({ ok: true, version: VERSION });
 }
 
-// POST /v1/families — bootstrap only; disabled via SETUP_LOCKED=1.
+// POST /v1/families — bootstrap when unlocked; hub-owner circle creation
+// when locked via SETUP_LOCKED=1 (v0.2.0+).
 async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise<Response> {
   if (env.SETUP_LOCKED === '1') {
-    throw new HttpError(403, 'setup_locked', 'Family setup is locked on this instance');
+    return await handleCreateFamilyLocked(db, env, req);
   }
   const body = await readJson(req);
   const name = reqString(body['name'], 'name', 1, 120);
@@ -316,6 +318,108 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
     },
     201,
   );
+}
+
+/**
+ * True when the caller is a hub owner: holds the 'owner' role in at least
+ * one family. Identity is matched by email, since one human has one member
+ * row per family but a single email across them.
+ */
+async function isHubOwner(db: DbClient, auth: AuthContext): Promise<boolean> {
+  if (auth.role === 'owner') return true;
+  const me = await db.queryOne(`SELECT email FROM members WHERE id = ?`, [auth.member_id]);
+  if (!me) return false;
+  const row = await db.queryOne(
+    `SELECT 1 FROM members WHERE email = ? AND role = 'owner' LIMIT 1`,
+    [me['email'] as string],
+  );
+  return row !== null;
+}
+
+// POST /v1/families while SETUP_LOCKED=1 — hub-owner circle creation
+// (v0.2.0+). The caller must authenticate (401) and be a hub owner (403).
+// The creator becomes an 'owner' member of the new family, and receives a
+// single-use provisioning code (mirroring bootstrap) so their agent can
+// mint a token bound to the new family — the existing token stays bound
+// to the old one.
+async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): Promise<Response> {
+  const auth = await resolveToken(db, env, req.headers.get('authorization'));
+  if (!(await isHubOwner(db, auth))) {
+    throw new HttpError(
+      403,
+      'forbidden',
+      'Only hub owners can create a family while setup is locked',
+    );
+  }
+  const body = await readJson(req);
+  const name = reqString(body['name'], 'name', 1, 120).trim();
+  if (name.length === 0) {
+    throw new HttpError(400, 'bad_request', 'name must not be blank');
+  }
+  const kind =
+    body['kind'] === undefined ? 'family' : reqEnum(body['kind'], 'kind', FAMILY_KINDS);
+
+  const me = await db.queryOne(`SELECT name, email FROM members WHERE id = ?`, [auth.member_id]);
+  if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
+  const creatorName = me['name'] as string;
+  const creatorEmail = me['email'] as string;
+
+  const familyId = newId();
+  const memberId = newId();
+  const ts = nowIso();
+  const code = newProvisioningCode();
+  const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
+  const provisionExpiresAt = hoursFromNow(PROVISION_TTL_HOURS);
+  await db.execAtomically([
+    {
+      sql: `INSERT INTO families(id, name, kind, created_at) VALUES (?,?,?,?)`,
+      params: [familyId, name, kind, ts],
+    },
+    {
+      sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
+      params: [memberId, familyId, creatorName, creatorEmail, 'owner', ts],
+    },
+    {
+      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
+            VALUES (?,?,?,?,?,?,NULL)`,
+      params: [codeHash, familyId, memberId, 'owner-agent', auth.member_id, provisionExpiresAt],
+    },
+  ]);
+  return json(
+    {
+      id: familyId,
+      name,
+      kind,
+      created_at: ts,
+      provisioning_code: code,
+      provisioning_expires_at: provisionExpiresAt,
+    },
+    201,
+  );
+}
+
+// GET /v1/families — list families the caller is a member of (v0.2.0+).
+// Membership is matched by email: one human, one member row per family.
+async function handleListFamilies(db: DbClient, auth: AuthContext): Promise<Response> {
+  const me = await db.queryOne(`SELECT email FROM members WHERE id = ?`, [auth.member_id]);
+  if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
+  const rows = await db.queryAll(
+    `SELECT f.id, f.name, f.kind, f.created_at, m.role AS my_role
+       FROM families f
+       JOIN members m ON m.family_id = f.id
+      WHERE m.email = ?
+      ORDER BY f.created_at ASC`,
+    [me['email'] as string],
+  );
+  return json({
+    families: rows.map((r) => ({
+      id: r['id'],
+      name: r['name'],
+      kind: r['kind'],
+      my_role: r['my_role'],
+      created_at: r['created_at'],
+    })),
+  });
 }
 
 // POST /v1/families/:fid/invites — owner/parent only.
@@ -543,6 +647,17 @@ async function handleListMembers(db: DbClient, auth: AuthContext): Promise<Respo
     [auth.family_id],
   );
   return json({ members: rows.map(publicMember) });
+}
+
+// GET /v1/me — identity bound to the calling token. Lets clients verify
+// which circle a token belongs to before storing it (fail-closed paste flow).
+async function handleGetSelf(db: DbClient, auth: AuthContext): Promise<Response> {
+  const row = await db.queryOne(
+    `SELECT * FROM members WHERE id = ? AND family_id = ?`,
+    [auth.member_id, auth.family_id],
+  );
+  if (!row) throw new HttpError(401, 'unauthorized', 'Invalid token');
+  return json({ ...publicMember(row), agent_label: auth.agent_label });
 }
 
 // POST /v1/topics
@@ -1188,7 +1303,9 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
 
     if (path === '/v1/auth/rotate' && method === 'POST') return await handleRotate(db, env, req, auth);
     if (path === '/v1/auth/revoke' && method === 'POST') return await handleRevoke(db, env, req, auth);
+    if (path === '/v1/families' && method === 'GET') return await handleListFamilies(db, auth);
     if (path === '/v1/members' && method === 'GET') return await handleListMembers(db, auth);
+    if (path === '/v1/me' && method === 'GET') return await handleGetSelf(db, auth);
     if (path === '/v1/provisioning-codes' && method === 'POST') {
       return await handleMintProvisioning(db, env, req, auth);
     }
