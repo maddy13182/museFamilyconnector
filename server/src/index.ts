@@ -13,6 +13,7 @@ import {
   AuthContext,
   TASK_STATUSES,
   MEMBER_ROLES,
+  TRANSFER_COMPLETION_MODES,
   FAMILY_KINDS,
 } from './types.js';
 import {
@@ -57,12 +58,13 @@ const IDEM_TTL_HOURS = 24;
 const IDEM_CREATE_TTL_HOURS = 24;
 const PROVISION_TTL_HOURS = 24;
 const INVITE_TTL_DAYS = 7;
+const TRANSFER_TTL_DAYS = 7;
 
 // Idempotency for create operations (family/topic/invite). Entries use the
 // separate idempotency_keys table; creates use create_idempotency, which also
 // remembers the provisioning code so a deduped retry can mint a fresh one
 // and revoke the orphaned token from the first attempt.
-type CreateScope = 'family' | 'topic' | 'invite';
+type CreateScope = 'family' | 'topic' | 'invite' | 'ownership_transfer';
 
 function readIdemKey(req: Request): string | null {
   const k = req.headers.get('idempotency-key');
@@ -1182,6 +1184,288 @@ async function handleAcceptInvite(
     },
     201,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Ownership transfer (offer -> accept). Ownership is a responsibility and is
+// never forced on anyone: the current owner offers it to one existing member
+// of the same circle, and the recipient must explicitly accept before
+// anything changes. Exactly one pending transfer may exist per circle.
+// ---------------------------------------------------------------------------
+
+function publicTransfer(row: Row): Record<string, unknown> {
+  return {
+    id: row['id'],
+    family_id: row['family_id'],
+    from_member_id: row['from_member_id'],
+    to_member_id: row['to_member_id'],
+    on_complete: row['on_complete'],
+    status: row['status'],
+    created_at: row['created_at'],
+    expires_at: row['expires_at'],
+    decided_at: row['decided_at'],
+  };
+}
+
+async function findPendingTransfer(db: DbClient, familyId: string): Promise<Row | null> {
+  return await db.queryOne(
+    `SELECT * FROM ownership_transfers WHERE family_id = ? AND status = 'pending' LIMIT 1`,
+    [familyId],
+  );
+}
+
+// Lazy expiry: a pending transfer past its expires_at can never be accepted
+// again, so mark it cancelled the first time it is noticed. No background
+// job needed (same pattern as the rate-limit rows in migration 0007).
+async function cancelExpiredTransfer(db: DbClient, transfer: Row): Promise<void> {
+  await db.execAtomically([
+    {
+      sql: `UPDATE ownership_transfers SET status = 'cancelled', decided_at = ? WHERE id = ? AND status = 'pending'`,
+      params: [nowIso(), transfer['id'] as string],
+    },
+  ]);
+  logEvent('info', 'ownership_transfer_expired', {});
+}
+
+// POST /v1/families/:fid/transfer — owner offers ownership to another member.
+async function handleOfferOwnership(
+  db: DbClient,
+  env: Env,
+  req: Request,
+  auth: AuthContext,
+  fid: string,
+): Promise<Response> {
+  if (fid !== auth.family_id) throw new HttpError(404, 'not_found', 'Family not found');
+  if (auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only the circle owner can initiate an ownership transfer');
+  }
+  const body = await readJson(req);
+  const toMemberId = reqString(body['to_member_id'], 'to_member_id', 1, 64);
+  const onComplete =
+    body['on_complete'] === undefined
+      ? 'remove'
+      : reqEnum(body['on_complete'], 'on_complete', TRANSFER_COMPLETION_MODES);
+
+  // Target must be an existing member of THIS circle — never from
+  // caller-supplied identity claims beyond the member id — and must not
+  // already be an owner (a caller who is an owner cannot offer to themselves).
+  const target = await db.queryOne(
+    `SELECT * FROM members WHERE id = ? AND family_id = ?`,
+    [toMemberId, auth.family_id],
+  );
+  if (!target) throw new HttpError(404, 'not_found', 'Target member is not in this circle');
+  if (target['role'] === 'owner') {
+    throw new HttpError(422, 'already_owner', 'Target member is already a circle owner');
+  }
+
+  // Idempotent retry: same key returns the transfer the first attempt made
+  // (mirroring create/invite dedup) instead of a second pending transfer.
+  const idemKey = readIdemKey(req);
+  if (idemKey) {
+    const prior = await findCreateIdem(db, 'ownership_transfer', auth.member_id, idemKey);
+    if (prior) {
+      const t = await db.queryOne(`SELECT * FROM ownership_transfers WHERE id = ?`, [
+        prior['resource_id'] as string,
+      ]);
+      if (!t) {
+        throw new HttpError(500, 'internal', 'Idempotency record points at a missing transfer');
+      }
+      logEvent('info', 'idempotency_hit', { scope: 'ownership_transfer', key: idemKey });
+      return json({ transfer: publicTransfer(t), deduped: true });
+    }
+  }
+
+  // Exactly one pending transfer per circle. An expired pending transfer is
+  // not a live offer — cancel it and let the new offer proceed.
+  const existing = await findPendingTransfer(db, auth.family_id);
+  if (existing) {
+    if ((existing['expires_at'] as string) <= nowIso()) {
+      await cancelExpiredTransfer(db, existing);
+    } else {
+      throw new HttpError(409, 'transfer_pending', 'A transfer offer is already pending for this circle');
+    }
+  }
+
+  const transferId = newId();
+  const ts = nowIso();
+  const expiresAt = daysFromNow(TRANSFER_TTL_DAYS);
+  const ops: { sql: string; params: (string | number | null)[] }[] = [
+    {
+      sql: `INSERT INTO ownership_transfers(id, family_id, from_member_id, to_member_id, on_complete, status, created_at, expires_at, decided_at)
+            VALUES (?,?,?,?,?,'pending',?,?,NULL)`,
+      params: [transferId, auth.family_id, auth.member_id, toMemberId, onComplete, ts, expiresAt],
+    },
+  ];
+  if (idemKey) {
+    ops.push({
+      sql: `INSERT OR REPLACE INTO create_idempotency
+              (scope, member_id, key, resource_id, code_hash, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      params: [
+        'ownership_transfer',
+        auth.member_id,
+        idemKey,
+        transferId,
+        null,
+        ts,
+        hoursFromNow(IDEM_CREATE_TTL_HOURS),
+      ],
+    });
+  }
+  try {
+    await db.execAtomically(ops);
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      // Lost a race with a concurrent offer: exactly one pending transfer
+      // per circle is enforced by the partial unique index.
+      throw new HttpError(409, 'transfer_pending', 'A transfer offer is already pending for this circle');
+    }
+    throw e;
+  }
+  if (idemKey) logEvent('info', 'idempotency_stored', { scope: 'ownership_transfer', key: idemKey });
+  logEvent('info', 'ownership_transfer_initiated', {});
+  const created = await db.queryOne(`SELECT * FROM ownership_transfers WHERE id = ?`, [
+    transferId,
+  ]);
+  if (!created) throw new HttpError(500, 'internal', 'Transfer row missing after insert');
+  return json({ transfer: publicTransfer(created) }, 201);
+}
+
+// POST /v1/families/:fid/transfer/accept — the named recipient accepts.
+async function handleAcceptOwnershipTransfer(
+  db: DbClient,
+  auth: AuthContext,
+  fid: string,
+): Promise<Response> {
+  if (fid !== auth.family_id) throw new HttpError(404, 'not_found', 'Family not found');
+  const transfer = await findPendingTransfer(db, auth.family_id);
+  if (!transfer) {
+    throw new HttpError(404, 'not_found', 'No pending ownership transfer for this circle');
+  }
+  if ((transfer['expires_at'] as string) <= nowIso()) {
+    await cancelExpiredTransfer(db, transfer);
+    throw new HttpError(410, 'transfer_expired', 'The ownership transfer offer has expired');
+  }
+  // Only the named recipient may accept — ownership is never forced on
+  // anyone else.
+  if (auth.member_id !== transfer['to_member_id']) {
+    throw new HttpError(403, 'forbidden', 'Only the named recipient can accept this ownership transfer');
+  }
+
+  // Re-verify both parties are still in place before the swap. The offer
+  // lapses if the offering owner left the circle or lost the owner role,
+  // and if the recipient is gone there is no one to promote.
+  const target = await db.queryOne(
+    `SELECT id, role FROM members WHERE id = ? AND family_id = ?`,
+    [transfer['to_member_id'] as string, auth.family_id],
+  );
+  if (!target) {
+    throw new HttpError(410, 'transfer_recipient_gone', 'The transfer recipient is no longer a member');
+  }
+  const offerer = await db.queryOne(
+    `SELECT id, role FROM members WHERE id = ? AND family_id = ?`,
+    [transfer['from_member_id'] as string, auth.family_id],
+  );
+  if (!offerer || offerer['role'] !== 'owner') {
+    await db.execAtomically([
+      {
+        sql: `UPDATE ownership_transfers SET status = 'cancelled', decided_at = ? WHERE id = ? AND status = 'pending'`,
+        params: [nowIso(), transfer['id'] as string],
+      },
+    ]);
+    throw new HttpError(409, 'transfer_offer_lapsed', 'The offering owner is no longer a circle owner');
+  }
+
+  const ts = nowIso();
+  const offererId = offerer['id'] as string;
+  const recipientId = target['id'] as string;
+  const onComplete = transfer['on_complete'] as string;
+  // The swap is ONE atomic batch — promote first, then strip the offering
+  // owner's role — so the circle never sits with zero owners.
+  const ops: { sql: string; params: (string | number | null)[] }[] = [
+    {
+      sql: `UPDATE members SET role = 'owner' WHERE id = ? AND family_id = ?`,
+      params: [recipientId, auth.family_id],
+    },
+    {
+      sql: `UPDATE ownership_transfers SET status = 'completed', decided_at = ? WHERE id = ? AND status = 'pending'`,
+      params: [ts, transfer['id'] as string],
+    },
+    {
+      sql: `UPDATE members SET role = 'parent' WHERE id = ? AND role = 'owner'`,
+      params: [offererId],
+    },
+  ];
+  if (onComplete === 'remove') {
+    // The offering owner's session ends with the transfer: revoke every
+    // agent token they hold for this circle. Their member row is RETAINED
+    // (not deleted) — invites, topics, entries, tasks and the audit trail
+    // reference members(id) with NOT NULL foreign keys, so a physical
+    // DELETE would either fail or destroy circle history. With no valid
+    // tokens and the owner role stripped, they cannot act in the circle
+    // again until the new owner re-enrolls them.
+    ops.push({
+      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL`,
+      params: [ts, offererId],
+    });
+  }
+  await db.execAtomically(ops);
+  logEvent('info', 'ownership_transfer_completed', {});
+  const completed = await db.queryOne(`SELECT * FROM ownership_transfers WHERE id = ?`, [
+    transfer['id'] as string,
+  ]);
+  if (!completed) throw new HttpError(500, 'internal', 'Transfer row missing after completion');
+  return json({
+    transfer: publicTransfer(completed),
+    new_owner: { id: recipientId, role: 'owner' },
+    previous_owner: { id: offererId, role: onComplete === 'demote' ? 'parent' : 'removed' },
+  });
+}
+
+// POST /v1/families/:fid/transfer/cancel — the current owner withdraws a
+// pending offer.
+async function handleCancelOwnershipTransfer(
+  db: DbClient,
+  auth: AuthContext,
+  fid: string,
+): Promise<Response> {
+  if (fid !== auth.family_id) throw new HttpError(404, 'not_found', 'Family not found');
+  if (auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only the circle owner can cancel an ownership transfer');
+  }
+  const transfer = await findPendingTransfer(db, auth.family_id);
+  if (!transfer) {
+    throw new HttpError(404, 'not_found', 'No pending ownership transfer for this circle');
+  }
+  if ((transfer['expires_at'] as string) <= nowIso()) {
+    await cancelExpiredTransfer(db, transfer);
+    throw new HttpError(410, 'transfer_expired', 'The ownership transfer offer has already expired');
+  }
+  const ts = nowIso();
+  await db.execAtomically([
+    {
+      sql: `UPDATE ownership_transfers SET status = 'cancelled', decided_at = ? WHERE id = ? AND status = 'pending'`,
+      params: [ts, transfer['id'] as string],
+    },
+  ]);
+  logEvent('info', 'ownership_transfer_cancelled', {});
+  const cancelled = await db.queryOne(`SELECT * FROM ownership_transfers WHERE id = ?`, [
+    transfer['id'] as string,
+  ]);
+  if (!cancelled) throw new HttpError(500, 'internal', 'Transfer row missing after cancellation');
+  return json({ transfer: publicTransfer(cancelled) });
+}
+
+// GET /v1/families/:fid/transfer — any circle member may read the pending
+// offer (or {transfer: null} when there is none).
+async function handleGetOwnershipTransfer(
+  db: DbClient,
+  auth: AuthContext,
+  fid: string,
+): Promise<Response> {
+  if (fid !== auth.family_id) throw new HttpError(404, 'not_found', 'Family not found');
+  const transfer = await findPendingTransfer(db, auth.family_id);
+  return json({ transfer: transfer ? publicTransfer(transfer) : null });
 }
 
 // POST /v1/provisioning-codes — mint a single-use code for an extra agent.
@@ -2633,6 +2917,26 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     const famInvite = /^\/v1\/families\/([^/]+)\/invites$/.exec(path);
     if (famInvite && method === 'POST') {
       return await handleCreateInvite(db, env, req, auth, decodeURIComponent(famInvite[1]));
+    }
+
+    // Ownership transfer (offer -> accept): POST /v1/families/:id/transfer,
+    // POST /v1/families/:id/transfer/accept, POST .../cancel, GET .../transfer.
+    const famTransfer = /^\/v1\/families\/([^/]+)\/transfer(\/accept|\/cancel)?$/.exec(path);
+    if (famTransfer) {
+      const fid = decodeURIComponent(famTransfer[1]);
+      const action = famTransfer[2];
+      if (!action && method === 'POST') {
+        return await handleOfferOwnership(db, env, req, auth, fid);
+      }
+      if (!action && method === 'GET') {
+        return await handleGetOwnershipTransfer(db, auth, fid);
+      }
+      if (action === '/accept' && method === 'POST') {
+        return await handleAcceptOwnershipTransfer(db, auth, fid);
+      }
+      if (action === '/cancel' && method === 'POST') {
+        return await handleCancelOwnershipTransfer(db, auth, fid);
+      }
     }
 
     const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes)$/.exec(path);
