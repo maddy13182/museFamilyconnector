@@ -40,6 +40,13 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 - Logging: server logs idempotency hits/stores, code minting, orphan
   revocation, and name conflicts; client `--debug` shows retry attempts with
   timestamps.
+## Added
+- In-worker rate limiting for the two unauthenticated credential endpoints
+  (`POST /v1/invites/:code/accept`, `POST /v1/provisioning-codes/:code/redeem`):
+  10 attempts per 10 minutes per IP, then 429 with `Retry-After`. Backed by a
+  fixed-window counter in D1 (migration 0007). workers.dev has no custom zone
+  so Cloudflare's zone-based rate-limiting rules don't apply — this closes
+  that gap. Legitimate use (1-2 attempts) is unaffected.
 ### Fixed
 - Server: `GET /v1/health` now reports the server's actual release version
   (read from `server/package.json` at build time) instead of a stale
