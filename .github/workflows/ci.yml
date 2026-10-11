@@ -44,6 +44,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install agent dependencies
+        run: pip install -r agent-skill/requirements.txt
+
       - name: Run agent CLI tests
         run: python3 -m unittest discover -s agent-skill/tests
 

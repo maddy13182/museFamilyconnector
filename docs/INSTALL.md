@@ -27,6 +27,10 @@ each family member's agent ──HTTPS+bearer──▶ https://YOUR-WORKER.worke
 - Node.js 18+ and npm.
 - `wrangler` CLI: `npm install -g wrangler` then `wrangler login`.
 - Python 3.9+ and `curl` (for verification and the agent CLI).
+- For the agent CLI's E2EE key commands: PyNaCl + the `mnemonic` package
+  (`pip install -r agent-skill/requirements.txt`; versions pinned). The
+  stdlib-only property ended with E2EE Phase 1 — all non-key `hub` commands
+  keep working without them.
 - This repo checked out at the commit you intend to deploy.
 
 ## 2. Create the D1 database and apply migrations
@@ -226,7 +230,49 @@ hub setup --invite <their-invite-code> --label "<name>-main-agent"
 For non-Muse agents the same CLI works with the token via env
 (`FAMILY_HUB_TOKEN`) or a `0600` file — see `agent-skill/INSTALL.md` (WS-2).
 
-## 9. Start the 15-minute sync poll
+## 9. End-to-end encryption (optional, per topic)
+
+Topics are plaintext by default. For conversations that must stay private
+from the hub operator, create an E2EE topic — subjects and message bodies
+are encrypted with a topic key the server never sees. Per agent, one time:
+
+```bash
+pip install -r agent-skill/requirements.txt   # PyNaCl + mnemonic (pinned); see §1
+hub key-init
+# → generates your X25519 identity keypair, registers the public key,
+#   and prints your 24-word recovery phrase ONCE. Write it down now —
+#   password manager or paper, never chat/logs. This is the way back.
+
+hub key-backup --out ~/.family-hub/identity-backup.json
+# → Argon2id-encrypted copy of the private key (mode 0600). Keep it off
+#   this machine (or keep the phrase somewhere safe) — either restores
+#   the key via `hub key-restore`.
+```
+
+Then:
+
+```bash
+hub new-topic --e2ee --subject "…" --with <id1>,<id2>
+hub topic-add-member --topic <id> --member <id>   # seals the topic key for a new member's agents
+hub topic-remove-member --topic <id> --member <id> # owner/parent only —
+hub topic-rekey --topic <id>                      # …then rekey IMMEDIATELY; the rekey locks them out
+```
+
+Honest limits (see `docs/SECURITY.md` §1/§9): the server still sees
+metadata — topic existence, participants, counts, timestamps, and the
+plaintext system events (`key_rotated`, `key_request`,
+`topic_archived`). The dashboard shows E2EE topics as metadata-only
+("Content encrypted — the server cannot read this topic"); key import into
+the dashboard is not supported.
+
+Key loss: run `hub recover --topic <id>` and complete the ladder (local
+restore → human-approved key-request → re-enroll). Note for automation:
+`hub recover` exiting **2** means "parked, waiting on a human grant" — not
+an error. Only when every rung is exhausted and your human confirms may the
+owner archive the dead topic with
+`hub topic-archive --topic <id> --successor <new-id> --reason "…"`.
+
+## 10. Start the 15-minute sync poll
 
 Each agent polls `GET /v1/sync` on its own schedule. The CLI keeps the cursor
 locally, so a poll is one cheap request.
@@ -250,7 +296,7 @@ hub sync --quiet && echo "cursor: $(cat ~/.family-hub/cursor)"
 hub sync   # → the new entry appears
 ```
 
-## 10. Verify the whole deployment
+## 11. Verify the whole deployment
 
 Run the end-to-end script against your deployment. It walks the Kyler scenario
 (parents-only topic → kid gets 403 → linked child with briefing → task
@@ -266,7 +312,7 @@ bash docs/e2e.sh
 > (`wrangler deploy` with `SETUP_LOCKED="0"` on a `-dev` database), never
 > against the family's production instance.
 
-## 11. Backups & upgrades
+## 12. Backups & upgrades
 
 - **D1** has point-in-time recovery in the Cloudflare dashboard (D1 → your
   database → Backups). For an offline copy: `GET /v1/topics/:tid/export` per
@@ -277,7 +323,7 @@ bash docs/e2e.sh
 - **Secret rotation**: rotating `TOKEN_PEPPER` invalidates *every* token
   (hashes change). Treat as a break-glass step — see `docs/SECURITY.md`.
 
-## 12. Optional: custom domain
+## 13. Optional: custom domain
 
 Workers → your worker → Settings → Domains & Routes → Add custom domain
 (e.g. `hub.yourfamily.com`). TLS is automatic. Update the skill's configured

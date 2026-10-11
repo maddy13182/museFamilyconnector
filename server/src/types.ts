@@ -63,6 +63,13 @@ export const ENTRY_KINDS = [
   'task_note',
   'task_done',
   'redaction',
+  // E2EE Phase 4 system kinds (client-posted, plaintext by design):
+  'key_rotated',
+  'key_request',
+  'pending_key_distribution',
+  // E2EE Phase 5 system kind (client-posted, plaintext by design):
+  // topic_archived retires a dead topic and names its successor.
+  'topic_archived',
 ] as const;
 
 export const TASK_STATUSES = [

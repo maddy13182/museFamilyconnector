@@ -5,7 +5,13 @@ it first, then invites everyone else.
 
 ## Prerequisites
 
-- Python 3.8+ with **no extra packages** (`hub` is stdlib-only).
+- Python 3.8+.
+- **PyNaCl + the `mnemonic` package** (pinned in `requirements.txt`):
+  `pip install -r requirements.txt`. These are needed for the E2EE identity
+  key commands (`setup` key generation, `key-init`, `key-backup`,
+  `key-restore`). The stdlib-only property ended with E2EE Phase 1 — every
+  other `hub` command keeps working without them, and key commands fail
+  with a clear message telling you how to install them.
 - An **invite code** from the family owner (sent over text/email — the code is
   single-use, expires in 7 days, and grants no read access by itself).
 

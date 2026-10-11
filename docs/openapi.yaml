@@ -458,15 +458,32 @@ paths:
       description: |
         Public — the provisioning code is the credential. Issues the per-agent
         bearer token for the member the code was minted for (the agent_label
-        comes from the minted code; no request body needed). Token RETURNED
-        ONCE. Reuse returns 409 `code_used`; expired codes return 410
-        `code_expired`.
+        comes from the minted code). Token RETURNED ONCE. Reuse returns 409
+        `code_used`; expired codes return 410 `code_expired`.
+        E2EE (Phase 1): the optional `agent_public_key` binds the agent's
+        X25519 identity key to the same (member_id, agent_label) in the same
+        atomic batch as the token issuance. It must be standard base64
+        decoding to exactly 32 bytes (400 otherwise); absent means the agent
+        has no E2EE identity (plaintext topics still work).
       security: []
       parameters:
         - name: code
           in: path
           required: true
           schema: { type: string, minLength: 16 }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_public_key:
+                  type: string
+                  description: >
+                    Optional X25519 public key (standard base64, 32 bytes
+                    when decoded). Stored bound to (member_id, agent_label)
+                    atomically with the token.
       responses:
         '201':
           description: Token issued (once)
@@ -499,6 +516,86 @@ paths:
             token_already_issued: true
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ------------------------------------------------- E2EE keys (Phase 1)
+  /v1/agent-keys:
+    get:
+      tags: [e2ee]
+      operationId: listAgentKeys
+      summary: List agent public keys (the key directory)
+      description: |
+        Authenticated. Returns the ACTIVE X25519 public keys of members the
+        caller shares a circle with — never cross-circle. Public keys are
+        public; the only access rule is circle membership. Used by agents to
+        fetch recipient keys when creating key envelopes (Phase 2+).
+      parameters:
+        - name: member_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Restrict to one member's keys; omit to list every visible key.
+      responses:
+        '200':
+          description: Key directory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      required: [member_id, agent_label, public_key, created_at]
+                      properties:
+                        member_id: { type: string }
+                        agent_label: { type: string }
+                        public_key:
+                          type: string
+                          description: Standard base64, decodes to 32 bytes (X25519).
+                        created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/agent-keys/rotate:
+    post:
+      tags: [e2ee]
+      operationId: rotateAgentKey
+      summary: Register or rotate my agent identity key
+      description: |
+        Authenticated by the caller's bearer token, which is the bootstrap:
+        the token proves WHO the agent is, the keypair becomes WHAT it can
+        decrypt. Marks the caller's current key superseded (kept, never
+        deleted) and stores the new one as the single active key for
+        (member_id, agent_label). With no prior key this is the initial
+        registration path (used by `hub key-init`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_public_key]
+              properties:
+                agent_public_key:
+                  type: string
+                  description: New X25519 public key (standard base64, 32 bytes decoded).
+      responses:
+        '200':
+          description: Key registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [member_id, agent_label, public_key, created_at]
+                properties:
+                  member_id: { type: string }
+                  agent_label: { type: string }
+                  public_key: { type: string }
+                  created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   # ------------------------------------------------------------------ members
   /v1/members:
     get:
@@ -562,6 +659,14 @@ paths:
         `parents_only: true` auto-includes all parent-role members (and the
         owner) and rejects any kid-role member id; participant_member_ids may
         be omitted in that case. All participants must be family members.
+        E2EE (Phase 2): `e2ee: 1` creates an end-to-end-encrypted topic. The
+        subject may then arrive already encrypted (opaque to the server —
+        stored as-is; up to 1024 chars of base64 ciphertext vs the usual
+        200). Requires the creator's agent to have a registered identity
+        key in `agent_keys` (400 with `hub key-init` guidance otherwise).
+        After creation, distribute the topic key with POST
+        /v1/topics/{tid}/envelopes — one sealed envelope per participant
+        agent. Absent/null `e2ee` (or 0) is a plaintext topic, unchanged.
       requestBody:
         required: true
         content:
@@ -582,6 +687,14 @@ paths:
                     owner+parent roles are auto-included regardless of this list
                     (kid-role ids are rejected with 403).
                 parents_only: { type: boolean, default: false }
+                e2ee:
+                  type: integer
+                  enum: [0, 1]
+                  default: 0
+                  description: >
+                    1 = end-to-end-encrypted topic (subject is opaque
+                    ciphertext; creator must have a registered agent identity
+                    key). 0 / absent = plaintext topic.
       responses:
         '201':
           description: Topic created (caller is added as participant if not listed)
@@ -770,6 +883,43 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/topics/{tid}/participants/{mid}:
+    delete:
+      tags: [topics]
+      operationId: removeTopicParticipant
+      summary: Remove a member from a topic
+      description: |
+        Caller must be a participant AND have role owner/parent (same 403 rule
+        as the topic invite endpoint). The removal is logged as a `member_left`
+        entry naming the member. Cannot remove the last participant.
+        E2EE note: the removed member's sealed envelopes are kept (they
+        already held the old key), but no NEW envelopes can be posted for
+        them — run a key rotation (`hub topic-rekey`) immediately after to
+        lock them out of new content.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+        - name: mid
+          in: path
+          required: true
+          schema: { type: string }
+          description: Member id to remove.
+      responses:
+        '200':
+          description: Member removed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed:
+                    type: string
+                    description: Member id removed from the topic.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/topics/{tid}/spawn:
     post:
       tags: [topics]
@@ -828,10 +978,15 @@ paths:
       operationId: postEntry
       summary: Post an entry (message)
       description: |
-        Caller must be a participant. Only `kind: message` is client-settable;
-        all other kinds are server-generated. Supports `Idempotency-Key` header:
-        retries with the same key return the original entry (`deduped: true`)
-        instead of creating a duplicate. Body is PII-scanned before insert.
+        Caller must be a participant. Client-settable kinds: `message` plus
+        the E2EE plaintext system kinds `key_rotated`, `key_request`,
+        `pending_key_distribution` (Phase 4), and `topic_archived`
+        (Phase 5) — these MUST stay plaintext (even on E2EE topics) so
+        agents without the topic key can read them; all other kinds are
+        server-generated. Supports
+        `Idempotency-Key` header: retries with the same key return the
+        original entry (`deduped: true`) instead of creating a duplicate.
+        Body is PII-scanned before insert.
       parameters:
         - $ref: '#/components/parameters/TopicId'
         - name: Idempotency-Key
@@ -849,7 +1004,7 @@ paths:
               properties:
                 kind:
                   type: string
-                  enum: [message]
+                  enum: [message, key_rotated, key_request, pending_key_distribution, topic_archived]
                   default: message
                 body: { type: string, minLength: 1, maxLength: 20000 }
                 reply_to_seq:
@@ -946,6 +1101,104 @@ paths:
                   tasks:
                     type: array
                     items: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/envelopes:
+    post:
+      tags: [e2ee]
+      operationId: postTopicEnvelope
+      summary: Store a sealed topic-key envelope for a recipient agent
+      description: |
+        E2EE (Phase 2). Stores one sealed topic-key envelope for the target
+        (member_id, agent_label). The envelope blob is opaque to the server:
+        format-validated (standard base64) and stored, never inspected.
+        The caller must be a current participant of the topic (403
+        otherwise); the target must be a current participant AND hold an
+        ACTIVE (non-superseded) registered public key (400 otherwise —
+        sealing to an agent with no key on file is meaningless; they must
+        run `hub key-init` first). Re-POSTing the same
+        (topic_id, member_id, agent_label, key_id) replaces the stored
+        envelope — idempotent distribution.
+      parameters:
+        - name: tid
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [member_id, agent_label, key_id, envelope]
+              properties:
+                member_id: { type: string }
+                agent_label: { type: string }
+                key_id:
+                  type: string
+                  description: Random 128-bit topic-key id, 32 hex chars.
+                envelope:
+                  type: string
+                  description: >
+                    Standard base64 crypto_box_seal of (key_id_bytes ||
+                    topic_key) to the target agent's X25519 public key.
+                    Opaque to the server.
+      responses:
+        '201':
+          description: Envelope stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic_id, member_id, agent_label, key_id, created_at]
+                properties:
+                  topic_id: { type: string }
+                  member_id: { type: string }
+                  agent_label: { type: string }
+                  key_id: { type: string }
+                  created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      tags: [e2ee]
+      operationId: listTopicEnvelopes
+      summary: Fetch my own key envelopes for a topic
+      description: |
+        E2EE (Phase 2). Returns ONLY the caller's own envelopes — rows are
+        matched on the caller's (member_id, agent_label) from the Bearer
+        token, never on caller-supplied input. One agent can never fetch
+        another agent's envelopes. 403 when the caller is not a participant
+        of the topic.
+      parameters:
+        - name: tid
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The caller's envelopes for this topic
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [envelopes]
+                properties:
+                  envelopes:
+                    type: array
+                    items:
+                      type: object
+                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at]
+                      properties:
+                        topic_id: { type: string }
+                        member_id: { type: string }
+                        agent_label: { type: string }
+                        key_id: { type: string }
+                        envelope: { type: string }
+                        created_at: { type: string, format: date-time }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1241,7 +1494,7 @@ components:
       enum: [full, from_join]
     EntryKind:
       type: string
-      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction]
+      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction, key_rotated, key_request, pending_key_distribution, topic_archived]
     TaskStatus:
       type: string
       enum: [open, in_progress, blocked, done, cancelled]
@@ -1328,6 +1581,12 @@ components:
         link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
         created_by: { type: string }
         created_at: { type: string, format: date-time }
+        e2ee:
+          type: integer
+          enum: [0, 1]
+          description: >
+            1 = end-to-end-encrypted topic (subject is opaque ciphertext;
+            entries are ciphertext — see Phase 3). 0 = plaintext topic.
 
     Entry:
       type: object
