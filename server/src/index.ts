@@ -101,22 +101,38 @@ async function recordCreateIdem(
   logEvent('info', 'idempotency_stored', { scope, key });
 }
 
-// Mint a single-use provisioning code. Shared by circle creation, the manual
-// mint endpoint, and the dedup path (which issues a FRESH code — the original
-// code's plaintext is unrecoverable once stored as a hash).
+// Mint a single-use provisioning code. Shared by the manual mint endpoint
+// and the dedup path (which issues a FRESH code — the original code's
+// plaintext is unrecoverable once stored as a hash).
+// F17: issuedByTokenId records the token under whose authority the code is
+// minted (the caller's auth.token_id); NULL when no auth context exists.
 async function mintProvisioningCode(
   db: DbClient,
   env: Env,
-  opts: { familyId: string; memberId: string; agentLabel: string; createdBy: string },
+  opts: {
+    familyId: string;
+    memberId: string;
+    agentLabel: string;
+    createdBy: string;
+    issuedByTokenId?: string | null;
+  },
 ): Promise<{ code: string; codeHash: string; expiresAt: string }> {
   const code = newProvisioningCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const expiresAt = hoursFromNow(PROVISION_TTL_HOURS);
   await db.execAtomically([
     {
-      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
-            VALUES (?,?,?,?,?,?,NULL)`,
-      params: [codeHash, opts.familyId, opts.memberId, opts.agentLabel, opts.createdBy, expiresAt],
+      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at, issued_by_token_id)
+            VALUES (?,?,?,?,?,?,NULL,?)`,
+      params: [
+        codeHash,
+        opts.familyId,
+        opts.memberId,
+        opts.agentLabel,
+        opts.createdBy,
+        expiresAt,
+        opts.issuedByTokenId ?? null,
+      ],
     },
   ]);
   logEvent('info', 'provisioning_code_minted', {});
@@ -622,6 +638,7 @@ async function dedupFamilyCreate(
     memberId: member['id'] as string,
     agentLabel: 'owner-agent',
     createdBy: auth.member_id,
+    issuedByTokenId: auth.token_id,
   });
   await recordCreateIdem(db, 'family', auth.member_id, idemKey, familyId, minted.codeHash);
   return json(
@@ -787,18 +804,46 @@ async function handleAcceptInvite(
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
   const ts = nowIso();
+  // F05: atomic conditional consume. The member and token INSERTs only fire
+  // while the invite is still unused, and the UPDATE consumes it — one atomic
+  // batch, in this order (the conditional INSERTs must run before the consume
+  // UPDATE so they see pre-consume state). Concurrent accepts of the same
+  // code therefore create exactly one member and one token; the winner is the
+  // call whose member row exists afterwards.
   await db.execAtomically([
     {
-      sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-      params: [memberId, inviteFamilyId, displayName, email, inviteRole, ts],
+      sql: `INSERT INTO members(id, family_id, name, email, role, created_at)
+            SELECT ?,?,?,?,?,?
+             WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
+      params: [memberId, inviteFamilyId, displayName, email, inviteRole, ts, codeHash],
     },
-    { sql: `UPDATE invites SET used_at = ? WHERE code_hash = ?`, params: [ts, codeHash] },
     {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?, ?,?,NULL,NULL)`,
-      params: [tokenHash, tokenId, memberId, agentLabel, ts],
+      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
+            SELECT ?,?,?,?,?,NULL,NULL,NULL
+             WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
+      params: [tokenHash, tokenId, memberId, agentLabel, ts, codeHash],
+    },
+    {
+      sql: `UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL`,
+      params: [ts, codeHash],
     },
   ]);
+  const won = await db.queryOne(`SELECT id FROM members WHERE id = ?`, [memberId]);
+  if (!won) {
+    // Lost a concurrent-accept race: the winner's member row holds this email.
+    const winnerMember = await db.queryOne(
+      `SELECT * FROM members WHERE family_id = ? AND email = ?`,
+      [inviteFamilyId, email],
+    );
+    return json(
+      {
+        error: { code: 'invite_used', message: 'Invite already used' },
+        member: winnerMember ? publicMember(winnerMember) : null,
+        token_already_issued: true,
+      },
+      409,
+    );
+  }
   // Token is returned ONCE here and never again.
   return json(
     {
@@ -833,14 +878,18 @@ async function handleMintProvisioning(
   );
   if (!target) throw new HttpError(404, 'not_found', 'Member not found');
   const selfMint = memberId === auth.member_id;
-  if (!selfMint && auth.role !== 'owner' && auth.role !== 'parent') {
-    throw new HttpError(403, 'forbidden', 'Only owner/parent can mint codes for other members');
+  // F01: only the owner can mint a credential for another member. Self-mint
+  // is always allowed, for every role. In particular a parent can never mint
+  // for an owner-role member (or for any other member at all).
+  if (!selfMint && auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only the owner can mint codes for other members');
   }
   const minted = await mintProvisioningCode(db, env, {
     familyId: auth.family_id,
     memberId,
     agentLabel,
     createdBy: auth.member_id,
+    issuedByTokenId: auth.token_id,
   });
   return json({ provisioning_code: minted.code, expires_at: minted.expiresAt }, 201);
 }
@@ -880,17 +929,42 @@ async function handleRedeemProvisioning(
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
   const ts = nowIso();
+  // F05: atomic conditional consume + issue in a single batch. The token
+  // INSERT only fires while the code is still unused (the conditional
+  // INSERT...SELECT runs before the consume UPDATE so it sees pre-consume
+  // state); the UPDATE then consumes the code iff still unused. Concurrent
+  // redeems of the same code therefore mint exactly one token — the winner
+  // is the call whose token_id the code row records as redeemed_token_id.
+  // F17: the new token inherits the code's issued_by_token_id, so revoking
+  // the minter's token cascades to it.
   await db.execAtomically([
     {
-      sql: `UPDATE provisioning_codes SET used_at = ?, redeemed_token_id = ? WHERE code_hash = ?`,
-      params: [ts, tokenId, codeHash],
+      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
+            SELECT ?, ?, pc.member_id, pc.agent_label, ?, NULL, NULL, pc.issued_by_token_id
+              FROM provisioning_codes pc
+             WHERE pc.code_hash = ? AND pc.used_at IS NULL`,
+      params: [tokenHash, tokenId, ts, codeHash],
     },
     {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?, ?,?,NULL,NULL)`,
-      params: [tokenHash, tokenId, pc['member_id'] as string, pc['agent_label'] as string, ts],
+      sql: `UPDATE provisioning_codes SET used_at = ?, redeemed_token_id = ? WHERE code_hash = ? AND used_at IS NULL`,
+      params: [ts, tokenId, codeHash],
     },
   ]);
+  const consumed = await db.queryOne(
+    `SELECT redeemed_token_id FROM provisioning_codes WHERE code_hash = ?`,
+    [codeHash],
+  );
+  if (!consumed || consumed['redeemed_token_id'] !== tokenId) {
+    // Lost a concurrent-redeem race: another call consumed the code first.
+    return json(
+      {
+        error: { code: 'code_used', message: 'Provisioning code already used' },
+        member: member ? publicMember(member) : null,
+        token_already_issued: true,
+      },
+      409,
+    );
+  }
   return json({ token, token_id: tokenId, member: publicMember(member) }, 201);
 }
 
@@ -903,6 +977,15 @@ async function handleRotate(
 ): Promise<Response> {
   const raw = req.headers.get('authorization')!.slice('Bearer '.length).trim();
   const oldHash = await credentialHash(env.TOKEN_PEPPER, raw);
+  // F04: a retired credential cannot be rotated again. A fully-revoked token
+  // never reaches here (the auth choke point rejects it with 401); this
+  // covers a token already carrying revoked_at, e.g. inside its
+  // rotation-grace window. Rotate the current token instead.
+  const old = await db.queryOne(`SELECT revoked_at FROM agent_tokens WHERE token_hash = ?`, [oldHash]);
+  if (!old) throw new HttpError(401, 'unauthorized', 'Unknown token');
+  if (old['revoked_at']) {
+    throw new HttpError(403, 'forbidden', 'Token is retired; rotate using the current token instead');
+  }
   const token = newAgentToken();
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
@@ -911,15 +994,23 @@ async function handleRotate(
   await db.execAtomically([
     { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_hash = ?`, params: [graceUntil, oldHash] },
     {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?, ?,?,NULL,NULL)`,
+      // issued_by_token_id stays NULL: rotation replaces a credential rather
+      // than delegating authority, so the new token is deliberately NOT a
+      // cascade target when the old token is revoked (F17).
+      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
+            VALUES (?,?,?, ?,?,NULL,NULL,NULL)`,
       params: [tokenHash, tokenId, auth.member_id, auth.agent_label, ts],
     },
   ]);
   return json({ token, token_id: tokenId, grace_until: graceUntil });
 }
 
-// POST /v1/auth/revoke {token_id} — self, or owner/parent for any family token.
+// POST /v1/auth/revoke {token_id} — self-revoke always; owner/parent for
+// other members' tokens, except a parent can NEVER revoke an owner's token
+// (F01). Revocation is immediate and unconditional: it overwrites any future
+// rotation-grace timestamp (F04), expires pending provisioning codes issued
+// under the token, and revokes one-level descendant tokens (F17; the
+// one-level limit is documented — grandchildren survive).
 async function handleRevoke(
   db: DbClient,
   _env: Env,
@@ -929,20 +1020,38 @@ async function handleRevoke(
   const body = await readJson(req);
   const tokenId = reqString(body['token_id'], 'token_id', 1, 128);
   const target = await db.queryOne(
-    `SELECT t.*, m.family_id AS fam FROM agent_tokens t JOIN members m ON m.id = t.member_id WHERE t.token_id = ?`,
+    `SELECT t.*, m.family_id AS fam, m.role AS member_role
+       FROM agent_tokens t JOIN members m ON m.id = t.member_id
+      WHERE t.token_id = ?`,
     [tokenId],
   );
   if (!target || target['fam'] !== auth.family_id) {
     throw new HttpError(404, 'not_found', 'Token not found');
   }
   const selfRevoke = (target['member_id'] as string) === auth.member_id;
-  if (!selfRevoke && auth.role !== 'owner' && auth.role !== 'parent') {
-    throw new HttpError(403, 'forbidden', 'Only owner/parent can revoke other members\u2019 tokens');
+  if (!selfRevoke) {
+    if (auth.role !== 'owner' && auth.role !== 'parent') {
+      throw new HttpError(403, 'forbidden', 'Only owner/parent can revoke other members\u2019 tokens');
+    }
+    if (target['member_role'] === 'owner' && auth.role !== 'owner') {
+      throw new HttpError(403, 'forbidden', 'Only an owner can revoke an owner\u2019s token');
+    }
   }
+  const now = nowIso();
   await db.execAtomically([
+    // F04: unconditional — overwrites a future rotation-grace revoked_at.
+    { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ?`, params: [now, tokenId] },
+    // F17: expire pending (unused, unexpired) codes issued under this token.
+    // Redeeming them afterwards yields 410 code_expired.
     {
-      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL`,
-      params: [nowIso(), tokenId],
+      sql: `UPDATE provisioning_codes SET expires_at = ?
+             WHERE issued_by_token_id = ? AND used_at IS NULL AND expires_at > ?`,
+      params: [now, tokenId, now],
+    },
+    // F17: one-level cascade to descendant tokens issued under this token.
+    {
+      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE issued_by_token_id = ?`,
+      params: [now, tokenId],
     },
   ]);
   return json({ ok: true });
