@@ -794,6 +794,176 @@ class TestCircles(HubTestBase):
 
 
 # ---------------------------------------------------------------------------
+# Circle ownership transfer: transfer / transfer-accept / transfer-status /
+# transfer-cancel
+# ---------------------------------------------------------------------------
+
+
+class TestCircleTransfer(HubTestBase):
+    def parse(self, argv):
+        return hub.build_parser().parse_args(argv)
+
+    def call_paths(self):
+        return [(c["method"], urlparse.urlparse(c["url"]).path)
+                for c in self.fake.calls]
+
+    def test_transfer_parses(self):
+        a = self.parse(["circle", "transfer", "--to", "m2"])
+        self.assertEqual(a.circle_action, "transfer")
+        self.assertEqual(a.to_member, "m2")
+        self.assertEqual(a.on_complete, "remove")  # default
+
+    def test_transfer_on_complete_choices(self):
+        a = self.parse(["circle", "transfer", "--to", "m2",
+                        "--on-complete", "demote"])
+        self.assertEqual(a.on_complete, "demote")
+        a = self.parse(["circle", "transfer", "--to", "m2",
+                        "--on-complete", "remove"])
+        self.assertEqual(a.on_complete, "remove")
+        with self.assertRaises(SystemExit):
+            self.parse(["circle", "transfer", "--to", "m2",
+                        "--on-complete", "suspend"])
+
+    def test_transfer_requires_to(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["circle", "transfer"])
+
+    def test_transfer_accept_parses(self):
+        a = self.parse(["circle", "transfer-accept"])
+        self.assertEqual(a.circle_action, "transfer-accept")
+        self.assertIsNone(a.transfer_id)
+        b = self.parse(["circle", "transfer-accept",
+                        "--transfer-id", "t123"])
+        self.assertEqual(b.transfer_id, "t123")
+
+    def test_transfer_status_and_cancel_parse(self):
+        a = self.parse(["circle", "transfer-status"])
+        self.assertEqual(a.circle_action, "transfer-status")
+        a = self.parse(["circle", "transfer-cancel"])
+        self.assertEqual(a.circle_action, "transfer-cancel")
+
+    def test_transfer_posts_to_member_and_default_on_complete(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/families/c111/transfer", 201,
+                      {"id": "t1", "status": "pending",
+                       "to_member_id": "m2", "on_complete": "remove"})
+        rc, out, _ = self.run_cli(["circle", "transfer", "--to", "m2"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("POST", "/v1/families/c111/transfer")])
+        body = json.loads(self.fake.calls[0]["body"])
+        self.assertEqual(body,
+                         {"to_member_id": "m2", "on_complete": "remove"})
+        self.assertIn('"id": "t1"', out)
+        self.assertIn("pending", out)
+        self.assertTokenAbsent(out)
+
+    def test_transfer_on_complete_demote(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/families/c111/transfer", 201,
+                      {"id": "t2", "status": "pending"})
+        rc, _out, _ = self.run_cli(
+            ["circle", "transfer", "--to", "m2", "--on-complete", "demote"])
+        self.assertEqual(rc, 0)
+        body = json.loads(self.fake.calls[0]["body"])
+        self.assertEqual(body["on_complete"], "demote")
+
+    def test_transfer_rejects_blank_to_member(self):
+        self.seed_config(family_id="c111")
+        rc, _out, err = self.run_cli(["circle", "transfer", "--to", "  "])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("--to", err)
+
+    def test_transfer_secret_fields_scrubbed(self):
+        # A buggy server response that includes credential material must
+        # never be echoed to stdout.
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/families/c111/transfer", 201,
+                      {"id": "t3", "status": "pending",
+                       "token": "fh_SUPER_SECRET_999"})
+        rc, out, err = self.run_cli(["circle", "transfer", "--to", "m2"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("fh_SUPER_SECRET_999", out)
+        self.assertNotIn("fh_SUPER_SECRET_999", err)
+        self.assertIn("[redacted]", out)
+
+    def test_transfer_accept_with_id(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/families/c111/transfer/accept", 200,
+                      {"id": "t1", "status": "accepted"})
+        rc, out, _ = self.run_cli(
+            ["circle", "transfer-accept", "--transfer-id", "t1"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("POST", "/v1/families/c111/transfer/accept")])
+        body = json.loads(self.fake.calls[0]["body"])
+        self.assertEqual(body, {"transfer_id": "t1"})
+        self.assertIn("accepted", out)
+        self.assertTokenAbsent(out)
+
+    def test_transfer_accept_without_id(self):
+        # The id is optional client-side: the server may resolve a single
+        # pending transfer itself.
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/families/c111/transfer/accept", 200,
+                      {"id": "t1", "status": "accepted"})
+        rc, _out, _ = self.run_cli(["circle", "transfer-accept"])
+        self.assertEqual(rc, 0)
+        body = json.loads(self.fake.calls[0]["body"])
+        self.assertEqual(body, {})
+
+    def test_transfer_status_pending(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/families/c111/transfer", 200,
+                      {"transfer": {"id": "t1", "status": "pending",
+                                    "to_member_id": "m2"}})
+        rc, out, _ = self.run_cli(["circle", "transfer-status"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("GET", "/v1/families/c111/transfer")])
+        self.assertIn('"id": "t1"', out)
+        self.assertIn("pending", out)
+        self.assertNotIn("none", out)
+        self.assertTokenAbsent(out)
+
+    def test_transfer_status_none(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/families/c111/transfer", 200,
+                      {"transfer": None})
+        rc, out, _ = self.run_cli(["circle", "transfer-status"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "none")
+        self.assertTokenAbsent(out)
+
+    def test_transfer_cancel_posts(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/families/c111/transfer/cancel", 200,
+                      {"id": "t1", "status": "cancelled"})
+        rc, out, _ = self.run_cli(["circle", "transfer-cancel"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("POST", "/v1/families/c111/transfer/cancel")])
+        self.assertIn("cancelled", out)
+        self.assertTokenAbsent(out)
+
+    def test_transfer_uses_circle_override(self):
+        self.seed_config(family_id="c111",
+                         circle_tokens={"c222": "fh_C222_tok"})
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add("POST", "/v1/families/c222/transfer", 201,
+                      {"id": "t9", "status": "pending"})
+        rc, _out, _ = self.run_cli(
+            ["circle", "transfer", "--to", "m2", "--circle", "Friends"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("GET", "/v1/families"),
+                          ("POST", "/v1/families/c222/transfer")])
+        self.assertEqual(self.fake.calls[1]["headers"]["Authorization"],
+                         "Bearer fh_C222_tok")
+
+
+# ---------------------------------------------------------------------------
 # Per-circle tokens (v0.2.0): one token per circle, active-circle auth,
 # legacy fallback, multi-circle sync, dashboard-token
 # ---------------------------------------------------------------------------

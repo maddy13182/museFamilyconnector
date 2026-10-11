@@ -4189,6 +4189,84 @@ def cmd_circle_use(args, transport):
     return 0
 
 
+def _transfer_path(family_id, suffix=""):
+    return "/v1/families/%s/transfer%s" % (
+        urlparse.quote(family_id, safe=""), suffix)
+
+
+def _emit_transfer_result(resp):
+    """Print a transfer endpoint response — structural secret-scrubbed.
+
+    These endpoints never issue credentials (only IDs), but if a server
+    ever slipped a secret field into its response, it must not reach
+    stdout — hence the scrub (same keys as the debug-dump scrubber).
+    """
+    emit_json(_scrub_sensitive_value(resp if isinstance(resp, dict) else
+                                     {"ok": True}))
+    return 0
+
+
+def cmd_circle_transfer(args, transport):
+    """Initiate an ownership transfer of the active circle (owner only)."""
+    ctx = _ctx(args, transport)
+    family_id = _resolve_circle(args, ctx)
+    to_member_id = (args.to_member or "").strip()
+    if not to_member_id:
+        raise HubError("bad_request", "A --to member id is required.")
+    resp = ctx.client.call(
+        "POST",
+        _transfer_path(family_id),
+        json_body={"to_member_id": to_member_id,
+                   "on_complete": args.on_complete},
+    )
+    return _emit_transfer_result(resp)
+
+
+def cmd_circle_transfer_accept(args, transport):
+    """Accept a pending ownership transfer of the active circle."""
+    ctx = _ctx(args, transport)
+    family_id = _resolve_circle(args, ctx)
+    body = {}
+    transfer_id = (args.transfer_id or "").strip()
+    if transfer_id:
+        body["transfer_id"] = transfer_id
+    resp = ctx.client.call(
+        "POST",
+        _transfer_path(family_id, "/accept"),
+        json_body=body,
+    )
+    return _emit_transfer_result(resp)
+
+
+def cmd_circle_transfer_status(args, transport):
+    """Show the pending ownership transfer for the active circle, if any."""
+    ctx = _ctx(args, transport)
+    family_id = _resolve_circle(args, ctx)
+    resp = ctx.client.call("GET", _transfer_path(family_id))
+    if isinstance(resp, dict) and "transfer" in resp:
+        transfer = resp.get("transfer")
+    elif resp:
+        transfer = resp
+    else:
+        transfer = None
+    if transfer is None:
+        emit("none")
+        return 0
+    emit_json(_scrub_sensitive_value(transfer))
+    return 0
+
+
+def cmd_circle_transfer_cancel(args, transport):
+    """Cancel the pending ownership transfer of the active circle (owner only)."""
+    ctx = _ctx(args, transport)
+    family_id = _resolve_circle(args, ctx)
+    resp = ctx.client.call(
+        "POST",
+        _transfer_path(family_id, "/cancel"),
+    )
+    return _emit_transfer_result(resp)
+
+
 def cmd_dashboard_token(args, transport):
     """Print the stored token for a circle (for pasting into the dashboard).
 
@@ -4536,6 +4614,37 @@ def build_parser():
     c.add_argument("--label", default=None,
                    help="Agent label for invite codes (default: profile agent label)")
     c.set_defaults(func=cmd_circle_join)
+
+    c = csub.add_parser("transfer",
+                        help="Initiate a circle ownership transfer (owner only)")
+    c.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
+    c.add_argument("--to", required=True, dest="to_member", metavar="MEMBER_ID",
+                   help="Member id who becomes the new owner")
+    c.add_argument("--on-complete", choices=["demote", "remove"],
+                   default="remove",
+                   help="What happens to the current owner once the transfer "
+                        "is accepted (default: %(default)s)")
+    c.set_defaults(func=cmd_circle_transfer)
+    c = csub.add_parser("transfer-accept",
+                        help="Accept a pending circle ownership transfer")
+    c.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
+    c.add_argument("--transfer-id", default=None, metavar="TRANSFER_ID",
+                   help="Transfer id (may be omitted when only one transfer "
+                        "is pending)")
+    c.set_defaults(func=cmd_circle_transfer_accept)
+    c = csub.add_parser("transfer-status",
+                        help="Show the pending circle ownership transfer, if any")
+    c.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
+    c.set_defaults(func=cmd_circle_transfer_status)
+    c = csub.add_parser("transfer-cancel",
+                        help="Cancel the pending circle ownership transfer "
+                             "(owner only)")
+    c.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
+    c.set_defaults(func=cmd_circle_transfer_cancel)
 
     p = sub.add_parser("dashboard-token",
                        help="Print this circle's token for the dashboard (sensitive!)")
