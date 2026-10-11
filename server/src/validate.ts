@@ -110,3 +110,46 @@ export function optSearchQuery(v: string | null): string | null {
 export function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => '\\' + c);
 }
+
+// E2EE (Phase 1): an X25519 public key as strict standard-base64. Must
+// decode to exactly 32 bytes. Strict on purpose: canonical base64 with
+// padding only — unpadded or URL-safe alphabets are rejected so the same
+// key can never be stored in two textual forms.
+const AGENT_PUBKEY_B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+export function reqAgentPublicKey(v: unknown, name: string): string {
+  if (typeof v !== 'string') {
+    throw new HttpError(400, 'bad_request', `${name} must be a base64 string`);
+  }
+  const s = v.trim();
+  if (s.length === 0 || s.length > 64 || s.length % 4 !== 0 || !AGENT_PUBKEY_B64_RE.test(s)) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      `${name} must be standard base64 (with padding) decoding to exactly 32 bytes`,
+    );
+  }
+  // atob() is available in both the Worker runtime and Node; each output
+  // char is one byte, so .length is the decoded byte count. The strict
+  // regex above already ruled out whitespace/non-alphabet input.
+  let byteLen: number;
+  try {
+    byteLen = atob(s).length;
+  } catch {
+    throw new HttpError(400, 'bad_request', `${name} is not valid base64`);
+  }
+  if (byteLen !== 32) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      `${name} must decode to exactly 32 bytes (X25519 public key); got ${byteLen}`,
+    );
+  }
+  return s;
+}
+
+/** Optional variant: undefined/null = absent (no E2EE identity). */
+export function optAgentPublicKey(v: unknown, name: string): string | null {
+  if (v === undefined || v === null) return null;
+  return reqAgentPublicKey(v, name);
+}

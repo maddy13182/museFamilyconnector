@@ -27,6 +27,10 @@ each family member's agent ──HTTPS+bearer──▶ https://YOUR-WORKER.worke
 - Node.js 18+ and npm.
 - `wrangler` CLI: `npm install -g wrangler` then `wrangler login`.
 - Python 3.9+ and `curl` (for verification and the agent CLI).
+- For the agent CLI's E2EE key commands: PyNaCl + the `mnemonic` package
+  (`pip install -r agent-skill/requirements.txt`; versions pinned). The
+  stdlib-only property ended with E2EE Phase 1 — all non-key `hub` commands
+  keep working without them.
 - This repo checked out at the commit you intend to deploy.
 
 ## 2. Create the D1 database and apply migrations

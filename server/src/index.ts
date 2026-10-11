@@ -37,6 +37,8 @@ import {
   reqJsonData,
   optSearchQuery,
   escapeLike,
+  reqAgentPublicKey,
+  optAgentPublicKey,
 } from './validate.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
@@ -433,6 +435,18 @@ function publicMember(row: Row): Record<string, unknown> {
     name: row['name'],
     email: row['email'],
     role: row['role'],
+    created_at: row['created_at'],
+  };
+}
+
+// E2EE (Phase 1): the key directory serves public keys only — the single
+// canonical serializer, mirroring publicMember(). Never includes anything
+// but the key and its binding metadata.
+function publicAgentKey(row: Row): Record<string, unknown> {
+  return {
+    member_id: row['member_id'],
+    agent_label: row['agent_label'],
+    public_key: row['public_key'],
     created_at: row['created_at'],
   };
 }
@@ -1207,7 +1221,13 @@ async function handleRedeemProvisioning(
   req: Request,
   code: string,
 ): Promise<Response> {
-  await readJson(req).catch(() => ({})); // body optional/ignored
+  // E2EE (Phase 1): optional agent_public_key binds the agent's X25519
+  // identity to the same (member_id, agent_label) as the token being
+  // issued. Validated (400) BEFORE the single-use code is consumed — a
+  // malformed key must never burn the code. Absent = the agent has no
+  // E2EE identity; plaintext topics still work.
+  const body: Record<string, unknown> = await readJson(req).catch(() => ({}));
+  const agentPublicKey = optAgentPublicKey(body['agent_public_key'], 'agent_public_key');
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const pc = await db.queryOne(`SELECT * FROM provisioning_codes WHERE code_hash = ?`, [codeHash]);
   if (!pc) throw new HttpError(404, 'not_found', 'Provisioning code not found');
@@ -1235,6 +1255,27 @@ async function handleRedeemProvisioning(
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
   const ts = nowIso();
+  if (agentPublicKey) {
+    // One active key per (member_id, agent_label). A second enrollment for
+    // the same agent label must not silently replace the existing E2EE
+    // identity — the partial unique index is the backstop, but fail here
+    // with an actionable 409 instead of a constraint error. (Rotation of an
+    // existing identity goes through POST /v1/agent-keys/rotate with the
+    // agent's bearer token, not a fresh provisioning code.)
+    const existing = await db.queryOne(
+      `SELECT id FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+      [pc['member_id'] as string, pc['agent_label'] as string],
+    );
+    if (existing) {
+      throw new HttpError(
+        409,
+        'agent_key_exists',
+        'An E2EE identity key is already registered for this agent label. ' +
+          'Use a distinct agent label for the new agent, or rotate the ' +
+          'existing key with POST /v1/agent-keys/rotate.',
+      );
+    }
+  }
   // F05: atomic conditional consume + issue in a single batch. The token
   // INSERT only fires while the code is still unused (the conditional
   // INSERT...SELECT runs before the consume UPDATE so it sees pre-consume
@@ -1255,6 +1296,22 @@ async function handleRedeemProvisioning(
       sql: `UPDATE provisioning_codes SET used_at = ?, redeemed_token_id = ? WHERE code_hash = ? AND used_at IS NULL`,
       params: [ts, tokenId, codeHash],
     },
+    // E2EE (Phase 1): bind the agent's public key to the same
+    // (member_id, agent_label) in the SAME atomic batch as the token
+    // issuance. The conditional INSERT only fires for the redeem that won
+    // the code (redeemed_token_id = this call's tokenId, set by the UPDATE
+    // above) — the loser of a concurrent-redeem race stores nothing.
+    ...(agentPublicKey
+      ? [
+          {
+            sql: `INSERT INTO agent_keys(id, member_id, agent_label, public_key, created_at, superseded_at)
+                  SELECT ?, pc.member_id, pc.agent_label, ?, ?, NULL
+                    FROM provisioning_codes pc
+                   WHERE pc.code_hash = ? AND pc.redeemed_token_id = ?`,
+            params: [newId(), agentPublicKey, ts, codeHash, tokenId],
+          },
+        ]
+      : []),
   ]);
   const consumed = await db.queryOne(
     `SELECT redeemed_token_id FROM provisioning_codes WHERE code_hash = ?`,
@@ -1272,6 +1329,68 @@ async function handleRedeemProvisioning(
     );
   }
   return json({ token, token_id: tokenId, member: publicMember(member) }, 201);
+}
+
+// E2EE (Phase 1) — GET /v1/agent-keys?member_id=… — the public-key
+// directory. Authenticated. Returns ACTIVE keys only, and only for members
+// the caller shares a circle (family) with — never cross-circle. Public
+// keys are public, so the only access rule is circle membership; no key
+// material beyond the public key is ever returned (see publicAgentKey).
+async function handleAgentKeyDirectory(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const memberId = url.searchParams.get('member_id');
+  if (memberId !== null && (memberId.length === 0 || memberId.length > 128)) {
+    throw new HttpError(400, 'bad_request', 'member_id must be 1-128 chars');
+  }
+  const base = `SELECT k.member_id, k.agent_label, k.public_key, k.created_at
+      FROM agent_keys k
+      JOIN members m ON m.id = k.member_id
+     WHERE k.superseded_at IS NULL AND m.family_id = ?`;
+  const rows = memberId
+    ? await db.queryAll(`${base} AND k.member_id = ?`, [auth.family_id, memberId])
+    : await db.queryAll(base, [auth.family_id]);
+  return json({ keys: rows.map(publicAgentKey) });
+}
+
+// E2EE (Phase 1) — POST /v1/agent-keys/rotate {agent_public_key} —
+// register (or rotate) the caller's agent identity key. Authenticated by
+// the caller's bearer token, which is the bootstrap: the token proves WHO
+// the agent is, the keypair becomes WHAT it can decrypt. The current
+// active key (if any) is marked superseded and kept — never deleted — so
+// existing envelopes still resolve; the new row becomes the single active
+// key for (member_id, agent_label). Calling it with no prior key is the
+// initial registration path (used by `hub key-init`).
+async function handleAgentKeyRotate(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+): Promise<Response> {
+  const body = await readJson(req);
+  const agentPublicKey = reqAgentPublicKey(body['agent_public_key'], 'agent_public_key');
+  const ts = nowIso();
+  const keyId = newId();
+  await db.execAtomically([
+    {
+      sql: `UPDATE agent_keys SET superseded_at = ?
+             WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+      params: [ts, auth.member_id, auth.agent_label],
+    },
+    {
+      sql: `INSERT INTO agent_keys(id, member_id, agent_label, public_key, created_at, superseded_at)
+            VALUES (?,?,?,?,?,NULL)`,
+      params: [keyId, auth.member_id, auth.agent_label, agentPublicKey, ts],
+    },
+  ]);
+  return json({
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    public_key: agentPublicKey,
+    created_at: ts,
+  });
 }
 
 // POST /v1/auth/rotate — new token; old valid 24h grace.
@@ -2312,6 +2431,13 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     if (path === '/v1/me' && method === 'GET') return await handleGetSelf(db, auth);
     if (path === '/v1/provisioning-codes' && method === 'POST') {
       return await handleMintProvisioning(db, env, req, auth);
+    }
+    // E2EE (Phase 1) key infrastructure.
+    if (path === '/v1/agent-keys' && method === 'GET') {
+      return await handleAgentKeyDirectory(db, req, auth);
+    }
+    if (path === '/v1/agent-keys/rotate' && method === 'POST') {
+      return await handleAgentKeyRotate(db, req, auth);
     }
     if (path === '/v1/topics' && method === 'POST') return await handleCreateTopic(db, env, req, auth);
     if (path === '/v1/topics' && method === 'GET') return await handleListTopics(db, req, auth);

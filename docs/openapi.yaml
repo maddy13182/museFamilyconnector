@@ -458,15 +458,32 @@ paths:
       description: |
         Public — the provisioning code is the credential. Issues the per-agent
         bearer token for the member the code was minted for (the agent_label
-        comes from the minted code; no request body needed). Token RETURNED
-        ONCE. Reuse returns 409 `code_used`; expired codes return 410
-        `code_expired`.
+        comes from the minted code). Token RETURNED ONCE. Reuse returns 409
+        `code_used`; expired codes return 410 `code_expired`.
+        E2EE (Phase 1): the optional `agent_public_key` binds the agent's
+        X25519 identity key to the same (member_id, agent_label) in the same
+        atomic batch as the token issuance. It must be standard base64
+        decoding to exactly 32 bytes (400 otherwise); absent means the agent
+        has no E2EE identity (plaintext topics still work).
       security: []
       parameters:
         - name: code
           in: path
           required: true
           schema: { type: string, minLength: 16 }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_public_key:
+                  type: string
+                  description: >
+                    Optional X25519 public key (standard base64, 32 bytes
+                    when decoded). Stored bound to (member_id, agent_label)
+                    atomically with the token.
       responses:
         '201':
           description: Token issued (once)
@@ -499,6 +516,86 @@ paths:
             token_already_issued: true
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ------------------------------------------------- E2EE keys (Phase 1)
+  /v1/agent-keys:
+    get:
+      tags: [e2ee]
+      operationId: listAgentKeys
+      summary: List agent public keys (the key directory)
+      description: |
+        Authenticated. Returns the ACTIVE X25519 public keys of members the
+        caller shares a circle with — never cross-circle. Public keys are
+        public; the only access rule is circle membership. Used by agents to
+        fetch recipient keys when creating key envelopes (Phase 2+).
+      parameters:
+        - name: member_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Restrict to one member's keys; omit to list every visible key.
+      responses:
+        '200':
+          description: Key directory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      required: [member_id, agent_label, public_key, created_at]
+                      properties:
+                        member_id: { type: string }
+                        agent_label: { type: string }
+                        public_key:
+                          type: string
+                          description: Standard base64, decodes to 32 bytes (X25519).
+                        created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/agent-keys/rotate:
+    post:
+      tags: [e2ee]
+      operationId: rotateAgentKey
+      summary: Register or rotate my agent identity key
+      description: |
+        Authenticated by the caller's bearer token, which is the bootstrap:
+        the token proves WHO the agent is, the keypair becomes WHAT it can
+        decrypt. Marks the caller's current key superseded (kept, never
+        deleted) and stores the new one as the single active key for
+        (member_id, agent_label). With no prior key this is the initial
+        registration path (used by `hub key-init`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_public_key]
+              properties:
+                agent_public_key:
+                  type: string
+                  description: New X25519 public key (standard base64, 32 bytes decoded).
+      responses:
+        '200':
+          description: Key registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [member_id, agent_label, public_key, created_at]
+                properties:
+                  member_id: { type: string }
+                  agent_label: { type: string }
+                  public_key: { type: string }
+                  created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   # ------------------------------------------------------------------ members
   /v1/members:
     get:
