@@ -1,0 +1,39 @@
+# Merge-level changelog consolidation: on every push to main, fold
+# changelog.d/ fragments into CHANGELOG.md's [Unreleased] section and commit
+# the result. PRs add fragments; this workflow assembles them.
+name: Changelog
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Serialize runs: two rapid pushes must not consolidate concurrently.
+concurrency:
+  group: changelog-consolidate
+  cancel-in-progress: false
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Consolidate fragments
+        run: python3 scripts/consolidate_changelog.py
+
+      - name: Commit if changed
+        run: |
+          if git status --porcelain | grep -q .; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add CHANGELOG.md changelog.d/
+            git commit -m "chore: consolidate changelog fragments"
+            git push
+          else
+            echo "nothing to consolidate"
+          fi

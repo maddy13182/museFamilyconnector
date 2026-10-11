@@ -47,6 +47,9 @@ jobs:
       - name: Run agent CLI tests
         run: python3 -m unittest discover -s agent-skill/tests
 
+      - name: Run repo script tests (changelog + PR check)
+        run: python3 -m unittest discover -s scripts/tests
+
   security:
     name: security scan (semgrep + bandit)
     runs-on: ubuntu-latest
@@ -87,42 +90,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Versions in sync + bump required for functional changes
+      - name: Version bumps match changelog fragments
         env:
-          EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -e
-          v_file="$(cat VERSION)"
-          v_pkg="$(python3 -c "import json; print(json.load(open('server/package.json'))['version'])")"
-          v_hub="$(grep -E '^VERSION = ' agent-skill/hub | cut -d'"' -f2)"
-          if [ "$v_file" != "$v_pkg" ] || [ "$v_file" != "$v_hub" ]; then
-            echo "::error::Version mismatch: VERSION=$v_file server/package.json=$v_pkg agent-skill/hub=$v_hub. Keep all three in sync (docs/VERSIONING.md)."
-            exit 1
-          fi
-          echo "versions consistent: $v_file"
-          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_REF" ]; then
-            base="origin/${BASE_REF}"
-            functional="$(git diff --name-only "${base}...HEAD" -- server/src server/migrations agent-skill/hub agent-skill/tests || true)"
-            # A "version bump" means the project's own version value changed,
-            # not merely that a version-carrying file was touched (a Dependabot
-            # dependency bump edits server/package.json without bumping the
-            # project version). Compare field values, not file diffs.
-            v_base_file="$(git show "${base}:VERSION" 2>/dev/null || true)"
-            v_base_pkg="$(git show "${base}:server/package.json" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" 2>/dev/null || true)"
-            v_base_hub="$(git show "${base}:agent-skill/hub" 2>/dev/null | grep -E '^VERSION = ' | cut -d'"' -f2 || true)"
-            versioned=""
-            if [ "$v_base_file" != "$v_file" ] || [ "$v_base_pkg" != "$v_pkg" ] || [ "$v_base_hub" != "$v_hub" ]; then
-              versioned="1"
-            fi
-            changelog="$(git diff --name-only "${base}...HEAD" -- CHANGELOG.md || true)"
-            if [ -n "$functional" ] && [ -z "$versioned" ]; then
-              echo "::error::This PR changes functional code but does not bump the version. Update VERSION, server/package.json, agent-skill/hub and CHANGELOG.md per docs/VERSIONING.md."
-              exit 1
-            fi
-            if [ -n "$versioned" ] && [ -z "$changelog" ]; then
-              echo "::error::Version bumped but CHANGELOG.md not updated. Add an entry per docs/VERSIONING.md."
-              exit 1
-            fi
-            echo "version gate passed"
+          if [ -n "$BASE_REF" ]; then
+            python3 scripts/pr_check.py --base "origin/${BASE_REF}"
+          else
+            echo "no base ref (not a PR); skipping"
           fi
