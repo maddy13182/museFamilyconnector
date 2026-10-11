@@ -423,18 +423,25 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
   const code = newProvisioningCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const provisionExpiresAt = hoursFromNow(PROVISION_TTL_HOURS);
-  await db.execAtomically([
-    { sql: `INSERT INTO families(id, name, created_at) VALUES (?,?,?)`, params: [familyId, name, ts] },
-    {
-      sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-      params: [memberId, familyId, ownerName, ownerEmail, 'owner', ts],
-    },
-    {
-      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
-            VALUES (?,?,?,?,?,?,NULL)`,
-      params: [codeHash, familyId, memberId, 'owner-agent', memberId, provisionExpiresAt],
-    },
-  ]);
+  try {
+    await db.execAtomically([
+      { sql: `INSERT INTO families(id, name, created_at) VALUES (?,?,?)`, params: [familyId, name, ts] },
+      {
+        sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
+        params: [memberId, familyId, ownerName, ownerEmail, 'owner', ts],
+      },
+      {
+        sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
+              VALUES (?,?,?,?,?,?,NULL)`,
+        params: [codeHash, familyId, memberId, 'owner-agent', memberId, provisionExpiresAt],
+      },
+    ]);
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      throw new HttpError(409, 'circle_name_taken', `A circle named "${name}" already exists`);
+    }
+    throw e;
+  }
   return json(
     {
       family: { id: familyId, name, created_at: ts },
@@ -677,6 +684,12 @@ async function handleCreateInvite(
   if (idemKey) {
     const prior = await findCreateIdem(db, 'invite', auth.member_id, idemKey);
     if (prior) {
+      // Mirror the normal path: if the email joined since, report it.
+      const already = await db.queryOne(
+        `SELECT id FROM members WHERE family_id = ? AND email = ?`,
+        [auth.family_id, email],
+      );
+      if (already) throw new HttpError(409, 'already_member', 'This email is already a family member');
       // Fresh invite code for the same (email, role): the original code's
       // plaintext is unrecoverable, and the invitee never got it.
       logEvent('info', 'idempotency_hit', { scope: 'invite', key: idemKey });
@@ -689,8 +702,14 @@ async function handleCreateInvite(
                 VALUES (?,?,?,?,?,?,NULL)`,
           params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
         },
+        {
+          sql: `INSERT OR REPLACE INTO create_idempotency
+                  (scope, member_id, key, resource_id, code_hash, created_at, expires_at)
+                VALUES (?,?,?,?,?,?,?)`,
+          params: ['invite', auth.member_id, idemKey, codeHash, null, nowIso(), hoursFromNow(IDEM_CREATE_TTL_HOURS)],
+        },
       ]);
-      await recordCreateIdem(db, 'invite', auth.member_id, idemKey, codeHash, null);
+      logEvent('info', 'idempotency_stored', { scope: 'invite', key: idemKey });
       return json({ invite_code: code, expires_at: expiresAt, deduped: true });
     }
   }
@@ -703,14 +722,23 @@ async function handleCreateInvite(
   const code = newInviteCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const expiresAt = daysFromNow(INVITE_TTL_DAYS);
-  await db.execAtomically([
+  const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
       sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
             VALUES (?,?,?,?,?,?,NULL)`,
       params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
     },
-  ]);
-  if (idemKey) await recordCreateIdem(db, 'invite', auth.member_id, idemKey, codeHash, null);
+  ];
+  if (idemKey) {
+    ops.push({
+      sql: `INSERT OR REPLACE INTO create_idempotency
+              (scope, member_id, key, resource_id, code_hash, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      params: ['invite', auth.member_id, idemKey, codeHash, null, nowIso(), hoursFromNow(IDEM_CREATE_TTL_HOURS)],
+    });
+  }
+  await db.execAtomically(ops);
+  if (idemKey) logEvent('info', 'idempotency_stored', { scope: 'invite', key: idemKey });
   return json({ invite_code: code, expires_at: expiresAt }, 201);
 }
 
@@ -1001,19 +1029,29 @@ async function handleCreateTopic(
 
   const topicId = newId();
   const ts = nowIso();
-  const ops = [
+  const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
       sql: `INSERT INTO topics(id, family_id, subject, kind, parents_only, parent_topic_id, link_visibility, created_by, created_at)
             VALUES (?,?,?,?,?,?,?,?,?)`,
       params: [topicId, auth.family_id, subject, kind, parentsOnly ? 1 : 0, null, 'placeholder', auth.member_id, ts],
     },
-    ...ids.map((mid) => ({
-      sql: `INSERT INTO topic_participants(topic_id, member_id, joined_at, history_from_seq) VALUES (?,?,?,1)`,
-      params: [topicId, mid, ts] as (string | number | null)[],
-    })),
+    ...ids.map(
+      (mid): { sql: string; params: (string | number | null)[] } => ({
+        sql: `INSERT INTO topic_participants(topic_id, member_id, joined_at, history_from_seq) VALUES (?,?,?,1)`,
+        params: [topicId, mid, ts],
+      }),
+    ),
   ];
+  if (idemKey) {
+    ops.push({
+      sql: `INSERT OR REPLACE INTO create_idempotency
+              (scope, member_id, key, resource_id, code_hash, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      params: ['topic', auth.member_id, idemKey, topicId, null, ts, hoursFromNow(IDEM_CREATE_TTL_HOURS)],
+    });
+  }
   await db.execAtomically(ops);
-  if (idemKey) await recordCreateIdem(db, 'topic', auth.member_id, idemKey, topicId, null);
+  if (idemKey) logEvent('info', 'idempotency_stored', { scope: 'topic', key: idemKey });
   const topic = await db.queryOne(`SELECT * FROM topics WHERE id = ?`, [topicId]);
   return json({ topic }, 201);
 }

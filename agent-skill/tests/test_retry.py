@@ -151,6 +151,33 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, "conflict")
         self.assertEqual(cm.exception.server_code, "code_used")
 
+    def test_redeem_retried_without_key(self):
+        # Single-use codes are retry-safe: no key, but retries happen.
+        t = ScriptedTransport(
+            [
+                http.client.RemoteDisconnected("x"),
+                (201, {"token": "t", "member": {}}),
+            ]
+        )
+        client = make_client(t)
+        resp = client.call(
+            "POST", "/v1/provisioning-codes/fhp_abc/redeem", json_body={}, auth=False
+        )
+        self.assertEqual(resp["token"], "t")
+        self.assertEqual(len(t.calls), 2)
+        self.assertIsNone(t.calls[0]["headers"].get("Idempotency-Key"))
+
+    def test_task_create_not_retried_without_key(self):
+        # Duplicating operations must not retry blindly.
+        t = ScriptedTransport(
+            [http.client.RemoteDisconnected("x")]
+        )
+        client = make_client(t)
+        with self.assertRaises(hub.HubError) as cm:
+            client.call("POST", "/v1/topics/t1/tasks", json_body={}, auth=False)
+        self.assertEqual(cm.exception.code, "connection")
+        self.assertEqual(len(t.calls), 1)
+
 
 class CircleCreateRecoveryTest(unittest.TestCase):
     def setUp(self):

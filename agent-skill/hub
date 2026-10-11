@@ -437,6 +437,20 @@ def _auto_idem_key(path):
     return bool(re.match(r"^/v1/families/[^/]+/invites$", path))
 
 
+def _single_use_code_path(path):
+    """True for redeem/accept paths whose codes are single-use.
+
+    Retrying these can never duplicate the effect: if the first attempt
+    committed, the retry gets 409 code_used/invite_used (which callers
+    handle); if it never arrived, the retry succeeds. So they are retry-safe
+    without an idempotency key.
+    """
+    return bool(
+        re.match(r"^/v1/provisioning-codes/.+/redeem$", path)
+        or re.match(r"^/v1/invites/.+/accept$", path)
+    )
+
+
 # Network-level failures worth retrying. Note http.client.RemoteDisconnected
 # ("Remote end closed connection without response") is NOT wrapped in
 # URLError by urlopen — it propagates raw, which is exactly what bit the
@@ -518,9 +532,9 @@ class HubClient:
         """Run the transport with exponential backoff.
 
         Retries network-level failures (dropped connections, timeouts),
-        HTTP 429 (honoring Retry-After) and 5xx. Never retries 4xx: those are
-        deterministic. Every retry reuses the same idempotency key (set by the
-        caller), so retried creates cannot duplicate.
+        HTTP 429 and 5xx. Never retries 4xx: those are deterministic. Every
+        retry reuses the same idempotency key (set by the caller), so retried
+        creates cannot duplicate.
         """
         last_status = None
         last_text = None
@@ -586,8 +600,20 @@ class HubClient:
             idempotency_key = uuid.uuid4().hex
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
+        # Retry is only safe when the operation cannot duplicate: GETs are
+        # inherently safe; POSTs are safe with an idempotency key the server
+        # honors, or on single-use-code paths (redeem/accept) where a retry
+        # can at worst return 409. Without that, a dropped connection after
+        # the server committed would duplicate the operation on retry (e.g.
+        # token rotation would rotate twice, leaving the client tokenless).
+        safe_to_retry = (
+            method == "GET"
+            or idempotency_key is not None
+            or (method == "POST" and _single_use_code_path(path))
+        )
         status, resp_text = self._transport_with_retry(
-            method, url, headers, body_bytes, retries)
+            method, url, headers, body_bytes, retries if safe_to_retry else 0
+        )
         if self.debug:
             self._debug_dump(method, url, headers, body_bytes, status, resp_text)
         if 200 <= status < 300:
