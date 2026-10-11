@@ -18,6 +18,14 @@ is loaded at runtime from (in precedence order):
 The token is NEVER accepted on the command line (it would show up in ``ps``)
 and NEVER printed — not in normal output, not in ``--debug``, not in
 tracebacks. Every byte written to stdout/stderr passes through ``redact()``.
+The sole exception is ``hub dashboard-token``, which prints one stored
+token preceded by a warning (it bypasses redaction deliberately).
+
+Multi-circle (v0.2.0): the server binds each bearer token to ONE circle, so
+a profile keeps ``circle_tokens: {circle_id: token}`` in the 0600
+config.json. Every API call authenticates with the active circle's token,
+falling back to the single-token chain above when a circle has no stored
+token (bootstrap-family backwards compatibility).
 
 Python 3, standard library only.
 """
@@ -37,7 +45,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -80,6 +88,62 @@ def emit_json(obj):
 
 
 # ---------------------------------------------------------------------------
+# Debug-output scrubbing. _debug_dump runs *inside* client.call, i.e. before
+# a freshly minted token (redeem response) can be registered with
+# note_secret(), so redact() alone cannot protect it. These scrubs are
+# structural and need no registration.
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_JSON_KEYS = frozenset({"token", "provisioning_code", "provisioningCode"})
+
+
+def _scrub_sensitive_value(obj):
+    """Recursively replace sensitive JSON values with [redacted]."""
+    if isinstance(obj, dict):
+        return {
+            k: ("[redacted]" if k in _SENSITIVE_JSON_KEYS
+                else _scrub_sensitive_value(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_scrub_sensitive_value(v) for v in obj]
+    return obj
+
+
+def _scrub_sensitive_text(text):
+    """Scrub secrets from a debug-dump payload.
+
+    JSON bodies get sensitive fields redacted structurally. Non-JSON text
+    passes through unchanged (redact() still applies to registered values).
+    Never raises.
+    """
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    if isinstance(parsed, (dict, list)):
+        try:
+            return json.dumps(_scrub_sensitive_value(parsed))
+        except (TypeError, ValueError):
+            return "[unprintable]"
+    return text
+
+
+_CODE_IN_URL = re.compile(r"(fhp_|fhi_)[^/?#\s]*")
+
+
+def _scrub_url(url):
+    """Redact bearer codes embedded in URL paths.
+
+    note_secret() covers the literal code, but URL-quoting can alter its
+    bytes; the regex covers that edge.
+    """
+    return _CODE_IN_URL.sub(r"\1[redacted]", url or "")
+
+
+# ---------------------------------------------------------------------------
 # Config / profiles
 # ---------------------------------------------------------------------------
 
@@ -101,8 +165,12 @@ def config_path(profile):
     return os.path.join(profile_dir(profile), "config.json")
 
 
-def cursor_path(profile):
-    return os.path.join(profile_dir(profile), "cursor")
+def cursor_path(profile, circle_id=None):
+    base = os.path.join(profile_dir(profile), "cursor")
+    if circle_id:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(circle_id))[:64] or "x"
+        return base + "-" + safe
+    return base
 
 
 def default_token_path(profile):
@@ -120,10 +188,16 @@ def load_config(profile):
 def save_config(profile, cfg):
     d = profile_dir(profile)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    # Belt and suspenders: a config file must never contain a token.
+    # Belt and suspenders: the legacy single-token keys must never live in
+    # the config file (they belong in env / vault / the 0600 token file).
+    # circle_tokens is the sanctioned exception: one token per circle, and
+    # this file is already 0600. Tokens are never printed (see redact()).
     scrubbed = {k: v for k, v in cfg.items() if k not in ("token", "bearer_token")}
     tmp = config_path(profile) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    # Create 0600 from the first byte: circle_tokens live in this file, and a
+    # post-write chmod would leave a world-readable window on strict umasks.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(scrubbed, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, config_path(profile))
@@ -386,12 +460,15 @@ class HubClient:
             for k, v in headers.items()
         }
         emit_err("--- hub debug ---")
-        emit_err("%s %s" % (method, url))
+        emit_err("%s %s" % (method, _scrub_url(url)))
         emit_err("request headers: %s" % json.dumps(safe_headers))
         if body_bytes:
-            emit_err("request body: %s" % body_bytes.decode("utf-8", "replace")[:2000])
+            emit_err("request body: %s"
+                     % _scrub_sensitive_text(
+                         body_bytes.decode("utf-8", "replace"))[:2000])
         emit_err("response status: %s" % status)
-        emit_err("response body: %s" % (resp_text or "")[:2000])
+        emit_err("response body: %s"
+                 % _scrub_sensitive_text(resp_text or "")[:2000])
         emit_err("--- end debug ---")
 
     # -- public ---------------------------------------------------------
@@ -473,6 +550,76 @@ def _message_text(args, attr="message", file_attr="message_file"):
     return text
 
 
+# ---------------------------------------------------------------------------
+# Per-circle tokens (v0.2.0): the server binds each bearer token to ONE
+# circle, so the profile keeps circle_tokens {circle_id: token} in the 0600
+# config. Every API call uses the active circle's token, falling back to
+# the legacy single-token chain when a circle has no stored token.
+# ---------------------------------------------------------------------------
+
+
+def _token_for_circle(cfg, profile, circle_id):
+    """Return (token, source) for a specific circle.
+
+    circle_tokens[circle_id] wins. The legacy single-token chain is only a
+    fallback for the bootstrap family it was minted for (cfg.family_id):
+    the server binds every token to exactly one family and 404s cross-
+    family calls, so sending the legacy token for any other circle would
+    only produce a confusing failure. Anything else needs its own token
+    via `hub circle join`.
+    """
+    circle_tokens = cfg.get("circle_tokens") or {}
+    tok = circle_tokens.get(circle_id)
+    if tok and str(tok).strip():
+        tok = str(tok).strip()
+        note_secret(tok)
+        return tok, "circle-token"
+    if circle_id and circle_id != cfg.get("family_id"):
+        raise HubError(
+            "auth",
+            "No token stored for this circle. Run "
+            "`hub circle join --code <invite code>` to join it.",
+        )
+    try:
+        return load_token(cfg, profile)
+    except HubError:
+        if circle_id:
+            raise HubError(
+                "auth",
+                "No token stored for this circle. Run "
+                "`hub circle join --code <invite code>` to join it "
+                "(or `hub setup` if this profile was never configured).",
+            )
+        raise
+
+
+def _has_usable_token(cfg, profile, circle_id):
+    """True when a call scoped to circle_id could authenticate.
+
+    Side-effect free: checks existence, never reads or warns.
+    """
+    if (cfg.get("circle_tokens") or {}).get(circle_id):
+        return True
+    # Legacy single-token chain is only valid for the bootstrap family.
+    if circle_id and circle_id == cfg.get("family_id"):
+        if os.environ.get("FAMILY_HUB_TOKEN", "").strip():
+            return True
+        if cfg.get("vault_cmd") or os.environ.get("FAMILY_HUB_VAULT_CMD"):
+            return True
+        token_file = cfg.get("token_file") or default_token_path(profile)
+        if os.path.exists(token_file):
+            return True
+    return False
+
+
+def _member_for_circle(cfg, circle_id):
+    """This agent's member record for a circle (per-circle id/role)."""
+    cm = (cfg.get("circle_members") or {}).get(circle_id) or {}
+    if cm.get("id"):
+        return cm
+    return cfg.get("member") or {}
+
+
 def _ctx(args, transport, need_auth=True):
     profile = args.profile
     cfg = load_config(profile)
@@ -485,26 +632,151 @@ def _ctx(args, transport, need_auth=True):
         )
     token = None
     if need_auth:
-        token, _source = load_token(cfg, profile)
+        token, _source = _token_for_circle(cfg, profile, _active_circle_id(cfg))
     client = HubClient(server, token, debug=args.debug, transport=transport)
     return types.SimpleNamespace(
         profile=profile, cfg=cfg, server=server, client=client
     )
 
 
-def _read_cursor(profile):
+def _ctx_loose(args, transport):
+    """Context for discovery commands (circles, use, dashboard-token).
+
+    Tolerates a tokenless *active* circle: discovery works with any usable
+    token, since GET /v1/families lists by human (email), not by token.
+    Raises only when the profile has no credential at all.
+    """
+    ctx = _ctx(args, transport, need_auth=False)
+    circle_tokens = ctx.cfg.get("circle_tokens") or {}
+    for tok in circle_tokens.values():
+        if tok and str(tok).strip():
+            tok = str(tok).strip()
+            note_secret(tok)
+            ctx.client = HubClient(
+                ctx.server, tok, debug=args.debug, transport=transport
+            )
+            return ctx
+    token, _source = load_token(ctx.cfg, ctx.profile)
+    ctx.client = HubClient(
+        ctx.server, token, debug=args.debug, transport=transport
+    )
+    return ctx
+
+
+def _retarget_client(ctx, args, circle_id):
+    """Point ctx.client at another circle's token (for --circle overrides)."""
     try:
-        with open(cursor_path(profile), "r", encoding="utf-8") as fh:
+        token, _source = _token_for_circle(ctx.cfg, ctx.profile, circle_id)
+    except HubError:
+        raise HubError(
+            "auth",
+            "No token stored for circle %s. Run "
+            "`hub circle join --code <invite code>` first." % circle_id,
+        )
+    ctx.client = HubClient(
+        ctx.server, token, debug=ctx.client.debug,
+        transport=ctx.client.transport,
+    )
+    return ctx
+
+
+def _read_cursor(profile, circle_id=None):
+    try:
+        with open(cursor_path(profile, circle_id), "r", encoding="utf-8") as fh:
             return int(fh.read().strip() or 0)
     except (OSError, ValueError):
         return 0
 
 
-def _write_cursor(profile, value):
+def _write_cursor(profile, value, circle_id=None):
     d = profile_dir(profile)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    with open(cursor_path(profile), "w", encoding="utf-8") as fh:
+    with open(cursor_path(profile, circle_id), "w", encoding="utf-8") as fh:
         fh.write(str(int(value)))
+
+
+# ---------------------------------------------------------------------------
+# Circles (v0.2.0: a profile can belong to many circles; one is active)
+# ---------------------------------------------------------------------------
+
+
+def _active_circle_id(cfg):
+    """Effective circle id: explicit active_circle_id, else legacy family_id."""
+    return cfg.get("active_circle_id") or cfg.get("family_id")
+
+
+def _list_circles(client):
+    """GET /v1/families -> the circles this agent belongs to."""
+    return _as_list(client.call("GET", "/v1/families"), "families")
+
+
+def _match_circle(circles, spec):
+    """Resolve a circle name or id/prefix to a circle id. Never guesses.
+
+    Exact name match wins; otherwise an id prefix must match exactly one
+    circle. Ambiguity or no match raises HubError listing the candidates.
+    """
+    by_name = [
+        c for c in circles if isinstance(c, dict) and c.get("name") == spec
+    ]
+    if len(by_name) == 1:
+        return by_name[0].get("id")
+    if len(by_name) > 1:
+        raise HubError(
+            "bad_request",
+            "Multiple circles named %r; use an id instead: %s"
+            % (spec, ", ".join(str(c.get("id")) for c in by_name)),
+        )
+    by_id = [
+        c
+        for c in circles
+        if isinstance(c, dict) and str(c.get("id") or "").startswith(spec)
+    ]
+    if len(by_id) == 1:
+        return by_id[0].get("id")
+    if len(by_id) > 1:
+        raise HubError(
+            "bad_request",
+            "Ambiguous circle %r; matches: %s"
+            % (
+                spec,
+                ", ".join(
+                    "%s (%s)" % (c.get("id"), c.get("name")) for c in by_id
+                ),
+            ),
+        )
+    available = ", ".join(
+        repr(c.get("name")) for c in circles if isinstance(c, dict)
+    )
+    raise HubError(
+        "not_found",
+        "No circle matches %r. Available: %s" % (spec, available or "(none)"),
+    )
+
+
+def _resolve_circle(args, ctx):
+    """Central circle resolution for every command.
+
+    `--circle <name-or-id>` wins; otherwise the profile's active circle
+    (active_circle_id, falling back to legacy family_id). Raises HubError
+    when nothing resolves — callers never see a bare None.
+
+    An explicit --circle override also retargets the client to that
+    circle's token: the flag switches BOTH the target and the credential.
+    """
+    override = getattr(args, "circle", None)
+    if override:
+        cid = _match_circle(_list_circles(ctx.client), override)
+        _retarget_client(ctx, args, cid)
+        return cid
+    cid = _active_circle_id(ctx.cfg)
+    if not cid:
+        raise HubError(
+            "config",
+            "No active circle in this profile — run `hub circle use <name>` "
+            "or re-run `hub setup` to refresh it.",
+        )
+    return cid
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +798,7 @@ def cmd_setup(args, transport):
     code = args.invite or getpass.getpass("Invite or provisioning code: ").strip()
     if not code:
         raise HubError("bad_request", "An invite or provisioning code is required.")
+    note_secret(code)  # bearer code: keep it out of --debug URL dumps etc.
     if code.startswith("fhp_"):
         # Owner bootstrap flow: the member already exists; the provisioning
         # code mints this agent's token directly (label set at bootstrap).
@@ -615,23 +888,84 @@ def cmd_setup(args, transport):
     return 0
 
 
-def cmd_sync(args, transport):
-    ctx = _ctx(args, transport)
-    cursor = _read_cursor(ctx.profile)
-    resp = ctx.client.call(
-        "GET", "/v1/sync", query={"after_gseq": cursor, "limit": args.limit}
+def _sync_one_circle(ctx, transport, circle_id, circle_name, token, limit):
+    """Sync a single circle; returns its new entries (labeled)."""
+    client = HubClient(ctx.server, token, debug=ctx.client.debug,
+                       transport=transport)
+    cursor = _read_cursor(ctx.profile, circle_id)
+    resp = client.call(
+        "GET", "/v1/sync", query={"after_gseq": cursor, "limit": limit}
     )
     entries = _as_list(resp, "entries")
-    emit_json(entries)
+    labeled = []
+    for e in entries:
+        if isinstance(e, dict):
+            e = dict(e)
+            e["circle_id"] = circle_id
+            e["circle_name"] = circle_name
+        labeled.append(e)
     if entries:
         gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
         gseqs = [g for g in gseqs if isinstance(g, int)]
         nxt = None
         if isinstance(resp, dict):
             nxt = resp.get("next_after_gseq")
-        _write_cursor(ctx.profile, nxt if isinstance(nxt, int) else max(gseqs))
-    else:
-        emit_err("no new entries (cursor gseq=%d)" % cursor)
+        if gseqs or isinstance(nxt, int):
+            _write_cursor(
+                ctx.profile,
+                nxt if isinstance(nxt, int) else max(gseqs),
+                circle_id,
+            )
+    return labeled
+
+
+def cmd_sync(args, transport):
+    ctx = _ctx(args, transport)
+    circle_tokens = ctx.cfg.get("circle_tokens") or {}
+    if not circle_tokens:
+        # Legacy single-token profile: behavior unchanged.
+        cursor = _read_cursor(ctx.profile)
+        resp = ctx.client.call(
+            "GET", "/v1/sync", query={"after_gseq": cursor, "limit": args.limit}
+        )
+        entries = _as_list(resp, "entries")
+        emit_json(entries)
+        if entries:
+            gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
+            gseqs = [g for g in gseqs if isinstance(g, int)]
+            nxt = None
+            if isinstance(resp, dict):
+                nxt = resp.get("next_after_gseq")
+            _write_cursor(ctx.profile, nxt if isinstance(nxt, int) else max(gseqs))
+        else:
+            emit_err("no new entries (cursor gseq=%d)" % cursor)
+        return 0
+    # Multi-circle: one token per circle, one cursor per circle. The legacy
+    # bootstrap circle still syncs via its fallback token when present.
+    names = {
+        c.get("id"): c.get("name")
+        for c in _list_circles(ctx.client)
+        if isinstance(c, dict)
+    }
+    targets = [
+        (cid, tok) for cid, tok in circle_tokens.items() if tok
+    ]
+    legacy_cid = ctx.cfg.get("family_id")
+    if legacy_cid and legacy_cid not in dict(targets):
+        try:
+            tok, _src = load_token(ctx.cfg, ctx.profile)
+            targets.append((legacy_cid, tok))
+        except HubError:
+            pass
+    all_entries = []
+    for cid, tok in targets:
+        all_entries.extend(
+            _sync_one_circle(ctx, transport, cid, names.get(cid, cid), tok,
+                             args.limit)
+        )
+    emit_json(all_entries)
+    if not all_entries:
+        emit_err("no new entries")
     return 0
 
 
@@ -716,15 +1050,9 @@ def cmd_invite(args, transport):
 
 
 def cmd_invite_member(args, transport):
-    """Mint a family invite code for a new member (owner/parent only)."""
+    """Mint a circle invite code for a new member (owner/parent only)."""
     ctx = _ctx(args, transport)
-    cfg = load_config(args.profile)
-    family_id = cfg.get("family_id")
-    if not family_id:
-        raise HubError(
-            "config",
-            "No family_id in this profile — re-run `hub setup` to refresh it.",
-        )
+    family_id = _resolve_circle(args, ctx)
     role = (args.role or "").strip().lower()
     if role not in ("owner", "parent", "kid"):
         raise HubError("bad_request", "--role must be one of: owner, parent, kid.")
@@ -825,7 +1153,7 @@ def cmd_tasks(args, transport):
         "GET", "/v1/topics/%s/tasks" % urlparse.quote(args.topic, safe="")
     )
     tasks = _as_list(resp, "tasks")
-    me = (ctx.cfg.get("member") or {}).get("id")
+    me = _member_for_circle(ctx.cfg, _active_circle_id(ctx.cfg)).get("id")
     wanted_assignee = me if args.assigned_to == "me" else args.assigned_to
     out = []
     for task in tasks:
@@ -859,6 +1187,197 @@ def cmd_me(args, _transport):
             "auth_method": cfg.get("auth_method"),
         }
     )
+    return 0
+
+
+def cmd_circles(args, transport):
+    ctx = _ctx_loose(args, transport)
+    circles = _list_circles(ctx.client)
+    active = _active_circle_id(ctx.cfg)
+    if not circles:
+        emit("no circles — create one with `hub circle create --name ...`.")
+        return 0
+    for c in circles:
+        if not isinstance(c, dict):
+            continue
+        is_active = c.get("id") == active
+        emit(
+            "%s %s — kind: %s, role: %s, id: %s%s"
+            % (
+                "*" if is_active else " ",
+                c.get("name"),
+                c.get("kind"),
+                c.get("my_role"),
+                c.get("id"),
+                " (active)" if is_active else "",
+            )
+        )
+    return 0
+
+
+def _redeem_code(server, transport, debug, code, display_name="",
+                 agent_label=""):
+    """Redeem a provisioning (fhp_) or invite (fhi_) code; no auth needed.
+
+    Returns (token, member dict). The raw code is registered as a secret so
+    it can never appear in output (e.g. the --debug URL dump).
+    """
+    note_secret(code)
+    client = HubClient(server, token=None, debug=debug, transport=transport)
+    if code.startswith("fhp_"):
+        path = "/v1/provisioning-codes/%s/redeem" % urlparse.quote(code, safe="")
+        body = {}
+    else:
+        path = "/v1/invites/%s/accept" % urlparse.quote(code, safe="")
+        if not display_name or not agent_label:
+            raise HubError(
+                "bad_request",
+                "Invite codes need --name and --label (or a configured "
+                "profile member/label).",
+            )
+        body = {"display_name": display_name, "agent_label": agent_label}
+    resp = client.call("POST", path, json_body=body, auth=False)
+    if not isinstance(resp, dict) or "token" not in resp or "member" not in resp:
+        raise HubError("error", "Unexpected redeem response from the server.")
+    return resp["token"], resp["member"]
+
+
+def _store_circle_token(ctx, circle_id, token, member):
+    """Persist a circle token + member record; never prints the token."""
+    note_secret(token)
+    circle_tokens = ctx.cfg.get("circle_tokens") or {}
+    circle_tokens[circle_id] = token
+    ctx.cfg["circle_tokens"] = circle_tokens
+    if isinstance(member, dict) and member.get("id"):
+        circle_members = ctx.cfg.get("circle_members") or {}
+        circle_members[circle_id] = {
+            "id": member.get("id"),
+            "name": member.get("name"),
+            "role": member.get("role"),
+            "email": member.get("email"),
+        }
+        ctx.cfg["circle_members"] = circle_members
+    save_config(ctx.profile, ctx.cfg)
+
+
+def cmd_circle_create(args, transport):
+    ctx = _ctx(args, transport)
+    name = (args.name or "").strip()
+    if not name:
+        raise HubError("bad_request", "A non-empty --name is required.")
+    check_pii(name)
+    circle = ctx.client.call(
+        "POST",
+        "/v1/families",
+        json_body={"name": name, "kind": args.kind},
+    ) or {}
+    cid = circle.get("id")
+    if not cid:
+        raise HubError("error", "Server did not return a circle id.")
+    code = circle.get("provisioning_code")
+    if not code:
+        # Older server: no auto-redeem possible; fall back to manual steps.
+        emit('created circle "%s" (id=%s)' % (circle.get("name", name), cid))
+        emit("select it with: hub circle use %s" % cid)
+        return 0
+    # Auto-redeem: mint this agent's token for the new circle immediately,
+    # so the creator can use it without a second round-trip.
+    token, member = _redeem_code(
+        ctx.server, transport, args.debug, code,
+    )
+    if member.get("family_id") and member.get("family_id") != cid:
+        raise HubError(
+            "error",
+            "Redeem returned a member for a different circle; refusing to "
+            "store the token.",
+        )
+    _store_circle_token(ctx, cid, token, member)
+    ctx.cfg["active_circle_id"] = cid
+    save_config(ctx.profile, ctx.cfg)
+    emit('created circle "%s" (id=%s) — now active' % (circle.get("name", name), cid))
+    return 0
+
+
+def cmd_circle_join(args, transport):
+    """Join a circle with a provisioning or invite code someone shared."""
+    ctx = _ctx(args, transport, need_auth=False)
+    code = (args.code or "").strip()
+    if not code:
+        # Prompt rather than require argv: codes in argv land in shell
+        # history and ps output.
+        code = getpass.getpass("Invite or provisioning code: ").strip()
+    if not code:
+        raise HubError("bad_request", "An invite or provisioning code is required.")
+    member = ctx.cfg.get("member") or {}
+    display_name = (args.name or member.get("name") or "").strip()
+    agent_label = (args.label or ctx.cfg.get("agent_label") or "").strip()
+    token, new_member = _redeem_code(
+        ctx.server, transport, args.debug, code,
+        display_name=display_name, agent_label=agent_label,
+    )
+    cid = new_member.get("family_id")
+    if not cid:
+        raise HubError("error", "Redeem response did not identify a circle.")
+    _store_circle_token(ctx, cid, token, new_member)
+    ctx.cfg["active_circle_id"] = cid
+    save_config(ctx.profile, ctx.cfg)
+    # Friendly output: resolve the circle name with the new token.
+    try:
+        probe = HubClient(ctx.server, token, transport=transport)
+        names = {
+            c.get("id"): c.get("name")
+            for c in _as_list(probe.call("GET", "/v1/families"), "families")
+            if isinstance(c, dict)
+        }
+        cname = names.get(cid, cid)
+    except HubError:
+        cname = cid
+    emit('joined circle "%s" (id=%s) — now active' % (cname, cid))
+    return 0
+
+
+def cmd_circle_use(args, transport):
+    ctx = _ctx_loose(args, transport)
+    cid = _match_circle(_list_circles(ctx.client), args.target)
+    ctx.cfg["active_circle_id"] = cid
+    save_config(ctx.profile, ctx.cfg)
+    emit("active circle set to %s" % cid)
+    if not _has_usable_token(ctx.cfg, ctx.profile, cid):
+        emit_err(
+            "warning: no token stored for this circle — run "
+            "`hub circle join --code <invite code>` to join it."
+        )
+    return 0
+
+
+def cmd_dashboard_token(args, transport):
+    """Print the stored token for a circle (for pasting into the dashboard).
+
+    The ONLY command that prints a token. The warning precedes the token;
+    the token is written raw (bypassing redaction) so it stays usable.
+    """
+    ctx = _ctx_loose(args, transport)
+    cid = _match_circle(_list_circles(ctx.client), args.circle)
+    tok = (ctx.cfg.get("circle_tokens") or {}).get(cid)
+    tok = str(tok).strip() if tok else ""
+    if not tok:
+        if cid == ctx.cfg.get("family_id"):
+            try:
+                tok, _src = load_token(ctx.cfg, ctx.profile)
+            except HubError:
+                tok = None
+        if not tok:
+            raise HubError(
+                "auth",
+                "No token stored for this circle. Run "
+                "`hub circle join --code <invite code>` first.",
+            )
+    note_secret(tok)  # keep it out of any later redacted output
+    emit(
+        "WARNING: this token is a password-equivalent credential. "
+        "Never share it, never paste it anywhere untrusted."
+    )
+    sys.stdout.write(str(tok).strip() + "\n")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1468,9 @@ def build_parser():
                    help="What history the new members see")
     p.set_defaults(func=cmd_invite)
 
-    p = sub.add_parser("invite-member", help="Mint a family invite code for a new member (owner/parent only)")
+    p = sub.add_parser("invite-member", help="Mint a circle invite code for a new member (owner/parent only)")
+    p.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
     p.add_argument("--email", required=True, help="New member's email address")
     p.add_argument("--role", required=True, choices=["owner", "parent", "kid"],
                    help="Role for the new member")
@@ -999,6 +1520,38 @@ def build_parser():
 
     p = sub.add_parser("members", help="List members of your family")
     p.set_defaults(func=cmd_members)
+
+    p = sub.add_parser("circles", help="List circles you belong to (active marked)")
+    p.set_defaults(func=cmd_circles)
+
+    p = sub.add_parser("circle", help="Manage circles")
+    csub = p.add_subparsers(dest="circle_action", required=True,
+                            metavar="<action>")
+    c = csub.add_parser("create", help="Create a new circle")
+    c.add_argument("--name", required=True, help="Circle name")
+    c.add_argument("--kind", choices=["family", "general"], default="family",
+                   help="Circle kind (default: %(default)s)")
+    c.set_defaults(func=cmd_circle_create)
+    c = csub.add_parser("use", help="Set the active circle for this profile")
+    c.add_argument("target", metavar="NAME_OR_ID",
+                   help="Circle name or id (id prefix ok if unambiguous)")
+    c.set_defaults(func=cmd_circle_use)
+    c = csub.add_parser("join", help="Join a circle with an invite/provisioning code")
+    c.add_argument("--code", required=False, default=None,
+                   help="Invite (fhi_) or provisioning (fhp_) code "
+                        "(prompted securely if omitted, so it stays out of "
+                        "shell history)")
+    c.add_argument("--name", default=None,
+                   help="Display name for invite codes (default: profile member name)")
+    c.add_argument("--label", default=None,
+                   help="Agent label for invite codes (default: profile agent label)")
+    c.set_defaults(func=cmd_circle_join)
+
+    p = sub.add_parser("dashboard-token",
+                       help="Print this circle's token for the dashboard (sensitive!)")
+    p.add_argument("--circle", required=True, metavar="NAME_OR_ID",
+                   help="Circle name or id")
+    p.set_defaults(func=cmd_dashboard_token)
 
     p = sub.add_parser("me", help="Show this agent's identity (never the credential)")
     p.set_defaults(func=cmd_me)

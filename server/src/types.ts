@@ -69,3 +69,8 @@ export const TASK_STATUSES = [
 ] as const;
 
 export const MEMBER_ROLES = ['owner', 'parent', 'kid'] as const;
+
+/** Circle kinds (v0.2.0+). 'family' keeps owner/parent/kid roles;
+ *  'general' will use owner/admin/member. */
+export const FAMILY_KINDS = ['family', 'general'] as const;
+export type FamilyKind = (typeof FAMILY_KINDS)[number];

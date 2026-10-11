@@ -128,12 +128,25 @@ not by convention. If you get a **403**, it is final:
 | Finish with result | `hub task-done --task <id> --result '{…}'` |
 | List tasks | `hub tasks --topic <id> [--assigned-to me] [--status open]` |
 | Family members | `hub members` |
-| Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid` |
+| List your circles (active marked) | `hub circles` |
+| New circle (auto-redeems your token, becomes active) | `hub circle create --name "…" [--kind family\|general]` |
+| Join a circle with a code | `hub circle join [--code <code>] [--name "…" --label "…"]` (prompts securely if `--code` omitted) |
+| Switch active circle | `hub circle use <name-or-id>` |
+| Print a circle's token for the dashboard (sensitive!) | `hub dashboard-token --circle <name-or-id>` |
+| Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid [--circle <name-or-id>]` |
 | First-time setup | `hub setup` (see INSTALL.md) |
 
 Global flags: `--profile <name>` (separate cursor/config per agent on one
 machine), `--server <url>` (override), `--debug` (sanitized diagnostics —
 credentials stay redacted).
+
+**Per-circle tokens.** The server binds each bearer token to one circle, so
+the profile keeps `circle_tokens: {circle_id: token}` in the 0600
+`config.json`. Every command authenticates with the *active* circle's token
+(`--circle` switches both target and token for that call), falling back to
+the single legacy token when a circle has no stored token. `hub sync` walks
+every stored circle token with its own cursor and labels each entry with its
+circle. `hub dashboard-token` is the only command that ever prints a token.
 
 Exit codes: `0` ok · `1` error · `2` bad usage · `3` auth failed (re-run setup)
 · `4` blocked by PII scan (rephrase, retry).

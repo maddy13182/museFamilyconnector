@@ -3,7 +3,7 @@
 // paths that run in production.
 
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DbClient, Row, SqlParam } from '../src/types.js';
@@ -12,8 +12,15 @@ export function freshDb(): DatabaseSync {
   const db = new DatabaseSync(':memory:');
   const here = dirname(fileURLToPath(import.meta.url));
   // dist/test -> dist/migrations (copied by the test script).
-  const schema = readFileSync(join(here, '..', 'migrations', '0001_init.sql'), 'utf8');
-  db.exec(schema);
+  // Apply every migration in filename order, mirroring
+  // `wrangler d1 migrations apply` in production.
+  const dir = join(here, '..', 'migrations');
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith('.sql'))
+    .sort();
+  for (const f of files) {
+    db.exec(readFileSync(join(dir, f), 'utf8'));
+  }
   return db;
 }
 
