@@ -354,6 +354,8 @@ class TestRedaction(HubTestBase):
 
     def test_post_redacted(self):
         self.seed_config()
+        self.fake.add("GET", "/v1/topics/t1", 200,
+                      {"topic": {"id": "t1", "e2ee": 0}})
         self.fake.add("POST", "/v1/topics/t1/entries", 200,
                       {"gseq": 9, "seq": 4, "body": "hi"})
         rc, out, err = self.run_cli(
@@ -390,6 +392,8 @@ class TestRedaction(HubTestBase):
 
     def test_422_pii_message(self):
         self.seed_config()
+        self.fake.add("GET", "/v1/topics/t1", 200,
+                      {"topic": {"id": "t1", "e2ee": 0}})
         self.fake.add("POST", "/v1/topics/t1/entries", 422,
                       {"error": {"code": "pii",
                                  "message": "possible card number detected"}})
@@ -508,11 +512,13 @@ class TestCommands(HubTestBase):
 
     def test_post_idempotency_key_auto(self):
         self.seed_config()
+        self.fake.add("GET", "/v1/topics/t1", 200,
+                      {"topic": {"id": "t1", "e2ee": 0}})
         self.fake.add("POST", "/v1/topics/t1/entries", 200, {"gseq": 1})
         rc, out, _ = self.run_cli(["post", "--topic", "t1", "--message", "x"])
         self.assertEqual(rc, 0)
-        self.assertIn("Idempotency-Key",
-                      self.fake.calls[0]["headers"])
+        post = [c for c in self.fake.calls if c["method"] == "POST"][0]
+        self.assertIn("Idempotency-Key", post["headers"])
         self.assertIn("idempotency_key", out)
 
     def test_post_bad_data_json(self):

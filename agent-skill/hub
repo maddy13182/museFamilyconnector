@@ -868,6 +868,450 @@ def _store_topic_key(profile, topic_id, key_id_hex, topic_key):
     return path
 
 
+# ---------------------------------------------------------------------------
+# E2EE message encryption — Phase 3
+#
+# Wire format for one encrypted field (entry body, entry data):
+#
+#     fh1.<key_id_hex>.<msg_id_hex>.<base64(nonce || ciphertext)>
+#
+#   * tag "fh1": version tag; self-describing on the wire.
+#   * key_id_hex: 32 lowercase hex chars (128-bit key id), PLAINTEXT. Lets a
+#     reader pick the right key from the local keystore without trial
+#     decryption. The entries table has no key_id column and the schema is
+#     frozen, so the key id rides inside the body/data blob.
+#   * msg_id_hex: 32 lowercase hex chars (128-bit client-chosen random id),
+#     PLAINTEXT. Bound into the AAD (see _e2ee_msg_aad); gives every message
+#     a unique AAD identity so one message's ciphertext cannot be replayed
+#     as a different entry.
+#   * nonce: 24 fresh random bytes per encrypted field (XChaCha20).
+#   * ciphertext: XChaCha20-Poly1305-IETF(plaintext, aad, nonce, topic_key),
+#     nonce prepended, whole blob base64'd. Ciphertext goes in the existing
+#     entries.body / entries.data columns (base64 TEXT) — no server schema
+#     change; the server stores and returns it opaquely.
+#
+# AAD (additional authenticated data) — canonical byte string:
+#
+#     b"fh-msg-v1" + b"\x00" + topic_id.encode("utf-8")
+#                   + b"\x00" + key_id_hex.encode("ascii")
+#                   + b"\x00" + msg_id_hex.encode("ascii")
+#
+# The domain separator prevents cross-protocol confusion; NUL separators are
+# unambiguous because no field may contain NUL (hex fields are [0-9a-f]{32}
+# by construction; topic ids are server-issued ids, checked on build).
+#
+# WHY msg_id AND NOT seq: the design asks for AAD binding (topic_id, seq,
+# key_id), but seq is assigned server-side at INSERT — the CLI cannot know
+# it before POST, and the ciphertext must be final before POST (single-POST
+# flow; no second round trip). Options considered:
+#   (a) two-step POST (post, learn seq, re-encrypt) — rejected: breaks the
+#       atomic single-POST + idempotency-key dedup semantics, doubles round
+#       trips.
+#   (b) bind (topic_id, key_id, msg_id) with a client-chosen random msg_id
+#       carried in plaintext in the wire envelope — CHOSEN. No server change
+#       needed: the msg_id travels inside the opaque body/data blob the
+#       server stores and returns. Prevents cut-and-paste of ciphertext
+#       across topics (topic_id), across key rotations (key_id), and replay
+#       of one message's ciphertext as another entry (msg_id).
+#   (c) bind (topic_id, key_id) only — weaker than (b): a SQL-writing
+#       adversary could copy one entry's ciphertext into another entry row
+#       of the same topic undetectably. With (b) that fails AAD loudly
+#       unless the attacker also copies the msg_id, which yields a duplicate
+#       msg_id (detectable) rather than a forged message.
+# Accepted tradeoff: server-assigned seq is NOT in the AAD, so silent
+# reordering of entries by a malicious server is not cryptographically
+# detectable. Reordering is not a confidentiality violation (the threat
+# model in design §1 targets content confidentiality; availability-style
+# games are out of scope), and readers still see the server's seq.
+#
+# Entry `data` (when present) is encrypted with the SAME scheme and the same
+# key_id/msg_id; its plaintext is the canonical JSON serialization
+# (json.dumps with sort_keys=True, separators=(",", ":"))). Each encrypted
+# field gets its own fresh nonce. data=None stays null.
+#
+# READ POLICY for E2EE topics (hub read / hub sync):
+#   * body starts with "fh1." -> parse; select key by the plaintext key_id.
+#       - key missing from the local keystore -> placeholder body, data=None
+#         (never crash the command, never show ciphertext as text).
+#       - AAD/tag verification fails -> LOUD HubError naming topic+seq
+#         (tamper evidence); the command aborts, nothing silently dropped.
+#       - wire malformed (tag present but unparseable) -> LOUD HubError.
+#   * body does NOT start with "fh1." -> pass through untouched. The server
+#     legitimately writes plaintext entries into E2EE topics (redaction
+#     announcements, redacted bodies); those were never confidential and
+#     must keep working.
+# Plaintext topics: never touched, byte-identical to today.
+#
+# PII: the server cannot scan ciphertext, so the CLI's local pre-scan
+# (check_pii) is the enforcement point for E2EE topics — it runs on the
+# PLAINTEXT (body and the canonical data JSON) before encrypting.
+# ---------------------------------------------------------------------------
+
+_E2EE_MSG_TAG = "fh1"
+_E2EE_MSG_AAD_DOMAIN = b"fh-msg-v1"
+_E2EE_MSG_NONCE_BYTES = 24  # XChaCha20 nonce
+_E2EE_MSG_ID_BYTES = 16  # 128-bit client message id, hex on the wire
+_E2EE_HEX32_RE = None  # compiled lazily (re is imported at module top)
+
+_E2EE_MISSING_KEY_BODY = (
+    "[cannot decrypt \u2014 key not available (see `hub key-request`)]"
+)
+_E2EE_ENCRYPTED_SUBJECT = "[encrypted]"
+
+
+def _e2ee_hex32_re():
+    global _E2EE_HEX32_RE
+    if _E2EE_HEX32_RE is None:
+        _E2EE_HEX32_RE = re.compile(r"[0-9a-f]{32}\Z")
+    return _E2EE_HEX32_RE
+
+
+def _e2ee_msg_aad(topic_id, key_id_hex, msg_id_hex):
+    """Build the canonical AAD byte string for one E2EE message field.
+
+    Exact construction: b"fh-msg-v1" + b"\\x00" + topic_id.encode("utf-8")
+    + b"\\x00" + key_id_hex.encode("ascii") + b"\\x00" +
+    msg_id_hex.encode("ascii"). Raises HubError if any field contains NUL
+    (would break the unambiguous separator scheme) or is not valid hex
+    where hex is required.
+    """
+    hex_re = _e2ee_hex32_re()
+    if not hex_re.match(key_id_hex or ""):
+        raise HubError("error", "E2EE: key_id is not 32 lowercase hex chars.")
+    if not hex_re.match(msg_id_hex or ""):
+        raise HubError("error", "E2EE: msg_id is not 32 lowercase hex chars.")
+    topic_id = str(topic_id)
+    for name, val in (("topic_id", topic_id), ("key_id", key_id_hex),
+                      ("msg_id", msg_id_hex)):
+        if "\x00" in val:
+            raise HubError("error", "E2EE: %s contains NUL; cannot build AAD." % name)
+    return (_E2EE_MSG_AAD_DOMAIN + b"\x00" + topic_id.encode("utf-8") + b"\x00"
+            + key_id_hex.encode("ascii") + b"\x00" + msg_id_hex.encode("ascii"))
+
+
+def _e2ee_encrypt_field(plaintext_bytes, topic_id, key_id_hex, topic_key):
+    """Encrypt one field (body or data); return the fh1 wire string.
+
+    Fresh random 24-byte nonce AND fresh random 128-bit msg_id per call.
+    """
+    nacl = _require_nacl()
+    msg_id_hex = os.urandom(_E2EE_MSG_ID_BYTES).hex()
+    nonce = os.urandom(_E2EE_MSG_NONCE_BYTES)
+    aad = _e2ee_msg_aad(topic_id, key_id_hex, msg_id_hex)
+    ct = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        plaintext_bytes, aad, nonce, topic_key)
+    blob = base64.b64encode(nonce + ct).decode("ascii")
+    return "%s.%s.%s.%s" % (_E2EE_MSG_TAG, key_id_hex, msg_id_hex, blob)
+
+
+def _e2ee_parse_wire(wire, entry_ref="entry"):
+    """Parse an fh1 wire string -> (key_id_hex, msg_id_hex, nonce, ct).
+
+    Returns None when `wire` is not an E2EE wire string at all (no "fh1."
+    tag) — the caller passes such bodies through untouched. Raises a loud
+    HubError naming the entry when the tag is present but the wire is
+    malformed: on an E2EE topic that is tamper/corruption evidence, never
+    something to guess at.
+    """
+    if not isinstance(wire, str) or not wire.startswith(_E2EE_MSG_TAG + "."):
+        return None
+    parts = wire.split(".", 3)
+    hex_re = _e2ee_hex32_re()
+
+    def malformed(why):
+        return HubError(
+            "error",
+            "E2EE integrity failure on %s: entry body is not a valid fh1 "
+            "wire string (%s). Possible tampering or corruption; refusing "
+            "to guess. Raw body withheld." % (entry_ref, why),
+        )
+
+    if len(parts) != 4:
+        raise malformed("expected 4 dot-separated parts")
+    _, key_id_hex, msg_id_hex, blob = parts
+    if not hex_re.match(key_id_hex):
+        raise malformed("key_id is not 32 lowercase hex chars")
+    if not hex_re.match(msg_id_hex):
+        raise malformed("msg_id is not 32 lowercase hex chars")
+    try:
+        raw = base64.b64decode(blob, validate=True)
+    except ValueError as exc:
+        raise malformed("payload is not valid base64 (%s)" % exc)
+    if len(raw) < _E2EE_MSG_NONCE_BYTES + 16:  # nonce + Poly1305 tag
+        raise malformed("payload too short for nonce + auth tag")
+    return key_id_hex, msg_id_hex, raw[:_E2EE_MSG_NONCE_BYTES], raw[_E2EE_MSG_NONCE_BYTES:]
+
+
+def _e2ee_decrypt_subject(subject_b64, topic_key):
+    """Decrypt a Phase 2 subject blob: base64(nonce[24] || ct).
+
+    AAD is the frozen b"fh-topic-subject-v1". Raises HubError on failure.
+    """
+    nacl = _require_nacl()
+    try:
+        raw = base64.b64decode(subject_b64, validate=True)
+    except ValueError as exc:
+        raise HubError("error", "E2EE subject is not valid base64 (%s)." % exc)
+    if len(raw) < _E2EE_SUBJECT_NONCE_BYTES + 16:
+        raise HubError("error", "E2EE subject blob too short.")
+    nonce, ct = raw[:_E2EE_SUBJECT_NONCE_BYTES], raw[_E2EE_SUBJECT_NONCE_BYTES:]
+    try:
+        pt = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            ct, _E2EE_SUBJECT_AAD, nonce, topic_key)
+    except Exception as exc:
+        raise HubError("error", "E2EE subject failed authentication (%s)." % exc)
+    return pt.decode("utf-8")
+
+
+def _load_topic_keys(profile, topic_id):
+    """Load the local keystore: {key_id_hex: key_bytes}; {} when absent.
+
+    Every loaded key is registered with note_secret() (base64 + hex) so it
+    can never reach stdout/stderr through the redaction layer.
+    """
+    path = os.path.join(topic_keys_dir(profile), str(topic_id) + ".json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (ValueError, OSError) as exc:
+        raise HubError(
+            "error",
+            "Cannot read the E2EE keystore for topic %s (%s): %s."
+            % (topic_id, path, exc),
+        )
+    if not isinstance(data, dict):
+        raise HubError(
+            "error",
+            "E2EE keystore for topic %s is corrupt (expected a JSON object)."
+            % topic_id,
+        )
+    keys = {}
+    for kid, b64 in data.items():
+        try:
+            key = base64.b64decode(b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise HubError(
+                "error",
+                "E2EE keystore for topic %s has a bad key for key_id %s: %s."
+                % (topic_id, kid, exc),
+            )
+        if len(key) != _E2EE_TOPIC_KEY_BYTES:
+            raise HubError(
+                "error",
+                "E2EE keystore for topic %s has a %d-byte key for key_id %s; "
+                "expected %d." % (topic_id, len(key), kid, _E2EE_TOPIC_KEY_BYTES),
+            )
+        keys[str(kid)] = key
+        _note_topic_key_secrets(key)
+    return keys
+
+
+def _e2ee_current_key(profile, topic_id, ctx):
+    """Select the key to encrypt new messages under: (key_id_hex, key_bytes).
+
+    Single-key keystore (the Phase 3 norm): returned directly, no extra
+    round trip. Multi-key keystore (post-rotation): the server's envelope
+    list is the source of truth for "current" — pick the newest own
+    envelope whose key_id is held locally.
+    """
+    topic_id = str(topic_id)
+    keys = _load_topic_keys(profile, topic_id)
+    keystore_path = os.path.join(topic_keys_dir(profile), topic_id + ".json")
+    if not keys:
+        raise HubError(
+            "error",
+            "Cannot post to E2EE topic %s: no topic key in the local "
+            "keystore (%s). Nothing was posted and nothing was sent. Fetch "
+            "your key envelope first (see `hub key-request`) or ask a topic "
+            "participant to share one, then retry." % (topic_id, keystore_path),
+        )
+    if len(keys) == 1:
+        key_id_hex = next(iter(keys))
+        return key_id_hex, keys[key_id_hex]
+    resp = ctx.client.call(
+        "GET", "/v1/topics/%s/envelopes" % urlparse.quote(topic_id, safe=""))
+    envs = [e for e in _as_list(resp, "envelopes") if isinstance(e, dict)]
+    envs.sort(key=lambda e: e.get("created_at") or "")
+    for env in reversed(envs):
+        key_id_hex = env.get("key_id")
+        if key_id_hex in keys:
+            return key_id_hex, keys[key_id_hex]
+    raise HubError(
+        "error",
+        "Cannot post to E2EE topic %s: the local keystore holds %d keys but "
+        "none matches a current server envelope. Re-fetch your envelope "
+        "(see `hub key-request`) and retry; nothing was posted."
+        % (topic_id, len(keys)),
+    )
+
+
+def _fetch_topic_record(client, topic_id):
+    """GET /v1/topics/:id -> the topic dict; HubError when missing/malformed."""
+    resp = client.call(
+        "GET", "/v1/topics/%s" % urlparse.quote(str(topic_id), safe=""))
+    topic = resp.get("topic") if isinstance(resp, dict) else None
+    if not isinstance(topic, dict):
+        raise HubError(
+            "error",
+            "Unexpected response fetching topic %s." % topic_id,
+        )
+    return topic
+
+
+def _decrypt_entry_in_place(entry, keys):
+    """Decrypt one E2EE-topic entry's body/data in place (dict mutated).
+
+    `keys` is the local keystore {key_id_hex: key_bytes} for the entry's
+    topic (may be empty). Implements the Phase 3 read policy: wire bodies
+    are decrypted (missing key -> placeholder; tamper -> loud HubError);
+    non-wire bodies pass through untouched.
+    """
+    topic_id = str(entry.get("topic_id"))
+    entry_ref = "topic %s entry seq=%s" % (topic_id, entry.get("seq"))
+
+    def decrypt_field(wire):
+        """(plaintext_str_or_None, key_was_missing)."""
+        parsed = _e2ee_parse_wire(wire, entry_ref)
+        if parsed is None:
+            return None, False  # not E2EE wire: pass through
+        key_id_hex, msg_id_hex, nonce, ct = parsed
+        key = keys.get(key_id_hex)
+        if key is None:
+            return None, True
+        nacl = _require_nacl()
+        aad = _e2ee_msg_aad(topic_id, key_id_hex, msg_id_hex)
+        try:
+            pt = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                ct, aad, nonce, key)
+        except Exception as exc:
+            raise HubError(
+                "error",
+                "E2EE integrity failure on %s: message authentication "
+                "failed (%s). The stored ciphertext does not match its "
+                "topic/key/message binding \u2014 possible tampering, "
+                "corruption, or key mismatch. Entry NOT shown; nothing was "
+                "silently dropped." % (entry_ref, exc),
+            )
+        return pt.decode("utf-8"), False
+
+    body = entry.get("body")
+    if isinstance(body, str) and body.startswith(_E2EE_MSG_TAG + "."):
+        plaintext, missing = decrypt_field(body)
+        if missing:
+            # Key not available: placeholder, never the raw ciphertext.
+            entry["body"] = _E2EE_MISSING_KEY_BODY
+            entry["data"] = None
+            return
+        entry["body"] = plaintext
+    data = entry.get("data")
+    if isinstance(data, str) and data.startswith(_E2EE_MSG_TAG + "."):
+        plaintext, missing = decrypt_field(data)
+        if missing:
+            entry["data"] = None
+        else:
+            try:
+                entry["data"] = json.loads(plaintext)
+            except ValueError as exc:
+                raise HubError(
+                    "error",
+                    "E2EE integrity failure on %s: decrypted data is not "
+                    "valid JSON (%s)." % (entry_ref, exc),
+                )
+
+
+def _decrypt_topic_subjects(profile, topics):
+    """Decrypt E2EE topic subjects in place for display (hub topics).
+
+    Plaintext topics are untouched. For E2EE topics the subject is the
+    Phase 2 blob base64(nonce || XChaCha20(subject, aad=b"fh-topic-subject-v1")).
+    Any locally held key is tried (subjects stay under their original key
+    across rotations); when no key decrypts it, the subject shows as
+    "[encrypted]" — a failed decrypt is indistinguishable from a missing
+    key, so both map to the placeholder rather than a loud error.
+    """
+    keystores = {}  # topic_id -> {key_id_hex: key_bytes}
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+        if topic.get("e2ee") != 1:
+            continue
+        topic_id = str(topic.get("id") or "")
+        if topic_id not in keystores:
+            keystores[topic_id] = _load_topic_keys(profile, topic_id)
+        subject = topic.get("subject")
+        plaintext = None
+        if isinstance(subject, str):
+            for key in keystores[topic_id].values():
+                try:
+                    plaintext = _e2ee_decrypt_subject(subject, key)
+                except HubError:
+                    continue
+                break
+        topic["subject"] = plaintext if plaintext is not None else _E2EE_ENCRYPTED_SUBJECT
+
+
+def _cmd_post_e2ee(args, ctx, topic, message, data):
+    """Post to an E2EE topic: local PII pre-scan, then encrypt (body, data).
+
+    Precondition: cmd_post already ran check_pii(message) and parsed --data.
+    The server cannot scan ciphertext, so the CLI's local check_pii is the
+    enforcement point here — it runs on the PLAINTEXT (message and the
+    canonical data JSON) before encrypting. Never posts plaintext to an
+    E2EE topic; fails loudly (nothing sent) when the local keystore has no
+    key for the topic.
+    """
+    topic_id = str(topic.get("id") or args.topic)
+    data_json = None
+    if data is not None:
+        data_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        check_pii(data_json)
+    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, topic_id, ctx)
+    enc_body = _e2ee_encrypt_field(
+        message.encode("utf-8"), topic_id, key_id_hex, topic_key)
+    payload = {"kind": args.kind, "body": enc_body}
+    if args.reply_to is not None:
+        payload["reply_to_seq"] = args.reply_to
+    if data is not None:
+        payload["data"] = _e2ee_encrypt_field(
+            data_json.encode("utf-8"), topic_id, key_id_hex, topic_key)
+    key = args.idempotency_key or uuid.uuid4().hex
+    entry = ctx.client.call(
+        "POST",
+        "/v1/topics/%s/entries" % urlparse.quote(args.topic, safe=""),
+        json_body=payload,
+        idempotency_key=key,
+    )
+    emit_json({"idempotency_key": key, "entry": entry})
+    return 0
+def _decrypt_entries_for_display(client, profile, entries):
+    """Decrypt E2EE entries in place; plaintext topics untouched.
+
+    E2EE auto-detect is O(1) per topic: the topic record is fetched once per
+    distinct topic_id in this batch and cached for the run — never per
+    entry, never per crypto operation.
+    """
+    e2ee_flags = {}  # topic_id -> bool
+    keystores = {}  # topic_id -> {key_id_hex: key_bytes}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        topic_id = entry.get("topic_id")
+        if topic_id is None:
+            continue
+        topic_id = str(topic_id)
+        if topic_id not in e2ee_flags:
+            e2ee_flags[topic_id] = (
+                _fetch_topic_record(client, topic_id).get("e2ee") == 1
+            )
+        if not e2ee_flags[topic_id]:
+            continue  # plaintext topic: byte-identical behavior
+        if topic_id not in keystores:
+            keystores[topic_id] = _load_topic_keys(profile, topic_id)
+        _decrypt_entry_in_place(entry, keystores[topic_id])
+
+
 def _load_identity_key(path):
     """Load and validate the 32-byte private key; HubError when unusable."""
     try:
@@ -1798,6 +2242,9 @@ def _sync_one_circle(ctx, transport, circle_id, circle_name, token, limit):
             e["circle_id"] = circle_id
             e["circle_name"] = circle_name
         labeled.append(e)
+    # Decrypt E2EE entries with THIS circle's client (per-circle token);
+    # topic records are fetched once per topic, not per entry.
+    _decrypt_entries_for_display(client, ctx.profile, labeled)
     new_cursor = None
     if entries:
         gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
@@ -1820,6 +2267,7 @@ def cmd_sync(args, transport):
             "GET", "/v1/sync", query={"after_gseq": cursor, "limit": args.limit}
         )
         entries = _as_list(resp, "entries")
+        _decrypt_entries_for_display(ctx.client, ctx.profile, entries)
         emit_json(entries)
         if entries:
             gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
@@ -1884,7 +2332,9 @@ def cmd_topics(args, transport):
     if args.search:
         query["q"] = args.search
     resp = ctx.client.call("GET", "/v1/topics", query=query)
-    emit_json(_as_list(resp, "topics"))
+    topics = _as_list(resp, "topics")
+    _decrypt_topic_subjects(ctx.profile, topics)
+    emit_json(topics)
     return 0
 
 
@@ -1895,22 +2345,35 @@ def cmd_read(args, transport):
         "/v1/topics/%s/history" % urlparse.quote(args.topic, safe=""),
         query={"after_seq": args.after, "limit": args.limit},
     )
-    emit_json(_as_list(resp, "entries"))
+    entries = _as_list(resp, "entries")
+    _decrypt_entries_for_display(ctx.client, ctx.profile, entries)
+    emit_json(entries)
     return 0
 
 
 def cmd_post(args, transport):
     ctx = _ctx(args, transport)
     message = _message_text(args)
+    # Local checks first: the PII pre-scan and --data parsing happen before
+    # anything hits the wire (a refusal sends nothing).
     check_pii(message)
+    data = None
+    if args.data:
+        try:
+            data = json.loads(args.data)
+        except ValueError:
+            raise HubError("bad_request", "--data must be valid JSON.")
+    # One topic-record fetch per post (O(1)): routes E2EE topics to the
+    # encrypting path. The plaintext construction below is byte-identical
+    # to the pre-E2EE behavior.
+    topic = _fetch_topic_record(ctx.client, args.topic)
+    if topic.get("e2ee") == 1:
+        return _cmd_post_e2ee(args, ctx, topic, message, data)
     body = {"kind": args.kind, "body": message}
     if args.reply_to is not None:
         body["reply_to_seq"] = args.reply_to
     if args.data:
-        try:
-            body["data"] = json.loads(args.data)
-        except ValueError:
-            raise HubError("bad_request", "--data must be valid JSON.")
+        body["data"] = data
     key = args.idempotency_key or uuid.uuid4().hex
     entry = ctx.client.call(
         "POST",
