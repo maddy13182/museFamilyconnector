@@ -124,3 +124,23 @@ test('served page embeds the token logic and wiring, not query-param scoping', (
   assert.ok(!UI_HTML.includes('circleScopedPath'), 'query-param scoping removed');
   assert.ok(!UI_HTML.includes('family_id='), 'no family_id query params emitted');
 });
+
+test('dashboard E2EE view is metadata-only with honest labeling', () => {
+  // Never decrypt in the browser: subjects render as [encrypted], bodies
+  // as hidden, and the label states the server cannot read the topic.
+  assert.ok(UI_HTML.includes('[encrypted]'), 'E2EE topics labeled, not subject-rendered');
+  assert.ok(
+    UI_HTML.includes('Content encrypted — the server cannot read this topic.'),
+    'honest cannot-read label present',
+  );
+  assert.ok(
+    UI_HTML.includes('Key import into the dashboard is not supported'),
+    'deferred key import stated',
+  );
+  assert.ok(UI_HTML.includes('renderArchivedBanner'), 'archive banner renderer embedded');
+  assert.ok(
+    UI_HTML.includes('Discussion continues at'),
+    'archive banner names the successor',
+  );
+  assert.ok(UI_HTML.includes('updatePostUi'), 'post-box gating embedded');
+});
