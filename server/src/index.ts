@@ -43,6 +43,7 @@ import {
   reqE2eeFlag,
   reqKeyId,
   reqEnvelopeB64,
+  isE2eeWireBody,
 } from './validate.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
@@ -1691,21 +1692,45 @@ async function handleAgentKeyRotate(
 //     404 when the topic doesn't exist in the caller's family);
 //   - the target (member_id, agent_label) must be a current participant
 //     AND hold an ACTIVE (non-superseded) registered public key (400
-//     otherwise — sealing to an agent with no key on file is meaningless).
+//     otherwise — sealing to an agent with no key on file is meaningless);
+//   - KEY ELECTION (secfix F1): topics.current_key_id is the single source
+//     of truth for "the current key". POSTing an envelope whose key_id
+//     differs from current_key_id INTRODUCES a new key (rotation) and is
+//     allowed only for owner/parent callers (403 otherwise); on success
+//     current_key_id advances to the new key_id in the same atomic batch.
+//     This stops a participant from downgrading victims to a removed
+//     member's key or hijacking encryption to an attacker key.
 // Re-POSTing the same (topic_id, member_id, agent_label, key_id) replaces
-// the stored envelope — idempotent distribution.
+// the stored envelope — idempotent distribution — and PRESERVES the
+// original created_at (secfix F3): re-POSTing must not forge recency.
 async function handlePostEnvelope(
   db: DbClient,
   req: Request,
   auth: AuthContext,
   tid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   const body = await readJson(req);
   const targetMemberId = reqString(body['member_id'], 'member_id', 1, 128);
   const targetAgentLabel = reqString(body['agent_label'], 'agent_label', 1, 80);
   const keyId = reqKeyId(body['key_id'], 'key_id');
   const envelope = reqEnvelopeB64(body['envelope'], 'envelope');
+  // F1: a key_id different from the topic's current_key_id is a rotation —
+  // owner/parent privilege. (current_key_id is NULL only for topics created
+  // before this column existed; the same gate bootstraps those.)
+  const currentKeyId = topic['current_key_id'] as string | null;
+  let rotates = false;
+  if (keyId !== currentKeyId) {
+    if (auth.role !== 'owner' && auth.role !== 'parent') {
+      throw new HttpError(
+        403,
+        'forbidden',
+        'Only an owner or parent may introduce a new topic key (rotation). ' +
+          'Ask an owner/parent to run `hub topic-rekey`.',
+      );
+    }
+    rotates = true;
+  }
   const targetPart = await db.queryOne(
     `SELECT member_id FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
     [tid, targetMemberId],
@@ -1725,20 +1750,36 @@ async function handlePostEnvelope(
     );
   }
   const ts = nowIso();
-  await db.execAtomically([
+  const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
-      sql: `INSERT OR REPLACE INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at)
-            VALUES (?,?,?,?,?,?)`,
+      // F3: ON CONFLICT updates only the envelope blob — created_at keeps
+      // its original value, so a re-POST cannot forge recency.
+      sql: `INSERT INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(topic_id, member_id, agent_label, key_id)
+            DO UPDATE SET envelope = excluded.envelope`,
       params: [tid, targetMemberId, targetAgentLabel, keyId, envelope, ts],
     },
-  ]);
+  ];
+  if (rotates) {
+    ops.push({
+      sql: `UPDATE topics SET current_key_id = ? WHERE id = ?`,
+      params: [keyId, tid],
+    });
+  }
+  await db.execAtomically(ops);
+  const row = await db.queryOne(
+    `SELECT created_at FROM topic_key_envelopes
+      WHERE topic_id = ? AND member_id = ? AND agent_label = ? AND key_id = ?`,
+    [tid, targetMemberId, targetAgentLabel, keyId],
+  );
   return json(
     {
       topic_id: tid,
       member_id: targetMemberId,
       agent_label: targetAgentLabel,
       key_id: keyId,
-      created_at: ts,
+      created_at: row!['created_at'],
     },
     201,
   );
@@ -1893,6 +1934,25 @@ async function handleCreateTopic(
   // E2EE (Phase 2): optional per-topic opt-in. Absent/null = 0 — plaintext
   // topics behave byte-identically to today.
   const e2ee = reqE2eeFlag(body['e2ee'], 'e2ee');
+  // E2EE (secfix F1): the creator's client-generated key_id becomes the
+  // topic's current_key_id — the single source of truth clients use to
+  // elect the encryption key. Required for e2ee=1 (fail-closed: without it
+  // no key could ever be elected); rejected for plaintext topics, where
+  // current_key_id stays NULL.
+  const initialKeyId =
+    body['initial_key_id'] === undefined || body['initial_key_id'] === null
+      ? null
+      : reqKeyId(body['initial_key_id'], 'initial_key_id');
+  if (e2ee === 1 && initialKeyId === null) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      'initial_key_id is required for E2EE topics (the creator\u2019s key_id)',
+    );
+  }
+  if (e2ee !== 1 && initialKeyId !== null) {
+    throw new HttpError(400, 'bad_request', 'initial_key_id is only valid for E2EE topics');
+  }
   // For E2EE topics the subject may arrive already encrypted (opaque to the
   // server — stored as-is): base64 of nonce(24) + XChaCha20-Poly1305
   // ciphertext of a <=200-char subject, so up to ~320 chars. The 1024 cap
@@ -1971,9 +2031,9 @@ async function handleCreateTopic(
   const ts = nowIso();
   const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
-      sql: `INSERT INTO topics(id, family_id, subject, kind, parents_only, parent_topic_id, link_visibility, created_by, created_at, e2ee)
-            VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      params: [topicId, auth.family_id, subject, kind, parentsOnly ? 1 : 0, null, 'placeholder', auth.member_id, ts, e2ee],
+      sql: `INSERT INTO topics(id, family_id, subject, kind, parents_only, parent_topic_id, link_visibility, created_by, created_at, e2ee, current_key_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      params: [topicId, auth.family_id, subject, kind, parentsOnly ? 1 : 0, null, 'placeholder', auth.member_id, ts, e2ee, initialKeyId],
     },
     ...ids.map(
       (mid): { sql: string; params: (string | number | null)[] } => ({
@@ -2035,6 +2095,34 @@ async function handleGetTopic(db: DbClient, auth: AuthContext, tid: string): Pro
     [tid],
   );
   return json({ topic, participants: parts });
+}
+
+// E2EE (secfix F4) — PATCH /v1/topics/:tid/subject {subject} — replace the
+// topic subject. Participant-only (403 otherwise; 404 when the topic
+// doesn't exist in the caller's family). E2EE topics only (400 otherwise):
+// the endpoint exists so `hub new-topic --e2ee` can re-encrypt the subject
+// with topic-bound AAD immediately after creation — topic ids are
+// server-generated, so the CLI cannot bind topic_id at create time and must
+// do the two-step (create, then PATCH). The subject is opaque to the
+// server: validated like a created E2EE subject (1..1024 chars, the
+// ciphertext headroom cap), stored as-is, never inspected or PII-scanned.
+async function handlePatchTopicSubject(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  const { topic } = await requireParticipant(db, auth, tid);
+  if (topic['e2ee'] !== 1) {
+    throw new HttpError(400, 'bad_request', 'subject PATCH is only supported for E2EE topics');
+  }
+  const body = await readJson(req);
+  const subject = reqString(body['subject'], 'subject', 1, 1024);
+  await db.execAtomically([
+    { sql: `UPDATE topics SET subject = ? WHERE id = ?`, params: [subject, tid] },
+  ]);
+  const updated = await db.queryOne(`SELECT * FROM topics WHERE id = ?`, [tid]);
+  return json({ topic: updated });
 }
 
 // GET /v1/topics/:tid/history?after_seq=&limit=
@@ -2288,7 +2376,12 @@ async function handlePostEntry(
         }
         return n as number;
       })();
-  piiGuard(text);
+  // E2EE ciphertext bodies are opaque to the server: scanning them for PII
+  // is pointless and risks false-positive 422s on base64 digit runs, so
+  // well-formed fh1 wire bodies skip the PII scan. The CLI is the
+  // enforcement point for E2EE topics — it scans the plaintext BEFORE
+  // encrypting. Malformed fh1-looking bodies are still scanned.
+  if (!isE2eeWireBody(text)) piiGuard(text);
   // F08: entry data (JSON) is scanned too — string leaves, recursively.
   if (data) piiGuardJson(JSON.parse(data));
 
@@ -2939,7 +3032,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       }
     }
 
-    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes)$/.exec(path);
+    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes|subject)$/.exec(path);
     if (topicSub && method === 'GET' && topicSub[2] === 'history') {
       return await handleHistory(db, req, auth, decodeURIComponent(topicSub[1]));
     }
@@ -2967,6 +3060,11 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     }
     if (topicSub && method === 'GET' && topicSub[2] === 'envelopes') {
       return await handleGetEnvelopes(db, auth, decodeURIComponent(topicSub[1]));
+    }
+    // E2EE (secfix F4) — participant-only subject re-encryption (two-step
+    // topic-bound subject AAD for `hub new-topic --e2ee`).
+    if (topicSub && method === 'PATCH' && topicSub[2] === 'subject') {
+      return await handlePatchTopicSubject(db, req, auth, decodeURIComponent(topicSub[1]));
     }
 
     const topicOnly = /^\/v1\/topics\/([^/]+)$/.exec(path);

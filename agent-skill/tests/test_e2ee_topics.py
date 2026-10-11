@@ -2,8 +2,9 @@
 """Tests for `hub new-topic --e2ee` (E2EE Phase 2).
 
 Full flow with a stateful mocked transport: local topic-key generation,
-subject encryption (XChaCha20-Poly1305, nonce prepended, base64), one sealed
-envelope per participant agent (crypto_box_seal over key_id || topic_key),
+subject encryption (XChaCha20-Poly1305, nonce prepended, base64; topic-bound
+AAD via the PATCH two-step), one sealed envelope per participant agent
+(crypto_box_seal over topic_id || 0x00 || key_id || topic_key),
 0600 local key storage, and the own-envelope round-trip verification.
 Also: missing keypair fails with `hub key-init` guidance (never
 auto-generates), keyless participants warn but don't abort, and a failed
@@ -58,6 +59,8 @@ class E2eeFakeHub:
         self.envelopes = []
         self.corrupt_own_envelope = corrupt_own_envelope
         self.caller = ("m1", "owner-agent")
+        self.current_key_id = None  # secfix F1: mirrors topics.current_key_id
+        self.subject = "<ciphertext>"  # latest PATCHed subject
 
     def _record(self, method, url, headers, body_bytes):
         self.calls.append(
@@ -77,8 +80,13 @@ class E2eeFakeHub:
         method = method.upper()
 
         if method == "POST" and path == "/v1/topics":
+            body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+            # secfix F1: the server records the creator's key_id as current.
+            self.current_key_id = body.get("initial_key_id")
+            self.subject = body.get("subject", "<ciphertext>")
             return 201, json.dumps(
-                {"topic": {"id": TOPIC_ID, "subject": "<ciphertext>", "e2ee": 1}}
+                {"topic": {"id": TOPIC_ID, "subject": self.subject, "e2ee": 1,
+                           "current_key_id": self.current_key_id}}
             )
         if method == "GET" and path == "/v1/me":
             return 200, json.dumps(
@@ -87,9 +95,22 @@ class E2eeFakeHub:
         if method == "GET" and path == "/v1/topics/%s" % TOPIC_ID:
             return 200, json.dumps(
                 {
-                    "topic": {"id": TOPIC_ID, "e2ee": 1},
+                    "topic": {"id": TOPIC_ID, "e2ee": 1,
+                              "current_key_id": self.current_key_id},
                     "participants": [{"member_id": m} for m in self.participants],
                 }
+            )
+        # secfix F4: participant-only subject re-encryption (topic-bound AAD).
+        if method == "PATCH" and path == "/v1/topics/%s/subject" % TOPIC_ID:
+            body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+            subject = body.get("subject")
+            if not isinstance(subject, str) or not (1 <= len(subject) <= 1024):
+                return 400, json.dumps(
+                    {"error": {"code": "bad_request", "message": "bad subject"}})
+            self.subject = subject
+            return 200, json.dumps(
+                {"topic": {"id": TOPIC_ID, "subject": self.subject, "e2ee": 1,
+                           "current_key_id": self.current_key_id}}
             )
         if method == "GET" and path == "/v1/agent-keys":
             mid = (query.get("member_id") or [""])[0]
@@ -224,9 +245,12 @@ class TestNewTopicE2eeFlow(E2eeTopicTestBase):
         create_body = json.loads(creates[0]["body"])
         self.assertEqual(create_body["e2ee"], 1)
         self.assertNotIn("Surprise party", create_body["subject"])
+        # secfix F1: the creator's key_id is declared at creation so the
+        # server can record it as topics.current_key_id.
+        key_id_hex = result["e2ee"]["key_id"]
+        self.assertEqual(create_body["initial_key_id"], key_id_hex)
 
         # 2. Local key file: 0600, mapping key_id -> base64 topic key.
-        key_id_hex = result["e2ee"]["key_id"]
         self.assertRegex(key_id_hex, r"^[0-9a-f]{32}$")
         key_path = os.path.join(hub.topic_keys_dir("default"), TOPIC_ID + ".json")
         self.assertEqual(
@@ -238,13 +262,27 @@ class TestNewTopicE2eeFlow(E2eeTopicTestBase):
         self.assertEqual(len(topic_key), 32)
         self.assertEqual(stored, {key_id_hex: base64.b64encode(topic_key).decode("ascii")})
 
-        # 3. The stored key decrypts the posted subject (nonce prepended, AAD bound).
-        raw = base64.b64decode(create_body["subject"])
+        # 3. secfix F4: immediately after creation the CLI PATCHes the
+        # subject re-encrypted with the topic-bound AAD (topic ids are
+        # server-generated, so it cannot be bound at create time).
+        patches = [
+            c for c in self.fake.calls
+            if c["method"] == "PATCH" and c["url"].endswith("/subject")
+        ]
+        self.assertEqual(len(patches), 1)
+        patched_subject = json.loads(patches[0]["body"])["subject"]
+        self.assertNotIn("Surprise party", patched_subject)
+        raw = base64.b64decode(patched_subject)
         nonce, ct = raw[:24], raw[24:]
         pt = bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
-            ct, SUBJECT_AAD, nonce, topic_key
+            ct, SUBJECT_AAD + b"\x00" + TOPIC_ID.encode("utf-8"), nonce, topic_key
         )
         self.assertEqual(pt.decode("utf-8"), "Surprise party for Mahesh")
+        # ...and it does NOT verify under a different topic's AAD.
+        with self.assertRaises(Exception):
+            bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                ct, SUBJECT_AAD + b"\x00" + b"some-other-topic", nonce, topic_key
+            )
 
         # 4. One envelope per participant agent (3): each opens to key_id || topic_key.
         posts = self.envelope_posts()
@@ -258,7 +296,11 @@ class TestNewTopicE2eeFlow(E2eeTopicTestBase):
             opened = bindings.crypto_box_seal_open(
                 base64.b64decode(b["envelope"]), bytes(sk.public_key), bytes(sk)
             )
-            self.assertEqual(opened, bytes.fromhex(key_id_hex) + topic_key)
+            # secfix F2: sealed plaintext binds the topic id.
+            self.assertEqual(
+                opened,
+                TOPIC_ID.encode("utf-8") + b"\x00" + bytes.fromhex(key_id_hex) + topic_key,
+            )
         self.assertEqual(
             targets, {("m1", "owner-agent"), ("m2", "bee-agent"), ("m2", "bee2-agent")}
         )
@@ -368,6 +410,62 @@ class TestNewTopicE2eeMissingKey(E2eeTopicTestBase):
         )
         self.assertEqual(rc, 1)
         self.assertIn("key-init", err)
+
+
+# ---------------------------------------------------------------------------
+# secfix F2 — sealed envelopes bind topic_id (cross-topic transplant)
+# ---------------------------------------------------------------------------
+
+
+class TestEnvelopeTopicBinding(unittest.TestCase):
+    """Unit tests for the topic_id binding inside sealed envelopes.
+
+    Sealed plaintext: topic_id || 0x00 || key_id(16) || topic_key(32).
+    """
+
+    def setUp(self):
+        self.sk = PrivateKey.generate()
+        self.pub_b64 = base64.b64encode(bytes(self.sk.public_key)).decode("ascii")
+        self.priv = bytes(self.sk)
+        self.key_id = os.urandom(16)
+        self.topic_key = os.urandom(32)
+
+    def test_round_trip_opens_for_right_topic(self):
+        env = hub._e2ee_seal_envelope("topic-A", self.key_id, self.topic_key, self.pub_b64)
+        kid, key = hub._e2ee_open_envelope(env, self.priv, "topic-A")
+        self.assertEqual(kid, self.key_id)
+        self.assertEqual(key, self.topic_key)
+
+    def test_transplant_to_other_topic_rejected(self):
+        # Sealed for topic A; opening for topic B must fail loudly.
+        env = hub._e2ee_seal_envelope("topic-A", self.key_id, self.topic_key, self.pub_b64)
+        with self.assertRaises(hub.HubError) as cm:
+            hub._e2ee_open_envelope(env, self.priv, "topic-B")
+        self.assertIn("DIFFERENT topic", str(cm.exception))
+
+    def test_sealed_plaintext_carries_topic_id(self):
+        env = hub._e2ee_seal_envelope("topic-A", self.key_id, self.topic_key, self.pub_b64)
+        opened = bindings.crypto_box_seal_open(
+            base64.b64decode(env), bytes(self.sk.public_key), self.priv
+        )
+        self.assertEqual(
+            opened, b"topic-A" + b"\x00" + self.key_id + self.topic_key
+        )
+
+    def test_legacy_plaintext_without_separator_rejected(self):
+        # A pre-binding envelope (key_id || topic_key, no NUL) is malformed
+        # under the new format and must never be stored.
+        legacy = bindings.crypto_box_seal(
+            self.key_id + self.topic_key, bytes(self.sk.public_key)
+        )
+        env = base64.b64encode(legacy).decode("ascii")
+        with self.assertRaises(hub.HubError) as cm:
+            hub._e2ee_open_envelope(env, self.priv, "topic-A")
+        self.assertIn("malformed", str(cm.exception))
+
+    def test_nul_topic_id_refused_at_seal(self):
+        with self.assertRaises(hub.HubError):
+            hub._e2ee_seal_envelope("topic\x00evil", self.key_id, self.topic_key, self.pub_b64)
 
 
 if __name__ == "__main__":

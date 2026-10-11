@@ -181,8 +181,10 @@ export function reqKeyId(v: unknown, name: string): string {
 // E2EE (Phase 2): a sealed key envelope — standard base64, opaque to the
 // server (stored, never inspected). Format-validated only: the strict
 // alphabet/padding rules keep one canonical textual form, and the length
-// cap bounds the blob store. crypto_box_seal of the 48-byte
-// (key_id || topic_key) plaintext is 96 bytes → 128 base64 chars.
+// cap bounds the blob store. The sealed plaintext is
+// topic_id || 0x00 || key_id(16) || topic_key(32) (secfix F2: the topic_id
+// binding stops cross-topic envelope transplants), so its length varies
+// with the topic id; only the cap applies.
 const ENVELOPE_B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const ENVELOPE_B64_MAX = 4096;
 
@@ -199,4 +201,28 @@ export function reqEnvelopeB64(v: unknown, name: string): string {
     );
   }
   return s;
+}
+
+// E2EE (Phase 3): structural well-formedness check for one encrypted field:
+//   fh1.<key_id_hex:32>.<msg_id_hex:32>.<base64(nonce[24] || ciphertext)>
+// No crypto is performed — this only answers "is this shaped like E2EE
+// ciphertext?" so handlePostEntry can skip the PII scan for it (scanning
+// ciphertext is pointless and risks false-positive 422s on base64 digit
+// runs). A body that merely starts with "fh1." but is malformed returns
+// false and is still scanned as plaintext.
+const FH1_TAG = 'fh1.';
+const FH1_HEX32_RE = /^[0-9a-f]{32}$/;
+const FH1_B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const FH1_MIN_RAW_BYTES = 24 + 16; // XChaCha20 nonce + Poly1305 tag
+
+export function isE2eeWireBody(v: unknown): boolean {
+  if (typeof v !== 'string' || !v.startsWith(FH1_TAG)) return false;
+  const parts = v.split('.');
+  if (parts.length !== 4) return false;
+  const [, keyId, msgId, blob] = parts;
+  if (!FH1_HEX32_RE.test(keyId) || !FH1_HEX32_RE.test(msgId)) return false;
+  if (blob.length === 0 || blob.length % 4 !== 0 || !FH1_B64_RE.test(blob)) return false;
+  const pad = blob.endsWith('==') ? 2 : blob.endsWith('=') ? 1 : 0;
+  const rawLen = Math.floor((blob.length * 3) / 4) - pad;
+  return rawLen >= FH1_MIN_RAW_BYTES;
 }

@@ -54,8 +54,9 @@ class MsgFakeHub:
         self.envelopes = {}  # tid -> [envelope dicts]
         self.gseq = 0
 
-    def add_topic(self, tid, e2ee=0, subject="subject"):
-        self.topics[tid] = {"id": tid, "e2ee": e2ee, "subject": subject}
+    def add_topic(self, tid, e2ee=0, subject="subject", current_key_id=None):
+        self.topics[tid] = {"id": tid, "e2ee": e2ee, "subject": subject,
+                            "current_key_id": current_key_id}
         self.entries.setdefault(tid, [])
         self.envelopes.setdefault(tid, [])
 
@@ -401,10 +402,13 @@ class TestKeyRotation(E2eeMsgTestBase):
         bodies = [e["body"] for e in json.loads(out)]
         self.assertEqual(bodies, ["old era", "new era"])
 
-    def test_post_selects_newest_envelope_key_when_rotated(self):
+    def test_post_selects_server_advertised_current_key(self):
+        # secfix F1: with several keys in the keystore, the CURRENT key is
+        # elected from the server-advertised topics.current_key_id — never
+        # from envelope recency.
         old_key, old_kid = self.new_key()
         new_key, new_kid = self.new_key()
-        self.fake.add_topic("et1", e2ee=1)
+        self.fake.add_topic("et1", e2ee=1, current_key_id=new_kid)
         self.seed_keystore("et1", {old_kid: old_key, new_kid: new_key})
         self.fake.add_envelope("et1", old_kid, "2026-10-10T00:00:00Z")
         self.fake.add_envelope("et1", new_kid, "2026-10-11T00:00:00Z")
@@ -414,6 +418,39 @@ class TestKeyRotation(E2eeMsgTestBase):
         payload = json.loads(self.post_entry_calls()[0]["body"])
         kid_on_wire, _mid, _raw = self.wire_parts(payload["body"])
         self.assertEqual(kid_on_wire, new_kid)
+
+    def test_election_ignores_recency_forgery(self):
+        # secfix F1 regression: an old-key envelope re-POSTed with a NEWER
+        # created_at must NOT win the election — the victim still encrypts
+        # under the server-advertised current key.
+        old_key, old_kid = self.new_key()
+        new_key, new_kid = self.new_key()
+        self.fake.add_topic("et1", e2ee=1, current_key_id=new_kid)
+        self.seed_keystore("et1", {old_kid: old_key, new_kid: new_key})
+        self.fake.add_envelope("et1", new_kid, "2026-10-10T00:00:00Z")
+        self.fake.add_envelope("et1", old_kid, "2026-10-12T00:00:00Z")  # forged recency
+        rc, out, err = self.run_cli(
+            ["post", "--topic", "et1", "--message", "after rotation"])
+        self.assertEqual(rc, 0, err)
+        payload = json.loads(self.post_entry_calls()[0]["body"])
+        kid_on_wire, _mid, _raw = self.wire_parts(payload["body"])
+        self.assertEqual(kid_on_wire, new_kid)
+
+    def test_election_fails_loudly_when_current_key_missing_locally(self):
+        # The server-advertised current key is not in the keystore (and the
+        # keystore holds several keys, so election matters): fail loudly
+        # with fetch guidance instead of silently using a stale key.
+        old_key, old_kid = self.new_key()
+        new_key, new_kid = self.new_key()
+        other_key, other_kid = self.new_key()
+        self.fake.add_topic("et1", e2ee=1, current_key_id=new_kid)
+        self.seed_keystore("et1", {old_kid: old_key, other_kid: other_key})
+        rc, out, err = self.run_cli(
+            ["post", "--topic", "et1", "--message", "after rotation"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("key-fetch", err)
+        self.assertEqual(self.post_entry_calls(), [],
+                         "nothing may be posted when election fails")
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +593,7 @@ class TestMixedSync(E2eeMsgTestBase):
 class TestTopicSubjects(E2eeMsgTestBase):
     def test_subjects_decrypted_and_plaintext_untouched(self):
         key, kid = self.new_key()
-        enc_subject = hub._e2ee_encrypt_subject("secret plans", key)
+        enc_subject = hub._e2ee_encrypt_subject("secret plans", key, "et1")
         self.fake.add_topic("pt1", e2ee=0, subject="lunch plans")
         self.fake.add_topic("et1", e2ee=1, subject=enc_subject)
         self.seed_keystore("et1", {kid: key})
@@ -568,7 +605,7 @@ class TestTopicSubjects(E2eeMsgTestBase):
 
     def test_subject_missing_key_shows_placeholder(self):
         key, _kid = self.new_key()
-        enc_subject = hub._e2ee_encrypt_subject("secret plans", key)
+        enc_subject = hub._e2ee_encrypt_subject("secret plans", key, "et1")
         self.fake.add_topic("et1", e2ee=1, subject=enc_subject)
         # No keystore: placeholder, not base64.
         rc, out, err = self.run_cli(["topics"])
@@ -576,6 +613,32 @@ class TestTopicSubjects(E2eeMsgTestBase):
         topics = json.loads(out)
         self.assertEqual(topics[0]["subject"], "[encrypted]")
         self.assertNotIn(enc_subject, out)
+
+
+    def test_subject_encrypted_for_other_topic_shows_placeholder(self):
+        # secfix F4: a subject blob swapped in from another topic fails the
+        # topic-bound AAD check and shows "[encrypted]", never plaintext.
+        key, kid = self.new_key()
+        enc_for_other = hub._e2ee_encrypt_subject("secret plans", key, "other-topic")
+        self.fake.add_topic("et1", e2ee=1, subject=enc_for_other)
+        self.seed_keystore("et1", {kid: key})
+        rc, out, err = self.run_cli(["topics"])
+        self.assertEqual(rc, 0, err)
+        topics = json.loads(out)
+        self.assertEqual(topics[0]["subject"], "[encrypted]")
+        self.assertNotIn("secret plans", out)
+
+    def test_subject_aad_differs_per_topic(self):
+        # The same subject encrypted for two topics yields different blobs
+        # (different AAD), and each only verifies under its own topic.
+        key, _kid = self.new_key()
+        enc_a = hub._e2ee_encrypt_subject("same subject", key, "topic-A")
+        enc_b = hub._e2ee_encrypt_subject("same subject", key, "topic-B")
+        self.assertNotEqual(enc_a, enc_b)
+        self.assertEqual(hub._e2ee_decrypt_subject(enc_a, key, "topic-A"), "same subject")
+        self.assertEqual(hub._e2ee_decrypt_subject(enc_b, key, "topic-B"), "same subject")
+        with self.assertRaises(hub.HubError):
+            hub._e2ee_decrypt_subject(enc_a, key, "topic-B")
 
 
 # ---------------------------------------------------------------------------

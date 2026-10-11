@@ -121,8 +121,12 @@ class RekeyFakeHub:
         # POST /v1/topics (create)
         if method == "POST" and path == "/v1/topics":
             pids = list(dict.fromkeys(body.get("participant_member_ids") or []))
-            self.topics[TOPIC_ID] = {"e2ee": body.get("e2ee") or 0, "participants": pids}
-            return 201, json.dumps({"topic": {"id": TOPIC_ID, "e2ee": body.get("e2ee") or 0}})
+            # secfix F1: the server records the creator's key_id as current.
+            self.topics[TOPIC_ID] = {"e2ee": body.get("e2ee") or 0,
+                                     "participants": pids,
+                                     "current_key_id": body.get("initial_key_id")}
+            return 201, json.dumps({"topic": {"id": TOPIC_ID, "e2ee": body.get("e2ee") or 0,
+                                              "current_key_id": body.get("initial_key_id")}})
 
         # /v1/topics/<tid>/...
         if len(segs) >= 3 and segs[0] == "v1" and segs[1] == "topics":
@@ -136,11 +140,21 @@ class RekeyFakeHub:
 
             if method == "GET" and sub is None:
                 return 200, json.dumps(
-                    {"topic": {"id": tid, "e2ee": topic["e2ee"]},
+                    {"topic": {"id": tid, "e2ee": topic["e2ee"],
+                               "current_key_id": topic.get("current_key_id")},
                      "participants": [
                          {"member_id": p, "name": self.members[p]["name"]}
                          for p in topic["participants"]
                      ]})
+            # secfix F4: subject re-encryption PATCH (topic-bound AAD).
+            if method == "PATCH" and sub == "subject":
+                subject = body.get("subject")
+                if not isinstance(subject, str) or not (1 <= len(subject) <= 1024):
+                    return 400, json.dumps({"error": {"code": "bad_request",
+                                                      "message": "bad subject"}})
+                return 200, json.dumps(
+                    {"topic": {"id": tid, "e2ee": topic["e2ee"],
+                               "current_key_id": topic.get("current_key_id")}})
             if method == "GET" and sub == "history":
                 return 200, json.dumps(
                     {"entries": [e for e in self.entries if e["topic_id"] == tid]})
@@ -175,6 +189,13 @@ class RekeyFakeHub:
                 if tlabel not in [l for l, _ in self.keys_by_member.get(tmid, [])]:
                     return 400, json.dumps({"error": {"code": "bad_request",
                                                       "message": "target has no registered identity key"}})
+                # secfix F1: introducing a new key_id is a rotation —
+                # owner/parent only; success advances current_key_id.
+                if body.get("key_id") != topic.get("current_key_id"):
+                    if self.members[mid]["role"] not in ("owner", "parent"):
+                        return 403, json.dumps({"error": {"code": "forbidden",
+                                                          "message": "owner/parent only"}})
+                    topic["current_key_id"] = body.get("key_id")
                 self._env_counter += 1
                 rec = {"topic_id": tid, "member_id": tmid, "agent_label": tlabel,
                        "key_id": body.get("key_id"), "envelope": body.get("envelope"),
@@ -241,7 +262,8 @@ class E2eeRekeyTestBase(unittest.TestCase):
         self.privs = {}
         self.pubs = {}
         for mid, label in [("m1", "owner-agent"), ("m2", "bee-agent"),
-                           ("m3", "cee-agent"), ("m5", "eee-agent")]:
+                           ("m3", "cee-agent"), ("m5", "eee-agent"),
+                           ("m6", "kid-agent")]:
             sk = PrivateKey.generate()
             self.privs[(mid, label)] = sk
             self.pubs[(mid, label)] = base64.b64encode(bytes(sk.public_key)).decode("ascii")
@@ -252,6 +274,7 @@ class E2eeRekeyTestBase(unittest.TestCase):
                 "m2": [("bee-agent", self.pubs[("m2", "bee-agent")])],
                 "m3": [("cee-agent", self.pubs[("m3", "cee-agent")])],
                 "m5": [("eee-agent", self.pubs[("m5", "eee-agent")])],
+                "m6": [("kid-agent", self.pubs[("m6", "kid-agent")])],
             },
             members={
                 "m1": {"name": "Owner", "role": "owner"},
@@ -259,6 +282,7 @@ class E2eeRekeyTestBase(unittest.TestCase):
                 "m3": {"name": "Cee", "role": "parent"},
                 "m4": {"name": "Dee", "role": "parent"},
                 "m5": {"name": "Eee", "role": "parent"},
+                "m6": {"name": "Kid", "role": "kid"},
             },
         )
         self.seed_config("default", "m1", "owner-agent", "owner")
@@ -360,8 +384,13 @@ class TestTopicAddMember(E2eeRekeyTestBase):
         pub = bytes(self.privs[("m3", "cee-agent")].public_key)
         opened = bindings.crypto_box_seal_open(
             sealed, pub, bytes(self.privs[("m3", "cee-agent")]))
-        self.assertEqual(opened, bytes.fromhex(new_id) + self.keystore("default")[new_id])
-        self.assertNotEqual(opened[16:], old_key,
+        # secfix F2: sealed plaintext binds the topic id.
+        self.assertEqual(
+            opened,
+            TOPIC_ID.encode("utf-8") + b"\x00" + bytes.fromhex(new_id)
+            + self.keystore("default")[new_id],
+        )
+        self.assertNotEqual(opened[len(TOPIC_ID) + 1 + 16:], old_key,
                             "new member must never receive old keys")
 
     def test_add_member_refuses_non_participant(self):
@@ -515,6 +544,21 @@ class TestRemoveAndRekey(E2eeRekeyTestBase):
         self.assertNotEqual(rc, 0)
         self.assertIn("key-request", err)
 
+    def test_rekey_as_kid_fails_loudly(self):
+        # secfix F1: rotation is an owner/parent privilege. The CLI fails
+        # BEFORE generating anything, with guidance — nothing is posted and
+        # the server-advertised current key is unchanged.
+        key_id, _key = self.create_e2ee_topic(["m1", "m2", "m6"])
+        self.as_member("kidprof", "m6", "kid-agent", role="kid")
+        before = len(self.fake.envelope_posts())
+        rc, out, err = self.run_cli(
+            ["--profile", "kidprof", "topic-rekey", "--topic", TOPIC_ID])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("owner or parent", err)
+        self.assertEqual(len(self.fake.envelope_posts()), before,
+                         "a kid rotation attempt must not post any envelope")
+        self.assertEqual(self.fake.topics[TOPIC_ID]["current_key_id"], key_id)
+
 
 class TestKeyRequestGrant(E2eeRekeyTestBase):
     def test_request_posts_visibly_with_no_auto_fulfillment(self):
@@ -561,7 +605,10 @@ class TestKeyRequestGrant(E2eeRekeyTestBase):
         opened = bindings.crypto_box_seal_open(
             sealed, bytes(self.privs[("m5", "eee-agent")].public_key),
             bytes(self.privs[("m5", "eee-agent")]))
-        self.assertEqual(opened, bytes.fromhex(key_id) + key)
+        # secfix F2: sealed plaintext binds the topic id.
+        self.assertEqual(
+            opened, TOPIC_ID.encode("utf-8") + b"\x00" + bytes.fromhex(key_id) + key
+        )
 
     def test_grant_refuses_keyless_member(self):
         self.create_e2ee_topic(["m1", "m2"])
@@ -632,6 +679,33 @@ class TestKeyFetchAndSyncRefresh(E2eeRekeyTestBase):
         self.assertEqual(rc, 0, "stderr: %s" % err)
         wire = json.loads(out)["entry"]["entry"]["body"]
         self.assertEqual(hub._e2ee_parse_wire(wire)[0], new_id)
+
+
+    def test_refresh_rejects_transplanted_envelope(self):
+        # secfix F2: an envelope sealed for a DIFFERENT topic is rejected
+        # and NEVER merged into this topic's keystore — quiet or loud.
+        self.create_e2ee_topic(["m1", "m2"])
+        other_kid = os.urandom(16)
+        other_key = os.urandom(32)
+        transplant = hub._e2ee_seal_envelope(
+            "some-other-topic", other_kid, other_key,
+            self.pubs[("m1", "owner-agent")])
+        self.fake.envelopes.append({
+            "topic_id": TOPIC_ID, "member_id": "m1", "agent_label": "owner-agent",
+            "key_id": other_kid.hex(), "envelope": transplant,
+            "created_at": "2026-10-11T00:00:99Z",
+        })
+        client = hub.HubClient("https://hub.example", token="test-token",
+                               transport=self.fake)
+        # quiet=True (sync path): skipped silently, never stored.
+        fresh = hub._e2ee_refresh_own_keys(client, "default", TOPIC_ID, quiet=True)
+        self.assertEqual(fresh, [])
+        self.assertNotIn(other_kid.hex(), self.keystore("default"))
+        # quiet=False (key-fetch path): loud HubError, still never stored.
+        with self.assertRaises(hub.HubError) as cm:
+            hub._e2ee_refresh_own_keys(client, "default", TOPIC_ID, quiet=False)
+        self.assertIn("DIFFERENT topic", str(cm.exception))
+        self.assertNotIn(other_kid.hex(), self.keystore("default"))
 
 
 class TestSystemKindRouting(E2eeRekeyTestBase):

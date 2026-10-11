@@ -131,6 +131,7 @@ test('e2ee=1 without a registered creator key is 400 with key-init guidance', as
     kind: 'group',
     participant_member_ids: [],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(res.status, 400);
   assert.match(String(res.body.error.message), /hub key-init/);
@@ -148,6 +149,7 @@ test('e2ee=1 with a registered key creates the topic; subject stored opaque as-i
     kind: 'group',
     participant_member_ids: [],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(res.status, 201);
   assert.equal(res.body.topic.e2ee, 1);
@@ -203,6 +205,7 @@ test('plaintext topic creation is byte-identical to before (e2ee absent)', async
     kind: 'group',
     participant_member_ids: [],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(enc.status, 201);
 });
@@ -228,6 +231,7 @@ test('envelope POST: non-participant caller is 403; unknown topic is 404', async
     kind: 'group',
     participant_member_ids: [],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -267,6 +271,7 @@ test('envelope POST: target must be a participant with an ACTIVE registered key'
     kind: 'group',
     participant_member_ids: [memberB.memberId],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -340,6 +345,7 @@ test('envelope POST: malformed key_id / envelope / member fields are 400', async
     kind: 'group',
     participant_member_ids: [],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -370,6 +376,7 @@ test('envelope POST: re-POST of the same (topic, member, label, key_id) is idemp
     kind: 'group',
     participant_member_ids: [],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -420,6 +427,7 @@ test('envelope GET: each agent sees only its own envelopes; non-participant 403'
     kind: 'group',
     participant_member_ids: [memberB.memberId],
     e2ee: 1,
+    initial_key_id: hex(16),
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;

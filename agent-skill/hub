@@ -63,7 +63,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -776,18 +776,25 @@ def _public_key_b64(priv_bytes):
 # ---------------------------------------------------------------------------
 # E2EE topics (Phase 2) — topic-key generation, subject encryption, envelopes.
 #
-# Ciphertext formats (frozen for Phase 3; see docs/E2EE_BUILD_SPEC.md):
+# Ciphertext formats (see docs/E2EE_BUILD_SPEC.md):
 #
 # - Subject: XChaCha20-Poly1305 (IETF) under the 32-byte topic key, random
 #   192-bit (24-byte) nonce PREPENDED to the ciphertext+tag, whole blob
-#   standard-base64. AAD is the fixed context b"fh-topic-subject-v1":
-#   the topic_id is not known yet at creation time, so it cannot be bound;
-#   the fixed string keeps the AAD slot non-empty and versioned.
-# - Envelope plaintext: key_id_bytes (16) || topic_key (32), sealed with
-#   libsodium crypto_box_seal to the recipient agent's X25519 public key.
-#   Binding key_id inside the sealed plaintext stops an envelope being
-#   replayed into a different key rotation of the same topic (design §2 L3).
-#   The sealed blob travels as standard base64.
+#   standard-base64. AAD is b"fh-topic-subject-v1" + b"\x00" + topic_id
+#   (secfix F4): binding the topic id stops a malicious server swapping
+#   subject blobs between topics. Topic ids are server-generated, so at
+#   CREATE time the id is not known yet — the create-step subject uses the
+#   legacy fixed AAD b"fh-topic-subject-v1", and `hub new-topic --e2ee`
+#   immediately PATCHes /v1/topics/:id/subject with the subject re-encrypted
+#   under the topic-bound AAD (before any envelope is distributed).
+# - Envelope plaintext: topic_id_bytes || b"\x00" || key_id_bytes (16) ||
+#   topic_key (32), sealed with libsodium crypto_box_seal to the recipient
+#   agent's X25519 public key. Binding key_id inside the sealed plaintext
+#   stops an envelope being replayed into a different key rotation of the
+#   same topic (design §2 L3); binding topic_id (secfix F2) stops a
+#   cross-topic transplant — an envelope sealed for topic A is rejected,
+#   never stored, when opened for topic B. The sealed blob travels as
+#   standard base64.
 #
 # The topic key NEVER leaves the machine except inside sealed envelopes,
 # and is never printed or logged: _note_topic_key_secrets() registers every
@@ -807,18 +814,57 @@ def _note_topic_key_secrets(topic_key):
     note_secret(topic_key.hex())
 
 
-def _e2ee_encrypt_subject(subject, topic_key):
-    """Encrypt a topic subject; returns the base64 (nonce || ciphertext) blob."""
+def _e2ee_subject_aad(topic_id):
+    """Build the topic-bound subject AAD.
+
+    b"fh-topic-subject-v1" + b"\\x00" + topic_id.encode("utf-8"). Binding
+    topic_id stops a malicious server from swapping subject blobs between
+    topics (secfix F4). Topic ids are server-generated, so at CREATE time
+    the id is not known yet: the create-step subject uses the legacy fixed
+    AAD and `hub new-topic --e2ee` immediately PATCHes the subject
+    re-encrypted under this AAD (see _cmd_new_topic_e2ee).
+    """
+    topic_id = str(topic_id)
+    if "\x00" in topic_id:
+        raise HubError("error", "E2EE: topic_id contains NUL; cannot build subject AAD.")
+    return _E2EE_SUBJECT_AAD + b"\x00" + topic_id.encode("utf-8")
+
+
+def _e2ee_encrypt_subject(subject, topic_key, topic_id=None):
+    """Encrypt a topic subject; returns the base64 (nonce || ciphertext) blob.
+
+    topic_id=None encrypts under the legacy fixed AAD — used ONLY for the
+    provisional create-step subject, which is immediately replaced by the
+    topic-bound PATCH. Pass the topic id everywhere else.
+    """
     nacl = _require_nacl()
     nonce = os.urandom(_E2EE_SUBJECT_NONCE_BYTES)
+    aad = _e2ee_subject_aad(topic_id) if topic_id is not None else _E2EE_SUBJECT_AAD
     ct = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
-        subject.encode("utf-8"), _E2EE_SUBJECT_AAD, nonce, topic_key
+        subject.encode("utf-8"), aad, nonce, topic_key
     )
     return base64.b64encode(nonce + ct).decode("ascii")
 
 
-def _e2ee_seal_envelope(key_id_bytes, topic_key, recipient_pubkey_b64):
-    """Seal (key_id || topic_key) to a recipient's public key; base64 out."""
+def _e2ee_topic_id_bytes(topic_id):
+    """topic_id as UTF-8 bytes for crypto bindings; HubError on NUL.
+
+    Topic ids are server-generated and never contain NUL; the check keeps
+    the b"\\x00" separator in the sealed envelope plaintext unambiguous.
+    """
+    tid = str(topic_id)
+    if "\x00" in tid:
+        raise HubError("error", "E2EE: topic_id contains NUL; cannot bind it.")
+    return tid.encode("utf-8")
+
+
+def _e2ee_seal_envelope(topic_id, key_id_bytes, topic_key, recipient_pubkey_b64):
+    """Seal (topic_id || 0x00 || key_id || topic_key) to a recipient's key.
+
+    Binding topic_id inside the sealed plaintext stops a cross-topic
+    transplant: an envelope sealed for topic A can never be merged into
+    topic B's keystore (see _e2ee_open_envelope). base64 out.
+    """
     nacl = _require_nacl()
     try:
         pub = base64.b64decode(recipient_pubkey_b64, validate=True)
@@ -833,12 +879,19 @@ def _e2ee_seal_envelope(key_id_bytes, topic_key, recipient_pubkey_b64):
             "Server returned a %d-byte public key for an envelope recipient; expected 32."
             % len(pub),
         )
-    sealed = nacl.bindings.crypto_box_seal(key_id_bytes + topic_key, pub)
+    plaintext = _e2ee_topic_id_bytes(topic_id) + b"\x00" + key_id_bytes + topic_key
+    sealed = nacl.bindings.crypto_box_seal(plaintext, pub)
     return base64.b64encode(sealed).decode("ascii")
 
 
-def _e2ee_open_envelope(envelope_b64, priv_bytes):
-    """Open a sealed envelope with our identity private key; raw bytes out."""
+def _e2ee_open_envelope(envelope_b64, priv_bytes, expected_topic_id):
+    """Open a sealed envelope with our identity private key.
+
+    Returns (key_id_bytes, topic_key). The topic_id bound inside the sealed
+    plaintext must match expected_topic_id — a mismatch is a cross-topic
+    transplant: rejected loudly and must NEVER be stored. Malformed
+    plaintext is rejected the same way.
+    """
     nacl = _require_nacl()
     pub = bytes(nacl.public.PrivateKey(priv_bytes).public_key)
     try:
@@ -846,9 +899,25 @@ def _e2ee_open_envelope(envelope_b64, priv_bytes):
     except ValueError as exc:
         raise HubError("error", "Own envelope is not valid base64 (%s)." % exc)
     try:
-        return nacl.bindings.crypto_box_seal_open(sealed, pub, priv_bytes)
+        opened = nacl.bindings.crypto_box_seal_open(sealed, pub, priv_bytes)
     except Exception as exc:
         raise HubError("error", "Failed to open own key envelope (%s)." % exc)
+    # Sealed plaintext: topic_id_bytes + b"\x00" + key_id_bytes(16) +
+    # topic_key(32). topic_ids never contain NUL, so the first NUL is the
+    # separator.
+    head, sep, rest = opened.partition(b"\x00")
+    if not sep or len(rest) != _E2EE_KEY_ID_BYTES + _E2EE_TOPIC_KEY_BYTES:
+        raise HubError(
+            "error",
+            "Own envelope has malformed sealed plaintext; refusing to store it.",
+        )
+    if head != _e2ee_topic_id_bytes(expected_topic_id):
+        raise HubError(
+            "error",
+            "Envelope rejected: it was sealed for a DIFFERENT topic "
+            "(cross-topic transplant); refusing to store it.",
+        )
+    return rest[:_E2EE_KEY_ID_BYTES], rest[_E2EE_KEY_ID_BYTES:]
 
 
 def topic_keys_dir(profile):
@@ -925,9 +994,11 @@ def _store_topic_key(profile, topic_id, key_id_hex, topic_key):
 # games are out of scope), and readers still see the server's seq.
 #
 # Entry `data` (when present) is encrypted with the SAME scheme and the same
-# key_id/msg_id; its plaintext is the canonical JSON serialization
-# (json.dumps with sort_keys=True, separators=(",", ":"))). Each encrypted
-# field gets its own fresh nonce. data=None stays null.
+# key_id, but its OWN fresh msg_id — each _e2ee_encrypt_field call mints a
+# fresh msg_id, so body and data do NOT share one. Its plaintext is the
+# canonical JSON serialization (json.dumps with sort_keys=True,
+# separators=(",", ":"))). Each encrypted field gets its own fresh nonce.
+# data=None stays null.
 #
 # READ POLICY for E2EE topics (hub read / hub sync):
 #   * body starts with "fh1." -> parse; select key by the plaintext key_id.
@@ -1042,10 +1113,12 @@ def _e2ee_parse_wire(wire, entry_ref="entry"):
     return key_id_hex, msg_id_hex, raw[:_E2EE_MSG_NONCE_BYTES], raw[_E2EE_MSG_NONCE_BYTES:]
 
 
-def _e2ee_decrypt_subject(subject_b64, topic_key):
-    """Decrypt a Phase 2 subject blob: base64(nonce[24] || ct).
+def _e2ee_decrypt_subject(subject_b64, topic_key, topic_id):
+    """Decrypt a subject blob: base64(nonce[24] || ct).
 
-    AAD is the frozen b"fh-topic-subject-v1". Raises HubError on failure.
+    AAD is the topic-bound b"fh-topic-subject-v1\\x00" + topic_id (secfix
+    F4). Raises HubError on failure — including when the blob was encrypted
+    for a different topic (cross-topic subject swap).
     """
     nacl = _require_nacl()
     try:
@@ -1057,7 +1130,7 @@ def _e2ee_decrypt_subject(subject_b64, topic_key):
     nonce, ct = raw[:_E2EE_SUBJECT_NONCE_BYTES], raw[_E2EE_SUBJECT_NONCE_BYTES:]
     try:
         pt = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
-            ct, _E2EE_SUBJECT_AAD, nonce, topic_key)
+            ct, _e2ee_subject_aad(topic_id), nonce, topic_key)
     except Exception as exc:
         raise HubError("error", "E2EE subject failed authentication (%s)." % exc)
     return pt.decode("utf-8")
@@ -1112,9 +1185,12 @@ def _e2ee_current_key(profile, topic_id, ctx):
     """Select the key to encrypt new messages under: (key_id_hex, key_bytes).
 
     Single-key keystore (the Phase 3 norm): returned directly, no extra
-    round trip. Multi-key keystore (post-rotation): the server's envelope
-    list is the source of truth for "current" — pick the newest own
-    envelope whose key_id is held locally.
+    round trip. Multi-key keystore (post-rotation): the server-advertised
+    topics.current_key_id is the source of truth for "current", read from
+    the topic record — NEVER envelope recency (secfix F1: created_at is
+    forgeable via re-POST, so electing by it lets an attacker downgrade a
+    victim to a removed member's key or hijack encryption to an attacker
+    key).
     """
     topic_id = str(topic_id)
     keys = _load_topic_keys(profile, topic_id)
@@ -1130,20 +1206,17 @@ def _e2ee_current_key(profile, topic_id, ctx):
     if len(keys) == 1:
         key_id_hex = next(iter(keys))
         return key_id_hex, keys[key_id_hex]
-    resp = ctx.client.call(
-        "GET", "/v1/topics/%s/envelopes" % urlparse.quote(topic_id, safe=""))
-    envs = [e for e in _as_list(resp, "envelopes") if isinstance(e, dict)]
-    envs.sort(key=lambda e: e.get("created_at") or "")
-    for env in reversed(envs):
-        key_id_hex = env.get("key_id")
-        if key_id_hex in keys:
-            return key_id_hex, keys[key_id_hex]
+    topic = _fetch_topic_record(ctx.client, topic_id)
+    current = topic.get("current_key_id")
+    if isinstance(current, str) and current in keys:
+        return current, keys[current]
     raise HubError(
         "error",
-        "Cannot post to E2EE topic %s: the local keystore holds %d keys but "
-        "none matches a current server envelope. Re-fetch your envelope "
-        "(see `hub key-request`) and retry; nothing was posted."
-        % (topic_id, len(keys)),
+        "Cannot post to E2EE topic %s: the server-advertised current key "
+        "(…%s) is not in the local keystore (%s). Fetch your key envelope "
+        "first (`hub key-fetch --topic %s`, or `hub sync`), then retry; "
+        "nothing was posted."
+        % (topic_id, str(current)[-8:], keystore_path, topic_id),
     )
 
 
@@ -1225,9 +1298,10 @@ def _decrypt_topic_subjects(profile, topics):
     """Decrypt E2EE topic subjects in place for display (hub topics).
 
     Plaintext topics are untouched. For E2EE topics the subject is the
-    Phase 2 blob base64(nonce || XChaCha20(subject, aad=b"fh-topic-subject-v1")).
-    Any locally held key is tried (subjects stay under their original key
-    across rotations); when no key decrypts it, the subject shows as
+    blob base64(nonce || XChaCha20(subject, aad=b"fh-topic-subject-v1\\x00"
+    + topic_id)) — the AAD binds the topic id (secfix F4). Any locally
+    held key is tried (subjects stay under their original key across
+    rotations); when no key decrypts it, the subject shows as
     "[encrypted]" — a failed decrypt is indistinguishable from a missing
     key, so both map to the placeholder rather than a loud error.
     """
@@ -1245,7 +1319,7 @@ def _decrypt_topic_subjects(profile, topics):
         if isinstance(subject, str):
             for key in keystores[topic_id].values():
                 try:
-                    plaintext = _e2ee_decrypt_subject(subject, key)
+                    plaintext = _e2ee_decrypt_subject(subject, key, topic_id)
                 except HubError:
                     continue
                 break
@@ -1403,7 +1477,7 @@ def _topic_participants(ctx, topic_id):
 
 
 def _e2ee_distribute_key(ctx, topic_id, key_id_hex, key_id_bytes, topic_key, member_ids):
-    """Seal (key_id || topic_key) for every registered agent of each member.
+    """Seal (topic_id || 0x00 || key_id || topic_key) for each member's agents.
 
     Returns (posted, keyless_members, failures): posted counts envelopes;
     keyless_members had no registered agent keys (caller decides policy);
@@ -1425,7 +1499,7 @@ def _e2ee_distribute_key(ctx, topic_id, key_id_hex, key_id_bytes, topic_key, mem
             continue
         for entry in agents:
             label = entry["agent_label"]
-            envelope = _e2ee_seal_envelope(key_id_bytes, topic_key, entry["public_key"])
+            envelope = _e2ee_seal_envelope(topic_id, key_id_bytes, topic_key, entry["public_key"])
             try:
                 ctx.client.call(
                     "POST",
@@ -1450,9 +1524,11 @@ def _e2ee_refresh_own_keys(client, profile, topic_id, quiet=True):
     opportunistic refresh) a missing identity key, a failed fetch, or an
     unopenable envelope is skipped silently — `hub key-fetch` is the loud,
     explicit path (quiet=False re-raises). An envelope whose sealed key_id
-    does not match its advertised key_id is NEVER stored.
+    does not match its advertised key_id, or whose bound topic_id does not
+    match this topic (cross-topic transplant), is NEVER stored.
     """
     _require_nacl()
+    topic_id = str(topic_id)
     try:
         priv = _load_identity_key(agent_key_path(profile))
     except HubError:
@@ -1461,7 +1537,7 @@ def _e2ee_refresh_own_keys(client, profile, topic_id, quiet=True):
         return []
     try:
         resp = client.call(
-            "GET", "/v1/topics/%s/envelopes" % urlparse.quote(str(topic_id), safe="")
+            "GET", "/v1/topics/%s/envelopes" % urlparse.quote(topic_id, safe="")
         )
     except HubError:
         if not quiet:
@@ -1476,14 +1552,13 @@ def _e2ee_refresh_own_keys(client, profile, topic_id, quiet=True):
         if not kid or not isinstance(kid, str) or kid in known:
             continue
         try:
-            opened = _e2ee_open_envelope(env.get("envelope") or "", priv)
+            kid_bytes, key = _e2ee_open_envelope(env.get("envelope") or "", priv, topic_id)
         except HubError:
             if not quiet:
                 raise
-            continue  # sealed to a different (e.g. superseded) identity key
-        if len(opened) != _E2EE_KEY_ID_BYTES + _E2EE_TOPIC_KEY_BYTES:
+            # Sealed to a different (e.g. superseded) identity key,
+            # transplanted from another topic, or malformed: never store.
             continue
-        kid_bytes, key = opened[:_E2EE_KEY_ID_BYTES], opened[_E2EE_KEY_ID_BYTES:]
         if kid_bytes.hex() != kid or len(key) != _E2EE_TOPIC_KEY_BYTES:
             continue  # key_id binding mismatch: never store a mislabeled key
         _merge_topic_key(profile, topic_id, kid, key)
@@ -1636,10 +1711,24 @@ def cmd_topic_rekey(args, transport):
        including agents that haven't fetched the new key yet.
     Members with no registered keys get a visible pending notice instead of
     an envelope — never silent.
+
+    Rotation is an owner/parent privilege (secfix F1): the server rejects a
+    new key_id from anyone else with 403, and this command fails loudly
+    BEFORE generating anything when the caller's role is not owner/parent.
     """
     ctx = _ctx(args, transport)
     _require_nacl()
     topic = _e2ee_require_topic(ctx, args.topic)
+    me = ctx.client.call("GET", "/v1/me")
+    me = me if isinstance(me, dict) else {}
+    if me.get("role") not in ("owner", "parent"):
+        raise HubError(
+            "forbidden",
+            "Only an owner or parent may rotate an E2EE topic's key "
+            "(your role: %s). Ask an owner/parent to run `hub topic-rekey`. "
+            "Nothing was generated and nothing was posted."
+            % (me.get("role") or "unknown"),
+        )
     old_key_id_hex, _old_key = _e2ee_current_key(ctx.profile, args.topic, ctx)
     priv = _load_identity_key(agent_key_path(ctx.profile))
 
@@ -1679,8 +1768,9 @@ def cmd_topic_rekey(args, transport):
             "Round-trip check failed: our own envelope for the new key is missing "
             "server-side. The new key was NOT stored.",
         )
-    opened = _e2ee_open_envelope(mine[0].get("envelope") or "", priv)
-    if opened != new_key_id_bytes + new_key:
+    opened_kid, opened_key = _e2ee_open_envelope(
+        mine[0].get("envelope") or "", priv, str(args.topic))
+    if opened_kid != new_key_id_bytes or opened_key != new_key:
         raise HubError(
             "error",
             "Round-trip check failed: our own envelope does not open to the new "
@@ -1689,8 +1779,6 @@ def cmd_topic_rekey(args, transport):
 
     key_path = _merge_topic_key(ctx.profile, args.topic, new_key_id_hex, new_key)
 
-    me = ctx.client.call("GET", "/v1/me")
-    me = me if isinstance(me, dict) else {}
     actor_name = me.get("name") or me.get("id") or "a member"
     actor_id = me.get("id") or ""
     body = (
@@ -2626,6 +2714,12 @@ def _print_recovery_phrase(priv_bytes):
 # values are stored in the backup file so restore always re-derives with
 # the same parameters.
 _BACKUP_KDF = "argon2id"
+# F5: Argon2 parameters arrive inside the backup file, so a tampered file
+# could otherwise force a giant allocation (OOM). Clamp to libsodium's
+# minimums at the floor and 1 GiB / 64 passes at the ceiling — far above
+# the MODERATE parameters _encrypt_key_backup writes (3 passes, 256 MiB).
+_BACKUP_KDF_OPSLIMIT_MAX = 64
+_BACKUP_KDF_MEMLIMIT_MAX = 1 << 30
 
 
 def _encrypt_key_backup(priv_bytes, password):
@@ -2663,9 +2757,33 @@ def _decrypt_key_backup(blob, password):
         raise HubError("bad_request", "Backup file is malformed.")
     if len(salt) != nacl.pwhash.argon2id.SALTBYTES:
         raise HubError("bad_request", "Backup file is malformed (bad salt).")
-    key = nacl.pwhash.argon2id.kdf(
-        32, password.encode("utf-8"), salt, opslimit=ops, memlimit=mem
-    )
+    # F5: clamp the KDF parameters read from the file — unbounded values
+    # would let a tampered backup force a huge allocation (OOM). Out of
+    # bounds is a loud HubError, never a crash.
+    ops_min = nacl.pwhash.argon2id.OPSLIMIT_MIN
+    mem_min = nacl.pwhash.argon2id.MEMLIMIT_MIN
+    if not (ops_min <= ops <= _BACKUP_KDF_OPSLIMIT_MAX):
+        raise HubError(
+            "bad_request",
+            "Backup file is malformed (opslimit %d out of bounds [%d, %d]); "
+            "refusing to derive a key from it."
+            % (ops, ops_min, _BACKUP_KDF_OPSLIMIT_MAX),
+        )
+    if not (mem_min <= mem <= _BACKUP_KDF_MEMLIMIT_MAX):
+        raise HubError(
+            "bad_request",
+            "Backup file is malformed (memlimit %d out of bounds [%d, %d]); "
+            "refusing to derive a key from it."
+            % (mem, mem_min, _BACKUP_KDF_MEMLIMIT_MAX),
+        )
+    try:
+        key = nacl.pwhash.argon2id.kdf(
+            32, password.encode("utf-8"), salt, opslimit=ops, memlimit=mem
+        )
+    except Exception as exc:
+        # Allocation (or other libsodium) failure surfaces as a HubError,
+        # never a crash.
+        raise HubError("error", "Backup key derivation failed (%s)." % exc)
     try:
         priv = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(ct, None, nonce, key)
     except Exception:
@@ -3624,13 +3742,18 @@ def _cmd_new_topic_e2ee(args, ctx, members):
        `hub key-init` guidance when it doesn't. Never auto-generated here.
     2. Generate the 32-byte topic key + random 128-bit key_id locally.
     3. Encrypt the subject (XChaCha20-Poly1305, nonce prepended, base64) and
-       POST the topic with e2ee=1. The subject is opaque to the server.
-    4. Read back the authoritative participant list (the server auto-adds the
+       POST the topic with e2ee=1 and initial_key_id (secfix F1: the server
+       records it as topics.current_key_id, the election source of truth).
+       The subject is opaque to the server.
+    4. Re-encrypt the subject with the topic-bound AAD (now that the
+       server-generated topic id is known) and PATCH it immediately
+       (secfix F4).
+    5. Read back the authoritative participant list (the server auto-adds the
        creator, and parents_only auto-adds grownups) and seal one envelope per
        participant agent from the key directory.
-    5. Fetch our own envelope back and decrypt it: proves the server stored
+    6. Fetch our own envelope back and decrypt it: proves the server stored
        what we sealed and that our private key opens it (round-trip check).
-    6. Persist key_id -> topic key at 0600 under topic_keys/<topic_id>.json.
+    7. Persist key_id -> topic key at 0600 under topic_keys/<topic_id>.json.
 
     The topic key never leaves the machine except inside sealed envelopes and
     is registered with note_secret() so it can never reach stdout/stderr.
@@ -3651,6 +3774,10 @@ def _cmd_new_topic_e2ee(args, ctx, members):
     _note_topic_key_secrets(topic_key)
     key_id_bytes = os.urandom(_E2EE_KEY_ID_BYTES)
     key_id_hex = key_id_bytes.hex()
+    # Provisional subject: the topic id is server-generated and not known
+    # yet, so it cannot be bound into the AAD at create time. This blob is
+    # replaced by the topic-bound PATCH in step 4, before any envelope is
+    # distributed or any key is stored locally.
     enc_subject = _e2ee_encrypt_subject(subject, topic_key)
 
     topic = ctx.client.call(
@@ -3662,6 +3789,7 @@ def _cmd_new_topic_e2ee(args, ctx, members):
             "participant_member_ids": members,
             "parents_only": bool(args.parents_only),
             "e2ee": 1,
+            "initial_key_id": key_id_hex,
         },
     )
     if not isinstance(topic, dict) or not isinstance(topic.get("topic"), dict):
@@ -3673,6 +3801,25 @@ def _cmd_new_topic_e2ee(args, ctx, members):
     if not topic_id:
         raise HubError("error", "Server did not return a topic id.")
     quoted_tid = urlparse.quote(str(topic_id), safe="")
+
+    # F4: bind topic_id into the subject AAD now that it is known. A
+    # failed PATCH aborts loudly BEFORE any envelope is distributed or any
+    # key stored locally — the topic is left for the user to delete/retry.
+    bound_subject = _e2ee_encrypt_subject(subject, topic_key, topic_id)
+    try:
+        ctx.client.call(
+            "PATCH",
+            "/v1/topics/%s/subject" % quoted_tid,
+            json_body={"subject": bound_subject},
+        )
+    except HubError as exc:
+        raise HubError(
+            "error",
+            "Created E2EE topic %s but the topic-bound subject PATCH failed "
+            "(%s). The topic key was NOT stored locally and no envelopes "
+            "were distributed; delete the topic and retry once the cause "
+            "is fixed." % (topic_id, exc),
+        )
 
     me = ctx.client.call("GET", "/v1/me")
     if not isinstance(me, dict) or not me.get("id"):
@@ -3704,7 +3851,7 @@ def _cmd_new_topic_e2ee(args, ctx, members):
             pub_b64 = entry.get("public_key") or ""
             if not label or not pub_b64:
                 continue
-            envelope = _e2ee_seal_envelope(key_id_bytes, topic_key, pub_b64)
+            envelope = _e2ee_seal_envelope(topic_id, key_id_bytes, topic_key, pub_b64)
             try:
                 ctx.client.call(
                     "POST",
@@ -3747,8 +3894,9 @@ def _cmd_new_topic_e2ee(args, ctx, members):
             "Round-trip check failed: our own envelope for topic %s is missing "
             "server-side. The topic key is NOT stored locally." % topic_id,
         )
-    opened = _e2ee_open_envelope(own_envelopes[0].get("envelope") or "", priv)
-    if opened != key_id_bytes + topic_key:
+    opened_kid, opened_key = _e2ee_open_envelope(
+        own_envelopes[0].get("envelope") or "", priv, str(topic_id))
+    if opened_kid != key_id_bytes or opened_key != topic_key:
         raise HubError(
             "error",
             "Round-trip check failed: our own envelope for topic %s does not "

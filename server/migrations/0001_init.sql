@@ -76,6 +76,13 @@ CREATE TABLE topics(
   -- E2EE (v0.7.0+, clean slate): 1 = end-to-end encrypted topic, 0 =
   -- plaintext. Per-topic opt-in; plaintext topics behave exactly as before.
   e2ee INTEGER NOT NULL DEFAULT 0,
+  -- E2EE key election (secfix F1): the key_id (32 hex chars) of the CURRENT
+  -- topic key. Set at E2EE topic creation from the creator's initial_key_id;
+  -- afterwards only an owner/parent may introduce a new key_id (rotation),
+  -- which advances this column atomically with the envelope insert. NULL
+  -- for plaintext topics. Clients elect the encryption key from this column,
+  -- never from envelope recency (created_at is forgeable via re-POST).
+  current_key_id TEXT NULL,
   created_by TEXT NOT NULL REFERENCES members(id),
   created_at TEXT NOT NULL
 );

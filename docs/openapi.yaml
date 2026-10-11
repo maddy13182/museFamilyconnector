@@ -827,10 +827,16 @@ paths:
         subject may then arrive already encrypted (opaque to the server —
         stored as-is; up to 1024 chars of base64 ciphertext vs the usual
         200). Requires the creator's agent to have a registered identity
-        key in `agent_keys` (400 with `hub key-init` guidance otherwise).
-        After creation, distribute the topic key with POST
-        /v1/topics/{tid}/envelopes — one sealed envelope per participant
-        agent. Absent/null `e2ee` (or 0) is a plaintext topic, unchanged.
+        key in `agent_keys` (400 with `hub key-init` guidance otherwise),
+        and requires `initial_key_id` (the creator's client-generated topic
+        key id, 32 hex chars) — the server records it as
+        `topics.current_key_id`, the single source of truth clients use to
+        elect the encryption key (secfix F1). `initial_key_id` is rejected
+        on plaintext topics. After creation, distribute the topic key with
+        POST /v1/topics/{tid}/envelopes — one sealed envelope per participant
+        agent — then PATCH /v1/topics/{tid}/subject with the subject
+        re-encrypted under the topic-bound AAD (secfix F4). Absent/null
+        `e2ee` (or 0) is a plaintext topic, unchanged.
       requestBody:
         required: true
         content:
@@ -859,6 +865,12 @@ paths:
                     1 = end-to-end-encrypted topic (subject is opaque
                     ciphertext; creator must have a registered agent identity
                     key). 0 / absent = plaintext topic.
+                initial_key_id:
+                  type: string
+                  description: >
+                    Required when e2ee=1 (rejected otherwise): the creator's
+                    client-generated 128-bit topic-key id, 32 hex chars.
+                    Recorded as topics.current_key_id.
       responses:
         '201':
           description: Topic created (caller is added as participant if not listed)
@@ -927,6 +939,47 @@ paths:
                   participants:
                     type: array
                     items: { $ref: '#/components/schemas/TopicParticipantView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/subject:
+    patch:
+      tags: [e2ee]
+      operationId: patchTopicSubject
+      summary: Replace the topic subject (E2EE re-encryption step)
+      description: |
+        E2EE (secfix F4). Replaces the topic subject. Participant-only
+        (403 otherwise; 404 when the topic doesn't exist in the caller's
+        family); E2EE topics only (400 otherwise). Exists so
+        `hub new-topic --e2ee` can re-encrypt the subject with the
+        topic-bound AAD (b"fh-topic-subject-v1" + 0x00 + topic_id)
+        immediately after creation — topic ids are server-generated, so the
+        CLI cannot bind topic_id at create time. The subject is opaque to
+        the server: validated like a created E2EE subject (1..1024 chars),
+        stored as-is, never inspected or PII-scanned.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject]
+              properties:
+                subject: { type: string, minLength: 1, maxLength: 1024 }
+      responses:
+        '200':
+          description: Subject replaced
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic]
+                properties:
+                  topic: { $ref: '#/components/schemas/Topic' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1282,9 +1335,13 @@ paths:
         otherwise); the target must be a current participant AND hold an
         ACTIVE (non-superseded) registered public key (400 otherwise —
         sealing to an agent with no key on file is meaningless; they must
-        run `hub key-init` first). Re-POSTing the same
+        run `hub key-init` first). Key election (secfix F1): a key_id
+        different from the topic's current_key_id INTRODUCES a new key
+        (rotation) — allowed only for owner/parent callers (403 otherwise);
+        on success current_key_id advances atomically. Re-POSTing the same
         (topic_id, member_id, agent_label, key_id) replaces the stored
-        envelope — idempotent distribution.
+        envelope — idempotent distribution — and preserves the original
+        created_at (secfix F3).
       parameters:
         - name: tid
           in: path
@@ -1306,9 +1363,10 @@ paths:
                 envelope:
                   type: string
                   description: >
-                    Standard base64 crypto_box_seal of (key_id_bytes ||
-                    topic_key) to the target agent's X25519 public key.
-                    Opaque to the server.
+                    Standard base64 crypto_box_seal of (topic_id_bytes ||
+                    0x00 || key_id_bytes || topic_key) to the target agent's
+                    X25519 public key (secfix F2: the topic_id binding stops
+                    cross-topic envelope transplants). Opaque to the server.
       responses:
         '201':
           description: Envelope stored
@@ -1787,6 +1845,14 @@ components:
           description: >
             1 = end-to-end-encrypted topic (subject is opaque ciphertext;
             entries are ciphertext — see Phase 3). 0 = plaintext topic.
+        current_key_id:
+          type: ["string", "null"]
+          description: >
+            E2EE key election (secfix F1): the key_id of the CURRENT topic
+            key. Set at E2EE creation from initial_key_id; afterwards only an
+            owner/parent may introduce a new key_id (rotation). Null for
+            plaintext topics. Clients elect the encryption key from this
+            field, never from envelope recency.
 
     Entry:
       type: object
