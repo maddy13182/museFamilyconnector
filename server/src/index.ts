@@ -524,6 +524,91 @@ async function appendEntry(
   throw new HttpError(500, 'internal', 'Could not append entry');
 }
 
+/** One statement inside an execAtomically batch. */
+type BatchOp = { sql: string; params: (string | number | null)[] };
+
+/**
+ * F12: build an entry INSERT that computes its per-topic seq INSIDE the
+ * statement (COALESCE(MAX(seq),0)+1), so the insert can share one atomic
+ * batch with the state change it records — no read-then-write seq race and
+ * no state-without-event window. An optional HAVING pin gates the insert on
+ * a condition evaluated after the earlier statements in the same batch
+ * (e.g. "the task row actually flipped to done"), so the event is written
+ * exactly when its state change applied. Aggregate-without-GROUP-BY still
+ * yields one row for an empty topic (seq 1); a false pin yields zero rows.
+ */
+function entryInsertOp(args: {
+  topicId: string;
+  kind: string;
+  body: string;
+  auth: AuthContext;
+  data: string | null;
+  ts: string;
+  replyToSeq?: number | null;
+  pin?: string;
+  pinParams?: (string | number | null)[];
+}): BatchOp {
+  const pin = args.pin ? ` HAVING ${args.pin}` : '';
+  return {
+    sql: `INSERT INTO entries(topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body, data, reply_to_seq)
+          SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+            FROM entries WHERE topic_id = ?${pin}`,
+    params: [
+      args.topicId,
+      args.ts,
+      args.auth.member_id,
+      args.auth.agent_label,
+      args.auth.token_id,
+      args.kind,
+      args.body,
+      args.data,
+      args.replyToSeq ?? null,
+      args.topicId,
+      ...(args.pinParams ?? []),
+    ],
+  };
+}
+
+/**
+ * F12: run an atomic batch that contains entry inserts, retrying once when
+ * the batch dies on a UNIQUE/constraint violation — a concurrent writer won
+ * the same per-topic seq, and the seq subquery is re-evaluated on retry.
+ * The batch is all-or-nothing, so a failed attempt never leaves partial
+ * state behind for the retry to duplicate.
+ */
+async function execBatchWithRetry(db: DbClient, buildOps: () => BatchOp[]): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await db.execAtomically(buildOps());
+      return;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (attempt === 0 && /unique|constraint/i.test(msg)) continue; // seq race: retry
+      throw e;
+    }
+  }
+  throw new HttpError(500, 'internal', 'Could not commit batch');
+}
+
+/**
+ * F14: read an OPTIONAL JSON object body. An absent/empty body is fine ({});
+ * a present-but-malformed body is 400 — never silently swallowed.
+ */
+async function readOptionalJson(req: Request): Promise<Record<string, unknown>> {
+  const text = await req.text();
+  if (text.trim() === '') return {};
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new HttpError(400, 'bad_request', 'Request body must be valid JSON');
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new HttpError(400, 'bad_request', 'Request body must be a JSON object');
+  }
+  return body as Record<string, unknown>;
+}
+
 /** Server rule: a task cannot be done while it has open subtasks. */
 async function assertNoOpenSubtasks(db: DbClient, taskId: string): Promise<void> {
   const open = await db.queryAll(
@@ -1563,23 +1648,33 @@ async function handlePostEntry(
     }
   }
 
-  const entry = await appendEntry(db, {
-    topic_id: tid,
-    kind,
-    body: text,
-    auth,
-    data,
-    reply_to_seq: replyTo,
-  });
+  // F12: the entry and its idempotency record commit in the SAME atomic
+  // batch — a crash between the two can no longer leave an entry with no
+  // retry key (or a key pointing at nothing).
+  const ts = nowIso();
+  const ops: BatchOp[] = [
+    entryInsertOp({ topicId: tid, kind, body: text, auth, data, ts, replyToSeq: replyTo }),
+  ];
   if (idemKey !== null) {
-    await db.execAtomically([
-      {
-        sql: `INSERT OR REPLACE INTO idempotency_keys(token_id, key, entry_gseq, created_at, expires_at)
-              VALUES (?,?,?,?,?)`,
-        params: [auth.token_id, idemKey, entry['gseq'] as number, nowIso(), hoursFromNow(IDEM_TTL_HOURS)],
-      },
-    ]);
+    ops.push({
+      // gseq is located via the just-inserted row: inside the batch our own
+      // write is visible and holds the topic's max seq, so ORDER BY seq DESC
+      // LIMIT 1 pinpoints this request's entry (ts pins it further).
+      sql: `INSERT OR REPLACE INTO idempotency_keys(token_id, key, entry_gseq, created_at, expires_at)
+            SELECT ?, ?, e.gseq, ?, ?
+              FROM entries e
+             WHERE e.topic_id = ? AND e.ts = ?
+             ORDER BY e.seq DESC LIMIT 1`,
+      params: [auth.token_id, idemKey, ts, hoursFromNow(IDEM_TTL_HOURS), tid, ts],
+    });
   }
+  await execBatchWithRetry(db, () => ops);
+  // ts is generated per request, so (topic_id, ts) identifies the new row.
+  const entry = await db.queryOne(
+    `SELECT * FROM entries WHERE topic_id = ? AND ts = ? ORDER BY seq DESC LIMIT 1`,
+    [tid, ts],
+  );
+  if (!entry) throw new HttpError(500, 'internal', 'Failed to read back inserted entry');
   return json({ entry: publicEntry(entry) }, 201);
 }
 
@@ -1650,23 +1745,67 @@ async function handleCreateTask(
 
   const taskId = newId();
   const ts = nowIso();
-  await db.execAtomically([
+  // F13: task_created carries the full task fields, so the log can
+  // reconstruct task state. The F06 visibility predicate reads task_id out
+  // of this same payload — it must stay.
+  const createdData = JSON.stringify({
+    task_id: taskId,
+    title,
+    description,
+    due_at: dueAt,
+    status: 'open',
+    owner_member_id: auth.member_id,
+    assignee_member_id: assignee,
+    parent_task_id: parentTask,
+    created_by: auth.member_id,
+    created_at: ts,
+  });
+  // F12: task row + task_created event commit in the SAME batch — the audit's
+  // fault injection (event write fails) must leave no orphan task.
+  // F14: the child insert is conditional on the parent still being open, so
+  // a parent completed between validation and this batch cannot gain an
+  // open child. The event is pinned to the insert actually applying.
+  const ops: BatchOp[] = [
     {
       sql: `INSERT INTO tasks(id, topic_id, title, description, status, owner_member_id, assignee_member_id,
                               parent_task_id, due_at, result, created_by, created_at, updated_at)
-            VALUES (?,?,?,?, 'open', ?,?,?,?,?, ?,?,?)`,
-      params: [taskId, tid, title, description, auth.member_id, assignee, parentTask, dueAt, null, auth.member_id, ts, ts],
+            SELECT ?,?,?,?, 'open',?,?,?,?,?,?,?,?
+             WHERE ? IS NULL
+                OR NOT EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status IN ('done','cancelled'))`,
+      params: [
+        taskId, tid, title, description, auth.member_id, assignee, parentTask, dueAt,
+        null, auth.member_id, ts, ts, parentTask, parentTask,
+      ],
     },
-  ]);
-  await appendEntry(db, {
-    topic_id: tid,
-    kind: 'task_created',
-    body: `Task created: ${title}`,
-    auth,
-    data: JSON.stringify({ task_id: taskId, assignee_member_id: assignee, parent_task_id: parentTask }),
-  });
+    entryInsertOp({
+      topicId: tid,
+      kind: 'task_created',
+      body: `Task created: ${title}`,
+      auth,
+      data: createdData,
+      ts,
+      pin: `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND created_at = ?)`,
+      pinParams: [taskId, ts],
+    }),
+  ];
+  await execBatchWithRetry(db, () => ops);
   const task = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
-  return json({ task: publicTask(task!) }, 201);
+  if (!task) {
+    // The conditional insert refused: re-read the parent for an accurate error.
+    const p = parentTask
+      ? await db.queryOne(`SELECT status FROM tasks WHERE id = ?`, [parentTask])
+      : null;
+    const pstatus = p?.['status'] as string | undefined;
+    if (pstatus === 'done' || pstatus === 'cancelled') {
+      throw new HttpError(
+        409,
+        'parent_completed',
+        'Cannot create a subtask under a completed or cancelled parent task',
+      );
+    }
+    throw new HttpError(500, 'internal', 'Task creation did not persist');
+  }
+  return json({ task: publicTask(task) }, 201);
 }
 
 async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): Promise<Row> {
@@ -1676,8 +1815,16 @@ async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): 
   return task;
 }
 
-// GET /v1/tasks/:tid — task + its entry trail.
-async function handleGetTask(db: DbClient, auth: AuthContext, taskId: string): Promise<Response> {
+// GET /v1/tasks/:tid?after_seq=&limit= — task + its entry trail.
+// F13: the trail is one indexed SQL query (idx_entries_task_trail),
+// paginated like /history — the old code fetched 5,000 topic entries and
+// filtered by task_id in JS.
+async function handleGetTask(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+  taskId: string,
+): Promise<Response> {
   const task = await getTaskInScope(db, auth, taskId);
   const topicId = task['topic_id'] as string;
   // F06: a from_join member must not read task snapshots created before they
@@ -1691,15 +1838,25 @@ async function handleGetTask(db: DbClient, auth: AuthContext, taskId: string): P
     `SELECT history_from_seq FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
     [topicId, auth.member_id],
   );
+  const url = new URL(req.url);
+  const after = parseSeqCursor(url.searchParams.get('after_seq'));
+  const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
   const rows = await db.queryAll(
-    `SELECT * FROM entries WHERE topic_id = ? AND seq >= ? ORDER BY seq ASC LIMIT 5000`,
-    [topicId, part!['history_from_seq'] as number],
+    `SELECT * FROM entries
+      WHERE topic_id = ? AND seq > ? AND seq >= ?
+        AND json_extract(data, '$.task_id') = ?
+      ORDER BY seq ASC LIMIT ?`,
+    [topicId, after, part!['history_from_seq'] as number, taskId, limit + 1],
   );
-  const trail = rows.filter((r) => {
-    const d = parseDataField(r) as Record<string, unknown> | null;
-    return d !== null && typeof d === 'object' && (d as Record<string, unknown>)['task_id'] === taskId;
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const nextAfter = page.length > 0 ? (page[page.length - 1]['seq'] as number) : after;
+  return json({
+    task: publicTask(task),
+    trail: page.map(publicEntry),
+    has_more: hasMore,
+    next_after_seq: nextAfter,
   });
-  return json({ task: publicTask(task), trail: trail.map(publicEntry) });
 }
 
 // GET /v1/topics/:tid/tasks — list tasks in a topic.
@@ -1729,23 +1886,28 @@ async function handlePatchTask(
   const params: (string | number | null)[] = [];
   let statusChanged: string | null = null;
   let assigneeChanged: string | null | undefined;
+  // F13: fields that previously changed silently; emitted as task_updated.
+  const updatedFields: Record<string, string | null> = {};
 
   if (body['title'] !== undefined) {
     const title = reqString(body['title'], 'title', 1, 200);
     piiGuard(title); // F08: task titles are scanned too.
     sets.push('title = ?');
     params.push(title);
+    updatedFields['title'] = title;
   }
   if (body['description'] !== undefined) {
     const description = optString(body['description'], 'description', MAX_BODY);
     if (description) piiGuard(description);
     sets.push('description = ?');
     params.push(description);
+    updatedFields['description'] = description;
   }
   if (body['due_at'] !== undefined) {
     const dueAt = body['due_at'] === null ? null : reqIsoDate(body['due_at'], 'due_at');
     sets.push('due_at = ?');
     params.push(dueAt);
+    updatedFields['due_at'] = dueAt;
   }
   if (body['assignee_member_id'] !== undefined) {
     const raw = body['assignee_member_id'];
@@ -1776,31 +1938,88 @@ async function handlePatchTask(
     const fresh = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
     return json({ task: publicTask(fresh!) });
   }
+  const ts = nowIso();
   sets.push('updated_at = ?');
-  params.push(nowIso());
-  params.push(taskId);
-  await db.execAtomically([
-    { sql: `UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`, params },
-  ]);
+  params.push(ts);
+  // F14: completing via PATCH is guarded INSIDE the update — the write only
+  // applies while no open subtask exists, in the same batch as the events.
+  // The pre-check above preserves the old fast-path 409; this guard closes
+  // the race between that check and the write.
+  let where = `WHERE id = ?`;
+  const whereParams: (string | number | null)[] = [taskId];
+  const completing = statusChanged === 'done';
+  if (completing) {
+    where += ` AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled'))`;
+    whereParams.push(taskId);
+  }
+  // F12: the state change and its events commit in the SAME batch. Each event
+  // is pinned to the update actually applying (updated_at flip), so a
+  // guard-blocked completion emits no phantom events.
+  const pin = `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`;
+  const pinParams: (string | number | null)[] = [taskId, ts];
+  const ops: BatchOp[] = [
+    { sql: `UPDATE tasks SET ${sets.join(', ')} ${where}`, params: [...params, ...whereParams] },
+  ];
+  if (Object.keys(updatedFields).length > 0) {
+    ops.push(
+      entryInsertOp({
+        topicId,
+        kind: 'task_updated',
+        body: `Task updated`,
+        auth,
+        data: JSON.stringify({ task_id: taskId, ...updatedFields }),
+        ts,
+        pin,
+        pinParams,
+      }),
+    );
+  }
   if (assigneeChanged !== undefined) {
-    await appendEntry(db, {
-      topic_id: topicId,
-      kind: 'task_assigned',
-      body: assigneeChanged ? `Task assigned` : `Task unassigned`,
-      auth,
-      data: JSON.stringify({ task_id: taskId, assignee_member_id: assigneeChanged }),
-    });
+    ops.push(
+      entryInsertOp({
+        topicId,
+        kind: 'task_assigned',
+        body: assigneeChanged ? `Task assigned` : `Task unassigned`,
+        auth,
+        data: JSON.stringify({ task_id: taskId, assignee_member_id: assigneeChanged }),
+        ts,
+        pin,
+        pinParams,
+      }),
+    );
   }
   if (statusChanged) {
-    await appendEntry(db, {
-      topic_id: topicId,
-      kind: 'task_status',
-      body: `Task status → ${statusChanged}`,
-      auth,
-      data: JSON.stringify({ task_id: taskId, status: statusChanged }),
-    });
+    ops.push(
+      entryInsertOp({
+        topicId,
+        kind: 'task_status',
+        body: `Task status → ${statusChanged}`,
+        auth,
+        data: JSON.stringify({ task_id: taskId, status: statusChanged }),
+        ts,
+        pin,
+        pinParams,
+      }),
+    );
   }
+  await execBatchWithRetry(db, () => ops);
   const updated = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
+  if (completing && updated!['status'] !== 'done') {
+    // The atomic guard refused the completion after the pre-check passed
+    // (a subtask was created in between): confirm for an accurate 409.
+    const open = await db.queryAll(
+      `SELECT id FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled')`,
+      [taskId],
+    );
+    if (open.length > 0) {
+      throw new HttpError(
+        409,
+        'subtasks_open',
+        `Cannot complete task: ${open.length} subtask(s) still open`,
+      );
+    }
+    throw new HttpError(500, 'internal', 'Task completion did not apply');
+  }
   return json({ task: publicTask(updated!) });
 }
 
@@ -1836,26 +2055,51 @@ async function handleTaskDone(
 ): Promise<Response> {
   const task = await getTaskInScope(db, auth, taskId);
   const topicId = task['topic_id'] as string;
-  const body = await readJson(req).catch((): Record<string, unknown> => ({}));
+  // F14: an absent body is fine; malformed JSON is 400 (no longer swallowed).
+  const body = await readOptionalJson(req);
   const result = reqJsonData(body['result'], 'result', MAX_DATA);
   // F08: completion results (JSON) are scanned too — string leaves, recursively.
   if (result) piiGuardJson(JSON.parse(result));
   await assertNoOpenSubtasks(db, taskId);
   const ts = nowIso();
-  await db.execAtomically([
+  // F12+F14: the completion and its task_done event commit in the SAME
+  // batch, and the open-subtask check is part of the UPDATE itself — a
+  // subtask created between the pre-check above and this write can no longer
+  // slip through. The event is pinned to the update actually applying, so a
+  // guard-blocked completion emits no phantom task_done.
+  await execBatchWithRetry(db, () => [
     {
-      sql: `UPDATE tasks SET status = 'done', result = ?, updated_at = ? WHERE id = ?`,
-      params: [result, ts, taskId],
+      sql: `UPDATE tasks SET status = 'done', result = ?, updated_at = ? WHERE id = ?
+             AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled'))`,
+      params: [result, ts, taskId, taskId],
     },
+    entryInsertOp({
+      topicId,
+      kind: 'task_done',
+      body: `Task completed`,
+      auth,
+      data: JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
+      ts,
+      pin: `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`,
+      pinParams: [taskId, ts],
+    }),
   ]);
-  await appendEntry(db, {
-    topic_id: topicId,
-    kind: 'task_done',
-    body: `Task completed`,
-    auth,
-    data: JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
-  });
   const updated = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
+  if (updated!['status'] !== 'done') {
+    // The atomic guard refused: a subtask opened after the pre-check.
+    const open = await db.queryAll(
+      `SELECT id FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled')`,
+      [taskId],
+    );
+    if (open.length > 0) {
+      throw new HttpError(
+        409,
+        'subtasks_open',
+        `Cannot complete task: ${open.length} subtask(s) still open`,
+      );
+    }
+    throw new HttpError(500, 'internal', 'Task completion did not apply');
+  }
   return json({ task: publicTask(updated!) });
 }
 
@@ -2026,7 +2270,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       const taskId = decodeURIComponent(taskSub[1]);
       if (!taskSub[2] && (method === 'GET' || method === 'PATCH')) {
         return method === 'GET'
-          ? await handleGetTask(db, auth, taskId)
+          ? await handleGetTask(db, req, auth, taskId)
           : await handlePatchTask(db, env, req, auth, taskId);
       }
       if (taskSub[3] === 'notes' && method === 'POST') {
