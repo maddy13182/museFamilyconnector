@@ -316,6 +316,8 @@ class TestRedaction(HubTestBase):
                       {"token": secret_tok, "token_id": "tokD",
                        "member": {"id": "mD", "family_id": "cD9",
                                   "name": "Tester", "role": "member"}})
+        self.fake.add("GET", "/v1/me", 200,
+                      {"id": "mD", "name": "Tester", "role": "member"})
         self.fake.add("GET", "/v1/families", 200, {"families": []})
         rc, out, err = self.run_cli(["--debug", "circle", "join",
                                      "--code", code])
@@ -414,6 +416,8 @@ class TestRedaction(HubTestBase):
                         "email": "l@example.com"},
              "token": new_token, "token_id": "tok_1"},
         )
+        self.fake.add("GET", "/v1/me", 200,
+                      {"id": "m2", "name": "Lakshmi", "role": "parent"})
         rc, out, err = self.run_cli([
             "setup", "--server", "https://hub.example",
             "--invite", "CODE123", "--name", "Lakshmi",
@@ -862,6 +866,8 @@ class TestCircleTokens(HubTestBase):
                       {"token": "fh_JOINED_tok111", "token_id": "tokJ",
                        "member": {"id": "m7", "family_id": "c777",
                                   "name": "Tester", "role": "member"}})
+        self.fake.add("GET", "/v1/me", 200,
+                      {"id": "m7", "name": "Tester", "role": "member"})
         self.fake.add("GET", "/v1/families", 200, {"families": [
             {"id": "c777", "name": "Book Club", "kind": "general",
              "my_role": "member"}]})
@@ -880,6 +886,8 @@ class TestCircleTokens(HubTestBase):
                       {"token": "fh_INVITED_tok222", "token_id": "tokI",
                        "member": {"id": "m8", "family_id": "c888",
                                   "name": "Tester", "role": "kid"}})
+        self.fake.add("GET", "/v1/me", 200,
+                      {"id": "m8", "name": "Tester", "role": "kid"})
         self.fake.add("GET", "/v1/families", 200, {"families": [
             {"id": "c888", "name": "Gym", "kind": "general",
              "my_role": "kid"}]})
@@ -1098,6 +1106,263 @@ class TestCircleTokens(HubTestBase):
         rc, _out, err = self.run_cli(["dashboard-token", "--circle", "Friends"])
         self.assertEqual(rc, 1)
         self.assertIn("No token stored", err)
+
+
+# ---------------------------------------------------------------------------
+# Enrollment hardening: F11 (sink validation before redeem, /v1/me gate)
+# and F03 (server origin pinning, https-only, --server override flag).
+# ---------------------------------------------------------------------------
+
+
+class TestEnrollHardening(HubTestBase):
+    def redeem_calls(self):
+        return [c for c in self.fake.calls
+                if "redeem" in urlparse.urlparse(c["url"]).path
+                or "accept" in urlparse.urlparse(c["url"]).path]
+
+    def me_calls(self):
+        return [c for c in self.fake.calls
+                if urlparse.urlparse(c["url"]).path == "/v1/me"]
+
+    def block_sink_probe(self):
+        # Root-proof "unwritable" sink: .sink-probe exists as a directory,
+        # so the 0600 write probe's os.open(O_WRONLY) raises EISDIR for
+        # every user — while the profile dir and its config stay intact.
+        pdir = hub.profile_dir("default")
+        os.makedirs(pdir, exist_ok=True)
+        os.makedirs(os.path.join(pdir, ".sink-probe"), exist_ok=True)
+
+    # -- F11: setup ----------------------------------------------------
+
+    def test_setup_env_verifies_token_via_me_before_success(self):
+        new_token = "fh_SETUPME_123"
+        self.fake.add("POST", "/v1/invites/OK1/accept", 200,
+                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                       "token": new_token, "token_id": "t1"})
+        self.fake.add("GET", "/v1/me", 200, {"id": "m2", "name": "N"})
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "OK1", "--name", "N", "--label", "l",
+            "--store", "env",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("setup complete", out)
+        # the /me probe carried the NEW token, and only then did we succeed
+        self.assertEqual(len(self.me_calls()), 1)
+        self.assertEqual(self.me_calls()[0]["headers"]["Authorization"],
+                         "Bearer " + new_token)
+        self.assertNotIn(new_token, out + err)
+
+    def test_setup_me_rejected_means_code_consumed(self):
+        new_token = "fh_SETUPME_456"
+        self.fake.add("POST", "/v1/invites/OK2/accept", 200,
+                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                       "token": new_token, "token_id": "t1"})
+        self.fake.add("GET", "/v1/me", 401,
+                      {"error": {"code": "auth", "message": "bad token"}})
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "OK2", "--name", "N", "--label", "l",
+        ])
+        self.assertEqual(rc, 3)
+        self.assertIn("consumed", err)
+        self.assertIn("fresh", err)
+        self.assertNotIn("setup complete", out)
+        self.assertNotIn(new_token, out + err)
+
+    def test_setup_me_network_failure_keeps_stored_credential(self):
+        # A 500 on /v1/me is not an auth rejection: the token WAS stored,
+        # so the operator must not burn another code.
+        new_token = "fh_SETUPME_789"
+        self.fake.add("POST", "/v1/invites/OK5/accept", 200,
+                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                       "token": new_token, "token_id": "t1"})
+        self.fake.add("GET", "/v1/me", 500,
+                      {"error": {"code": "internal", "message": "boom"}})
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "OK5", "--name", "N", "--label", "l",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertIn("WAS stored", err)
+        self.assertIn("do NOT request a new code", err)
+        self.assertNotIn(new_token, out + err)
+
+    def test_setup_file_sink_unwritable_fails_before_redeem(self):
+        self.block_sink_probe()
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "CODE9", "--name", "N", "--label", "l",
+            "--store", "file",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertIn("sink", err)
+        self.assertIn("NOT been used", err)
+        self.assertEqual(self.redeem_calls(), [])
+
+    def test_setup_file_store_writes_0600_token_file(self):
+        new_token = "fh_SETUPFILE_1"
+        self.fake.add("POST", "/v1/invites/OK4/accept", 200,
+                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                       "token": new_token, "token_id": "t1"})
+        self.fake.add("GET", "/v1/me", 200, {"id": "m2"})
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "OK4", "--name", "N", "--label", "l",
+            "--store", "file",
+        ])
+        self.assertEqual(rc, 0)
+        tokfile = hub.default_token_path("default")
+        with open(tokfile) as fh:
+            self.assertEqual(fh.read().strip(), new_token)
+        mode = stat.S_IMODE(os.stat(tokfile).st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_setup_vault_cmd_missing_binary_fails_before_redeem(self):
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "CODE9", "--name", "N", "--label", "l",
+            "--store", "vault-cmd",
+            "--vault-cmd", "definitely-not-a-real-binary-xyz read t",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertIn("vault", err.lower())
+        self.assertIn("NOT been used", err)
+        self.assertEqual(self.redeem_calls(), [])
+
+    def test_setup_vault_cmd_ok_records_helper(self):
+        new_token = "fh_SETUPVAULT_1"
+        self.fake.add("POST", "/v1/invites/OK3/accept", 200,
+                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                       "token": new_token, "token_id": "t1"})
+        self.fake.add("GET", "/v1/me", 200, {"id": "m2"})
+        rc, out, err = self.run_cli([
+            "setup", "--server", "https://hub.example",
+            "--invite", "OK3", "--name", "N", "--label", "l",
+            "--store", "vault-cmd", "--vault-cmd", "echo dummy",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("setup complete", out)
+        cfg = hub.load_config("default")
+        self.assertEqual(cfg["vault_cmd"], "echo dummy")
+        self.assertNotIn(new_token, out + err)
+
+    def test_env_sink_check_preserves_existing_var(self):
+        hub._validate_env_sink()  # must not raise...
+        # ...and must leave the harness-injected value alone
+        self.assertEqual(os.environ["FAMILY_HUB_TOKEN"], FAKE_TOKEN)
+
+    # -- F11: circle join ----------------------------------------------
+
+    def test_join_verifies_token_via_me_before_success(self):
+        new_token = "fh_JOINME_1"
+        self.seed_config()
+        self.fake.add("POST", "/v1/provisioning-codes/fhp_JM1/redeem", 201,
+                      {"token": new_token, "token_id": "tJ",
+                       "member": {"id": "m7", "family_id": "c701",
+                                  "name": "Tester", "role": "member"}})
+        self.fake.add("GET", "/v1/me", 200, {"id": "m7"})
+        self.fake.add("GET", "/v1/families", 200, {"families": []})
+        rc, out, err = self.run_cli(["circle", "join", "--code", "fhp_JM1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("now active", out)
+        self.assertEqual(len(self.me_calls()), 1)
+        self.assertEqual(self.me_calls()[0]["headers"]["Authorization"],
+                         "Bearer " + new_token)
+        self.assertNotIn(new_token, out + err)
+
+    def test_join_me_rejected_means_code_consumed(self):
+        new_token = "fh_JOINME_2"
+        self.seed_config()
+        self.fake.add("POST", "/v1/provisioning-codes/fhp_JM2/redeem", 201,
+                      {"token": new_token, "token_id": "tJ",
+                       "member": {"id": "m7", "family_id": "c702",
+                                  "name": "Tester", "role": "member"}})
+        self.fake.add("GET", "/v1/me", 403,
+                      {"error": {"code": "forbidden", "message": "nope"}})
+        rc, out, err = self.run_cli(["circle", "join", "--code", "fhp_JM2"])
+        self.assertEqual(rc, 3)
+        self.assertIn("consumed", err)
+        self.assertIn("fresh", err)
+        self.assertNotIn(new_token, out + err)
+
+    def test_join_unwritable_profile_dir_fails_before_redeem(self):
+        self.seed_config()
+        self.block_sink_probe()
+        rc, out, err = self.run_cli(["circle", "join", "--code", "fhp_JM3"])
+        self.assertEqual(rc, 1)
+        self.assertIn("sink", err)
+        self.assertIn("NOT been used", err)
+        self.assertEqual(self.redeem_calls(), [])
+
+    # -- F03: server origin pinning ------------------------------------
+
+    def test_server_override_requires_flag(self):
+        self.seed_config()  # pinned https://hub.example
+        rc, out, err = self.run_cli(
+            ["--server", "https://other.example", "topics"])
+        self.assertEqual(rc, 1)
+        self.assertIn("--allow-server-override", err)
+        self.assertEqual(self.fake.calls, [])  # nothing hit the wire
+
+    def test_server_override_with_flag_warns_loudly(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        rc, out, err = self.run_cli(
+            ["--server", "https://other.example",
+             "--allow-server-override", "topics"])
+        self.assertEqual(rc, 0)
+        self.assertIn("DIFFERENT", err)
+        self.assertIn("enrolled with", err)
+        self.assertIn("https://other.example", self.fake.last_url())
+
+    def test_server_override_same_origin_is_quiet(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        rc, out, err = self.run_cli(
+            ["--server", "https://hub.example/", "topics"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("DIFFERENT", err)
+
+    def test_http_url_rejected_at_setup(self):
+        rc, out, err = self.run_cli([
+            "setup", "--server", "http://hub.example",
+            "--invite", "C", "--name", "N", "--label", "l",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertIn("https", err)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_http_url_rejected_from_config(self):
+        self.seed_config(server_url="http://hub.example")
+        rc, out, err = self.run_cli(["topics"])
+        self.assertEqual(rc, 1)
+        self.assertIn("https", err)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_validate_server_url(self):
+        hub._validate_server_url("https://hub.example")
+        hub._validate_server_url("https://hub.example:8443/path")
+        hub._validate_server_url("http://localhost:8787")
+        hub._validate_server_url("http://127.0.0.1:8787")
+        hub._validate_server_url("http://[::1]:8787")
+        for bad in ("http://hub.example", "http://192.168.1.5/",
+                    "ftp://hub.example/", "file:///etc/passwd",
+                    "https://user:pw@hub.example/", "not a url", ""):
+            with self.assertRaises(hub.HubError, msg=bad):
+                hub._validate_server_url(bad)
+
+    def test_transport_rejects_plain_http(self):
+        client = hub.HubClient("http://hub.example")
+        with self.assertRaises(hub.HubError):
+            client._urllib_transport(
+                "GET", "http://hub.example/v1/me", {}, None)
+        # loopback http passes the policy check (fails later on connect)
+        loopback = hub.HubClient("http://127.0.0.1:9")
+        with self.assertRaises(hub.HubError) as ctx:
+            loopback._urllib_transport(
+                "GET", "http://127.0.0.1:9/v1/me", {}, None)
+        self.assertEqual(ctx.exception.code, "connection")
 
 
 if __name__ == "__main__":
