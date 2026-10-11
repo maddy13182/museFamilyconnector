@@ -1,0 +1,248 @@
+# Release: on merge to main, cut a signed CLI release when the CLI version
+# in agent-skill/pyproject.toml is NEWER than the latest `cli-v*` GitHub
+# Release tag.
+#
+# Steps: build the `hub` artifact (single script; deps install from the
+# lockfile at install time, not bundled) → sha256 → sign with sigstore
+# keyless OIDC → create GitHub Release `cli-v<x.y.z>` with assets
+# `hub`, `hub.sigstore`, `manifest.json` → update server/client-manifest.json
+# in the repo and commit back to main with `[skip ci]` (so no second
+# release run fires).
+#
+# Honest limit (docs/CLIENT_HARDENING_SPEC.md §2): this hardens the
+# *supply chain*. Nothing here stops a root-level adversary on the
+# installer's machine; it stops tampered / stale / corrupt artifacts.
+#
+# This workflow cannot be fully tested without cutting a real release;
+# validate changes by dry-running the decision/build/sign steps on a
+# scratch branch before merging.
+name: Release CLI
+
+on:
+  push:
+    branches: [main]
+
+# Minimal permissions: create releases (+ push the manifest commit) and
+# mint the OIDC token that sigstore-python uses for keyless signing.
+permissions:
+  contents: write
+  id-token: write
+
+# Two merges racing must not cut two releases for the same version.
+concurrency:
+  group: cli-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: sign + publish CLI release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The manifest-commit step pushes back to main.
+          fetch-depth: 0
+
+      - name: Read CLI version (single source of truth)
+        id: cli
+        run: |
+          ver=$(python3 - <<'EOF'
+          import re, sys
+          text = open("agent-skill/pyproject.toml", encoding="utf-8").read()
+          m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+          if not m:
+              sys.exit("agent-skill/pyproject.toml has no version line")
+          print(m.group(1))
+          EOF
+          )
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Latest cli-v* release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release list --limit 50 --json tagName \
+            --jq '[.[] | .tagName | select(startswith("cli-v"))][0] // empty')
+          echo "tag=${tag:-none}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to release
+        id: decide
+        env:
+          NEW_VERSION: ${{ steps.cli.outputs.version }}
+          OLD_TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          new = os.environ["NEW_VERSION"]
+          old = os.environ["OLD_TAG"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", new):
+              raise SystemExit("refusing: CLI version %r is not semver" % new)
+          def key(v):
+              v = v.removeprefix("cli-v")
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?", v)
+              if not m:
+                  raise SystemExit("refusing: existing tag %r is not semver" % v)
+              nums = tuple(int(m.group(i)) for i in (1, 2, 3))
+              pre = m.group(4) or ""
+              # stable sorts above its own prerelease: (nums, is_stable, pre)
+              return (nums, pre == "", pre)
+          release = key(new) > key(old) if old != "none" else True
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("release=%s\n" % ("true" if release else "false"))
+          print("cli=%s latest=%s -> release=%s" % (new, old, release))
+          EOF
+
+      - name: Build the hub artifact
+        if: steps.decide.outputs.release == 'true'
+        env:
+          NEW_VERSION: ${{ steps.cli.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          # The artifact is the single script; dependencies install from the
+          # lockfile at install time and are NOT bundled.
+          cp agent-skill/hub dist/hub
+          # Stamp the release version: a single-file artifact has no adjacent
+          # pyproject.toml and no pip metadata, so without this the artifact
+          # would report 0.0.0-dev and `hub upgrade` self-test would fail.
+          # pyproject.toml stays the single source of truth; the stamp is derived.
+          python3 - "$NEW_VERSION" <<'EOF'
+          import re, sys
+          new = sys.argv[1]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", new):
+              raise SystemExit("refusing to stamp non-semver %r" % new)
+          p = "dist/hub"
+          src = open(p, encoding="utf-8").read()
+          src, n = re.subn(
+              r'^_BUILD_VERSION = None$', '_BUILD_VERSION = "%s"' % new,
+              src, count=1, flags=re.M,
+          )
+          if n != 1:
+              raise SystemExit("expected exactly one _BUILD_VERSION anchor")
+          open(p, "w", encoding="utf-8").write(src)
+          EOF
+          chmod +x dist/hub
+          python3 dist/hub --version  # smoke: the artifact must run
+          test "$(python3 dist/hub --version | grep -o '[0-9][0-9a-zA-Z.+-]*' | head -1)" = "$NEW_VERSION"
+
+      - name: Compute sha256
+        if: steps.decide.outputs.release == 'true'
+        id: sha
+        run: |
+          sum=$(sha256sum dist/hub | cut -d' ' -f1)
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+
+      - name: Sign with sigstore (keyless OIDC)
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          pip install --quiet "sigstore>=3.0,<4.0"
+          python3 -m sigstore sign --bundle dist/hub.sigstore dist/hub
+
+      - name: Write release manifest.json
+        if: steps.decide.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.cli.outputs.version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          python3 - <<'EOF'
+          import datetime, json, os
+          version = os.environ["VERSION"]
+          sha = os.environ["SHA256"]
+          manifest = {
+              "version": version,
+              "sha256": sha,
+              "files": {"hub": sha},
+              "signature": "hub.sigstore",
+              # The exact Fulcio certificate identity the CLI pins when it
+              # verifies `hub.sigstore` (see `hub upgrade` / INSTALL.md).
+              "identity": {
+                  "issuer": "https://token.actions.githubusercontent.com",
+                  "identity": (
+                      "https://github.com/maddy13182/museFamilyconnector"
+                      "/.github/workflows/release.yml@refs/heads/main"
+                  ),
+              },
+              "released_at": datetime.datetime.now(
+                  datetime.timezone.utc
+              ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open("dist/manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          EOF
+
+      - name: Create GitHub Release
+        if: steps.decide.outputs.release == 'true'
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.cli.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="cli-v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "release $tag already exists; not recreating"
+            exit 0
+          fi
+          gh release create "$tag" dist/hub dist/hub.sigstore dist/manifest.json \
+            --title "Family Hub CLI v${VERSION}" \
+            --notes "Signed CLI release. Before installing: download all three assets, verify the sigstore signature, verify the sha256 against manifest.json, then install — see agent-skill/INSTALL.md."
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Update server/client-manifest.json
+        if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
+        env:
+          VERSION: ${{ steps.cli.outputs.version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          python3 - <<'EOF'
+          import datetime, json, os
+          path = "server/client-manifest.json"
+          prev = {}
+          if os.path.exists(path):
+              with open(path, encoding="utf-8") as fh:
+                  prev = json.load(fh)
+          version = os.environ["VERSION"]
+          manifest = {
+              "version": version,
+              # Never raise the floor automatically: the deploy runbook raises
+              # min_cli_version deliberately, after the fleet has upgraded
+              # (see docs/CLIENT_HARDENING_SPEC.md §7).
+              "min_cli_version": prev.get("min_cli_version", "0.0.0"),
+              "download_url": (
+                  "https://github.com/maddy13182/museFamilyconnector"
+                  "/releases/download/cli-v%s/hub" % version
+              ),
+              "sha256": os.environ["SHA256"],
+              "released_at": datetime.datetime.now(
+                  datetime.timezone.utc
+              ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          EOF
+
+      - name: Commit manifest back to main
+        if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
+        env:
+          VERSION: ${{ steps.cli.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add server/client-manifest.json
+          if git diff --cached --quiet; then
+            echo "no manifest change to commit"
+            exit 0
+          fi
+          # [skip ci]: the manifest commit must NOT trigger a second release
+          # run (nor any other workflow).
+          git commit -m "chore: client manifest for CLI v${VERSION} [skip ci]"
+          git push

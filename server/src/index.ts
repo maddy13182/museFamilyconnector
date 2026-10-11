@@ -52,6 +52,10 @@ import { UI_HTML } from './ui.js';
 // version independently (docs/VERSIONING.md).
 import pkg from '../package.json' with { type: 'json' };
 const SERVER_VERSION: string = pkg.version;
+// B2: repo-controlled CLI release manifest (server/client-manifest.json).
+// Bundled at build time = loaded at worker startup; no D1 read on the hot
+// path. The release workflow is the only writer.
+import clientManifest from '../client-manifest.json' with { type: 'json' };
 
 const MAX_BODY = 20000;
 const MAX_DATA = 20000;
@@ -161,6 +165,11 @@ function isUniqueViolation(e: unknown): boolean {
 // Workers Logs): method, path (redacted), status, code (string literal from
 // HttpError), ms, event-specific static strings. Do NOT add headers, bodies,
 // tokens, codes, emails, names, or message content.
+// EXCEPTION: key-lineage audit events (agent_key_registered,
+// agent_key_rotated, token_revoked) additionally carry key_fp (a fingerprint
+// of the PUBLIC key only — not secret), agent_label, member_id, and
+// family_id per the client-hardening spec §3 B3, so any message can be traced
+// end-to-end via key fp → agent_label → member_id → circle_id.
 type LogLevel = 'info' | 'warn' | 'error';
 
 export function logEvent(
@@ -703,11 +712,92 @@ async function assertNoOpenSubtasks(db: DbClient, taskId: string): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
+// Client version gate (B1) + key fingerprints (B3).
+// ---------------------------------------------------------------------------
+
+const CLI_UA_RE = /^family-hub-agent\/(\S+)$/;
+// Legacy sentinel: the hardcoded UA string that predated real versioning —
+// always treated as 0.0.0 (below any minimum) when the gate is on.
+const LEGACY_CLI_UA_VERSION = '1.0';
+
+type Semver = [number, number, number];
+
+/** Strict x.y.z parse; null when the string is not a semver. */
+function parseSemver(v: string): Semver | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v.trim());
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function compareSemver(a: Semver, b: Semver): number {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Reject CLI clients below the configured minimum version. Rules:
+ * - The exact legacy string `family-hub-agent/1.0` is a sentinel → 0.0.0.
+ * - Requests WITHOUT a `family-hub-agent` UA (browser dashboard, curl) are
+ *   never gated.
+ * - Default MIN_CLI_VERSION "0.0.0" = gate off.
+ * - Unparseable versions fail closed (treated as 0.0.0): a client that
+ *   cannot prove its version is treated as outdated.
+ * Called for /v1/... requests EXCEPT /v1/health and /v1/client/latest —
+ * an outdated client must always be able to reach liveness checks and the
+ * upgrade metadata (`hub upgrade` reads /v1/client/latest) it needs in
+ * order to update.
+ */
+function gateClientVersion(req: Request, env: Env): void {
+  const ua = req.headers.get('user-agent');
+  if (!ua) return;
+  const m = CLI_UA_RE.exec(ua.trim());
+  if (!m) return; // not a hub agent — browser dashboard, curl, uptime checks.
+  const raw = m[1] === LEGACY_CLI_UA_VERSION ? '0.0.0' : m[1];
+  const minRaw = (env.MIN_CLI_VERSION ?? '0.0.0').trim() || '0.0.0';
+  const client: Semver = parseSemver(raw) ?? [0, 0, 0];
+  const min: Semver = parseSemver(minRaw) ?? [0, 0, 0];
+  if (compareSemver(client, min) < 0) {
+    throw new HttpError(
+      400,
+      'client_too_old',
+      `Client version ${raw} is below the required minimum ${minRaw}. ` +
+        'Update your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry.',
+    );
+  }
+}
+
+/**
+ * Key fingerprint (B3): first 16 hex chars of SHA-256(public_key), prefixed
+ * `fp:`. Computed over the stored base64 representation. Public keys are
+ * public, so the fingerprint is safe for the audit log.
+ */
+async function keyFingerprint(publicKey: string): Promise<string> {
+  return 'fp:' + (await sha256hex(publicKey)).slice(0, 16);
+}
+
+// ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
 
 async function handleHealth(): Promise<Response> {
   return json({ ok: true, version: SERVER_VERSION });
+}
+
+// B2: GET /v1/client/latest — the CLI release the deployed server knows
+// about, sourced from the repo-controlled server/client-manifest.json
+// (bundled at build time; no D1 read on the hot path; the release workflow
+// is the only writer). Public: `hub upgrade` reads this before/without a
+// token, and the client version gate never blocks it.
+async function handleClientLatest(): Promise<Response> {
+  return json({
+    version: clientManifest.version,
+    min_cli_version: clientManifest.min_cli_version,
+    download_url: clientManifest.download_url,
+    sha256: clientManifest.sha256,
+    released_at: clientManifest.released_at,
+  });
 }
 
 // POST /v1/families — bootstrap when unlocked; hub-owner circle creation
@@ -1616,6 +1706,17 @@ async function handleRedeemProvisioning(
       409,
     );
   }
+  if (agentPublicKey) {
+    // B3: key registration audit — key fp → agent_label → member_id → circle.
+    // The conditional key INSERT above fired exactly when this redeem won
+    // (verified by redeemed_token_id), so the key is now registered.
+    logEvent('info', 'agent_key_registered', {
+      key_fp: await keyFingerprint(agentPublicKey),
+      agent_label: pc['agent_label'] as string,
+      member_id: pc['member_id'] as string,
+      family_id: member['family_id'] as string,
+    });
+  }
   return json({ token, token_id: tokenId, member: publicMember(member) }, 201);
 }
 
@@ -1661,6 +1762,13 @@ async function handleAgentKeyRotate(
   const agentPublicKey = reqAgentPublicKey(body['agent_public_key'], 'agent_public_key');
   const ts = nowIso();
   const keyId = newId();
+  // B3: read the current active key BEFORE superseding it, so rotation can
+  // audit old fp → new fp (no prior key = initial registration).
+  const prior = await db.queryOne(
+    `SELECT public_key FROM agent_keys
+      WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+    [auth.member_id, auth.agent_label],
+  );
   await db.execAtomically([
     {
       sql: `UPDATE agent_keys SET superseded_at = ?
@@ -1673,6 +1781,25 @@ async function handleAgentKeyRotate(
       params: [keyId, auth.member_id, auth.agent_label, agentPublicKey, ts],
     },
   ]);
+  const newFp = await keyFingerprint(agentPublicKey);
+  if (prior) {
+    // B3: rotation — old fp → new fp, chained to agent/member/circle.
+    logEvent('info', 'agent_key_rotated', {
+      old_key_fp: await keyFingerprint(prior['public_key'] as string),
+      key_fp: newFp,
+      agent_label: auth.agent_label,
+      member_id: auth.member_id,
+      family_id: auth.family_id,
+    });
+  } else {
+    // B3: initial registration via `hub key-init`.
+    logEvent('info', 'agent_key_registered', {
+      key_fp: newFp,
+      agent_label: auth.agent_label,
+      member_id: auth.member_id,
+      family_id: auth.family_id,
+    });
+  }
   return json({
     member_id: auth.member_id,
     agent_label: auth.agent_label,
@@ -1900,6 +2027,21 @@ async function handleRevoke(
       params: [now, tokenId],
     },
   ]);
+  // B3: revocation audit — the active key fingerprint for the revoked
+  // token's (member_id, agent_label), so the trail
+  // key fp → agent_label → member_id → circle_id stays complete through
+  // revocation. null when the agent never registered an identity key.
+  const activeKey = await db.queryOne(
+    `SELECT public_key FROM agent_keys
+      WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+    [target['member_id'] as string, target['agent_label'] as string],
+  );
+  logEvent('info', 'token_revoked', {
+    key_fp: activeKey ? await keyFingerprint(activeKey['public_key'] as string) : null,
+    agent_label: target['agent_label'] as string,
+    member_id: target['member_id'] as string,
+    family_id: target['fam'] as string,
+  });
   return json({ ok: true });
 }
 
@@ -2958,11 +3100,19 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
   const method = req.method.toUpperCase();
 
   try {
+    // B1: client version gate on API requests. Exempt: /v1/health and
+    // /v1/client/latest — an outdated client must always reach liveness
+    // checks and the upgrade metadata it needs in order to update.
+    if (path.startsWith('/v1/') && path !== '/v1/health' && path !== '/v1/client/latest') {
+      gateClientVersion(req, env);
+    }
+
     // Public: web UI + health.
     if (path === '/' && method === 'GET') {
       return new Response(UI_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
     }
     if (path === '/v1/health' && method === 'GET') return await handleHealth();
+    if (path === '/v1/client/latest' && method === 'GET') return await handleClientLatest();
 
     // Public: bootstrap + invite/provisioning redemption (code is the credential).
     // The two redemption endpoints are rate-limited per IP: they are the only

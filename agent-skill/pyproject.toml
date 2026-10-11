@@ -1,0 +1,24 @@
+# Single source of truth for the Family Hub CLI version (contract C6,
+# docs/VERSIONING.md). `agent-skill/hub` reads its version from this file
+# (or from installed package metadata) — never hardcode it elsewhere.
+#
+# The release artifact is the single `hub` file distributed via GitHub
+# Releases (see docs/CLIENT_HARDENING_SPEC.md §3 WS-C); this file is the
+# version registry + dependency declaration, not the distribution channel.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "family-hub-cli"
+version = "0.8.0"
+description = "Family Hub agent CLI (the `hub` single-file script)"
+requires-python = ">=3.9"
+dependencies = [
+    "PyNaCl==1.6.2",
+    "mnemonic==0.21",
+]
+
+[project.urls]
+Repository = "https://github.com/maddy13182/museFamilyconnector"

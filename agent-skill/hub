@@ -37,7 +37,7 @@ falling back to the single-token chain above when a circle has no stored
 token (bootstrap-family backwards compatibility).
 
 Python 3. The E2EE key commands (`key-init`, `key-backup`, `key-restore`,
-and key generation during `setup`) need PyNaCl + the `mnemonic` package
+`key-wrap`, and key generation during `setup`) need PyNaCl + the `mnemonic` package
 (pinned in agent-skill/requirements.txt); everything else is standard
 library only, and every non-key command keeps working when PyNaCl is
 missing.
@@ -46,6 +46,7 @@ missing.
 import argparse
 import base64
 import getpass
+import hashlib
 import http.client
 import json
 import os
@@ -57,13 +58,82 @@ import socket
 import stat
 import subprocess  # nosec B404 -- used only for the operator-configured vault helper (shell=False)
 import sys
+import tempfile
 import time
 import uuid
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.7.0"
+
+def _script_dir():
+    """Directory containing the `hub` script itself."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_toml_version():
+    """Version from the `pyproject.toml` next to the script, or None."""
+    try:
+        with open(
+            os.path.join(_script_dir(), "pyproject.toml"), "r", encoding="utf-8"
+        ) as f:
+            toml_text = f.read()
+    except OSError:
+        return None
+    match = re.search(r'^version\s*=\s*"([^"]+)"', toml_text, re.M)
+    return match.group(1) if match else None
+
+
+def _installed_version():
+    """Installed `family-hub-cli` package version, or None when the CLI was
+    not installed via pip (single-file / dev checkout)."""
+    try:
+        from importlib import metadata
+
+        return metadata.version("family-hub-cli")
+    except Exception:  # noqa: BLE001 -- expected outside pip installs
+        return None
+
+
+# Set at release-build time by .github/workflows/release.yml. A released
+# single-file artifact has no adjacent pyproject.toml and no pip metadata,
+# so the build stamps the version here. pyproject.toml remains the single
+# source of truth; the stamp is derived from it at build time.
+_BUILD_VERSION = None
+
+
+def _cli_version():
+    """CLI version, read from the single source of truth (contract C6).
+
+    `agent-skill/pyproject.toml` owns the version. A release-stamped build
+    reports its stamp; when installed as the `family-hub-cli` package,
+    installed metadata wins; otherwise the TOML next to the script is read
+    (dev checkout / single-file install).
+    "0.0.0-dev" only when none is available.
+    """
+    if _BUILD_VERSION:
+        return _BUILD_VERSION
+    return _installed_version() or _read_toml_version() or "0.0.0-dev"
+
+
+def _skill_version():
+    """Skill version from the `<!-- SKILL VERSION: x.y.z -->` header of
+    SKILL.md next to the script. Kept in lockstep with the CLI version;
+    "unknown" only when the header or the file is missing (dev checkout)."""
+    try:
+        with open(
+            os.path.join(_script_dir(), "SKILL.md"), "r", encoding="utf-8"
+        ) as f:
+            head = f.read(2048)
+    except OSError:
+        return "unknown"
+    match = re.search(r"<!--\s*SKILL VERSION:\s*([0-9A-Za-z.\-+]+)\s*-->", head)
+    return match.group(1) if match else "unknown"
+
+
+VERSION = _cli_version()
+SKILL_VERSION = _skill_version()
+
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -2603,7 +2673,13 @@ def _decrypt_entries_for_display(client, profile, entries, e2ee_flags=None):
 
 
 def _load_identity_key(path):
-    """Load and validate the 32-byte private key; HubError when unusable."""
+    """Load and validate the 32-byte private key; HubError when unusable.
+
+    Auto-detects the passphrase-wrapped form (FHWRAP1 magic header) and
+    unwraps it, sourcing the passphrase from FAMILY_HUB_KEY_PASSPHRASE or
+    an interactive getpass prompt (see `hub key-wrap`). Legacy unwrapped
+    keys keep working but emit a loud deprecation warning on every use.
+    """
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -2625,6 +2701,17 @@ def _load_identity_key(path):
             )
     except OSError:
         pass
+    if data.startswith(_KEYWRAP_MAGIC):
+        priv = _unwrap_identity_key(data)
+        _note_key_secrets(priv)
+        return priv
+    emit_err(
+        "warning: identity key at %s is stored UNWRAPPED on disk — anyone "
+        "who can read this file can impersonate this agent's E2EE identity. "
+        "Run `hub key-wrap` to encrypt it with a passphrase, then export "
+        "FAMILY_HUB_KEY_PASSPHRASE=<passphrase> for non-interactive use "
+        "(cron, agents). See agent-skill/INSTALL.md." % path
+    )
     if len(data) != 32:
         raise HubError(
             "config",
@@ -2794,6 +2881,236 @@ def _decrypt_key_backup(blob, password):
 
 
 # ---------------------------------------------------------------------------
+# Key wrapping at rest (passphrase-encrypted agent.key; `hub key-wrap`)
+#
+# Migrates an unwrapped 32-byte agent.key to the wrapped form:
+#
+#   FHWRAP1\n || salt(16) || nonce(24) || ciphertext
+#
+# where ciphertext is the 32-byte private key encrypted with
+# XChaCha20-Poly1305 (IETF) under a 32-byte key derived from the
+# operator's passphrase with Argon2id (libsodium MODERATE ops/mem limits,
+# frozen by this format — there is no parameter field, so wrap and unwrap
+# always use the same constants). Every primitive comes from
+# PyNaCl/libsodium; no custom constructions. A wrong passphrase fails the
+# Poly1305 MAC and surfaces as a clean "Incorrect passphrase" HubError —
+# never garbage bytes.
+#
+# Passphrase sourcing, in order:
+#   1. FAMILY_HUB_KEY_PASSPHRASE env var (agents/cron — non-interactive),
+#   2. interactive getpass prompt (never echoed).
+# It is NEVER a CLI flag (it would land in `ps` / shell history), NEVER
+# logged, and NEVER included in error messages. It is registered with
+# note_secret() so redact() scrubs it from all output.
+# ---------------------------------------------------------------------------
+
+_KEYWRAP_MAGIC = b"FHWRAP1\n"
+_KEYWRAP_ENV_VAR = "FAMILY_HUB_KEY_PASSPHRASE"
+_KEYWRAP_MIN_PASSPHRASE_LEN = 8  # same floor as `hub key-backup`
+
+
+def _key_wrap_passphrase():
+    """Return the key-wrapping passphrase: env var first, else getpass.
+
+    The value is registered with note_secret() so it can never leak into
+    output, and is never echoed, logged, or placed in error messages.
+    """
+    pw = os.environ.get(_KEYWRAP_ENV_VAR)
+    if pw:
+        note_secret(pw)
+        return pw
+    pw = getpass.getpass("Identity key passphrase: ")
+    note_secret(pw)
+    return pw
+
+
+def _key_wrap_derive(passphrase, salt):
+    """Derive the 32-byte wrapping key from passphrase+salt (Argon2id)."""
+    nacl = _require_nacl()
+    return nacl.pwhash.argon2id.kdf(
+        32,
+        passphrase.encode("utf-8"),
+        salt,
+        opslimit=nacl.pwhash.argon2id.OPSLIMIT_MODERATE,
+        memlimit=nacl.pwhash.argon2id.MEMLIMIT_MODERATE,
+    )
+
+
+def _wrap_identity_key(priv_bytes, passphrase):
+    """Encrypt a 32-byte private key; returns magic || salt || nonce || ct."""
+    nacl = _require_nacl()
+    if len(priv_bytes) != 32:
+        raise HubError(
+            "bad_request",
+            "Cannot wrap: expected a 32-byte private key, got %d bytes."
+            % len(priv_bytes),
+        )
+    salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+    nonce = nacl.utils.random(
+        nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+    )
+    key = _key_wrap_derive(passphrase, salt)
+    ct = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        priv_bytes, None, nonce, key
+    )
+    return _KEYWRAP_MAGIC + salt + nonce + ct
+
+
+def _unwrap_identity_key_with(blob, passphrase):
+    """Decrypt a wrapped blob with an explicit passphrase (no prompting).
+
+    Raises HubError("auth") with a clean "Incorrect passphrase" message on
+    MAC failure, HubError("config") on truncated/malformed blobs. Never
+    returns garbage.
+    """
+    nacl = _require_nacl()
+    salt_len = nacl.pwhash.argon2id.SALTBYTES
+    nonce_len = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+    off = len(_KEYWRAP_MAGIC)
+    if len(blob) < off + salt_len + nonce_len + 16:  # 16 = Poly1305 tag
+        raise HubError(
+            "config",
+            "Wrapped identity key is truncated or corrupt (%d bytes) — it "
+            "cannot be unwrapped. Restore from backup with `hub key-restore`."
+            % len(blob),
+        )
+    salt = blob[off : off + salt_len]
+    nonce = blob[off + salt_len : off + salt_len + nonce_len]
+    ct = blob[off + salt_len + nonce_len :]
+    key = _key_wrap_derive(passphrase, salt)
+    try:
+        priv = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            ct, None, nonce, key
+        )
+    except Exception:
+        raise HubError(
+            "auth",
+            "Incorrect passphrase — the wrapped identity key could not be "
+            "decrypted.",
+        )
+    if len(priv) != 32:
+        raise HubError(
+            "config",
+            "Wrapped identity key decrypted to %d bytes, expected 32 — it "
+            "is corrupt. Restore from backup with `hub key-restore`."
+            % len(priv),
+        )
+    return priv
+
+
+def _unwrap_identity_key(blob):
+    """Decrypt a wrapped blob, sourcing the passphrase (env var / prompt)."""
+    return _unwrap_identity_key_with(blob, _key_wrap_passphrase())
+
+
+def _prompt_new_key_wrap_passphrase():
+    """Get + confirm the passphrase for `hub key-wrap`.
+
+    From the env var when set (automation), else a double getpass prompt.
+    Enforces the minimum length so the wrap is real protection.
+    """
+    pw = os.environ.get(_KEYWRAP_ENV_VAR)
+    if pw:
+        note_secret(pw)
+    else:
+        pw1 = getpass.getpass(
+            "New key passphrase (min %d characters): "
+            % _KEYWRAP_MIN_PASSPHRASE_LEN
+        )
+        pw2 = getpass.getpass("Confirm key passphrase: ")
+        note_secret(pw1)
+        note_secret(pw2)
+        if pw1 != pw2:
+            raise HubError(
+                "bad_request", "Passphrases do not match — key not wrapped."
+            )
+        pw = pw1
+    if len(pw) < _KEYWRAP_MIN_PASSPHRASE_LEN:
+        raise HubError(
+            "bad_request",
+            "Passphrase must be at least %d characters — key not wrapped."
+            % _KEYWRAP_MIN_PASSPHRASE_LEN,
+        )
+    return pw
+
+
+def cmd_key_wrap(args, transport):
+    """Wrap the identity private key with a passphrase (Argon2id + XChaCha20-Poly1305).
+
+    Migrates agent.key in place: backs the unwrapped original up to
+    agent.key.bak-0600 FIRST, writes the wrapped blob at 0600, then proves
+    the wrapped file on disk round-trips to the identical key before the
+    job is done. On any verification failure the original is restored
+    from the backup and the error is loud — the agent is never stranded.
+    Idempotent: an already-wrapped key is a no-op.
+    """
+    _require_nacl()
+    profile = args.profile
+    key_path = agent_key_path(profile)
+    try:
+        with open(key_path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise HubError(
+            "config",
+            "No identity key at %s (%s). Run `hub key-init` first."
+            % (key_path, exc),
+        )
+    if data.startswith(_KEYWRAP_MAGIC):
+        emit(
+            "Identity key at %s is already passphrase-wrapped — nothing to do."
+            % key_path
+        )
+        return 0
+    if len(data) != 32:
+        raise HubError(
+            "config",
+            "Identity key at %s is %d bytes, expected 32 — it is corrupt. "
+            "Restore from backup with `hub key-restore`." % (key_path, len(data)),
+        )
+    bak_path = key_path + ".bak-0600"
+    if os.path.exists(bak_path) and not args.force:
+        raise HubError(
+            "bad_request",
+            "Refusing to overwrite existing backup %s (use --force to "
+            "overwrite — it still holds the unwrapped key)." % bak_path,
+        )
+    passphrase = _prompt_new_key_wrap_passphrase()
+    # 1. Back up the unwrapped original FIRST (0600, verified like any secret).
+    _write_secret_file_0600(bak_path, data, "unwrapped identity key backup")
+    # 2. Wrap and write the new agent.key (0600).
+    wrapped = _wrap_identity_key(data, passphrase)
+    _write_secret_file_0600(key_path, wrapped, "passphrase-wrapped identity key")
+    # 3. Prove the wrapped file round-trips BEFORE trusting it: decrypt what
+    #    is actually on disk with the same passphrase.
+    with open(key_path, "rb") as fh:
+        on_disk = fh.read()
+    if _unwrap_identity_key_with(on_disk, passphrase) != data:
+        # Restore the original so the agent keeps working, then fail loudly.
+        _write_secret_file_0600(key_path, data, "identity private key")
+        raise HubError(
+            "config",
+            "Wrapped key verification failed for %s: the file on disk does "
+            "not decrypt to the original key. The original was restored "
+            "from backup — nothing was lost." % key_path,
+        )
+    _note_key_secrets(data)
+    emit(
+        "Identity key wrapped with a passphrase at %s (0600). The unwrapped "
+        "original is backed up at %s (0600) — move it somewhere safe; once "
+        "the passphrase is stored safely (password manager / vault), delete "
+        "the on-machine backup, since an unwrapped copy on disk defeats the "
+        "wrap." % (key_path, bak_path)
+    )
+    emit(
+        "Ops note: non-interactive use (cron, agents) must now export "
+        "%s=<passphrase> — without it, hub blocks on a passphrase prompt. "
+        "See agent-skill/INSTALL.md." % _KEYWRAP_ENV_VAR
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # HTTP client (urllib; a fake transport can be injected for tests)
 # ---------------------------------------------------------------------------
 
@@ -2953,7 +3270,9 @@ class HubClient:
             "Accept": "application/json",
             # Cloudflare bot protection (Error 1010) blocks Python-urllib's
             # default UA. Identify honestly as the family-hub agent client.
-            "User-Agent": "family-hub-agent/1.0",
+            # The version is the real CLI version (contract C1); the server
+            # gates stale clients on it (WS-B).
+            "User-Agent": "family-hub-agent/" + VERSION,
         }
         if auth:
             if not self.token:
@@ -4448,6 +4767,741 @@ def cmd_dashboard_token(args, transport):
     sys.stdout.write(str(tok).strip() + "\n")
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Tamper-evidence (WS-E) — supply-chain integrity of the installed CLI.
+#
+# HONEST LIMIT (see docs/CLIENT_HARDENING_SPEC.md section 2): these checks
+# catch supply-chain tampering (a corrupted or unofficially modified `hub`
+# installed on this machine), accidental corruption, and casual
+# modification. They do NOT defend against an attacker with root on this
+# machine: root can read the bearer token and agent.key straight off disk,
+# which is easier than tampering with the CLI. The checks below are real
+# checks with clear failure modes — not theater — but they are not a
+# substitute for endpoint security.
+#
+# Two mechanisms:
+#   1. `hub verify-install` — on-demand verification of the installed CLI
+#      against the release `manifest.json` installed next to it (contract
+#      C5: {version, files: {hub: sha256}, signature: <sigstore bundle
+#      ref>}), including the sigstore bundle's attestation.
+#   2. Startup self-integrity check — every invocation hashes this file's
+#      own bytes and compares against the manifest's recorded hash.
+#      Mismatch -> refuse to run (exit 5). Missing/corrupt manifest ->
+#      warn once and continue (dev checkouts have no manifest).
+# ---------------------------------------------------------------------------
+
+# Exit status when the installed CLI does not match the signed release.
+EXIT_TAMPERED = 5
+
+# Expected sigstore certificate identity for the CLI release workflow
+# (contracts C3/C5; the workflow is `.github/workflows/release.yml`,
+# owned by WS-C). Used only for the best-effort full chain validation in
+# verify-install — never for the startup check.
+_RELEASE_WORKFLOW_IDENTITY = (
+    "https://github.com/maddy13182/museFamilyconnector"
+    "/.github/workflows/release.yml@refs/heads/main"
+)
+_SIGSTORE_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+
+# Warn-once flag for the missing/corrupt-manifest (dev checkout) path.
+_integrity_warned = False
+
+
+def _cli_install_dir():
+    """Directory holding the running `hub` script — the install location."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _installed_manifest_path():
+    """Path of the release manifest.json installed next to the CLI."""
+    return os.path.join(_cli_install_dir(), "manifest.json")
+
+
+def _sha256_file(path):
+    """Hex SHA-256 of a file's bytes, streamed."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_integrity_manifest(path):
+    """Load and schema-check the installed release manifest.
+
+    Returns (manifest, error): on success error is None. A missing or
+    corrupt manifest is NOT fatal here — it means a dev checkout or a
+    hand-rolled copy, and callers degrade to warn (startup) or FAIL
+    (verify-install) accordingly.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None, "no manifest.json next to the CLI (dev checkout?)"
+    except (OSError, ValueError) as exc:
+        return None, "manifest.json is unreadable or corrupt: %s" % exc
+    if not isinstance(data, dict):
+        return None, "manifest.json is corrupt: top-level value is not an object"
+    files = data.get("files")
+    hub_hash = files.get("hub") if isinstance(files, dict) else None
+    if not isinstance(data.get("version"), str):
+        return None, "manifest.json is corrupt: missing/invalid 'version'"
+    if not isinstance(hub_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", hub_hash):
+        return None, "manifest.json is corrupt: missing/invalid files.hub sha256"
+    return data, None
+
+
+def _startup_integrity_check():
+    """Startup self-integrity check.
+
+    Hashes this CLI's own file bytes and compares against the installed
+    manifest's recorded hash. Returns True to proceed, False to refuse.
+    Missing/corrupt manifest -> warn once on stderr and return True (dev
+    checkouts have no manifest and must keep working).
+    """
+    global _integrity_warned
+    manifest, err = _load_integrity_manifest(_installed_manifest_path())
+    if manifest is None:
+        if not _integrity_warned:
+            _integrity_warned = True
+            emit_err(
+                "warning: integrity manifest unavailable (%s); "
+                "startup self-check skipped." % err
+            )
+        return True
+    try:
+        actual = _sha256_file(os.path.abspath(__file__))
+    except OSError as exc:
+        # Fail open: we cannot establish a mismatch, so warn and continue
+        # rather than bricking a working install over an I/O error.
+        if not _integrity_warned:
+            _integrity_warned = True
+            emit_err(
+                "warning: could not hash the CLI file (%s); "
+                "startup self-check skipped." % exc
+            )
+        return True
+    if actual != manifest["files"]["hub"]:
+        emit_err(
+            "error: installed CLI does not match the signed release; "
+            "reinstall from the GitHub Release."
+        )
+        return False
+    return True
+
+
+def _bundle_artifact_digest(bundle_path):
+    """Hex SHA-256 the sigstore bundle attests to, or (None, error).
+
+    Compares the bundle's embedded messageDigest against the artifact:
+    this proves the signature was made over exactly these bytes. It does
+    not by itself prove *who* signed — that needs the full chain check.
+    """
+    try:
+        with open(bundle_path, "r", encoding="utf-8") as handle:
+            bundle = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return None, "cannot read bundle: %s" % exc
+    if not isinstance(bundle, dict) or "verificationMaterial" not in bundle:
+        return None, "not a sigstore bundle (missing verificationMaterial)"
+    message_sig = bundle.get("messageSignature") or {}
+    message_digest = message_sig.get("messageDigest") or {}
+    digest_b64 = message_digest.get("digest")
+    algorithm = (message_digest.get("algorithm") or "").upper()
+    if not digest_b64:
+        return None, (
+            "bundle carries no messageDigest for the artifact "
+            "(DSSE-envelope bundles are not supported)"
+        )
+    if algorithm and algorithm != "SHA2_256":
+        return None, "bundle digest algorithm is %s, expected SHA2_256" % algorithm
+    try:
+        raw = base64.b64decode(digest_b64)
+    except ValueError:
+        return None, "bundle messageDigest is not valid base64"
+    if len(raw) != 32:
+        return None, "bundle messageDigest is not a 32-byte SHA-256 digest"
+    return raw.hex(), None
+
+
+def _sigstore_chain_verify(bundle_path, hub_path):
+    """Best-effort full sigstore trust-chain validation.
+
+    Returns (status, detail) with status 'ok', 'fail', or 'skipped'.
+    'skipped' is honest, not a pass: it means the chain was not validated
+    because the `sigstore` CLI is not installed here.
+    """
+    sigstore_bin = shutil.which("sigstore")
+    if sigstore_bin is None:
+        return (
+            "skipped",
+            "sigstore CLI not installed — certificate and transparency-log "
+            "validation not performed (install `sigstore` for the full chain)",
+        )
+    try:
+        proc = subprocess.run(  # noqa: S603
+            # nosec B603 -- no shell; fixed argv, values never interpreted, binary via shutil.which
+            [
+                sigstore_bin,
+                "verify",
+                "identity",
+                "--bundle",
+                bundle_path,
+                "--cert-identity",
+                _RELEASE_WORKFLOW_IDENTITY,
+                "--cert-oidc-issuer",
+                _SIGSTORE_OIDC_ISSUER,
+                hub_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "fail", "sigstore verification errored: %s" % exc
+    if proc.returncode == 0:
+        return "ok", "certificate + transparency log validated"
+    detail = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+    return "fail", "sigstore rejected the bundle: %s" % (
+        detail[-1] if detail else "no output"
+    )
+
+
+def cmd_verify_install(args, transport):
+    """Verify the installed CLI against the release manifest + sigstore bundle.
+
+    Checks, in order: manifest present and well-formed; sha256 of this
+    file matches the manifest; the sigstore bundle exists, is
+    structurally a bundle, and attests to exactly these bytes; then (best
+    effort) the full sigstore trust chain. Exit 0 on PASS, 1 on FAIL.
+    """
+    hub_path = os.path.abspath(__file__)
+    manifest_path = _installed_manifest_path()
+    manifest_dir = os.path.dirname(manifest_path)
+
+    emit("verify-install: %s" % hub_path)
+
+    manifest, err = _load_integrity_manifest(manifest_path)
+    if manifest is None:
+        emit("[FAIL] manifest.json: %s" % err)
+        emit("RESULT: FAIL — no trustworthy release manifest to verify against.")
+        return 1
+    emit("[ OK ] manifest.json (version %s)" % manifest["version"])
+
+    try:
+        actual = _sha256_file(hub_path)
+    except OSError as exc:
+        emit("[FAIL] sha256: cannot read the installed file: %s" % exc)
+        emit("RESULT: FAIL — cannot verify the installed CLI.")
+        return 1
+    expected = manifest["files"]["hub"]
+    if actual != expected:
+        emit("[FAIL] sha256: manifest records %s…" % expected[:16])
+        emit("       but the installed file hashes to %s…" % actual[:16])
+        emit(
+            "RESULT: FAIL — installed CLI does not match the signed release; "
+            "reinstall from the GitHub Release."
+        )
+        return 1
+    emit("[ OK ] sha256 matches manifest (%s…)" % actual[:16])
+
+    sig_ref = manifest.get("signature")
+    if not sig_ref or not isinstance(sig_ref, str):
+        emit("[FAIL] signature: manifest has no sigstore bundle reference")
+        emit("RESULT: FAIL — release manifest carries no signature to validate.")
+        return 1
+    bundle_path = (
+        sig_ref if os.path.isabs(sig_ref) else os.path.join(manifest_dir, sig_ref)
+    )
+    if not os.path.isfile(bundle_path):
+        emit("[FAIL] signature: bundle %r not found next to the CLI" % sig_ref)
+        emit(
+            "RESULT: FAIL — signature bundle missing; "
+            "reinstall from the GitHub Release."
+        )
+        return 1
+    emit("[ OK ] sigstore bundle present: %s" % sig_ref)
+
+    bundle_digest, err = _bundle_artifact_digest(bundle_path)
+    if bundle_digest is None:
+        emit("[FAIL] sigstore bundle: %s" % err)
+        emit("RESULT: FAIL — the signature does not attest to this artifact.")
+        return 1
+    if bundle_digest != actual:
+        emit("[FAIL] sigstore bundle: bundle attests to %s…" % bundle_digest[:16])
+        emit("       but the installed file hashes to %s…" % actual[:16])
+        emit("RESULT: FAIL — the signature does not attest to this artifact.")
+        return 1
+    emit("[ OK ] bundle attests to exactly these bytes")
+
+    status, detail = _sigstore_chain_verify(bundle_path, hub_path)
+    if status == "fail":
+        emit("[FAIL] sigstore trust chain: %s" % detail)
+        emit("RESULT: FAIL — signature chain validation failed.")
+        return 1
+    if status == "skipped":
+        emit("[SKIP] sigstore trust chain: %s" % detail)
+    else:
+        emit("[ OK ] sigstore trust chain: %s" % detail)
+
+    emit(
+        "RESULT: PASS — installed CLI matches the signed release "
+        "(version %s)." % manifest["version"]
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI self-upgrade (WS-C: release management)
+#
+# `hub upgrade` pulls the signed release advertised by
+# GET /v1/client/latest, verifies it (sigstore signature + sha256), and
+# swaps it in atomically, keeping the previous binary for `hub rollback`.
+# It also records the installed release next to the CLI (contract C5) for
+# WS-E's `hub verify-install`.
+#
+# Tamper-evidence limit (docs/CLIENT_HARDENING_SPEC.md §2): this defends
+# the *supply chain* — what gets installed — plus accidental corruption
+# and casual tampering. It cannot stop a root-level adversary on this
+# machine (root can read agent.key and the bearer token straight off
+# disk); that limit is documented, not hand-waved.
+# ---------------------------------------------------------------------------
+
+# Signed artifacts live on GitHub Releases. The release workflow signs with
+# GitHub Actions' keyless OIDC signer (sigstore-python), so the expected
+# certificate identity pins this repo's release workflow on main.
+_RELEASE_IDENTITY_ISSUER = "https://token.actions.githubusercontent.com"
+_RELEASE_IDENTITY = (
+    "https://github.com/maddy13182/museFamilyconnector"
+    "/.github/workflows/release.yml@refs/heads/main"
+)
+_RELEASE_ASSET_HUB = "hub"
+_RELEASE_ASSET_BUNDLE = "hub.sigstore"
+_RELEASE_ASSET_MANIFEST = "manifest.json"
+_ROLLBACK_SUFFIX = ".prev"
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([-+][0-9A-Za-z.-]+)?$")
+_MANIFEST_URL_RE = re.compile(
+    r"^https://github\.com/[^/]+/[^/]+/releases/download/[^/]+/hub$"
+)
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _script_path():
+    """Absolute path of the running `hub` script (symlinks resolved)."""
+    here = globals().get("__file__") or sys.argv[0]
+    return os.path.realpath(os.path.abspath(here))
+
+
+def _parse_version(text):
+    """Parse ``x.y.z[-pre]`` into (major, minor, patch, pre)."""
+    m = _VERSION_RE.match(str(text).strip())
+    if not m:
+        raise HubError(
+            "bad_request",
+            "Unparseable version %r (expected semver like 0.7.0)." % (text,),
+        )
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or "")
+
+
+def _is_newer(candidate, current):
+    """True when `candidate` is strictly newer than `current`.
+
+    (major, minor, patch) compare first; a stable release beats its own
+    prerelease (0.7.0 > 0.7.0-rc1); prereleases compare lexically.
+    """
+    cand = _parse_version(candidate)
+    cur = _parse_version(current)
+    if cand[:3] != cur[:3]:
+        return cand[:3] > cur[:3]
+    if cand[3] == cur[3]:
+        return False
+    if not cand[3]:
+        return True  # stable beats a prerelease of the same numbers
+    if not cur[3]:
+        return False
+    return cand[3] > cur[3]
+
+
+def _validate_client_manifest(obj):
+    """Validate a GET /v1/client/latest payload (contract C2).
+
+    Returns the manifest dict; raises HubError on any schema violation.
+    """
+    if not isinstance(obj, dict):
+        raise HubError("bad_request", "Client manifest is not a JSON object.")
+    for field in ("version", "download_url", "sha256"):
+        if not obj.get(field):
+            raise HubError(
+                "bad_request", "Client manifest is missing %r." % (field,)
+            )
+    _parse_version(obj["version"])  # raises on garbage
+    if not _MANIFEST_URL_RE.match(str(obj["download_url"])):
+        raise HubError(
+            "bad_request",
+            "Client manifest download_url is not a GitHub Release asset "
+            "URL: %r." % (obj["download_url"],),
+        )
+    if not _SHA256_RE.match(str(obj["sha256"])):
+        raise HubError(
+            "bad_request", "Client manifest sha256 is not 64 hex chars."
+        )
+    return obj
+
+
+def _validate_download_url(url):
+    """Only https GitHub Release asset URLs are acceptable download sources."""
+    parts = urlparse.urlparse(str(url))
+    if parts.scheme != "https":
+        raise HubError(
+            "bad_request",
+            "Refusing to download over a non-https URL: %r." % (url,),
+        )
+    if parts.hostname != "github.com":
+        raise HubError(
+            "bad_request",
+            "Refusing to download from unexpected host %r (expected "
+            "github.com)." % (parts.hostname,),
+        )
+
+
+def _download_bytes(url, what, timeout=90):
+    """Fetch a release asset. Raises HubError on any failure."""
+    _validate_download_url(url)
+    req = urlrequest.Request(
+        url,
+        headers={
+            # Cloudflare bot protection blocks Python-urllib's default UA;
+            # identify honestly as the family-hub agent client.
+            "User-Agent": "family-hub-agent/" + _cli_version(),
+            "Accept": "application/octet-stream",
+        },
+    )
+    try:
+        # nosemgrep: dynamic-urllib-use-detected -- URL validated by _validate_download_url (https + github.com only) immediately above
+        with urlrequest.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            if resp.status != 200:
+                raise HubError(
+                    "connection",
+                    "Download of %s failed: HTTP %d." % (what, resp.status),
+                )
+            data = resp.read()
+    except urlerror.URLError as exc:
+        raise HubError("connection", "Download of %s failed: %s." % (what, exc))
+    if not data:
+        raise HubError("connection", "Download of %s returned an empty body." % what)
+    return data
+
+
+def _have_sigstore():
+    """True when the `sigstore` package can run (needed to verify releases)."""
+    try:
+        # Fixed argv; no untrusted input.
+        proc = subprocess.run(  # nosec B603
+            [sys.executable, "-m", "sigstore", "--version"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _verify_sigstore(artifact_path, bundle_path):
+    """Verify the sigstore bundle against the artifact; raise on failure.
+
+    A missing `sigstore` package is a hard refusal (with the install
+    command), not a skipped check — an unverified upgrade is a failed
+    upgrade. Verification is networked (Rekor / timestamp lookups).
+    """
+    if not _have_sigstore():
+        raise HubError(
+            "config",
+            "Cannot verify the release signature: the `sigstore` package is "
+            "not installed. Run `pip install sigstore`, then retry "
+            "`hub upgrade`. The upgrade is refused rather than skipping "
+            "signature verification.",
+        )
+    cmd = [
+        sys.executable,
+        "-m",
+        "sigstore",
+        "verify",
+        "identity",
+        "--bundle",
+        bundle_path,
+        "--cert-identity",
+        _RELEASE_IDENTITY,
+        "--cert-oidc-issuer",
+        _RELEASE_IDENTITY_ISSUER,
+        artifact_path,
+    ]
+    try:
+        # Fixed argv; only internal temp paths vary. No shell.
+        proc = subprocess.run(cmd, capture_output=True, timeout=180)  # nosec B603
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HubError("config", "sigstore verification could not run: %s." % exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise HubError(
+            "config",
+            "Signature verification FAILED for the downloaded CLI: %s "
+            "The artifact is NOT installed — the current version is kept."
+            % (detail[-1] if detail else "no detail from sigstore."),
+        )
+
+
+def _self_test(path, expect_version=None):
+    """Run the candidate binary's --version; raise HubError when it fails."""
+    try:
+        # Fixed argv; `path` is the upgrade candidate or the installed CLI.
+        proc = subprocess.run(
+            [sys.executable, path, "--version"], capture_output=True, timeout=60
+        )  # nosec B603
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HubError("config", "Self-test could not run %s: %s." % (path, exc))
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    if proc.returncode != 0:
+        raise HubError(
+            "config",
+            "Self-test FAILED for %s (exit %d): %s"
+            % (path, proc.returncode, out.strip()[:200]),
+        )
+    if expect_version and expect_version not in out:
+        raise HubError(
+            "config",
+            "Self-test version mismatch for %s: expected %s in %r."
+            % (path, expect_version, out.strip()[:200]),
+        )
+
+
+def _atomic_install(data, target):
+    """Write `data` to `target` atomically, preserving the existing mode.
+
+    The temp file lives in the target directory (same filesystem, so
+    os.replace is atomic) and is fsynced before the rename. A failure
+    leaves the old file untouched.
+    """
+    directory = os.path.dirname(target) or "."
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except OSError:
+        mode = 0o755
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".hub-upgrade-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_integrity_manifest(install_dir, version, sha256):
+    """Record the installed release next to the CLI (contract C5).
+
+    ``{version, files: {hub: sha256}, signature, identity}`` — consumed by
+    WS-E's `hub verify-install`, which re-checks the installed file's
+    sha256 and validates the sigstore bundle saved alongside it.
+    """
+    manifest = {
+        "version": version,
+        "files": {_RELEASE_ASSET_HUB: sha256},
+        "signature": _RELEASE_ASSET_BUNDLE,
+        "identity": {
+            "issuer": _RELEASE_IDENTITY_ISSUER,
+            "identity": _RELEASE_IDENTITY,
+        },
+    }
+    tmp = os.path.join(install_dir, ".manifest.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, os.path.join(install_dir, "manifest.json"))
+
+
+def _latest_release(client):
+    """Fetch and validate GET /v1/client/latest (unauthenticated)."""
+    try:
+        payload = client.call("GET", "/v1/client/latest", auth=False, retries=1)
+    except HubError as exc:
+        raise HubError(
+            exc.code,
+            "Could not check for updates at /v1/client/latest: %s" % exc,
+            http_status=exc.http_status,
+            server_code=exc.server_code,
+        )
+    return _validate_client_manifest(payload)
+
+
+def _release_asset_urls(manifest):
+    """Derive the bundle + release-manifest URLs from the hub download URL."""
+    dl = str(manifest["download_url"])
+    base = re.sub(r"/hub$", "", dl)
+    return (
+        dl,
+        base + "/" + _RELEASE_ASSET_BUNDLE,
+        base + "/" + _RELEASE_ASSET_MANIFEST,
+    )
+
+
+def cmd_upgrade(args, transport):
+    """Upgrade to the latest signed CLI release.
+
+    Checks GET /v1/client/latest, downloads the new artifact when newer,
+    verifies sigstore signature + sha256, self-tests the candidate, swaps
+    it in atomically, and keeps the previous binary as <script>.prev for
+    `hub rollback`. No-op (exit 0) when already current.
+    """
+    current = _cli_version()
+    emit("hub %s — checking for updates…" % current)
+    ctx = _ctx(args, transport, need_auth=False)
+    manifest = _latest_release(ctx.client)
+    new_version = str(manifest["version"])
+    if not _is_newer(new_version, current):
+        emit(
+            "Already current: hub %s (server advertises %s). Nothing to do."
+            % (current, new_version)
+        )
+        return 0
+    emit("New release available: %s → %s." % (current, new_version))
+
+    want = str(manifest["sha256"]).lower()
+    hub_url, bundle_url, rel_manifest_url = _release_asset_urls(manifest)
+    tmpdir = tempfile.mkdtemp(prefix="hub-upgrade-")
+    try:
+        artifact = _download_bytes(hub_url, "hub %s" % new_version)
+        got = hashlib.sha256(artifact).hexdigest()
+        if got != want:
+            raise HubError(
+                "config",
+                "sha256 MISMATCH for the downloaded hub %s: expected %s, "
+                "got %s. The artifact is NOT installed."
+                % (new_version, want, got),
+            )
+        bundle = _download_bytes(bundle_url, _RELEASE_ASSET_BUNDLE)
+        rel_manifest_raw = _download_bytes(
+            rel_manifest_url, _RELEASE_ASSET_MANIFEST
+        )
+        try:
+            rel_manifest = json.loads(rel_manifest_raw.decode("utf-8"))
+        except ValueError:
+            raise HubError(
+                "config",
+                "The release manifest.json is not valid JSON; refusing.",
+            )
+        if str(rel_manifest.get("sha256", "")).lower() != want:
+            raise HubError(
+                "config",
+                "Release manifest.json disagrees with the server manifest "
+                "on sha256; refusing.",
+            )
+        if str(rel_manifest.get("version", "")) != new_version:
+            raise HubError(
+                "config",
+                "Release manifest.json disagrees with the server manifest "
+                "on version; refusing.",
+            )
+
+        art_path = os.path.join(tmpdir, _RELEASE_ASSET_HUB)
+        bundle_path = os.path.join(tmpdir, _RELEASE_ASSET_BUNDLE)
+        with open(art_path, "wb") as fh:
+            fh.write(artifact)
+        # 0755: the candidate must be executable for its self-test. It lives
+        # in a 0700 temp dir and its bytes are the sha256-verified artifact.
+        os.chmod(art_path, 0o755)  # nosec B103
+        with open(bundle_path, "wb") as fh:
+            fh.write(bundle)
+
+        emit("Verifying sigstore signature…")
+        _verify_sigstore(art_path, bundle_path)
+        emit("Signature OK. Running the candidate's self-test…")
+        _self_test(art_path, expect_version=new_version)
+
+        target = _script_path()
+        install_dir = os.path.dirname(target) or "."
+        emit("Installing to %s…" % target)
+        # Keep the previous binary for rollback *before* cutting over.
+        shutil.copy2(target, target + _ROLLBACK_SUFFIX)
+        try:
+            _atomic_install(artifact, target)
+        except BaseException as exc:
+            raise HubError(
+                "config",
+                "Install failed (%s); the previous binary is kept at %s%s."
+                % (exc, target, _ROLLBACK_SUFFIX),
+            )
+        try:
+            _self_test(target, expect_version=new_version)
+        except HubError as exc:
+            # Cut-over self-test failed: restore the previous binary.
+            shutil.copy2(target + _ROLLBACK_SUFFIX, target)
+            raise HubError(
+                "config",
+                "The new binary failed its self-test after install (%s); "
+                "restored the previous version." % exc,
+            )
+        # Contract C5: integrity manifest + bundle live next to the CLI.
+        _write_integrity_manifest(install_dir, new_version, want)
+        shutil.copy2(bundle_path, os.path.join(install_dir, _RELEASE_ASSET_BUNDLE))
+        emit("Upgraded hub %s → %s." % (current, new_version))
+        emit(
+            "Previous binary kept at %s%s — `hub rollback` restores it."
+            % (target, _ROLLBACK_SUFFIX)
+        )
+        emit(
+            "Note: keep the rest of the skill files (e.g. SKILL.md) in "
+            "lockstep with the CLI version."
+        )
+        return 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def cmd_rollback(args, transport):
+    """Restore the previous CLI binary saved by `hub upgrade`.
+
+    Atomically swaps <script>.prev back into place, self-tests it, and
+    keeps the rolled-back-from binary as the new fallback (so a second
+    `hub rollback` rolls forward again).
+    """
+    target = _script_path()
+    prev = target + _ROLLBACK_SUFFIX
+    if not os.path.exists(prev):
+        raise HubError(
+            "config",
+            "No previous binary to roll back to (%s is missing). Only "
+            "`hub upgrade` leaves one." % prev,
+        )
+    emit("Self-testing the previous binary…")
+    _self_test(prev)
+    with open(target, "rb") as fh:
+        current_data = fh.read()
+    with open(prev, "rb") as fh:
+        prev_data = fh.read()
+    _atomic_install(prev_data, target)
+    try:
+        _self_test(target)
+    except HubError:
+        _atomic_install(current_data, target)
+        raise HubError(
+            "config",
+            "The previous binary failed its self-test after restore; "
+            "kept the current version.",
+        )
+    _atomic_install(current_data, prev)
+    emit("Rolled back: %s is restored from %s." % (target, prev))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -4484,7 +5538,13 @@ def build_parser():
         help="Print sanitized request/response dumps to stderr "
         "(credentials are always redacted)",
     )
-    parser.add_argument("--version", action="version", version="hub " + VERSION)
+    # Prints both the CLI and the skill version so a mismatch between the
+    # two (they are versioned in lockstep, contract C6) is detectable.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="hub " + VERSION + " (skill " + SKILL_VERSION + ")",
+    )
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     p = sub.add_parser("setup", help="Accept an invite (or owner provisioning code) and configure this agent")
@@ -4533,6 +5593,15 @@ def build_parser():
     p.add_argument("--force", action="store_true",
                    help="Overwrite an existing identity key")
     p.set_defaults(func=cmd_key_restore)
+
+    p = sub.add_parser(
+        "key-wrap",
+        help="Encrypt the identity private key at rest with a passphrase "
+             "(Argon2id + XChaCha20-Poly1305)",
+    )
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite an existing agent.key.bak-0600 backup")
+    p.set_defaults(func=cmd_key_wrap)
 
     p = sub.add_parser("sync", help="Print new entries across all visible topics")
     p.add_argument("--limit", type=int, default=200)
@@ -4800,8 +5869,27 @@ def build_parser():
                    help="Circle name or id")
     p.set_defaults(func=cmd_dashboard_token)
 
+    p = sub.add_parser(
+        "upgrade",
+        help="Upgrade to the latest signed CLI release (verifies signature + hash)",
+    )
+    p.set_defaults(func=cmd_upgrade)
+
+    p = sub.add_parser(
+        "rollback",
+        help="Restore the previous CLI binary saved by `hub upgrade`",
+    )
+    p.set_defaults(func=cmd_rollback)
+
     p = sub.add_parser("me", help="Show this agent's identity (never the credential)")
     p.set_defaults(func=cmd_me)
+
+    p = sub.add_parser(
+        "verify-install",
+        help="Verify the installed CLI against the signed release "
+        "(manifest hash + sigstore bundle)",
+    )
+    p.set_defaults(func=cmd_verify_install)
 
     return parser
 
@@ -4822,6 +5910,12 @@ def _wrap_setup(args, transport):
 def main(argv=None, transport=None):
     clear_secrets()
     args = build_parser().parse_args(argv)
+    # Startup self-integrity check (WS-E). verify-install is exempt from
+    # the hard refusal so it can diagnose a mismatch itself (it re-runs
+    # the full check and reports exactly which step failed).
+    if getattr(args, "func", None) is not cmd_verify_install:
+        if not _startup_integrity_check():
+            return EXIT_TAMPERED
     try:
         return args.func(args, transport)
     except HubError as exc:

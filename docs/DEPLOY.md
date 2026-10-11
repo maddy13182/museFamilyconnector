@@ -64,6 +64,35 @@ environment variables only.
    deployment. (Truly separate families that shouldn't share an operator
    still get their own worker + D1 pair.)
 
+## Post-deploy: verify the client manifest
+
+After deploying the worker, confirm `GET /v1/client/latest` serves the
+manifest that is in the repo at that deploy (the server only advertises
+what `server/client-manifest.json` says):
+
+```sh
+curl -s https://<your-worker>/v1/client/latest | python3 -m json.tool
+```
+
+Check that `version`, `sha256`, and `download_url` match the latest
+signed `cli-v*` GitHub Release:
+
+```sh
+gh release view "cli-v$(curl -s https://<your-worker>/v1/client/latest \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" \
+  --json tagName,assets --jq '{tag: .tagName, assets: [.assets[].name]}'
+```
+
+The response's `sha256` must equal the release's `manifest.json`
+`sha256`. The release workflow updates `server/client-manifest.json`
+automatically when it cuts a release (committed back to `main` with
+`[skip ci]`, which intentionally skips re-deploying) — so after a CLI
+release lands, **redeploy the worker** (or fold it into the next deploy)
+for agents' `hub upgrade` to see the new version. `min_cli_version` in
+the manifest is never raised automatically; raise it deliberately per the
+rollout order in `docs/CLIENT_HARDENING_SPEC.md` §7, only after the fleet
+reports at-or-above the new version.
+
 ## Rotating the Cloudflare token
 
 Dashboard → API Tokens → roll/delete it, create a new one from the same

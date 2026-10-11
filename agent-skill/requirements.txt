@@ -1,5 +1,10 @@
 # Pinned runtime dependencies for the `hub` CLI (agent-skill/hub).
 #
+# The human-readable source of truth for pins. The hash-locked file CI
+# installs from is agent-skill/requirements.lock; regenerate it with:
+#   pip-compile --generate-hashes agent-skill/requirements.txt \
+#     -o agent-skill/requirements.lock
+#
 # The stdlib-only property ended with E2EE Phase 1 (identity keys):
 # Python's standard library has no AEAD and no X25519, so key generation
 # and backup encryption need libsodium bindings.

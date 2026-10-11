@@ -11,7 +11,7 @@ one source of truth — never hardcode a version anywhere else:
 | Component | Source | Reported by |
 |---|---|---|
 | Server (API + dashboard) | `server/package.json` → `version` | `GET /v1/health` (`version`), every log line (`v`) |
-| Agent skill (CLI) | `agent-skill/hub` → `VERSION = "x.y.z"` | `hub --version` |
+| Agent skill (CLI) | `agent-skill/pyproject.toml` → `version` (single source of truth, contract C6) | `hub --version` |
 
 There is no repo-root `VERSION` file. The two components usually release
 together, but a server-only change bumps only the server version and vice

@@ -17,14 +17,103 @@ it first, then invites everyone else.
 
 ## Step 1 — Get the files
 
-Copy this directory to your agent's skills folder (or just use it in place
-from a checkout):
+**Option A — signed release (recommended).** Every CLI release is cut by
+the release workflow as `cli-v<x.y.z>` on GitHub, with three assets:
+`hub` (the single-file script), `hub.sigstore` (the sigstore keyless
+signature bundle), and `manifest.json` (`{version, sha256, files}`).
+
+```sh
+VER=0.7.0   # pick the version your owner tells you to install
+BASE=https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v$VER
+mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub
+curl -sSLO "$BASE/hub" -sSLO "$BASE/hub.sigstore" -sSLO "$BASE/manifest.json"
+chmod +x hub
+```
+
+Verify **before** installing — in this order:
+
+```sh
+# 1. Signature: proves the artifact was built by this repo's release
+#    workflow (keyless OIDC; no long-lived keys to steal).
+pip install "sigstore>=3.0,<4.0"
+python3 -m sigstore verify identity \
+  --bundle hub.sigstore \
+  --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" \
+  --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+  hub
+
+# 2. Hash: proves the bytes are exactly the released ones.
+python3 - <<'EOF'
+import hashlib, json
+want = json.load(open("manifest.json"))["sha256"]
+got = hashlib.sha256(open("hub", "rb").read()).hexdigest()
+assert got == want, "sha256 MISMATCH — do not install"
+print("sha256 OK:", got)
+EOF
+```
+
+If either check fails, **do not install** — tell the family owner.
+
+**Option B — copy from a checkout** (dev / owner machines only):
 
 ```sh
 mkdir -p ~/workspace/skills/family-hub
 cp -r /path/to/family-hub/agent-skill/* ~/workspace/skills/family-hub/
 chmod +x ~/workspace/skills/family-hub/hub
 ```
+
+Then install the pinned dependencies (the release bundles no deps —
+they install from the lockfile at install time):
+
+```sh
+pip install -r ~/workspace/skills/family-hub/requirements.txt
+```
+
+## Step 1b — Self-check
+
+```sh
+hub --version   # prints the CLI version (and, once WS-A lands, the skill version too)
+```
+
+A mismatch between the installed `hub` and the skill files it lives
+with is detectable here — keep them in lockstep (see "Upgrading" below).
+
+## Upgrading — `hub upgrade`
+
+`hub upgrade` asks the server what the current signed release is
+(`GET /v1/client/latest`), and only when it is newer than the installed
+CLI does it:
+
+1. Download `hub`, `hub.sigstore`, and `manifest.json` from the GitHub
+   Release.
+2. Verify the sigstore signature (refuses if the `sigstore` package is
+   missing — it will not skip verification).
+3. Verify the sha256 against both the release manifest and the server
+   manifest.
+4. Run the candidate's self-test (`--version`) **before** cutting over.
+5. Swap the new binary in **atomically**, keeping the previous binary as
+   `hub.prev`, and run the self-test again after the swap.
+6. Record the installed release next to the CLI (`manifest.json` +
+   `hub.sigstore`) for `hub verify-install`.
+
+No-op when already current:
+
+```sh
+hub upgrade
+```
+
+If the new binary fails its post-install self-test, the previous binary
+is restored automatically. To go back manually at any time:
+
+```sh
+hub rollback   # restores hub.prev; the rolled-back-from binary becomes the new fallback
+```
+
+> **Honest limit.** The signature/hash checks defend the *supply chain*
+> (what gets installed), accidental corruption, and casual tampering.
+> They cannot stop a root-level adversary on this machine: root can read
+> `agent.key` and the bearer token straight off disk, which is easier
+> than tampering with the CLI. That is documented, not hand-waved.
 
 ## Step 2 — Run setup
 
@@ -71,7 +160,15 @@ into the crontab**):
 With the platform scheduler / hooks: create a 15-minute cron whose command is
 `hub sync`, with `FAMILY_HUB_TOKEN` bound from the Secure Vault (same binding
 the agent's tool calls use). Multiple agents on one machine: give each its own
-`--profile` so cursors don't collide.
+`--profile` so cursors don't collide. If you wrapped the identity key with
+`hub key-wrap`, bind `FAMILY_HUB_KEY_PASSPHRASE` the same way — see
+"Protecting the identity key at rest" below.
+
+> **Wrapped keys + cron.** If you wrapped the agent key with
+> `hub key-wrap`, every non-interactive invocation (this cron included)
+> must export `FAMILY_HUB_KEY_PASSPHRASE` — otherwise `hub` blocks on an
+> interactive passphrase prompt and the job hangs. Bind it from the
+> Secure Vault exactly like the token, never paste it into the crontab.
 
 ## Step 4 — The 2-minute live check
 
@@ -83,6 +180,55 @@ hub sync      # [] means "caught up" — the cursor is stored for next time
 
 Then read `SKILL.md` (or have your agent read it) — that's the whole manual.
 
+## Protecting the identity key at rest (`hub key-wrap`)
+
+Your E2EE identity key lives at
+`~/.config/family-hub/profiles/<name>/agent.key` (`0600`). By default it is
+stored **unwrapped** (raw 32 bytes). `hub key-wrap` encrypts it in place
+with a passphrase:
+
+```sh
+hub key-wrap
+```
+
+What happens:
+
+1. The unwrapped original is backed up first to `agent.key.bak-0600`
+   (`0600`). Nothing is overwritten until the backup exists.
+2. You choose a passphrase (min 8 characters). It is **never** a CLI flag
+   (it would land in `ps` / shell history) — it comes from the
+   `FAMILY_HUB_KEY_PASSPHRASE` env var when set, otherwise an interactive
+   prompt that never echoes. It is never logged and never appears in error
+   messages.
+3. The key is encrypted with a key derived from your passphrase via
+   **Argon2id**, using **XChaCha20-Poly1305**. The wrapped file starts with
+   the magic header `FHWRAP1`, then `salt(16) || nonce || ciphertext`.
+4. `hub` proves the wrapped file decrypts back to the identical key
+   **before** trusting it; on any failure the original is restored from the
+   backup.
+
+After wrapping, every `hub` command that needs the key detects the
+`FHWRAP1` header automatically and asks for the passphrase (env var first,
+prompt second). A wrong passphrase gives a clean "Incorrect passphrase"
+error — never garbage output.
+
+Legacy unwrapped keys keep working, but `hub` prints a loud deprecation
+warning on every use pointing at `hub key-wrap`.
+
+> **Ops note — read this if you run `hub` on a schedule.** After wrapping,
+> any automation (e.g. the 15-minute `hub sync` cron from Step 3) must
+> export `FAMILY_HUB_KEY_PASSPHRASE=<passphrase>` in its environment, or it
+> will block forever on the passphrase prompt. Bind it from your secret
+> manager / vault the same way you bind `FAMILY_HUB_TOKEN` — never paste
+> it into the crontab.
+>
+> ```cron
+> */15 * * * * FAMILY_HUB_KEY_PASSPHRASE=<from vault> /home/you/workspace/skills/family-hub/hub sync --limit 200
+> ```
+>
+> (Use your scheduler's secret binding for the value; the literal above is
+> illustrative only.)
+
 ## For non-Muse agents
 
 Same `hub` binary works anywhere Python 3 exists. Provide the credential via
@@ -90,6 +236,32 @@ Same `hub` binary works anywhere Python 3 exists. Provide the credential via
 for a persistent `0600` token file. Everything else (subcommands, JSON
 output, exit codes) is framework-agnostic by design — see `docs/openapi.yaml`
 for the raw REST contract.
+
+## Verifying your install (tamper-evidence)
+
+The installed `hub` is a signed release. Two checks keep it honest:
+
+- **`hub verify-install`** — re-runnable any time. It checks the installed
+  `hub` file's sha256 against the release `manifest.json` installed next to
+  it, then validates the sigstore bundle: the bundle must structurally be a
+  sigstore bundle and must attest to exactly the installed bytes. If the
+  `sigstore` CLI is installed, the full certificate + transparency-log chain
+  is validated too; otherwise that step is reported as skipped (honestly —
+  not as a pass). Clear `RESULT: PASS` / `RESULT: FAIL` output, exit 0 / 1.
+- **Startup self-check** — every `hub` invocation hashes the CLI's own file
+  bytes and compares against the manifest's recorded hash. On mismatch the
+  CLI refuses to run (exit 5): `installed CLI does not match the signed
+  release; reinstall from the GitHub Release`. A missing or corrupt
+  `manifest.json` (a dev checkout, or a hand-rolled copy) warns once on
+  stderr and continues — it never hard-fails development.
+
+**Honest limit.** These checks catch supply-chain tampering (a corrupted or
+unofficially modified `hub` landing on this machine), accidental corruption,
+and casual modification. They do **not** defend against an attacker with root
+on this machine: root can read the bearer token and `agent.key` straight off
+disk, which is easier than tampering with the CLI. No security theater — if
+you suspect a host compromise, rotate credentials; the CLI refusing to run
+is not the layer that saves you there.
 
 ## Troubleshooting
 
@@ -101,3 +273,8 @@ for the raw REST contract.
 | `Blocked` (exit 4 / 422) | Your text tripped the PII scan — rephrase without card numbers/SSNs and retry |
 | `Cannot reach the Hub server` | Check `--server` / config URL and network |
 | `warning: token file … is readable by others` | `chmod 600` the file, or switch to `--store env` |
+| `hub upgrade`: `sigstore` not installed | `pip install "sigstore>=3.0,<4.0"`, then retry — the upgrade refuses rather than skipping verification |
+| `hub upgrade`: signature/sha256 FAILED | Do **not** install; the artifact may be tampered — tell the family owner |
+| cron job hangs on a prompt | `agent.key` is wrapped and the job lacks `FAMILY_HUB_KEY_PASSPHRASE` — bind it from the Secure Vault (see Step 3) |
+| `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the GitHub Release |
+| `RESULT: FAIL` from `hub verify-install` | Reinstall from the GitHub Release (artifact + `manifest.json` + `hub.sigstore`); don't keep using the failed copy |

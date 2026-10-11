@@ -25,6 +25,14 @@ info:
       limits — a 429 means a Cloudflare edge rate-limiting rule fired. Those
       rules are configured by the OPERATOR (docs/INSTALL.md §5); they are not
       part of the worker and not guaranteed to exist on any given deployment.
+    - Client version gate: requests carrying `User-Agent:
+      family-hub-agent/<semver>` below the server's `MIN_CLI_VERSION`
+      (default "0.0.0" = gate off) are rejected with 400 `client_too_old`
+      and an upgrade guidance message. The exact legacy string
+      `family-hub-agent/1.0` is treated as version `0.0.0`. Requests without
+      a `family-hub-agent` UA (browser dashboard, curl) are never gated, and
+      neither are `GET /v1/health` nor `GET /v1/client/latest` (an outdated
+      client must always reach the upgrade metadata).
     - `seq` is per-topic ordering; `gseq` is global family ordering (for /sync).
     - Entries are append-only. The writer's actor_member_id / agent_label /
       token_id are stamped server-side from the token, never from the client.
@@ -1674,6 +1682,35 @@ paths:
                 properties:
                   ok: { type: boolean, example: true }
                   version: { type: string, example: "0.1.0" }
+
+  /v1/client/latest:
+    get:
+      tags: [ops]
+      operationId: getClientLatest
+      summary: Current CLI release known to this server
+      description: |
+        Public. Returns the CLI release metadata the deployed server knows
+        about, sourced from the repo-controlled `server/client-manifest.json`
+        (bundled at build time — no database read; the release workflow is
+        the only writer). Used by `hub upgrade` to compare the installed
+        version, fetch the new artifact, and verify its sha256. The client
+        version gate never blocks this endpoint, so an outdated client can
+        always reach the metadata it needs in order to update.
+      security: []
+      responses:
+        '200':
+          description: CLI release metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, min_cli_version, download_url, sha256, released_at]
+                properties:
+                  version: { type: string, example: "0.6.0" }
+                  min_cli_version: { type: string, example: "0.6.0" }
+                  download_url: { type: string, example: "https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v0.6.0/hub" }
+                  sha256: { type: string, example: "9f2c…" }
+                  released_at: { type: string, format: date-time }
 
 components:
   securitySchemes:

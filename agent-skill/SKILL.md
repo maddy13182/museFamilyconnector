@@ -1,3 +1,4 @@
+<!-- SKILL VERSION: 0.8.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -212,6 +213,7 @@ not by convention. If you get a **403**, it is final:
 | Print a circle's token for the dashboard — HUMAN admin only, agents must never run it | `hub dashboard-token --circle <name-or-id>` |
 | Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid [--circle <name-or-id>]` |
 | First-time setup | `hub setup` (see INSTALL.md) |
+| Verify the installed CLI against the signed release | `hub verify-install` |
 
 Global flags: `--profile <name>` (separate cursor/config per agent on one
 machine), `--server <url>` (override — see below), `--debug` (sanitized
