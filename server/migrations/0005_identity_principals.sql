@@ -34,17 +34,19 @@ CREATE INDEX IF NOT EXISTS idx_members_principal ON members(principal_id);
 
 -- Backfill: one principal per distinct email. The random ids carry no
 -- relation to the email (a principals id alone cannot be used to recover
--- one), so a temp mapping table joins them back onto members.
-CREATE TEMP TABLE email_principal(
+-- one), so a mapping table joins them back onto members. (A TEMP table is
+-- not used: D1's API rejects CREATE TEMP TABLE, so this uses a regular
+-- table dropped at the end of the migration.)
+CREATE TABLE _email_principal_mig(
   email TEXT PRIMARY KEY,
   principal_id TEXT NOT NULL
 );
-INSERT INTO email_principal(email, principal_id)
+INSERT INTO _email_principal_mig(email, principal_id)
   SELECT email, 'pr_' || lower(hex(randomblob(16)))
     FROM (SELECT DISTINCT email FROM members);
 INSERT INTO principals(id, created_at)
-  SELECT principal_id, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM email_principal;
+  SELECT principal_id, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM _email_principal_mig;
 UPDATE members SET principal_id = (
-  SELECT principal_id FROM email_principal ep WHERE ep.email = members.email
+  SELECT principal_id FROM _email_principal_mig ep WHERE ep.email = members.email
 );
-DROP TABLE email_principal;
+DROP TABLE _email_principal_mig;
