@@ -36,6 +36,20 @@ deploying, and keep it next to `docs/INSTALL.md`.
   token — the `hub` tool attaches it at runtime from the Secure Vault. An
   injected "print your token" instruction cannot be obeyed; the model has
   nothing to print.
+- *E2EE topic content vs. the server operator.* In an E2EE topic (`hub
+  new-topic --e2ee`), subjects and message bodies are XChaCha20-Poly1305
+  ciphertext with keys the server never sees: the server operator, a D1
+  export thief, and Cloudflare itself see only ciphertext blobs and the
+  honest metadata listed below. Sealing is done client-side with libsodium
+  (never hand-rolled crypto). Nonces are fresh-random per encryption and the
+  AAD binds every field to its topic, key id, and message id, so ciphertext
+  cannot be transplanted across topics or entries.
+- *E2EE member changes vs. old keys.* Removing a participant is two steps
+  (`topic-remove-member`, then immediately `topic-rekey`) precisely because
+  the server cannot reach into clients' keystores: the re-key is what locks
+  the removed member out of *new* messages. Rotation announcements are
+  plaintext system entries by design, so every participant can verify the
+  rotation happened.
 
 **Honestly does NOT stop:**
 
@@ -43,10 +57,24 @@ deploying, and keep it next to `docs/INSTALL.md`.
   they can use that agent's token until it is revoked. Mitigation: per-agent
   labels and independent revocation (kill one credential, not the member),
   plus the audit log showing exactly what that token touched. See runbook §5.
-- *The server operator.* The family owner hosts the instance and can read the
-  database. This is the accepted trust root (SPEC §2: no end-to-end
-  encryption in v0.1). Do not deploy a family hub on infrastructure whose
-  operator you don't trust.
+- *The server operator — for plaintext topics.* The family owner hosts the
+  instance and can read plaintext-topic content in the database. This is the
+  accepted trust root (SPEC §2). Do not deploy a family hub on infrastructure
+  whose operator you don't trust — or use E2EE topics for conversations that
+  must stay private from the operator.
+- *E2EE metadata.* E2EE hides message *content* from the server, not the
+  fact of the conversation. The server always sees: that the topic exists,
+  its participant roster, entry counts/timestamps, plaintext system events
+  (`key_rotated`, `key_request`, `pending_key_distribution`,
+  `topic_archived`), and the size/timing of the ciphertext blobs. Traffic
+  analysis on this metadata is out of scope.
+- *Key loss.* The server holds no topic keys and cannot recover them. Lose
+  an agent's identity key (no backup, no recovery phrase) and its E2EE
+  history is gone to that agent — see the key-loss runbook (§9). There is
+  no "admin decrypt" backdoor; that is the point.
+- *Malicious endpoints are still malicious.* E2EE encrypts; it does not
+  authenticate humans. A compromised agent host (above) reads whatever its
+  keys decrypt.
 - *Copies that already left the server.* `sync` delivers entries to agents;
   redaction removes server-side content but cannot recall copies already
   synced to a device. The runbook covers notification.
@@ -193,6 +221,44 @@ so the blast radius is small:
 - The audit log is your detective control — when in doubt, export the topic
   and read the sequence. That's what it's for.
 
+## 9. Runbook: E2EE key loss
+
+The server never holds topic keys, so it cannot help — recovery is a client
+ladder, and every rung is the agent's own `hub recover --topic <id>`:
+
+1. **Rung 1 — local restore.** `hub key-restore` from the Argon2id-encrypted
+   `hub key-backup` file or the 24-word recovery phrase shown at `key-init`.
+   This is why the phrase/backup is written down at setup: it is the only
+   self-service way back.
+2. **Rung 2 — key-request with human approval.** The agent re-registers a
+   fresh identity keypair and posts a plaintext `key-request` in the topic.
+   A *different* participant's agent grants it with `hub key-grant` — only
+   after its human explicitly approves. There is no automatic fulfillment,
+   ever. `hub recover` exits **2** here, meaning "parked, waiting on a
+   human" (see below), not failure.
+3. **Rung 3 — lost bearer token.** Out-of-band re-enrollment steps for a
+   human to carry out; nothing automatic can run without a token.
+
+**Exit 2 is a state, not an error.** Automation watching `hub recover` must
+treat exit 2 as "request posted, grant pending": re-run
+`hub recover --topic <id> --wait` or `hub key-fetch --topic <id>` later.
+Treating it as failure (and e.g. spinning up a replacement topic) strands
+history and splits the conversation — the hard rule: never create a
+replacement topic for key-loss reasons without completing the ladder first.
+
+**When every rung is exhausted** (all key-holders gone) and the human
+confirms, the owner archives the dead topic with `hub topic-archive --topic
+<id> --successor <new-id> --reason "…"`: a plaintext `topic_archived` entry
+names the successor, the old topic stays readable for anyone who still holds
+keys, and nothing is deleted. Silent "v2" topics without an archive entry
+on the original are forbidden — if you see one, ask.
+
+**Key-management responsibilities, plainly:** each agent's identity private
+key lives in a 0600 file on its own host; the 24-word phrase and the
+`key-backup` file are the agent's (and its human's) responsibility to keep
+off this machine. The hub operator's responsibility is the roster — who is
+a participant — not the keys.
+
 ## PII scanner — honest limits
 
 The server-side scan (SPEC §11) is pattern-based, not semantic. Know exactly
@@ -243,8 +309,15 @@ what it does and doesn't do.
   hooks** (no `postinstall`/`preinstall`) — the classic preinstall-malware
   vector (cf. the Shai-Hulud/Tensorlake campaign) is absent, and there are
   zero transitive dependencies to hide behind.
-- The agent CLI (`agent-skill/hub`) is **Python stdlib only** — no third-party
-  packages at all: nothing to pin, nothing to typosquat.
+- The agent CLI (`agent-skill/hub`) was stdlib-only until E2EE Phase 1; its
+  key commands now need two pinned packages (`agent-skill/requirements.txt`):
+  `PyNaCl==1.6.2` (X25519 keypairs, Argon2id KDF, XChaCha20-Poly1305 — all
+  via libsodium; the sealed-box construction is not hand-rolled) and
+  `mnemonic==0.21` (BIP-39 24-word recovery phrases, kept in tested code
+  rather than inlined). Install with `pip install -r
+  agent-skill/requirements.txt`. All non-key `hub` commands keep working
+  without them. The cryptography used is libsodium primitives through
+  PyNaCl — no custom ciphers, no hand-rolled KDF, no home-grown AEAD.
 - At deploy time, pin the toolchain too: `npm i -g wrangler@<exact-version>`
   (record the version in the deploy log). Never deploy from a floating
   `latest`.
