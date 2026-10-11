@@ -195,6 +195,27 @@ function newId(): string {
   return crypto.randomUUID();
 }
 
+// Identity principals (F02). A principal is the stable cross-circle identity
+// behind member rows; authorization joins use it, never the email string.
+// New member rows get a FRESH principal, inserted in the same atomic batch as
+// the member row so a failed create leaves no orphan behind. The ONLY path
+// that reuses an existing principal is locked circle creation, which carries
+// the already-verified caller's principal onto the new member row —
+// hub-owner power must derive from a verified credential, never from an
+// email string the caller supplies.
+function newPrincipalId(): string {
+  return 'pr_' + newId().replace(/-/g, '');
+}
+function principalInsertOp(
+  principalId: string,
+  ts: string,
+): { sql: string; params: (string | number | null)[] } {
+  return {
+    sql: `INSERT INTO principals(id, created_at) VALUES (?,?)`,
+    params: [principalId, ts],
+  };
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -547,16 +568,18 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
 
   const familyId = newId();
   const memberId = newId();
+  const principalId = newPrincipalId();
   const ts = nowIso();
   const code = newProvisioningCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const provisionExpiresAt = hoursFromNow(PROVISION_TTL_HOURS);
   try {
     await db.execAtomically([
+      principalInsertOp(principalId, ts),
       { sql: `INSERT INTO families(id, name, created_at) VALUES (?,?,?)`, params: [familyId, name, ts] },
       {
-        sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-        params: [memberId, familyId, ownerName, ownerEmail, 'owner', ts],
+        sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at) VALUES (?,?,?,?,?,?,?)`,
+        params: [memberId, familyId, ownerName, ownerEmail, 'owner', principalId, ts],
       },
       {
         sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
@@ -582,17 +605,19 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
 }
 
 /**
- * True when the caller is a hub owner: holds the 'owner' role in at least
- * one family. Identity is matched by email, since one human has one member
- * row per family but a single email across them.
+ * True when the caller is a hub owner: the principal behind the verified
+ * calling token holds the 'owner' role in at least one circle (F02).
+ * Identity is matched by principal_id — never by the email string — so a
+ * member row that merely shares an email with another circle's owner gains
+ * no hub-owner powers. Fail closed: no principal, no power.
  */
 async function isHubOwner(db: DbClient, auth: AuthContext): Promise<boolean> {
   if (auth.role === 'owner') return true;
-  const me = await db.queryOne(`SELECT email FROM members WHERE id = ?`, [auth.member_id]);
-  if (!me) return false;
+  const pid = auth.principal_id;
+  if (!pid) return false;
   const row = await db.queryOne(
-    `SELECT 1 FROM members WHERE email = ? AND role = 'owner' LIMIT 1`,
-    [me['email'] as string],
+    `SELECT 1 FROM members WHERE principal_id = ? AND role = 'owner' LIMIT 1`,
+    [pid],
   );
   return row !== null;
 }
@@ -625,6 +650,14 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
   if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
   const creatorName = me['name'] as string;
   const creatorEmail = me['email'] as string;
+  // F02: the new member row inherits the caller's already-verified principal
+  // (bound to the token by resolveToken, never from caller input). This is
+  // the one legitimate cross-circle linking path: the caller's identity was
+  // proven by their credential, so their new membership is the same person.
+  const callerPrincipal = auth.principal_id;
+  if (!callerPrincipal) {
+    throw new HttpError(500, 'internal', 'Calling member has no principal');
+  }
 
   // Idempotent retry: the client never got the first response, but the work
   // is done. Return the existing circle with a FRESH provisioning code (the
@@ -660,8 +693,8 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
       params: [familyId, name, kind, ts],
     },
     {
-      sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-      params: [memberId, familyId, creatorName, creatorEmail, 'owner', ts],
+      sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at) VALUES (?,?,?,?,?,?,?)`,
+      params: [memberId, familyId, creatorName, creatorEmail, 'owner', callerPrincipal, ts],
     },
     {
       sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
@@ -725,7 +758,9 @@ async function dedupFamilyCreate(
   const family = await db.queryOne(`SELECT * FROM families WHERE id = ?`, [familyId]);
   if (!family) throw new HttpError(500, 'internal', 'Idempotency record points at a missing circle');
   const member = await db.queryOne(
-    `SELECT * FROM members WHERE family_id = ? AND email = (SELECT email FROM members WHERE id = ?)`,
+    // F02: match the caller's member row in the new circle by principal_id —
+    // the verified identity — never by the email string.
+    `SELECT * FROM members WHERE family_id = ? AND principal_id = (SELECT principal_id FROM members WHERE id = ?)`,
     [familyId, auth.member_id],
   );
   if (!member) throw new HttpError(500, 'internal', 'Idempotency record points at a missing member');
@@ -767,18 +802,21 @@ async function dedupFamilyCreate(
   );
 }
 
-// GET /v1/families — list families the caller is a member of (v0.2.0+).
-// Membership is matched by email: one human, one member row per family.
+// GET /v1/families — list circles the caller is a member of (v0.2.0+).
+// Membership is matched by principal_id (F02): the stable identity behind
+// the verified calling token. A member row that merely shares an email with
+// a member of another circle is NOT linked to it — emails are attributes,
+// not identity keys. Fail closed: no principal, no circles.
 async function handleListFamilies(db: DbClient, auth: AuthContext): Promise<Response> {
-  const me = await db.queryOne(`SELECT email FROM members WHERE id = ?`, [auth.member_id]);
-  if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
+  const pid = auth.principal_id;
+  if (!pid) return json({ families: [] });
   const rows = await db.queryAll(
     `SELECT f.id, f.name, f.kind, f.created_at, m.role AS my_role
        FROM families f
        JOIN members m ON m.family_id = f.id
-      WHERE m.email = ?
+      WHERE m.principal_id = ?
       ORDER BY f.created_at ASC`,
-    [me['email'] as string],
+    [pid],
   );
   return json({
     families: rows.map((r) => ({
@@ -912,6 +950,7 @@ async function handleAcceptInvite(
   if (dup) throw new HttpError(409, 'already_member', 'This email is already a family member');
 
   const memberId = newId();
+  const principalId = newPrincipalId();
   const token = newAgentToken();
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
@@ -922,12 +961,19 @@ async function handleAcceptInvite(
   // UPDATE so they see pre-consume state). Concurrent accepts of the same
   // code therefore create exactly one member and one token; the winner is the
   // call whose member row exists afterwards.
+  // F02: the new member gets a FRESH principal. An invite code proves code
+  // possession, not email ownership, so the row must never inherit another
+  // circle's principal by email match — even when the same email already has
+  // a member elsewhere. (If the conditional member INSERT below does not
+  // fire, the principals row is an inert orphan: nothing references
+  // principals outward.)
   await db.execAtomically([
+    principalInsertOp(principalId, ts),
     {
-      sql: `INSERT INTO members(id, family_id, name, email, role, created_at)
-            SELECT ?,?,?,?,?,?
+      sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at)
+            SELECT ?,?,?,?,?,?,?
              WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
-      params: [memberId, inviteFamilyId, displayName, email, inviteRole, ts, codeHash],
+      params: [memberId, inviteFamilyId, displayName, email, inviteRole, principalId, ts, codeHash],
     },
     {
       sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
