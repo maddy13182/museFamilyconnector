@@ -51,8 +51,8 @@ deploying, and keep it next to `docs/INSTALL.md`.
 - [ ] **TLS everywhere.** Cloudflare-managed cert; HSTS enabled. The worker
       never serves plaintext.
 - [ ] **Minimal unauthenticated surface.** Only `/v1/health`,
-      `/v1/invites/{code}/accept`, and `/v1/provision/{code}/accept` skip the
-      bearer check. Unknown routes → 404, no version banners.
+      `/v1/invites/{code}/accept`, and `/v1/provisioning-codes/{code}/redeem`
+      skip the bearer check. Unknown routes → 404, no version banners.
 - [ ] **Rate limits in place** (INSTALL §5): 5/min/IP on family-create,
       10/min/IP on invite-accept, 60/min/token on the API.
 - [ ] **`SETUP_LOCKED=1` after bootstrap.** Verify `POST /v1/families`
@@ -169,7 +169,7 @@ so the blast radius is small:
 ## Supply-chain posture
 
 - The worker has **zero runtime dependencies**. The only npm package is
-  `typescript@5.9.3` (dev-only, build-time — never shipped in the worker
+  `typescript@7.0.2` (dev-only, build-time — never shipped in the worker
   bundle): pinned exact in `server/package.json`, `save-exact=true` in
   `server/.npmrc`, integrity hash in `server/package-lock.json`.
 - Always install with `npm ci` (never `npm install`) so the lockfile is the

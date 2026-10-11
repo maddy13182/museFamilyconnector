@@ -33,12 +33,20 @@ Kid's agent ─┘         topics · tasks · append-only history
 - **Topics** are conversations: 1:1 or group, each with a subject and full,
   replayable history. A parents-only thread can **spawn** a linked kid-safe
   thread carrying only an approved briefing — the original stays invisible.
+- **Circles**: one hub hosts many circles — your family plus any other groups
+  (friends, gym, …). Each circle has its own members, topics, and tasks, and
+  your agent holds a separate token per circle. Create more any time with
+  `hub circle create`; switch with `hub circle use`.
 - **Tasks** live inside topics: create, assign to another member's agent,
   track progress notes, complete with a structured result. ("Check your
   calendar for conflicts" → daughter's agent asks her → reports back.)
 - **Sync**: agents poll `GET /v1/sync` every ~15 minutes and surface what's new.
 - **Identity**: every agent gets its own bearer token (the human's agent
-  enrolls via a one-time invite code). Tokens are revocable per agent.
+  enrolls via a one-time invite code). Tokens are revocable per agent, and
+  each token is bound to one circle — the agent keeps one token per circle.
+
+The concepts in full — hub vs circle vs topic, user vs agent identity, the
+auth and encryption model, and what to save: [`docs/CONCEPTS.md`](docs/CONCEPTS.md).
 
 ---
 
@@ -144,6 +152,12 @@ provisioning code** (`fhp_...`, not to be confused with the `fh_...` agent
 tokens) for your agent. Run your agent's setup with it now (step 9) — the
 code is single-use and expires in 24 hours.
 
+**Write these down before moving on** (password manager, never chat or git):
+your `TOKEN_PEPPER` value, your Cloudflare API token (if you use one), and —
+redeemed immediately — this provisioning code. See
+[`docs/CONCEPTS.md`](docs/CONCEPTS.md) ("What to save, and where") for why
+each matters.
+
 ### 7. Lock the bootstrap
 
 In `server/wrangler.toml`, set:
@@ -152,8 +166,10 @@ In `server/wrangler.toml`, set:
 SETUP_LOCKED = "1"
 ```
 
-then `wrangler deploy` again. `POST /v1/families` is now dead forever. (A
-second family = a second deployment, never a second call.)
+then `wrangler deploy` again. From now on, `POST /v1/families` without an
+existing owner token is rejected — but as an owner you can still create
+additional circles any time (`hub circle create --name "Gym friends"`), which
+is the normal way to grow beyond one family. No second deployment needed.
 
 ### 8. Test the dashboard
 
@@ -171,7 +187,10 @@ Then, in your Muse chat: tell your agent to read
 `~/workspace/skills/family-hub/SKILL.md` and run `hub setup`, giving it the
 provisioning code from step 6. The agent stores its credential in its
 configured credential store (secure vault, environment, or a locked-down
-file) — **it will never see the raw token**, by design.
+file) — **it will never see the raw token**, by design. (The one exception:
+`hub dashboard-token` prints a circle's token so *you* can paste it into the
+dashboard — treat its output like a password, and never let the agent print
+it unprompted.)
 
 Set up the poll (so the agent checks for new messages/tasks regularly):
 

@@ -58,8 +58,11 @@ environment variables only.
 2. `POST https://<your-worker>/v1/families`
    `{name, owner_name, owner_email}` → save the provisioning code; enroll your
    agent with it.
-3. Set `SETUP_LOCKED = "1"`, redeploy. The bootstrap endpoint is locked
-   forever. (A second family = a second deployment.)
+3. Set `SETUP_LOCKED = "1"`, redeploy. Unauthenticated `POST /v1/families`
+   calls are now rejected. As an owner you can still create additional
+   circles any time (`hub circle create`) — a second circle is not a second
+   deployment. (Truly separate families that shouldn't share an operator
+   still get their own worker + D1 pair.)
 
 ## Rotating the Cloudflare token
 

@@ -44,8 +44,8 @@ wrangler d1 create family-hub
 #     database_name = "family-hub"
 #     database_id = "<paste it here>"
 
-# 2c. Apply the schema to the REMOTE database
-wrangler d1 execute family-hub --remote --file=migrations/0001_init.sql
+# 2c. Apply the migrations to the REMOTE database
+wrangler d1 migrations apply family-hub --remote
 
 # 2d. Sanity check
 wrangler d1 execute family-hub --remote --command="SELECT name FROM sqlite_master WHERE type='table';"
@@ -108,8 +108,10 @@ curl -s -X POST $HUB/v1/families -H 'Content-Type: application/json' -d '{}'
 # → {"error":{"code":"setup_locked",…}}   ← this is what you want to see
 ```
 
-> If you ever need a second family, deploy a second worker + D1 pair. There is
-> exactly one family per deployment, by design.
+> If you ever need a truly separate family that shouldn't share an operator
+> or a database, deploy a second worker + D1 pair. Additional circles for
+> people you already trust (friends, groups) are created with
+> `hub circle create` — no second deployment needed.
 
 ## 5. Rate limiting (Cloudflare dashboard)
 
