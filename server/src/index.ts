@@ -1088,10 +1088,14 @@ async function handleAcceptInvite(
     );
   }
   // Token is returned ONCE here and never again.
+  // family_id must be present: the CLI's circle-join reads it to store the
+  // new token, and a missing field used to crash AFTER issuance but BEFORE
+  // the token was saved (invite spent, token lost).
   return json(
     {
       member: {
         id: memberId,
+        family_id: inviteFamilyId,
         name: displayName,
         email,
         role: invite['role'],

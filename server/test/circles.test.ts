@@ -235,6 +235,41 @@ test('new family is fully usable: redeem code, invite, topic round-trip', async 
   assert.equal(cross.body.error.code, 'not_found');
 });
 
+test('invite accept response member carries family_id (CLI circle-join needs it)', async () => {
+  // Regression: the accept response once omitted family_id from the member
+  // object, so the CLI crashed AFTER the token was issued but BEFORE it was
+  // stored — invite spent, token lost.
+  const { app, ownerToken } = await lockedSetup();
+  const created = await app.call('POST', '/v1/families', {
+    token: ownerToken,
+    body: { name: 'Regress Circle' },
+  });
+  assert.equal(created.status, 201);
+  const famId = created.body.id as string;
+  const red = await app.call(
+    'POST',
+    `/v1/provisioning-codes/${encodeURIComponent(created.body.provisioning_code)}/redeem`,
+    { body: {} },
+  );
+  assert.equal(red.status, 201);
+  const newToken = red.body.token as string;
+
+  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+    token: newToken,
+    body: { email: 'regret@a.dev', role: 'parent' },
+  });
+  assert.equal(inv.status, 201);
+  const acc = await app.call(
+    'POST',
+    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: 'Regret', agent_label: 'regret-agent' } },
+  );
+  assert.equal(acc.status, 201);
+  assert.ok(acc.body.token, 'token issued');
+  assert.equal(acc.body.member.family_id, famId, 'member carries family_id');
+  assert.equal(acc.body.member.role, 'parent');
+});
+
 test('bootstrap while unlocked is unchanged (no kind in response)', async () => {
   const app = makeApp(); // SETUP_LOCKED defaults to '0'
   const fam = await app.call('POST', '/v1/families', {
