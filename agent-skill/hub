@@ -1328,7 +1328,8 @@ def _cmd_post_e2ee(args, ctx, topic, message, data):
 #   so the re-key is what actually locks them out of new content.
 # ---------------------------------------------------------------------------
 
-_E2EE_SYSTEM_KINDS = ("key_rotated", "key_request", "pending_key_distribution")
+_E2EE_SYSTEM_KINDS = ("key_rotated", "key_request", "pending_key_distribution",
+                      "topic_archived")
 
 
 def _merge_topic_key(profile, topic_id, key_id_hex, topic_key):
@@ -1727,14 +1728,13 @@ def cmd_topic_rekey(args, transport):
     return 0
 
 
-def cmd_key_request(args, transport):
-    """Post a visible request for the current E2EE topic key.
+def _post_key_request(ctx, topic, note=None):
+    """Build and post the visible key_request system entry; returns the entry.
 
-    There is NO automatic fulfillment: a member-agent holding the key may
-    answer with `hub key-grant` — ONLY after its human explicitly approves.
+    Shared by `hub key-request` and the recovery ladder (rung 2). There is
+    NO automatic fulfillment: a member-agent holding the key may answer with
+    `hub key-grant` — ONLY after its human explicitly approves.
     """
-    ctx = _ctx(args, transport)
-    topic = _e2ee_require_topic(ctx, args.topic)
     me = ctx.client.call("GET", "/v1/me")
     me = me if isinstance(me, dict) else {}
     name = me.get("name") or me.get("id") or "unknown member"
@@ -1744,14 +1744,25 @@ def cmd_key_request(args, transport):
         "[key request] %s (agent %s) is asking for the current topic key for this "
         "E2EE topic. There is NO automatic fulfillment: a member-agent holding the "
         "key may run `hub key-grant --topic %s --member %s` — ONLY after its human "
-        "explicitly approves." % (name, label, args.topic, mid)
+        "explicitly approves." % (name, label, topic.get("id"), mid)
     )
-    if args.note:
-        check_pii(args.note)
-        body += "\nNote from requester: %s" % args.note.strip()
-    entry = _post_system_entry(
+    if note:
+        check_pii(note)
+        body += "\nNote from requester: %s" % note.strip()
+    return _post_system_entry(
         ctx, topic, "key_request", body, {"member_id": mid, "agent_label": label}
     )
+
+
+def cmd_key_request(args, transport):
+    """Post a visible request for the current E2EE topic key.
+
+    There is NO automatic fulfillment: a member-agent holding the key may
+    answer with `hub key-grant` — ONLY after its human explicitly approves.
+    """
+    ctx = _ctx(args, transport)
+    topic = _e2ee_require_topic(ctx, args.topic)
+    entry = _post_key_request(ctx, topic, args.note)
     emit_json({"entry": entry})
     emit_err(
         "key request posted and visible to all participants. Nothing was granted "
@@ -1914,6 +1925,541 @@ def cmd_topic_key_status(args, transport):
             "current_key_id": current_id,
             "participants": rows,
         }
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# E2EE recovery ladder (Phase 5) — the abandonment antidote.
+#
+# `hub recover` walks the rungs in order and stops at the first that works:
+#   rung 1 — local backup: restore the identity key from a key-backup file
+#            (conventional locations, --backup-file, or prompted path) or the
+#            24-word recovery phrase. A restored identity key re-opens the
+#            agent's envelopes, which is usually the whole fix.
+#   rung 2 — re-registration + member-assisted re-envelopment: with the Bearer
+#            token as bootstrap, register a fresh keypair (hub key-init guts)
+#            and post a visible key-request for a member-agent to grant after
+#            explicit human approval. --wait polls for the grant; without it
+#            the command exits 2 ("request posted, waiting for grant").
+#   rung 3 — provisioning code: no usable Bearer token at all. Nothing can
+#            run automatically; exact out-of-band instructions are printed for
+#            the human to relay.
+# Every rung is narrated: what was tried, what failed, what comes next.
+# Rungs are never silently skipped.
+# ---------------------------------------------------------------------------
+
+# Exit status when recovery is correctly parked waiting on a human grant.
+_RECOVER_EXIT_WAITING = 2
+
+
+def _prompt(text):
+    """input() wrapper so tests can drive interactive prompts."""
+    try:
+        return input(text)
+    except EOFError:
+        return ""
+
+
+def _recover_backup_search_paths(profile):
+    """Conventional locations for an identity-key backup file (rung 1)."""
+    pdir = profile_dir(profile)
+    home = os.path.expanduser("~")
+    return [
+        os.path.join(pdir, "identity-key-backup.json"),
+        os.path.join(home, "family-hub-identity-key-backup.json"),
+        os.path.join(home, ".config", "family-hub", "identity-key-backup.json"),
+    ]
+
+
+def _looks_like_key_backup(path):
+    """True when path parses as a hub identity-key backup blob. Read-only."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(blob, dict) and blob.get("kdf") == _BACKUP_KDF
+
+
+def _recover_rung1_backup(profile, key_path, backup_file_arg, phrase_file_arg):
+    """Rung 1 — restore the identity key from a local backup.
+
+    Tries, in order: --backup-file, conventional locations, a prompted path,
+    then the 24-word recovery phrase (--phrase-file or prompted). Returns
+    True when the identity key is now present and valid. Every attempt is
+    narrated; a wrong password or bad file fails this rung loudly, never
+    silently.
+    """
+    emit_err("[rung 1/3] local backup — restoring the identity key from backup…")
+    candidates = []
+    if (backup_file_arg or "").strip():
+        candidates.append(os.path.expanduser(backup_file_arg.strip()))
+    else:
+        for path in _recover_backup_search_paths(profile):
+            if os.path.isfile(path):
+                if _looks_like_key_backup(path):
+                    emit_err(
+                        "[rung 1/3] found a backup file at a conventional "
+                        "location: %s" % path
+                    )
+                    candidates.append(path)
+                else:
+                    emit_err(
+                        "[rung 1/3] %s exists but is not a hub key-backup "
+                        "file — skipping it." % path
+                    )
+        if not candidates:
+            emit_err(
+                "[rung 1/3] no backup file in the conventional locations "
+                "(checked: %s)."
+                % ", ".join(_recover_backup_search_paths(profile))
+            )
+            answer = _prompt("Path to a key-backup file (Enter to skip): ").strip()
+            if answer:
+                candidates.append(os.path.expanduser(answer))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                blob = json.load(fh)
+        except (OSError, ValueError) as exc:
+            emit_err("[rung 1/3] cannot read %s: %s" % (path, exc))
+            continue
+        password = getpass.getpass("Backup password for %s: " % path)
+        note_secret(password)
+        try:
+            priv = _decrypt_key_backup(blob, password)
+        except HubError as exc:
+            emit_err(
+                "[rung 1/3] the backup at %s did not decrypt (%s) — "
+                "wrong password or a corrupt file." % (path, exc)
+            )
+            continue
+        _note_key_secrets(priv)
+        _write_secret_file_0600(key_path, priv, "identity private key")
+        emit_err(
+            "[rung 1/3] identity key restored from backup %s "
+            "(mode 0600)." % path
+        )
+        return True
+    # The recovery phrase is the other half of rung 1 (same thing
+    # `hub key-restore` accepts).
+    phrase = None
+    if (phrase_file_arg or "").strip():
+        try:
+            with open(os.path.expanduser(phrase_file_arg.strip()), "r",
+                      encoding="utf-8") as fh:
+                phrase = fh.read()
+        except OSError as exc:
+            emit_err("[rung 1/3] cannot read phrase file: %s" % exc)
+            return False
+    else:
+        answer = _prompt(
+            "Restore from the 24-word recovery phrase instead? [y/N]: "
+        ).strip().lower()
+        if answer in ("y", "yes"):
+            phrase = getpass.getpass("Recovery phrase (24 words): ")
+    if phrase is None:
+        return False
+    note_secret(phrase)
+    try:
+        priv = _privkey_from_phrase(phrase)
+    except HubError as exc:
+        emit_err("[rung 1/3] the recovery phrase was rejected: %s" % exc)
+        return False
+    _note_key_secrets(priv)
+    _write_secret_file_0600(key_path, priv, "identity private key")
+    emit_err("[rung 1/3] identity key restored from the recovery phrase (mode 0600).")
+    return True
+
+
+def _recover_wait_for_grant(ctx, profile, topic_id, wait_interval, wait_timeout):
+    """Poll our own envelopes until the granted key lands or time runs out.
+
+    Uses the quiet refresh: envelopes sealed to the lost/superseded identity
+    key can never open again and must not abort the wait — only a newly
+    granted envelope matters here. A persistently unreachable server simply
+    runs the clock out with clear re-run guidance.
+    """
+    emit_err(
+        "waiting up to %ds for the grant (polling every %ds) — a human on "
+        "the other side must approve it; this is not instant."
+        % (wait_timeout, wait_interval)
+    )
+    deadline = time.time() + wait_timeout
+    while True:
+        time.sleep(wait_interval)
+        fresh = _e2ee_refresh_own_keys(ctx.client, profile, topic_id, quiet=True)
+        for kid in fresh:
+            emit_err(
+                "grant received: fetched a new key envelope (key …%s)."
+                % kid[-8:]
+            )
+        if _load_topic_keys(profile, topic_id):
+            emit_err("the topic key is now in the local keystore — recovered.")
+            return True
+        if time.time() >= deadline:
+            emit_err(
+                "timed out waiting for the grant. The key-request is still "
+                "visible in the topic — ask a key holder to run `hub key-grant "
+                "--topic %s`, then re-run `hub recover --topic %s --wait`."
+                % (topic_id, topic_id)
+            )
+            return False
+
+
+def _recover_pending_exit(topic_id):
+    """Exit 2: the request is posted; a human grant is still pending."""
+    err = HubError(
+        "pending",
+        "Key request posted and visible to all participants; waiting for a "
+        "member-agent to grant it (explicit human approval required — never "
+        "automatic). Re-run `hub recover --topic %s --wait` or "
+        "`hub key-fetch --topic %s` after the grant lands." % (topic_id, topic_id),
+    )
+    err.exit_code = _RECOVER_EXIT_WAITING
+    raise err
+
+
+def _recover_rung3_instructions(cfg, profile, server, topic_id):
+    """Rung 3 — no usable Bearer token: print the exact out-of-band steps."""
+    member = cfg.get("member") or {}
+    mid = member.get("id") or "<your member id — ask the hub owner>"
+    label = cfg.get("agent_label") or "<this agent's label>"
+    emit_err("[rung 3/3] provisioning code — out-of-band; a human must help.")
+    emit_err("")
+    emit_err(
+        "This agent has no working Bearer token, so it cannot authenticate to "
+        "the hub at all. Nothing below can run automatically — relay these "
+        "steps to a human:"
+    )
+    emit_err("")
+    emit_err(
+        "1. Ask the hub owner to mint a fresh single-use provisioning code for "
+        "this agent:"
+    )
+    emit_err("     member_id:   %s" % mid)
+    emit_err("     agent_label: %s" % label)
+    emit_err("   The owner mints it with an authenticated call:")
+    emit_err("     POST %s/v1/provisioning-codes" % server.rstrip("/"))
+    emit_err('     {"member_id": "%s", "agent_label": "%s"}' % (mid, label))
+    emit_err(
+        "   (Only the owner can mint for another member; any member can "
+        "self-mint for their own agent.) The code is single-use and expires — "
+        "have them send it to you OUT OF BAND, not through the hub."
+    )
+    emit_err("")
+    emit_err(
+        "2. Run `hub setup --server %s` and paste the code when prompted. "
+        "Setup generates a FRESH identity keypair and prints a NEW 24-word "
+        "recovery phrase — write it down this time." % server.rstrip("/")
+    )
+    emit_err("")
+    if topic_id:
+        emit_err(
+            "3. Then climb back up the ladder: `hub recover --topic %s` "
+            "(rung 2: re-register the new key, post a key-request, wait for a "
+            "member-agent to grant it)." % topic_id
+        )
+    else:
+        emit_err(
+            "3. Then climb back up the ladder: `hub recover --topic <id>` "
+            "for each E2EE topic (rung 2: re-register the new key, post a "
+            "key-request, wait for a member-agent to grant it)."
+        )
+
+
+def _is_auth_failure(exc):
+    """True when a HubError means the Bearer token is dead (401 mapping)."""
+    return isinstance(exc, HubError) and (exc.code == "auth" or exc.exit_code == 3)
+
+
+def cmd_recover(args, transport):
+    """Walk the E2EE recovery ladder when this agent has no usable topic key.
+
+    Rung 1 (local backup) → rung 2 (re-register + member-assisted
+    re-envelopment) → rung 3 (provisioning code, out-of-band). Each rung is
+    narrated: what was tried, what failed, what comes next. Rungs are never
+    silently skipped.
+
+    Exit status: 0 = recovered (or nothing to do); 2 = key-request posted,
+    waiting on a human grant; 1/3 = blocked (see the message).
+    """
+    _require_nacl()
+    profile = args.profile
+    cfg = load_config(profile)
+    circle_id = _active_circle_id(cfg)
+    server = (
+        args.server
+        or os.environ.get("FAMILY_HUB_URL")
+        or cfg.get("server_url")
+        or ""
+    )
+    topic_id = str(args.topic) if args.topic else None
+    scope = "topic %s" % topic_id if topic_id else "this agent's identity key"
+    emit_err(
+        "Recovery ladder for %s — rungs are tried in order; the first that "
+        "works ends the run." % scope
+    )
+    key_path = agent_key_path(profile)
+    has_token = _has_usable_token(cfg, profile, circle_id)
+    if not has_token:
+        emit_err(
+            "no usable Bearer token found for this profile — rung 2 "
+            "(re-registration) cannot authenticate."
+        )
+
+    try:
+        _load_identity_key(key_path)
+        identity_ok = True
+        emit_err("identity key: present at %s." % key_path)
+    except HubError:
+        identity_ok = False
+        emit_err(
+            "identity key: missing or unusable at %s." % key_path
+        )
+
+    ctx = None
+    if has_token:
+        if not server:
+            raise HubError(
+                "bad_request", "No server configured. Use --server or run `hub setup`."
+            )
+        try:
+            ctx = _ctx(args, transport)
+        except HubError as exc:
+            emit_err("cannot build an authenticated session: %s" % exc.friendly())
+            has_token = False
+
+    def authed_call(fn, what):
+        """Run fn(); a dead token demotes us to rung 3 instead of crashing."""
+        nonlocal has_token
+        try:
+            return fn()
+        except HubError as exc:
+            if _is_auth_failure(exc):
+                has_token = False
+                emit_err(
+                    "%s: the stored Bearer token was rejected by the server "
+                    "(expired or revoked)." % what
+                )
+                return None
+            raise
+
+    # Pre-check (not a rung): maybe a grant already landed server-side.
+    topic = None
+    if topic_id and has_token and ctx is not None:
+        topic = authed_call(lambda: _e2ee_require_topic(ctx, topic_id), "topic lookup")
+        if topic is not None and identity_ok:
+            fresh = authed_call(
+                lambda: _e2ee_refresh_own_keys(ctx.client, profile, topic_id, quiet=True),
+                "envelope refresh",
+            )
+            if fresh:
+                emit_err(
+                    "pre-check: fetched %d key envelope(s) without climbing "
+                    "the ladder." % len(fresh)
+                )
+
+    if topic_id and identity_ok and _load_topic_keys(profile, topic_id):
+        n = len(_load_topic_keys(profile, topic_id))
+        emit(
+            "no recovery needed: this agent already holds %d topic key(s) "
+            "for %s." % (n, topic_id)
+        )
+        emit_json(
+            {"topic_id": topic_id, "recovered": False, "reason": "keys already present"}
+        )
+        return 0
+
+    # -- Rung 1: local backup -------------------------------------------
+    if not identity_ok:
+        restored = _recover_rung1_backup(
+            profile, key_path, args.backup_file, args.phrase_file
+        )
+        if restored:
+            identity_ok = True
+            if topic_id and has_token and ctx is not None:
+                # The restored private key re-opens this agent's envelopes.
+                authed_call(
+                    lambda: _e2ee_refresh_own_keys(ctx.client, profile, topic_id, quiet=False),
+                    "envelope refresh",
+                )
+                if has_token and _load_topic_keys(profile, topic_id):
+                    n = len(_load_topic_keys(profile, topic_id))
+                    emit(
+                        "recovered at rung 1: the backup restored the identity "
+                        "key and %d topic key(s) for %s were fetched from "
+                        "existing envelopes." % (n, topic_id)
+                    )
+                    emit_json({"topic_id": topic_id, "recovered": True, "rung": 1})
+                    return 0
+                emit_err(
+                    "[rung 1/3] the identity key is back, but no envelope for "
+                    "topic %s could be opened with it. Next: rung 2." % topic_id
+                )
+        else:
+            emit_err("[rung 1/3] FAILED — no usable backup. Next: rung 2.")
+    else:
+        emit_err("[rung 1/3] skipped: the identity key is present (nothing to restore).")
+
+    # -- Rung 2: re-registration + member-assisted re-envelopment ---------
+    # Runs whenever the Bearer token works: _key_init_register generates a
+    # fresh keypair when the identity key is missing, and is a no-op when the
+    # current key is already registered.
+    if has_token and ctx is not None:
+        if topic_id is None:
+            emit_err("[rung 2/3] re-registration (identity-level; no topic given)…")
+            ok = authed_call(lambda: _key_init_register(ctx), "key re-registration")
+            if has_token and ok is not None:
+                emit(
+                    "identity key registered. Per-topic key requests still "
+                    "need `hub recover --topic <id>`."
+                )
+                emit_json({"recovered": True, "rung": 2, "topic_id": None})
+                return 0
+        else:
+            if topic is None:
+                topic = authed_call(
+                    lambda: _e2ee_require_topic(ctx, topic_id), "topic lookup"
+                )
+            if topic is not None:
+                emit_err(
+                    "[rung 2/3] re-registration + member-assisted re-envelopment…"
+                )
+                ok = authed_call(lambda: _key_init_register(ctx), "key re-registration")
+                if has_token and ok is not None:
+                    posted = authed_call(
+                        lambda: _post_key_request(
+                            ctx, topic,
+                            note="recovery: posted by `hub recover` (rung 2)",
+                        ),
+                        "key-request post",
+                    )
+                    if has_token and posted is not None:
+                        emit_err(
+                            "key request posted and visible to all participants. "
+                            "A member-agent holding the key must run `hub key-grant` "
+                            "— ONLY after its human explicitly approves. This is "
+                            "not instant."
+                        )
+                        if args.wait:
+                            if _recover_wait_for_grant(
+                                ctx, profile, topic_id,
+                                args.wait_interval, args.wait_timeout,
+                            ):
+                                emit_json(
+                                    {"topic_id": topic_id, "recovered": True, "rung": 2}
+                                )
+                                return 0
+                        _recover_pending_exit(topic_id)
+    elif not has_token:
+        emit_err(
+            "[rung 2/3] SKIPPED — no usable Bearer token, so this agent cannot "
+            "re-register or post a key-request. Next: rung 3."
+        )
+
+    # -- Rung 3: provisioning code (out-of-band) --------------------------
+    if not has_token:
+        _recover_rung3_instructions(cfg, profile, server, topic_id)
+        err = HubError(
+            "auth",
+            "Recovery is blocked at rung 3: this agent has no working Bearer "
+            "token. The steps printed above must be carried out by a human "
+            "out-of-band.",
+        )
+        err.exit_code = 3  # same convention as any other auth failure
+        raise err
+    # Token works but we still have nothing (e.g. topic lookup failed).
+    raise HubError(
+        "error",
+        "Recovery failed: the ladder is exhausted and topic %s is still "
+        "unreadable. Do NOT spin up a replacement topic — ask your human "
+        "whether to archive it with `hub topic-archive`." % (topic_id or "<none>",),
+    )
+
+
+def cmd_topic_archive(args, transport):
+    """Archive a dead topic with a plaintext pointer to its successor.
+
+    Total-loss case only: every recovery rung is exhausted and the human has
+    confirmed. Posts a PLAINTEXT `topic_archived` entry stating why the old
+    topic is unreadable, who authorized the archive, and where discussion
+    continues. The old topic is NEVER deleted — it stays readable as history
+    for anyone who still holds keys.
+
+    Requires explicit confirmation (prompt, or --yes to bypass): archiving
+    is destructive to readability.
+    """
+    ctx = _ctx(args, transport)
+    topic = _fetch_topic_record(ctx.client, args.topic)
+    topic_id = str(topic.get("id") or args.topic)
+    me = ctx.client.call("GET", "/v1/me")
+    me = me if isinstance(me, dict) else {}
+    mid = me.get("id") or ""
+    name = me.get("name") or mid or "unknown member"
+    role = me.get("role") or ""
+    holds_key = bool(_load_topic_keys(ctx.profile, topic_id))
+    if role not in ("owner", "parent") and not holds_key:
+        raise HubError(
+            "forbidden",
+            "Only the topic owner/parent or a remaining key-holder may archive "
+            "topic %s (your role is '%s' and you hold no topic key)."
+            % (topic_id, role),
+        )
+    successor = (args.successor or "").strip()
+    if successor:
+        # The successor must exist before the old topic points at it.
+        _fetch_topic_record(ctx.client, successor)
+    reason = (args.reason or "").strip()
+    if not reason:
+        reason = _prompt(
+            "Why is this topic unreadable? (goes into the public archive entry): "
+        ).strip()
+    if not reason:
+        raise HubError(
+            "bad_request",
+            "A reason is required — the archive entry must say why the old "
+            "topic is unreadable.",
+        )
+    check_pii(reason)
+    if not args.yes:
+        emit_err(
+            "You are about to ARCHIVE topic %s.\n"
+            "Its history stays readable for key-holders, but agents without "
+            "the key will never read it again. Successor: %s.\n"
+            "Type 'yes' to archive, anything else aborts."
+            % (
+                topic_id,
+                successor
+                or "(none — create the successor topic first if discussion continues)",
+            )
+        )
+        answer = _prompt("")
+        if answer.strip().lower() not in ("yes", "y"):
+            emit_err("archive cancelled: nothing was posted.")
+            return 1
+    where = (
+        "Discussion continues in topic %s." % successor
+        if successor
+        else "No successor topic was named — create one if discussion continues."
+    )
+    body = (
+        "[topic archived] This topic is no longer readable by all members "
+        "(%s). Archived by %s (%s). %s "
+        "The old messages remain in history for anyone who still holds the "
+        "topic key." % (reason, name, mid, where)
+    )
+    data = {
+        "successor_topic_id": successor or None,
+        "reason": reason,
+        "archived_by": mid,
+    }
+    entry = _post_system_entry(ctx, topic, "topic_archived", body, data)
+    emit_json({"topic_id": topic_id, "entry": entry})
+    emit_err(
+        "topic %s archived%s."
+        % (topic_id, " → successor %s" % successor if successor else "")
     )
     return 0
 
@@ -2754,15 +3300,16 @@ def cmd_setup(args, transport):
     return 0
 
 
-def cmd_key_init(args, transport):
-    """Generate (if needed) and register this agent's E2EE identity key.
+def _key_init_register(ctx):
+    """Ensure an identity keypair exists locally and is registered server-side.
 
-    Works as the initial registration when the agent has no key yet, and
-    as a no-op when the local key is already registered. The bearer token
-    is the bootstrap: it authenticates WHO the agent is while the keypair
-    becomes WHAT the agent can decrypt.
+    Returns (priv_bytes, public_b64, is_new). Works as the initial
+    registration when the agent has no key yet, and as a no-op when the
+    local key is already registered. The Bearer <redacted> is the bootstrap:
+    it authenticates WHO the agent is while the keypair becomes WHAT the
+    agent can decrypt. Shared by `hub key-init` and the recovery ladder
+    (rung 2).
     """
-    ctx = _ctx(args, transport)
     _require_nacl()
     priv, pub_b64, is_new = _ensure_identity_keypair(ctx.profile)
     if is_new:
@@ -2780,7 +3327,7 @@ def cmd_key_init(args, transport):
             and entry.get("public_key") == pub_b64
         ):
             emit("E2EE identity key is already registered for this agent — nothing to do.")
-            return 0
+            return priv, pub_b64, is_new
     resp = ctx.client.call(
         "POST", "/v1/agent-keys/rotate", json_body={"agent_public_key": pub_b64}
     )
@@ -2794,7 +3341,21 @@ def cmd_key_init(args, transport):
             "created_at": resp.get("created_at"),
         }
     )
+    return priv, pub_b64, is_new
+
+
+def cmd_key_init(args, transport):
+    """Generate (if needed) and register this agent's E2EE identity key.
+
+    Works as the initial registration when the agent has no key yet, and
+    as a no-op when the local key is already registered. The Bearer <redacted>
+    is the bootstrap: it authenticates WHO the agent is while the keypair
+    becomes WHAT the agent can decrypt.
+    """
+    ctx = _ctx(args, transport)
+    _key_init_register(ctx)
     return 0
+
 
 
 def cmd_key_backup(args, transport):
@@ -3032,8 +3593,8 @@ def cmd_post(args, transport):
     # to the pre-E2EE behavior.
     topic = _fetch_topic_record(ctx.client, args.topic)
     if args.kind in _E2EE_SYSTEM_KINDS:
-        # Phase 4 system entries (key_rotated / key_request /
-        # pending_key_distribution): plaintext by design, never encrypted —
+        # E2EE system entries (key_rotated / key_request /
+        # pending_key_distribution / topic_archived): plaintext by design, never encrypted —
         # they must be readable by agents that don't hold the topic key.
         entry = _post_system_entry(ctx, topic, args.kind, message, data)
         emit_json({"entry": entry})
@@ -3858,6 +4419,44 @@ def build_parser():
     )
     p.add_argument("--topic", required=True)
     p.set_defaults(func=cmd_topic_key_status)
+    p = sub.add_parser(
+        "recover",
+        help="E2EE: walk the recovery ladder when you have no usable topic "
+             "key (local backup -> re-register + key request -> "
+             "provisioning code)",
+    )
+    p.add_argument("--topic", default=None,
+                   help="Topic id to recover keys for (omit for identity-key "
+                        "recovery only)")
+    p.add_argument("--wait", action="store_true",
+                   help="After posting the key-request (rung 2), poll for the "
+                        "grant instead of exiting; without --wait the command "
+                        "exits 2 with the request posted and waiting")
+    p.add_argument("--wait-interval", type=float, default=15.0, metavar="SEC",
+                   help="Poll interval with --wait (default: %(default)s)")
+    p.add_argument("--wait-timeout", type=float, default=600.0, metavar="SEC",
+                   help="Give up waiting after SEC seconds (default: %(default)s)")
+    p.add_argument("--backup-file", default=None,
+                   help="Path to an identity-key backup file (skips the "
+                        "conventional-location scan in rung 1)")
+    p.add_argument("--phrase-file", default=None,
+                   help="File holding the 24-word recovery phrase (rung 1 fallback)")
+    p.set_defaults(func=cmd_recover)
+
+    p = sub.add_parser(
+        "topic-archive",
+        help="Retire a dead E2EE topic with a plaintext archive entry naming "
+             "its successor (total key loss only; requires confirmation)",
+    )
+    p.add_argument("--topic", required=True)
+    p.add_argument("--successor", default=None,
+                   help="Topic id discussion continues in (create it first)")
+    p.add_argument("--reason", default=None,
+                   help="Why the old topic is unreadable (goes into the public entry)")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip the interactive confirmation")
+    p.set_defaults(func=cmd_topic_archive)
+
 
     p = sub.add_parser("invite-member", help="Mint a circle invite code for a new member (owner/parent only)")
     p.add_argument("--circle", default=None, metavar="NAME_OR_ID",

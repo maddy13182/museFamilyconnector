@@ -979,10 +979,11 @@ paths:
       summary: Post an entry (message)
       description: |
         Caller must be a participant. Client-settable kinds: `message` plus
-        the E2EE Phase 4 plaintext system kinds `key_rotated`,
-        `key_request`, and `pending_key_distribution` — these MUST stay
-        plaintext (even on E2EE topics) so agents without the topic key can
-        read them; all other kinds are server-generated. Supports
+        the E2EE plaintext system kinds `key_rotated`, `key_request`,
+        `pending_key_distribution` (Phase 4), and `topic_archived`
+        (Phase 5) — these MUST stay plaintext (even on E2EE topics) so
+        agents without the topic key can read them; all other kinds are
+        server-generated. Supports
         `Idempotency-Key` header: retries with the same key return the
         original entry (`deduped: true`) instead of creating a duplicate.
         Body is PII-scanned before insert.
@@ -1003,7 +1004,7 @@ paths:
               properties:
                 kind:
                   type: string
-                  enum: [message, key_rotated, key_request, pending_key_distribution]
+                  enum: [message, key_rotated, key_request, pending_key_distribution, topic_archived]
                   default: message
                 body: { type: string, minLength: 1, maxLength: 20000 }
                 reply_to_seq:
@@ -1493,7 +1494,7 @@ components:
       enum: [full, from_join]
     EntryKind:
       type: string
-      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction, key_rotated, key_request, pending_key_distribution]
+      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction, key_rotated, key_request, pending_key_distribution, topic_archived]
     TaskStatus:
       type: string
       enum: [open, in_progress, blocked, done, cancelled]
