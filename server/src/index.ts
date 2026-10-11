@@ -1980,9 +1980,10 @@ async function handlePostEntry(
   // participants (requireParticipant above). key_rotated announces a topic
   // key rotation, key_request asks members for the current topic key, and
   // pending_key_distribution marks "member added, envelopes not yet sealed".
-  // All three must be readable by agents that do NOT hold the topic key
-  // (yet), so they are never encrypted client-side — the CLI posts them via
-  // its plaintext system-entry path with a loud stderr note.
+  // E2EE Phase 5 adds topic_archived: retiring a dead topic while naming its
+  // successor. All four must be readable by agents that do NOT hold the topic
+  // key (yet), so they are never encrypted client-side — the CLI posts them
+  // via its plaintext system-entry path with a loud stderr note.
   const kind = body['kind'] === undefined
     ? 'message'
     : reqEnum(body['kind'], 'kind', [
@@ -1990,6 +1991,7 @@ async function handlePostEntry(
         'key_rotated',
         'key_request',
         'pending_key_distribution',
+        'topic_archived',
       ] as const);
   const text = reqString(body['body'], 'body', 1, MAX_BODY);
   const data = reqJsonData(body['data'], 'data', MAX_DATA);

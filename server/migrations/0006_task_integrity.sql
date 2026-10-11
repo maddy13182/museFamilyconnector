@@ -6,6 +6,9 @@
 --    verbatim — additive, no data loss. Indexes are recreated after the
 --    rename (they are dropped with the old table).
 --
+--    E2EE Phase 5: entries.kind also gains 'topic_archived' (archive-with-
+--    successor for the total key-loss case). Same rebuild, same pattern.
+--
 --    Rebuild safety: D1 enforces foreign keys inside migrations (and
 --    PRAGMA foreign_keys=OFF is a no-op there), and entries is a parent
 --    table — idempotency_keys.entry_gseq REFERENCES entries(gseq). Dropping
@@ -45,7 +48,12 @@ CREATE TABLE entries_new(
     -- for the current topic key, pending_key_distribution marks "member
     -- added, envelopes not yet sealed". Added here (not 0001) because this
     -- rebuild defines the effective constraint.
-    'key_rotated','key_request','pending_key_distribution')),
+    'key_rotated','key_request','pending_key_distribution',
+    -- E2EE Phase 5 system kind (client-posted, plaintext by design):
+    -- topic_archived names the successor topic when a dead E2EE topic is
+    -- retired. Added here (not 0001) because this rebuild defines the
+    -- effective constraint.
+    'topic_archived')),
   body TEXT NOT NULL,
   data TEXT NULL,            -- JSON, machine payloads
   reply_to_seq INTEGER NULL,
