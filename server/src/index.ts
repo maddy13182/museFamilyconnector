@@ -24,7 +24,7 @@ import {
   newProvisioningCode,
   resolveToken,
 } from './auth.js';
-import { scanPii } from './pii.js';
+import { scanPii, type PiiHit } from './pii.js';
 import {
   reqString,
   optString,
@@ -211,6 +211,66 @@ function piiGuard(text: string): void {
   }
 }
 
+/**
+ * Pattern-based deep scan of a JSON value (F08): every string leaf is run
+ * through scanPii. Iterative to avoid recursion-depth issues on hostile
+ * input; cycle-safe for good measure. Never returns the matched value.
+ */
+function scanPiiDeep(value: unknown): PiiHit | null {
+  const stack: unknown[] = [value];
+  const seen = new Set<object>();
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v === 'string') {
+      const hit = scanPii(v);
+      if (hit) return hit;
+    } else if (v !== null && typeof v === 'object') {
+      if (seen.has(v)) continue;
+      seen.add(v);
+      for (const k of Object.keys(v)) stack.push((v as Record<string, unknown>)[k]);
+    }
+    // Non-string primitives (numbers, booleans, null) carry no PII text.
+  }
+  return null;
+}
+
+/** Reject on PII hit in any string leaf of a JSON value (F08: entry data,
+ *  task completion results). Never logs the match. */
+function piiGuardJson(value: unknown): void {
+  const hit = scanPiiDeep(value);
+  if (hit) {
+    throw new HttpError(
+      422,
+      'pii_detected',
+      `Message rejected: ${hit.description}. Please remove it and retry.`,
+    );
+  }
+}
+
+const PII_REDACTED_LEAF = '[redacted]';
+
+/**
+ * Structure-preserving PII scrub of a JSON value (F08): string leaves that
+ * scanPii flags are replaced with a marker; everything else (including
+ * linkage fields like task_id) is untouched.
+ */
+function redactPiiLeaves<T>(value: T): T {
+  if (typeof value === 'string') {
+    return (scanPii(value) ? PII_REDACTED_LEAF : value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactPiiLeaves) as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value)) {
+      out[k] = redactPiiLeaves((value as Record<string, unknown>)[k]);
+    }
+    return out as T;
+  }
+  return value;
+}
+
 function parseDataField(row: Row): unknown {
   const d = row['data'];
   if (d === null || d === undefined) return null;
@@ -312,6 +372,23 @@ async function requireFamilyMembers(
   }
   return rows;
 }
+
+/**
+ * Task visibility predicate (F06): a member may see a task only when its
+ * `task_created` entry sits at or after their `history_from_seq` floor, so a
+ * from_join member never sees tasks created before they joined. Every task
+ * row has exactly one task_created entry (appended by handleCreateTask), so
+ * EXISTS is exact — no migration needed.
+ * The single `?` binds the caller's member_id.
+ */
+const TASK_VISIBLE_TO_MEMBER = `EXISTS (
+  SELECT 1 FROM entries e
+    JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
+   WHERE e.topic_id = tasks.topic_id
+     AND e.kind = 'task_created'
+     AND json_extract(e.data, '$.task_id') = tasks.id
+     AND e.seq >= p.history_from_seq
+)`;
 
 /**
  * Append an entry, assigning per-topic seq = MAX(seq)+1 atomically.
@@ -1131,9 +1208,12 @@ async function handleExport(db: DbClient, auth: AuthContext, tid: string): Promi
     `SELECT * FROM entries WHERE topic_id = ? AND seq >= ? ORDER BY seq ASC`,
     [tid, history_from_seq],
   );
-  const tasks = await db.queryAll(`SELECT * FROM tasks WHERE topic_id = ? ORDER BY created_at ASC`, [
-    tid,
-  ]);
+  // F06: tasks are filtered by the caller's history floor — same rule as entry
+  // reads. A from_join member must not see tasks created before they joined.
+  const tasks = await db.queryAll(
+    `SELECT * FROM tasks WHERE topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER} ORDER BY created_at ASC`,
+    [tid, auth.member_id],
+  );
   return json({
     topic,
     participants: parts,
@@ -1167,8 +1247,11 @@ async function handleTopicInvite(
       }
     }
   }
-  const maxRow = await db.queryOne(`SELECT MAX(seq) AS m FROM entries WHERE topic_id = ?`, [tid]);
-  const fromSeq = historyFrom === 'full' ? 1 : ((maxRow?.['m'] as number | null) ?? 0) + 1;
+  // F06: the visibility cutoff is computed INSIDE the membership insert, as part
+  // of the same atomic batch (D1 batch / SQLite BEGIN..COMMIT). Reading
+  // MAX(seq) beforehand raced with concurrent appends and could set a stale
+  // floor that leaked entries posted between the read and the insert.
+  const fullFloor = historyFrom === 'full' ? 1 : 0;
   const ts = nowIso();
   const existing = await db.queryAll(`SELECT member_id FROM topic_participants WHERE topic_id = ?`, [
     tid,
@@ -1176,8 +1259,10 @@ async function handleTopicInvite(
   const existingIds = new Set(existing.map((r) => r['member_id'] as string));
   const added = memberIds.filter((id) => !existingIds.has(id));
   const ops = added.map((mid) => ({
-    sql: `INSERT INTO topic_participants(topic_id, member_id, joined_at, history_from_seq) VALUES (?,?,?,?)`,
-    params: [tid, mid, ts, fromSeq] as (string | number | null)[],
+    sql: `INSERT INTO topic_participants(topic_id, member_id, joined_at, history_from_seq)
+          SELECT ?, ?, ?, CASE WHEN ? = 1 THEN 1
+                               ELSE COALESCE((SELECT MAX(seq) FROM entries WHERE topic_id = ?), 0) + 1 END`,
+    params: [tid, mid, ts, fullFloor, tid] as (string | number | null)[],
   }));
   await db.execAtomically(ops);
   for (const mid of added) {
@@ -1268,6 +1353,8 @@ async function handlePostEntry(
         return n as number;
       })();
   piiGuard(text);
+  // F08: entry data (JSON) is scanned too — string leaves, recursively.
+  if (data) piiGuardJson(JSON.parse(data));
 
   const idemKey = req.headers.get('idempotency-key');
   if (idemKey !== null) {
@@ -1361,6 +1448,7 @@ async function handleCreateTask(
     }
   }
   if (description) piiGuard(description);
+  piiGuard(title); // F08: task titles are scanned too.
 
   const taskId = newId();
   const ts = nowIso();
@@ -1394,6 +1482,13 @@ async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): 
 async function handleGetTask(db: DbClient, auth: AuthContext, taskId: string): Promise<Response> {
   const task = await getTaskInScope(db, auth, taskId);
   const topicId = task['topic_id'] as string;
+  // F06: a from_join member must not read task snapshots created before they
+  // joined. 404 (same as a missing task) so existence doesn't leak.
+  const visible = await db.queryOne(
+    `SELECT 1 AS ok FROM tasks WHERE id = ? AND topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER}`,
+    [taskId, topicId, auth.member_id],
+  );
+  if (!visible) throw new HttpError(404, 'not_found', 'Task not found');
   const part = await db.queryOne(
     `SELECT history_from_seq FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
     [topicId, auth.member_id],
@@ -1412,9 +1507,11 @@ async function handleGetTask(db: DbClient, auth: AuthContext, taskId: string): P
 // GET /v1/topics/:tid/tasks — list tasks in a topic.
 async function handleListTopicTasks(db: DbClient, auth: AuthContext, tid: string): Promise<Response> {
   await requireParticipant(db, auth, tid);
+  // F06: same history floor as entry reads — from_join members don't see
+  // tasks whose task_created entry predates their join.
   const rows = await db.queryAll(
-    `SELECT * FROM tasks WHERE topic_id = ? ORDER BY created_at ASC`,
-    [tid],
+    `SELECT * FROM tasks WHERE topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER} ORDER BY created_at ASC`,
+    [tid, auth.member_id],
   );
   return json({ tasks: rows.map(publicTask) });
 }
@@ -1437,6 +1534,7 @@ async function handlePatchTask(
 
   if (body['title'] !== undefined) {
     const title = reqString(body['title'], 'title', 1, 200);
+    piiGuard(title); // F08: task titles are scanned too.
     sets.push('title = ?');
     params.push(title);
   }
@@ -1542,6 +1640,8 @@ async function handleTaskDone(
   const topicId = task['topic_id'] as string;
   const body = await readJson(req).catch((): Record<string, unknown> => ({}));
   const result = reqJsonData(body['result'], 'result', MAX_DATA);
+  // F08: completion results (JSON) are scanned too — string leaves, recursively.
+  if (result) piiGuardJson(JSON.parse(result));
   await assertNoOpenSubtasks(db, taskId);
   const ts = nowIso();
   await db.execAtomically([
@@ -1584,8 +1684,19 @@ async function handleRedact(
   if (!entry) throw new HttpError(404, 'not_found', 'Entry not found');
   const ts = nowIso();
   const scrubbed = `[redacted by owner, ${ts}]`;
+  // F08: also scrub PII-shaped string leaves in data, structure-preserving
+  // (linkage fields like task_id survive). NULL data stays NULL.
+  let newData = entry['data'] as string | null;
+  if (newData !== null) {
+    try {
+      newData = JSON.stringify(redactPiiLeaves(JSON.parse(newData)));
+    } catch {
+      // data is always JSON (validated at write); keep the original rather
+      // than lose it if parsing ever fails.
+    }
+  }
   await db.execAtomically([
-    { sql: `UPDATE entries SET body = ? WHERE gseq = ?`, params: [scrubbed, gseq] },
+    { sql: `UPDATE entries SET body = ?, data = ? WHERE gseq = ?`, params: [scrubbed, newData, gseq] },
   ]);
   await appendEntry(db, {
     topic_id: entry['topic_id'] as string,
