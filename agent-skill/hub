@@ -5180,7 +5180,8 @@ def _download_bytes(url, what, timeout=90):
         },
     )
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- URL is the validated GitHub Release asset URL
+        # nosemgrep: dynamic-urllib-use-detected -- URL validated by _validate_download_url (https + github.com only) immediately above
+        with urlrequest.urlopen(req, timeout=timeout) as resp:  # nosec B310
             if resp.status != 200:
                 raise HubError(
                     "connection",
