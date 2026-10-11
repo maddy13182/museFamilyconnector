@@ -153,3 +153,50 @@ export function optAgentPublicKey(v: unknown, name: string): string | null {
   if (v === undefined || v === null) return null;
   return reqAgentPublicKey(v, name);
 }
+
+// E2EE (Phase 2): the per-topic encryption flag. Optional in the request
+// body; absent/null = 0 (plaintext, today's behavior). When present it must
+// be the integer 0 or 1 — booleans and strings are rejected so the flag
+// can never arrive in two textual forms.
+export function reqE2eeFlag(v: unknown, name: string): number {
+  if (v === undefined || v === null) return 0;
+  if (v !== 0 && v !== 1) {
+    throw new HttpError(400, 'bad_request', `${name} must be 0 or 1`);
+  }
+  return v;
+}
+
+// E2EE (Phase 2): a topic-key id — the random 128-bit value the CLI
+// generates at topic creation, hex-encoded (32 hex chars). Normalized to
+// lowercase for canonical storage/lookup.
+const KEY_ID_HEX_RE = /^[0-9a-fA-F]{32}$/;
+
+export function reqKeyId(v: unknown, name: string): string {
+  if (typeof v !== 'string' || !KEY_ID_HEX_RE.test(v)) {
+    throw new HttpError(400, 'bad_request', `${name} must be 32 hex chars (a random 128-bit id)`);
+  }
+  return v.toLowerCase();
+}
+
+// E2EE (Phase 2): a sealed key envelope — standard base64, opaque to the
+// server (stored, never inspected). Format-validated only: the strict
+// alphabet/padding rules keep one canonical textual form, and the length
+// cap bounds the blob store. crypto_box_seal of the 48-byte
+// (key_id || topic_key) plaintext is 96 bytes → 128 base64 chars.
+const ENVELOPE_B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const ENVELOPE_B64_MAX = 4096;
+
+export function reqEnvelopeB64(v: unknown, name: string): string {
+  if (typeof v !== 'string') {
+    throw new HttpError(400, 'bad_request', `${name} must be a base64 string`);
+  }
+  const s = v.trim();
+  if (s.length === 0 || s.length > ENVELOPE_B64_MAX || s.length % 4 !== 0 || !ENVELOPE_B64_RE.test(s)) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      `${name} must be standard base64 (with padding), at most ${ENVELOPE_B64_MAX} chars`,
+    );
+  }
+  return s;
+}

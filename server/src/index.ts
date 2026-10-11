@@ -39,6 +39,9 @@ import {
   escapeLike,
   reqAgentPublicKey,
   optAgentPublicKey,
+  reqE2eeFlag,
+  reqKeyId,
+  reqEnvelopeB64,
 } from './validate.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
@@ -1393,6 +1396,91 @@ async function handleAgentKeyRotate(
   });
 }
 
+// E2EE (Phase 2) — POST /v1/topics/:tid/envelopes {member_id, agent_label,
+// key_id, envelope} — store one sealed topic-key envelope for a recipient
+// agent. The envelope blob is opaque to the server: format-validated
+// (base64) and stored, never inspected.
+//
+// Access control (defense in depth; crypto is per-agent but the blob store
+// still gates on membership):
+//   - caller must be a current participant of the topic (403 otherwise;
+//     404 when the topic doesn't exist in the caller's family);
+//   - the target (member_id, agent_label) must be a current participant
+//     AND hold an ACTIVE (non-superseded) registered public key (400
+//     otherwise — sealing to an agent with no key on file is meaningless).
+// Re-POSTing the same (topic_id, member_id, agent_label, key_id) replaces
+// the stored envelope — idempotent distribution.
+async function handlePostEnvelope(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  await requireParticipant(db, auth, tid);
+  const body = await readJson(req);
+  const targetMemberId = reqString(body['member_id'], 'member_id', 1, 128);
+  const targetAgentLabel = reqString(body['agent_label'], 'agent_label', 1, 80);
+  const keyId = reqKeyId(body['key_id'], 'key_id');
+  const envelope = reqEnvelopeB64(body['envelope'], 'envelope');
+  const targetPart = await db.queryOne(
+    `SELECT member_id FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
+    [tid, targetMemberId],
+  );
+  if (!targetPart) {
+    throw new HttpError(400, 'bad_request', 'envelope target must be a current participant of this topic');
+  }
+  const targetKey = await db.queryOne(
+    `SELECT 1 FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+    [targetMemberId, targetAgentLabel],
+  );
+  if (!targetKey) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      'envelope target has no registered identity key; they must run `hub key-init` before they can receive envelopes',
+    );
+  }
+  const ts = nowIso();
+  await db.execAtomically([
+    {
+      sql: `INSERT OR REPLACE INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at)
+            VALUES (?,?,?,?,?,?)`,
+      params: [tid, targetMemberId, targetAgentLabel, keyId, envelope, ts],
+    },
+  ]);
+  return json(
+    {
+      topic_id: tid,
+      member_id: targetMemberId,
+      agent_label: targetAgentLabel,
+      key_id: keyId,
+      created_at: ts,
+    },
+    201,
+  );
+}
+
+// E2EE (Phase 2) — GET /v1/topics/:tid/envelopes — return ONLY the caller's
+// own envelopes: rows are matched on the caller's (member_id, agent_label)
+// taken from the Bearer <redacted> never from caller-supplied input. One agent
+// can never fetch another agent's envelopes. 403 when the caller is not a
+// participant (404 when the topic doesn't exist in the caller's family).
+async function handleGetEnvelopes(
+  db: DbClient,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  await requireParticipant(db, auth, tid);
+  const rows = await db.queryAll(
+    `SELECT topic_id, member_id, agent_label, key_id, envelope, created_at
+       FROM topic_key_envelopes
+      WHERE topic_id = ? AND member_id = ? AND agent_label = ?
+      ORDER BY created_at ASC`,
+    [tid, auth.member_id, auth.agent_label],
+  );
+  return json({ envelopes: rows });
+}
+
 // POST /v1/auth/rotate — new token; old valid 24h grace.
 async function handleRotate(
   db: DbClient,
@@ -1518,7 +1606,15 @@ async function handleCreateTopic(
   auth: AuthContext,
 ): Promise<Response> {
   const body = await readJson(req);
-  const subject = reqString(body['subject'], 'subject', 1, 200);
+  // E2EE (Phase 2): optional per-topic opt-in. Absent/null = 0 — plaintext
+  // topics behave byte-identically to today.
+  const e2ee = reqE2eeFlag(body['e2ee'], 'e2ee');
+  // For E2EE topics the subject may arrive already encrypted (opaque to the
+  // server — stored as-is): base64 of nonce(24) + XChaCha20-Poly1305
+  // ciphertext of a <=200-char subject, so up to ~320 chars. The 1024 cap
+  // is headroom, not a license for longer subjects. Plaintext topics keep
+  // today's exact 1-200 limit.
+  const subject = reqString(body['subject'], 'subject', 1, e2ee === 1 ? 1024 : 200);
   const kind = reqEnum(body['kind'], 'kind', ['direct', 'group'] as const);
   const parentsOnly = body['parents_only'] === true;
   const idemKey = readIdemKey(req);
@@ -1529,6 +1625,24 @@ async function handleCreateTopic(
       const topic = await db.queryOne(`SELECT * FROM topics WHERE id = ?`, [prior['resource_id'] as string]);
       if (!topic) throw new HttpError(500, 'internal', 'Idempotency record points at a missing topic');
       return json({ topic, deduped: true });
+    }
+  }
+  // E2EE topics need the creator's agent to hold a registered identity key:
+  // the creator seals the first topic-key envelopes to every participant
+  // (including themselves), and sealing to yourself requires a public key
+  // on file. Fail with actionable guidance before touching participants.
+  if (e2ee === 1) {
+    const creatorKey = await db.queryOne(
+      `SELECT 1 FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+      [auth.member_id, auth.agent_label],
+    );
+    if (!creatorKey) {
+      throw new HttpError(
+        400,
+        'bad_request',
+        'E2EE topics require the creator\u2019s agent to have a registered identity key. ' +
+          'Run `hub key-init` to generate and register one, then retry.',
+      );
     }
   }
   // Group topics may pass an empty list: the creator is auto-added below.
@@ -1573,9 +1687,9 @@ async function handleCreateTopic(
   const ts = nowIso();
   const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
-      sql: `INSERT INTO topics(id, family_id, subject, kind, parents_only, parent_topic_id, link_visibility, created_by, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?)`,
-      params: [topicId, auth.family_id, subject, kind, parentsOnly ? 1 : 0, null, 'placeholder', auth.member_id, ts],
+      sql: `INSERT INTO topics(id, family_id, subject, kind, parents_only, parent_topic_id, link_visibility, created_by, created_at, e2ee)
+            VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      params: [topicId, auth.family_id, subject, kind, parentsOnly ? 1 : 0, null, 'placeholder', auth.member_id, ts, e2ee],
     },
     ...ids.map(
       (mid): { sql: string; params: (string | number | null)[] } => ({
@@ -2448,7 +2562,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       return await handleCreateInvite(db, env, req, auth, decodeURIComponent(famInvite[1]));
     }
 
-    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks)$/.exec(path);
+    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes)$/.exec(path);
     if (topicSub && method === 'GET' && topicSub[2] === 'history') {
       return await handleHistory(db, req, auth, decodeURIComponent(topicSub[1]));
     }
@@ -2469,6 +2583,13 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     }
     if (topicSub && method === 'POST' && topicSub[2] === 'tasks') {
       return await handleCreateTask(db, env, req, auth, decodeURIComponent(topicSub[1]));
+    }
+    // E2EE (Phase 2) key-envelope distribution endpoints.
+    if (topicSub && method === 'POST' && topicSub[2] === 'envelopes') {
+      return await handlePostEnvelope(db, req, auth, decodeURIComponent(topicSub[1]));
+    }
+    if (topicSub && method === 'GET' && topicSub[2] === 'envelopes') {
+      return await handleGetEnvelopes(db, auth, decodeURIComponent(topicSub[1]));
     }
 
     const topicOnly = /^\/v1\/topics\/([^/]+)$/.exec(path);
