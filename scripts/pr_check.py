@@ -39,6 +39,9 @@ LEVEL_NAME = {2: "major", 1: "minor", 0: "patch"}
 SERVER_VERSION_FILE = "server/package.json"
 SKILL_VERSION_FILE = "agent-skill/hub"
 SKILL_VERSION_RE = re.compile(r'^VERSION = "([^"]+)"', re.M)
+# Contract C6: pyproject.toml is the single source of truth for the CLI version.
+SKILL_TOML_FILE = "agent-skill/pyproject.toml"
+SKILL_TOML_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
 
 
 def sh(*args: str) -> str:
@@ -75,6 +78,13 @@ def server_version_at(ref: str | None) -> str:
 
 
 def skill_version_at(ref: str | None) -> str:
+    # Contract C6: prefer pyproject.toml (single source of truth); fall back
+    # to the legacy VERSION constant in agent-skill/hub for old branches.
+    toml_raw = file_at(ref, SKILL_TOML_FILE) if ref else _read_worktree(SKILL_TOML_FILE)
+    if toml_raw:
+        m = SKILL_TOML_VERSION_RE.search(toml_raw)
+        if m:
+            return m.group(1)
     raw = file_at(ref, SKILL_VERSION_FILE) if ref else open(SKILL_VERSION_FILE).read()
     if raw is None:
         raise ValueError(f"{SKILL_VERSION_FILE} missing at {ref}")
@@ -82,6 +92,14 @@ def skill_version_at(ref: str | None) -> str:
     if not m:
         raise ValueError(f"no VERSION = ... constant in {SKILL_VERSION_FILE} at {ref or 'worktree'}")
     return m.group(1)
+
+
+def _read_worktree(path: str) -> str | None:
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return None
 
 
 def main() -> int:
