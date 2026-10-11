@@ -322,6 +322,170 @@ paths:
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
+  # ------------------------------------------------- ownership transfer
+  /v1/families/{fid}/transfer:
+    post:
+      tags: [families]
+      operationId: offerOwnershipTransfer
+      summary: Offer circle ownership to another member
+      description: |
+        Two-phase ownership transfer (offer → accept). The caller must be a
+        circle `owner`. The target must be an existing member of the SAME
+        circle and not already an owner (→ 422 `already_owner`). Ownership is
+        never forced: nothing changes until the recipient explicitly accepts
+        at POST …/transfer/accept. Exactly one pending offer per circle
+        (→ 409 `transfer_pending`); offers expire after 7 days. Supports
+        `Idempotency-Key` like the other create endpoints — a repeated key
+        returns the original offer with `deduped: true` instead of a second one.
+      parameters:
+        - $ref: '#/components/parameters/FamilyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_member_id]
+              properties:
+                to_member_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                  description: Member id of the recipient (must be in this circle, not already an owner).
+                on_complete:
+                  $ref: '#/components/schemas/TransferCompletionMode'
+                  default: remove
+                  description: What happens to the offering owner when the recipient accepts.
+      responses:
+        '201':
+          description: Transfer offer created (pending)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transfer]
+                properties:
+                  transfer: { $ref: '#/components/schemas/Transfer' }
+        '200':
+          description: |
+            Idempotent retry with a repeated Idempotency-Key — the original
+            pending offer is returned with `deduped: true`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transfer, deduped]
+                properties:
+                  transfer: { $ref: '#/components/schemas/Transfer' }
+                  deduped: { type: boolean, example: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Target is already a circle owner
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [families]
+      operationId: getOwnershipTransfer
+      summary: Read the pending ownership transfer
+      description: |
+        Any circle member may read the pending offer. Returns
+        `{ "transfer": null }` when there is none.
+      parameters:
+        - $ref: '#/components/parameters/FamilyId'
+      responses:
+        '200':
+          description: The pending transfer, or null
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transfer]
+                properties:
+                  transfer:
+                    oneOf:
+                      - $ref: '#/components/schemas/Transfer'
+                      - type: 'null'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/families/{fid}/transfer/accept:
+    post:
+      tags: [families]
+      operationId: acceptOwnershipTransfer
+      summary: Accept an ownership transfer offer
+      description: |
+        Only the named recipient (`to_member_id`) may accept — 403 otherwise.
+        The offer must be pending and unexpired (expired → 410
+        `transfer_expired`, and the offer is marked cancelled). The role swap
+        is applied in ONE atomic batch — the recipient is promoted to `owner`
+        and the offering owner is demoted or access-revoked per `on_complete`
+        — so the circle never sits with zero owners. `remove` revokes every
+        agent token the previous owner held for this circle; their member row
+        is retained for audit history.
+      parameters:
+        - $ref: '#/components/parameters/FamilyId'
+      responses:
+        '200':
+          description: Ownership transferred
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transfer, new_owner, previous_owner]
+                properties:
+                  transfer: { $ref: '#/components/schemas/Transfer' }
+                  new_owner:
+                    type: object
+                    required: [id, role]
+                    properties:
+                      id: { type: string }
+                      role: { type: string, example: owner }
+                  previous_owner:
+                    type: object
+                    required: [id, role]
+                    properties:
+                      id: { type: string }
+                      role:
+                        type: string
+                        enum: [parent, removed]
+                        description: "`parent` for on_complete=demote, `removed` for on_complete=remove."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+
+  /v1/families/{fid}/transfer/cancel:
+    post:
+      tags: [families]
+      operationId: cancelOwnershipTransfer
+      summary: Cancel a pending ownership transfer offer
+      description: |
+        The current circle owner may withdraw a pending offer. The recipient
+        cannot cancel (→ 403); only the owner can. An already-expired offer
+        returns 410 `transfer_expired`.
+      parameters:
+        - $ref: '#/components/parameters/FamilyId'
+      responses:
+        '200':
+          description: Offer cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transfer]
+                properties:
+                  transfer: { $ref: '#/components/schemas/Transfer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Gone' }
+
   # -------------------------------------------------------------------- auth
   /v1/auth/rotate:
     post:
@@ -1500,7 +1664,7 @@ components:
       enum: [open, in_progress, blocked, done, cancelled]
     ErrorCode:
       type: string
-      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, internal]
+      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed]
 
     Error:
       type: object
@@ -1537,6 +1701,42 @@ components:
         email: { type: string, format: email }
         role: { $ref: '#/components/schemas/Role' }
         created_at: { type: string, format: date-time }
+
+    TransferCompletionMode:
+      type: string
+      enum: [demote, remove]
+      description: |
+        What happens to the offering owner once the recipient accepts:
+        `demote` drops them to parent (their tokens keep working); `remove`
+        strips the owner role AND revokes all of their agent tokens for the
+        circle, ending their access entirely. The member row itself is
+        retained for audit history.
+
+    Transfer:
+      type: object
+      required: [id, family_id, from_member_id, to_member_id, on_complete, status, created_at, expires_at]
+      properties:
+        id: { type: string }
+        family_id: { type: string }
+        from_member_id:
+          type: string
+          description: The offering owner.
+        to_member_id:
+          type: string
+          description: The named recipient — only they may accept.
+        on_complete: { $ref: '#/components/schemas/TransferCompletionMode' }
+        status:
+          type: string
+          enum: [pending, completed, cancelled]
+        created_at: { type: string, format: date-time }
+        expires_at:
+          type: string
+          format: date-time
+          description: Offers expire 7 days after creation; expired offers cannot be accepted (410).
+        decided_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Set when the transfer completes, is cancelled, or is noticed expired.
 
     TokenInfo:
       type: object

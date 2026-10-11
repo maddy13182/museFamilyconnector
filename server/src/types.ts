@@ -82,6 +82,12 @@ export const TASK_STATUSES = [
 
 export const MEMBER_ROLES = ['owner', 'parent', 'kid'] as const;
 
+/** Ownership-transfer completion modes: what happens to the offering owner
+ *  once the recipient accepts — 'demote' drops them to parent, 'remove'
+ *  deletes their member row and revokes their circle tokens. */
+export const TRANSFER_COMPLETION_MODES = ['demote', 'remove'] as const;
+export type TransferCompletionMode = (typeof TRANSFER_COMPLETION_MODES)[number];
+
 /** Circle kinds (v0.2.0+). 'family' keeps owner/parent/kid roles;
  *  'general' will use owner/admin/member. */
 export const FAMILY_KINDS = ['family', 'general'] as const;
