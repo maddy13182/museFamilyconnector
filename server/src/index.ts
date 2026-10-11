@@ -1307,6 +1307,14 @@ async function handlePostEntry(
 }
 
 // GET /v1/sync?after_gseq=&limit= — one call per poll, all visible topics.
+//
+// Pagination is page-based, never head-based: fetch limit+1 rows; when the
+// extra row is present there is more backlog to drain (has_more=true) and
+// only the first `limit` rows are returned. next_after_gseq is always the
+// last RETURNED entry's gseq — or the input cursor when the page is empty —
+// so a client paging through an arbitrarily deep backlog can never skip
+// entries (the old MAX-based cursor jumped past undelivered rows). No second
+// query: one SELECT per sync poll.
 async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promise<Response> {
   const url = new URL(req.url);
   const after = parseSeqCursor(url.searchParams.get('after_gseq'));
@@ -1316,16 +1324,16 @@ async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promis
        JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
       WHERE e.gseq > ? AND e.seq >= p.history_from_seq
       ORDER BY e.gseq ASC LIMIT ?`,
-    [auth.member_id, after, limit],
+    [auth.member_id, after, limit + 1],
   );
-  const maxRow = await db.queryOne(
-    `SELECT MAX(e.gseq) AS m FROM entries e
-       JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
-      WHERE e.seq >= p.history_from_seq`,
-    [auth.member_id],
-  );
-  const maxGseq = (maxRow?.['m'] as number | null) ?? 0;
-  return json({ entries: rows.map(publicEntry), max_gseq: maxGseq, next_after_gseq: maxGseq });
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const entries = page.map(publicEntry);
+  const nextAfter = page.length > 0 ? (page[page.length - 1]['gseq'] as number) : after;
+  // max_gseq stays for contract compatibility: the highest gseq in THIS
+  // page (clients MUST prefer next_after_gseq as their poll cursor).
+  const maxGseq = nextAfter;
+  return json({ entries, max_gseq: maxGseq, next_after_gseq: nextAfter, has_more: hasMore });
 }
 
 // POST /v1/topics/:tid/tasks

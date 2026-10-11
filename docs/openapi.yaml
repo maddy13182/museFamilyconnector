@@ -932,7 +932,10 @@ paths:
         The agent's main poll loop. Returns entries with gseq > after_gseq, in
         global order, across every topic the caller participates in (and with
         seq >= their history_from_seq per topic). One call per poll keeps a
-        local cursor (`next_after_gseq`).
+        local cursor (`next_after_gseq`). Pagination is page-based: when
+        `has_more` is true, more entries remain — keep polling with
+        `next_after_gseq` until it comes back false. The cursor never jumps
+        past undelivered entries, so a deep backlog drains without gaps.
       parameters:
         - name: after_gseq
           in: query
@@ -956,16 +959,25 @@ paths:
                     items: { $ref: '#/components/schemas/Entry' }
                   max_gseq:
                     type: integer
-                    description: Highest gseq visible to the caller in this response window.
+                    description: >
+                      Highest gseq in this response window (max of the returned
+                      entries; equals after_gseq when the page is empty).
+                      Kept for contract compatibility — clients MUST prefer
+                      next_after_gseq as their poll cursor.
                   next_after_gseq:
                     type: integer
                     description: >
-                      Pass as after_gseq on the next poll. The server sends the
-                      same value in max_gseq and next_after_gseq; clients should
-                      prefer next_after_gseq and fall back to max_gseq. Optional —
-                      omitted when the cursor is already at the head (fall back
-                      to the max gseq seen, or the after_gseq sent).
-                  has_more: { type: boolean }
+                      Pass as after_gseq on the next poll. Always the last
+                      returned entry's gseq, or the after_gseq sent when the
+                      page is empty (cursor unchanged). Never advances past
+                      undelivered entries: when has_more is true the client
+                      must keep polling to drain the backlog.
+                  has_more:
+                    type: boolean
+                    description: >
+                      True when more entries remain beyond this page. Poll
+                      again with next_after_gseq until false; then the client
+                      is caught up.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 

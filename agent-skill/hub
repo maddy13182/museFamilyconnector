@@ -1009,7 +1009,15 @@ def cmd_setup(args, transport):
 
 
 def _sync_one_circle(ctx, transport, circle_id, circle_name, token, limit):
-    """Sync a single circle; returns its new entries (labeled)."""
+    """Fetch a single circle's new entries WITHOUT advancing its cursor.
+
+    Returns (labeled_entries, new_cursor): the entries labeled with their
+    circle, plus the cursor value the caller must persist AFTER the entries
+    have been emitted (None when there is nothing new to acknowledge).
+    The cursor is returned, never written, so a failure downstream (a later
+    circle failing, or output never being emitted) cannot strand entries
+    behind an advanced cursor.
+    """
     client = HubClient(ctx.server, token, debug=ctx.client.debug,
                        transport=transport)
     cursor = _read_cursor(ctx.profile, circle_id)
@@ -1024,6 +1032,7 @@ def _sync_one_circle(ctx, transport, circle_id, circle_name, token, limit):
             e["circle_id"] = circle_id
             e["circle_name"] = circle_name
         labeled.append(e)
+    new_cursor = None
     if entries:
         gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
         gseqs = [g for g in gseqs if isinstance(g, int)]
@@ -1031,12 +1040,8 @@ def _sync_one_circle(ctx, transport, circle_id, circle_name, token, limit):
         if isinstance(resp, dict):
             nxt = resp.get("next_after_gseq")
         if gseqs or isinstance(nxt, int):
-            _write_cursor(
-                ctx.profile,
-                nxt if isinstance(nxt, int) else max(gseqs),
-                circle_id,
-            )
-    return labeled
+            new_cursor = nxt if isinstance(nxt, int) else max(gseqs)
+    return labeled, new_cursor
 
 
 def cmd_sync(args, transport):
@@ -1078,15 +1083,33 @@ def cmd_sync(args, transport):
         except HubError:
             pass
     all_entries = []
+    pending_cursors = []  # (circle_id, value): written ONLY after emit
+    errors = []  # (circle_name, message): per-circle partial results
     for cid, tok in targets:
-        all_entries.extend(
-            _sync_one_circle(ctx, transport, cid, names.get(cid, cid), tok,
-                             args.limit)
-        )
+        try:
+            entries, new_cursor = _sync_one_circle(
+                ctx, transport, cid, names.get(cid, cid), tok, args.limit
+            )
+        except HubError as exc:
+            # One circle failing must not lose the others' entries, and must
+            # never advance any cursor: a retry re-delivers what we emit.
+            errors.append((names.get(cid, cid), exc.friendly()))
+            continue
+        all_entries.extend(entries)
+        if new_cursor is not None:
+            pending_cursors.append((cid, new_cursor))
+    # Emit first; only afterwards persist cursors — and only when every
+    # circle succeeded. Output for the healthy circles still goes out,
+    # then the failures are reported and we exit non-zero.
     emit_json(all_entries)
     if not all_entries:
         emit_err("no new entries")
-    return 0
+    if not errors:
+        for cid, value in pending_cursors:
+            _write_cursor(ctx.profile, value, cid)
+    for circle_name, msg in errors:
+        emit_err("sync failed for circle %r: %s" % (circle_name, msg))
+    return 1 if errors else 0
 
 
 def cmd_topics(args, transport):
