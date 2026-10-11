@@ -55,6 +55,11 @@ const INVITE_TTL_DAYS = 7;
 // Structured logging. Every line carries the server version so log streams
 // can be correlated with releases. Never log tokens, codes, or request
 // bodies — paths are redacted via redactPath() and query strings are dropped.
+//
+// Field allowlist for `fields` (keep it tight — these lines persist in
+// Workers Logs): method, path (redacted), status, code (string literal from
+// HttpError), ms, event-specific static strings. Do NOT add headers, bodies,
+// tokens, codes, emails, names, or message content.
 type LogLevel = 'info' | 'warn' | 'error';
 
 export function logEvent(
@@ -74,11 +79,14 @@ export function logEvent(
 }
 
 // Redact single-use codes from URL paths before logging: on these routes the
-// code IS the credential.
+// code IS the credential. Redacts the whole tail after the prefix —
+// over-redaction is the safe direction (trailing slashes, extra segments).
+// The bare collection routes (/v1/invites, /v1/provisioning-codes) carry no
+// code and are left alone.
 export function redactPath(path: string): string {
   return path
-    .replace(/^(\/v1\/invites\/)[^/]+(\/accept)$/, '$1[redacted]$2')
-    .replace(/^(\/v1\/provisioning-codes\/)[^/]+(\/redeem)$/, '$1[redacted]$2');
+    .replace(/^(\/v1\/invites\/).*/, '$1[redacted]')
+    .replace(/^(\/v1\/provisioning-codes\/).*/, '$1[redacted]');
 }
 
 function nowIso(): string {
@@ -1311,11 +1319,13 @@ async function handleRedact(
 // (code) is logged by routeRequest's catch below, so failures produce a
 // detail line plus this access line.
 export async function handleRequest(req: Request, db: DbClient, env: Env): Promise<Response> {
-  const url = new URL(req.url);
-  const path = redactPath(url.pathname);
-  const method = req.method.toUpperCase();
   const start = Date.now();
+  let method = '?';
+  let path = '?';
   try {
+    const url = new URL(req.url);
+    path = redactPath(url.pathname);
+    method = req.method.toUpperCase();
     const res = await routeRequest(req, db, env);
     logEvent(res.status >= 500 ? 'error' : res.status >= 400 ? 'warn' : 'info', 'request', {
       method,

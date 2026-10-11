@@ -50,7 +50,7 @@ def parse_fragment(path: Path) -> tuple[str, list[str]]:
 
 def consolidate(frag_dir: Path = FRAG_DIR, changelog: Path = CHANGELOG) -> int:
     frags = sorted(
-        (p for p in frag_dir.glob("*.md") if p.name != "README.md"),
+        (p for p in frag_dir.glob("*.md") if p.name != "README.md" and p.is_file()),
         key=lambda p: p.name,
     )
     if not frags:

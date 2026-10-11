@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# Serialize runs: two rapid pushes must not consolidate concurrently.
+concurrency:
+  group: changelog-consolidate
+  cancel-in-progress: false
+
 jobs:
   consolidate:
     runs-on: ubuntu-latest

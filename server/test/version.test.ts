@@ -42,11 +42,21 @@ test('health reports the package.json version', async () => {
 });
 
 test('redactPath hides invite and provisioning codes', () => {
-  assert.equal(redactPath('/v1/invites/abc123/accept'), '/v1/invites/[redacted]/accept');
+  assert.equal(redactPath('/v1/invites/abc123/accept'), '/v1/invites/[redacted]');
   assert.equal(
     redactPath('/v1/provisioning-codes/xyz789/redeem'),
-    '/v1/provisioning-codes/[redacted]/redeem',
+    '/v1/provisioning-codes/[redacted]',
   );
+  // Near-miss shapes must not leak codes either (over-redaction is safe).
+  assert.equal(redactPath('/v1/invites/abc123/accept/'), '/v1/invites/[redacted]');
+  assert.equal(redactPath('/v1/invites/a/b/accept'), '/v1/invites/[redacted]');
+  assert.equal(
+    redactPath('/v1/provisioning-codes/xyz/redeem/'),
+    '/v1/provisioning-codes/[redacted]',
+  );
+  // Bare collection routes carry no code — left alone.
+  assert.equal(redactPath('/v1/invites'), '/v1/invites');
+  assert.equal(redactPath('/v1/provisioning-codes'), '/v1/provisioning-codes');
   assert.equal(redactPath('/v1/topics'), '/v1/topics');
   assert.equal(redactPath('/v1/health'), '/v1/health');
 });
