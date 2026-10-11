@@ -58,7 +58,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -1771,7 +1771,30 @@ def cmd_circle_join(args, transport):
         raise
     cid = new_member.get("family_id")
     if not cid:
-        raise HubError("error", "Redeem response did not identify a circle.")
+        # The token is issued and irreplaceable — never lose it over a
+        # malformed response. Fall back to resolving the circle with the new
+        # token itself: it is scoped to exactly the circle just joined.
+        if args.debug:
+            emit_err("hub debug: redeem response lacked family_id; resolving via /v1/families")
+        probe = HubClient(ctx.server, token, transport=transport)
+        fams = [
+            c for c in _as_list(probe.call("GET", "/v1/families"), "families")
+            if isinstance(c, dict) and c.get("id")
+        ]
+        if len(fams) == 1:
+            cid = fams[0]["id"]
+    if not cid:
+        # Truly unresolvable — but the token must still survive. Persist it
+        # keyed by member id and give a precise recovery step instead of
+        # dropping the credential.
+        mid = new_member.get("id") or "redeemed"
+        _store_circle_token(ctx, "pending-" + str(mid), token, new_member)
+        raise HubError(
+            "error",
+            "Joined, but the circle could not be identified. Your token was "
+            "saved — run `hub circles` to find the circle, then "
+            "`hub circle use <id>`.",
+        )
     _store_circle_token(ctx, cid, token, new_member)
     ctx.cfg["active_circle_id"] = cid
     save_config(ctx.profile, ctx.cfg)
