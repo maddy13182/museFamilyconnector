@@ -916,6 +916,26 @@ class TestCircleTokens(HubTestBase):
         self.assertEqual(cfg["active_circle_id"], "c888")
         self.assertNotIn("fh_INVITED_tok222", out + err)
 
+    def test_join_redeem_missing_family_id_falls_back_to_families(self):
+        # The token is irreplaceable: if a redeem response ever lacks
+        # family_id again, the CLI must resolve the circle via /v1/families
+        # with the new token — never crash and lose the credential.
+        self.seed_config()
+        self.fake.add("POST", "/v1/invites/fhi_NOFAMID/accept", 201,
+                      {"token": "fh_NOFAM_tok333", "token_id": "tokN",
+                       "member": {"id": "m9", "name": "Tester", "role": "kid"}})
+        self.fake.add("GET", "/v1/me", 200,
+                      {"id": "m9", "name": "Tester", "role": "kid"})
+        self.fake.add("GET", "/v1/families", 200, {"families": [
+            {"id": "c999", "name": "Fallback Gym", "kind": "general",
+             "my_role": "kid"}]})
+        rc, out, err = self.run_cli(["circle", "join", "--code", "fhi_NOFAMID"])
+        self.assertEqual(rc, 0)
+        cfg = hub.load_config("default")
+        self.assertEqual(cfg["circle_tokens"]["c999"], "fh_NOFAM_tok333")
+        self.assertEqual(cfg["active_circle_id"], "c999")
+        self.assertNotIn("fh_NOFAM_tok333", out + err)
+
     def test_join_invite_code_needs_name_label(self):
         os.environ.pop("FAMILY_HUB_TOKEN", None)
         hub.save_config("default", {"server_url": "https://hub.example"})

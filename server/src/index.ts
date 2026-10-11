@@ -678,10 +678,15 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
     }
     throw e;
   }
+  // Member goes through publicMember(), the single canonical serializer —
+  // hand-built member objects drift (a missing family_id once crashed the
+  // CLI's circle join after token issuance).
+  const createdMember = await db.queryOne(`SELECT * FROM members WHERE id = ?`, [memberId]);
+  if (!createdMember) throw new HttpError(500, 'internal', 'Member row missing after create');
   return json(
     {
       family: { id: familyId, name, created_at: ts },
-      member: { id: memberId, name: ownerName, email: ownerEmail, role: 'owner', created_at: ts },
+      member: publicMember(createdMember),
       provisioning_code: code,
       provisioning_expires_at: hoursFromNow(PROVISION_TTL_HOURS),
     },
@@ -1088,19 +1093,15 @@ async function handleAcceptInvite(
     );
   }
   // Token is returned ONCE here and never again.
-  // family_id must be present: the CLI's circle-join reads it to store the
-  // new token, and a missing field used to crash AFTER issuance but BEFORE
-  // the token was saved (invite spent, token lost).
+  // The member object goes through publicMember(), the single canonical
+  // member serializer — never hand-built. (A hand-built object once omitted
+  // family_id, crashing the CLI's circle join AFTER issuance but BEFORE the
+  // token was saved: invite spent, token lost.)
+  const newMember = await db.queryOne(`SELECT * FROM members WHERE id = ?`, [memberId]);
+  if (!newMember) throw new HttpError(500, 'internal', 'Member row missing after accept');
   return json(
     {
-      member: {
-        id: memberId,
-        family_id: inviteFamilyId,
-        name: displayName,
-        email,
-        role: invite['role'],
-        created_at: ts,
-      },
+      member: publicMember(newMember),
       token,
       token_id: tokenId,
     },
