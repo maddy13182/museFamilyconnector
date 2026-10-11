@@ -17,10 +17,12 @@ deploying, and keep it next to `docs/INSTALL.md`.
   the pepper (which lives only as a worker secret).
 - *Credential guessing.* Tokens are 256-bit, invite/provisioning codes
   128-bit, all from a CSPRNG. Online guessing is infeasible by construction.
-  Note: the worker itself enforces NO rate limits — practical throttling of
-  guessing attempts comes only from the Cloudflare edge rate-limiting rules
-  the operator configures (INSTALL §5). A deployment without those rules has
-  no throttling at all.
+  Note: the worker rate-limits the two unauthenticated credential endpoints
+  (`POST /v1/invites/:code/accept`, `POST /v1/provisioning-codes/:code/redeem`)
+  in-worker — 10 attempts per 10 minutes per IP, then 429. (workers.dev has
+  no custom zone, so Cloudflare's zone-based rate-limiting rules don't apply;
+  the in-worker limiter closes that gap. On a custom-domain deployment you
+  can additionally configure edge rules per INSTALL §5.)
 - *Invite/code replay.* Single-use codes; reuse returns 409 (`invite_used` /
   `code_used`). 7-day expiry.
 - *Privilege creep.* Agents act strictly as their member (SPEC §3). A kid's

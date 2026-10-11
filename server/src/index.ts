@@ -191,6 +191,64 @@ function hoursFromNow(h: number): string {
 function daysFromNow(d: number): string {
   return new Date(Date.now() + d * 86400_000).toISOString();
 }
+
+// Rate limiting for unauthenticated credential endpoints.
+//
+// workers.dev has no custom zone, so Cloudflare's zone-based rate-limiting
+// rules don't apply here. This is a fixed-window counter in D1, checked
+// BEFORE the credential lookup. Legitimate use is 1-2 attempts ever; the
+// limit (10 per 10 min per IP per endpoint) only bites brute-forcers.
+// Returns a 429 Response when exceeded, null when the request may proceed.
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_WINDOW_MS = 10 * 60_000;
+
+function clientIp(req: Request): string {
+  // Cloudflare always sets CF-Connecting-IP; fall back defensively.
+  return req.headers.get('CF-Connecting-IP')?.trim() || 'unknown';
+}
+
+async function checkRateLimit(
+  db: DbClient,
+  req: Request,
+  endpoint: 'invite_accept' | 'code_redeem',
+): Promise<Response | null> {
+  const ip = clientIp(req);
+  const now = Date.now();
+  const windowStart = new Date(
+    Math.floor(now / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_WINDOW_MS,
+  ).toISOString();
+  const key = `${ip}|${endpoint}|${windowStart}`;
+  const expiresAt = new Date(now + RATE_LIMIT_WINDOW_MS).toISOString();
+  const nowIsoStr = new Date(now).toISOString();
+
+  // Lazy-expire old rows (indexed delete, one per check).
+  await db.execAtomically([
+    { sql: `DELETE FROM rate_limits WHERE expires_at <= ?`, params: [nowIsoStr] },
+    {
+      sql: `INSERT INTO rate_limits(key, count, window_start, expires_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(key) DO UPDATE SET count = count + 1`,
+      params: [key, 1, windowStart, expiresAt],
+    },
+  ]);
+  const row = await db.queryOne(`SELECT count FROM rate_limits WHERE key = ?`, [key]);
+  const count = (row?.['count'] as number) ?? 1;
+  if (count > RATE_LIMIT_MAX) {
+    const retryAfter = Math.max(1, Math.ceil((new Date(expiresAt).getTime() - now) / 1000));
+    const res = json(
+      {
+        error: {
+          code: 'rate_limited',
+          message: `Too many attempts. Try again in ${retryAfter} seconds.`,
+        },
+      },
+      429,
+    );
+    res.headers.set('Retry-After', String(retryAfter));
+    return res;
+  }
+  return null;
+}
 function newId(): string {
   return crypto.randomUUID();
 }
@@ -2224,12 +2282,19 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     if (path === '/v1/health' && method === 'GET') return await handleHealth();
 
     // Public: bootstrap + invite/provisioning redemption (code is the credential).
+    // The two redemption endpoints are rate-limited per IP: they are the only
+    // unauthenticated brute-force surface (128-bit codes, but hammering still
+    // burns worker invocations).
     if (path === '/v1/families' && method === 'POST') return await handleCreateFamily(db, env, req);
     if (path.startsWith('/v1/invites/') && path.endsWith('/accept') && method === 'POST') {
+      const limited = await checkRateLimit(db, req, 'invite_accept');
+      if (limited) return limited;
       const code = decodeURIComponent(path.slice('/v1/invites/'.length, -'/accept'.length));
       return await handleAcceptInvite(db, env, req, code);
     }
     if (path.startsWith('/v1/provisioning-codes/') && path.endsWith('/redeem') && method === 'POST') {
+      const limited = await checkRateLimit(db, req, 'code_redeem');
+      if (limited) return limited;
       const code = decodeURIComponent(
         path.slice('/v1/provisioning-codes/'.length, -'/redeem'.length),
       );
