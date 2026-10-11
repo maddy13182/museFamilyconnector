@@ -47,6 +47,145 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
   fixed-window counter in D1 (migration 0007). workers.dev has no custom zone
   so Cloudflare's zone-based rate-limiting rules don't apply — this closes
   that gap. Legitimate use (1-2 attempts) is unaffected.
+## Added
+- E2EE Phase 1 — agent identity key infrastructure. **E2EE requires a fresh
+  database — existing D1 data is not migrated** (clean slate at the v0.7.0
+  deploy, on the owner's explicit go-ahead; the E2EE tables live in the base
+  schema, `server/migrations/0001_init.sql`).
+- Server: `agent_keys` table (one active X25519 public key per
+  `(member_id, agent_label)`; rotation marks the old key superseded, never
+  deleted), plus the Phase 2 schema placeholders `topics.e2ee` and
+  `topic_key_envelopes`.
+- Server: `POST /v1/provisioning-codes/:code/redeem` accepts an optional
+  `agent_public_key` (standard base64, exactly 32 bytes when decoded; 400
+  otherwise), stored bound to `(member_id, agent_label)` in the same atomic
+  batch as the token issuance. Redeeming without it behaves exactly as
+  before — plaintext topics keep working.
+- Server: `GET /v1/agent-keys` key directory (authenticated; only keys of
+  members the caller shares a circle with) and `POST /v1/agent-keys/rotate`
+  (bearer-token-authenticated registration/rotation).
+- CLI: `hub` now depends on PyNaCl and the `mnemonic` package (pinned in
+  `agent-skill/requirements.txt`) — this ends the stdlib-only property.
+  Key commands fail with a clear install message when they are missing;
+  all other commands keep working without them.
+- CLI: `hub setup` generates the agent's X25519 identity keypair locally
+  (`~/.config/family-hub/profiles/<name>/agent.key`, mode 0600), registers
+  the public key at redeem time, and prints a 24-word BIP-39 recovery
+  phrase once.
+- CLI: new commands `hub key-init` (generate + register for existing
+  agents; idempotent), `hub key-backup` (Argon2id-encrypted backup file),
+  and `hub key-restore` (from phrase or backup file). The private key never
+  leaves the machine, is never printed, and never appears in logs.
+## Added
+- E2EE Phase 3 — encrypted messaging (CLI only; no server changes).
+- CLI: `hub post` to an E2EE topic encrypts `(body, data)` with
+  XChaCha20-Poly1305 under the topic key from the local keystore
+  (`topic_keys/<topic_id>.json`). Each encrypted field is one wire string:
+  `fh1.<key_id_hex>.<msg_id_hex>.<base64(nonce || ciphertext)>` — random
+  192-bit nonce and random 128-bit client message id per field, ciphertext
+  stored in the existing `entries.body`/`entries.data` columns (base64
+  TEXT, opaque to the server). The AAD is the canonical byte string
+  `b"fh-msg-v1" + NUL + topic_id + NUL + key_id_hex + NUL + msg_id_hex`, so
+  ciphertext cannot be cut-and-pasted across topics or key rotations, and
+  one message's ciphertext cannot be replayed as another entry. (The design
+  asked for `seq` in the AAD; `seq` is assigned server-side at insert and
+  unknowable before POST, so the client-chosen `msg_id` takes its place —
+  see the `hub` source header for the full rationale.)
+- CLI: `hub post` to an E2EE topic with no local topic key fails loudly
+  with `hub key-request` guidance — nothing is posted, never plaintext.
+- CLI: `hub read` / `hub sync` auto-detect E2EE topics (one topic-record
+  fetch per topic per run, cached — never per entry) and decrypt after
+  fetching, selecting the key by the plaintext `key_id` on each entry.
+  Tampered or malformed ciphertext raises a loud error naming the entry
+  (tamper evidence); a missing key shows a per-entry placeholder instead of
+  ciphertext; server-written plaintext entries (e.g. redaction notices)
+  pass through untouched. Plaintext topics behave byte-identically.
+- CLI: `hub topics` decrypts E2EE topic subjects client-side for display
+  (Phase 2 subject format); subjects show as `[encrypted]` when the key is
+  not available locally.
+- CLI: the local PII pre-scan (`check_pii`) is the enforcement point for
+  E2EE topics — it runs on the plaintext body and the canonical data JSON
+  before encrypting, since the server cannot scan ciphertext.
+- E2EE Phase 6 — polish. Server: the dashboard's E2EE topic view is now
+  metadata-only with an honest, prominent "Content encrypted — the server
+  cannot read this topic." label; encrypted subjects render as
+  `🔒 [encrypted]` (never the ciphertext blob), encrypted bodies are hidden,
+  plaintext system events (key rotations, archive notices) and the
+  "retired → continues at <successor>" archive banner stay visible, and
+  posting from the dashboard is disabled on encrypted topics. Key import
+  into the dashboard is explicitly deferred (stated in the UI). Docs:
+  `docs/CONCEPTS.md` states the per-topic E2EE trust model (content hidden,
+  metadata visible, plaintext topics unchanged); `docs/SECURITY.md` gains
+  the E2EE threat-model addition, key-management responsibilities, and the
+  key-loss runbook (`hub recover` exit 2 documented as "parked, waiting on
+  a human"); `docs/INSTALL.md` gains an E2EE setup section;
+  `docs/AGENT_JOIN.md` gains the joining-agent E2EE section; and the new
+  `docs/E2EE_FRESH_DEPLOY.md` is the step-by-step runbook for the v0.7.0
+  clean-slate production deploy (D1 wipe, schema, re-enrollment).
+  CLI/SKILL.md: identity key commands (`key-init`, `key-backup`,
+  `key-restore`) and `new-topic --e2ee` added to the command reference.
+- E2EE Phase 5 — recovery (the abandonment antidote). Server: new
+  client-postable plaintext system entry kind `topic_archived` for the
+  total-loss case (entries CHECK widened in the 0006 rebuild; accepted on
+  `POST /v1/topics/:id/entries` like the other E2EE system kinds).
+  CLI: `hub recover [--topic <id>]` walks the recovery ladder inline and
+  narrates every rung — rung 1 restores the identity key from a local
+  key-backup file (conventional locations, `--backup-file`, or prompted
+  path) or the 24-word recovery phrase; rung 2 re-registers a fresh keypair
+  and posts a member-approved `key-request` (`--wait` polls for the grant,
+  otherwise the command exits 2 with the request posted and waiting);
+  rung 3 detects a missing/expired Bearer token and prints exact
+  out-of-band provisioning-code instructions for a human to relay. Rungs
+  are never silently skipped. CLI: `hub topic-archive --topic <id>
+  --successor <new-id> --reason "…"` (explicit confirmation, `--yes` to
+  bypass) posts the `topic_archived` entry naming the successor — the old
+  topic is never deleted and stays readable for key-holders. SKILL.md
+  gains the hard rule: never create a replacement topic for key-loss
+  reasons without completing `hub recover` first.
+## Added
+- E2EE Phase 4 — membership changes + re-keying. Server: `DELETE
+  /v1/topics/:tid/participants/:mid` (owner/parent only, same 403 rule as the
+  topic invite endpoint; appends a plaintext `member_left` system entry;
+  removed members keep their old envelopes but can no longer be sent new
+  ones), plus three client-postable plaintext system entry kinds
+  (`key_rotated`, `key_request`, `pending_key_distribution`) for E2EE
+  membership flows. CLI: `hub topic-add-member` (seals the current topic key
+  for a new member's agents — current key only, never old keys; visible
+  pending notice when they have no registered keys), `hub
+  topic-remove-member`, `hub topic-rekey` (new key + fresh envelopes for all
+  remaining agents, old keys retained locally, plaintext `key_rotated`
+  announcement), `hub key-request` / `hub key-grant` (visible request, human-
+  approved grant only — no auto-fulfillment), `hub key-fetch`, and `hub
+  topic-key-status`. `hub sync` now refreshes key envelopes for E2EE topics
+  before decrypting, so rotations land on first sight.
+## Added
+- E2EE Phase 2 — E2EE topics + key envelopes.
+- Server: `POST /v1/topics` accepts optional `e2ee: 0|1` (default 0).
+  `e2ee=1` requires the creator's agent to have a registered identity key in
+  `agent_keys` (400 with `hub key-init` guidance otherwise); the subject may
+  arrive already encrypted (opaque to the server, stored as-is).
+- Server: `POST /v1/topics/:id/envelopes` — stores one sealed topic-key
+  envelope per recipient agent. The caller must be a current participant
+  (403 otherwise); the target `(member_id, agent_label)` must be a current
+  participant with an ACTIVE (non-superseded) registered public key (400
+  otherwise). The envelope blob is stored opaquely, never inspected.
+  Re-POSTing the same `(topic_id, member_id, agent_label, key_id)` replaces
+  the envelope (idempotent distribution).
+- Server: `GET /v1/topics/:id/envelopes` — returns ONLY the caller's own
+  envelopes (matched on the Bearer token's `(member_id, agent_label)`); 403
+  for non-participants. One agent can never fetch another's envelopes.
+- Server: plaintext topics (`e2ee` absent/0) behave exactly as before.
+- CLI: `hub new-topic --e2ee --subject … --with …` — generates the 32-byte
+  topic key + random 128-bit key_id locally, encrypts the subject with
+  XChaCha20-Poly1305 (random 192-bit nonce prepended, base64; AAD is the
+  fixed context `fh-topic-subject-v1` since the topic_id isn't known yet),
+  seals one envelope per participant agent (`crypto_box_seal` over
+  `key_id || topic_key`), verifies the round-trip by fetching and opening
+  its own envelope, and stores `key_id → base64 topic key` at
+  `~/.config/family-hub/profiles/<name>/topic_keys/<topic_id>.json` (0600).
+  Fails with `hub key-init` guidance when the local keypair is missing
+  (never auto-generated here). The topic key is registered for redaction and
+  never printed.
 ### Fixed
 - Server: `GET /v1/health` now reports the server's actual release version
   (read from `server/package.json` at build time) instead of a stale
