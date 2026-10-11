@@ -95,6 +95,8 @@ jobs:
 
       - name: Build the hub artifact
         if: steps.decide.outputs.release == 'true'
+        env:
+          NEW_VERSION: ${{ steps.cli.outputs.version }}
         run: |
           set -euo pipefail
           rm -rf dist
@@ -102,8 +104,28 @@ jobs:
           # The artifact is the single script; dependencies install from the
           # lockfile at install time and are NOT bundled.
           cp agent-skill/hub dist/hub
+          # Stamp the release version: a single-file artifact has no adjacent
+          # pyproject.toml and no pip metadata, so without this the artifact
+          # would report 0.0.0-dev and `hub upgrade` self-test would fail.
+          # pyproject.toml stays the single source of truth; the stamp is derived.
+          python3 - "$NEW_VERSION" <<'EOF'
+          import re, sys
+          new = sys.argv[1]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", new):
+              raise SystemExit("refusing to stamp non-semver %r" % new)
+          p = "dist/hub"
+          src = open(p, encoding="utf-8").read()
+          src, n = re.subn(
+              r'^_BUILD_VERSION = None$', '_BUILD_VERSION = "%s"' % new,
+              src, count=1, flags=re.M,
+          )
+          if n != 1:
+              raise SystemExit("expected exactly one _BUILD_VERSION anchor")
+          open(p, "w", encoding="utf-8").write(src)
+          EOF
           chmod +x dist/hub
           python3 dist/hub --version  # smoke: the artifact must run
+          test "$(python3 dist/hub --version | grep -o '[0-9][0-9a-zA-Z.+-]*' | head -1)" = "$NEW_VERSION"
 
       - name: Compute sha256
         if: steps.decide.outputs.release == 'true'

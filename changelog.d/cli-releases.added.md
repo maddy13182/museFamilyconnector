@@ -12,3 +12,7 @@
   already current. `agent-skill/INSTALL.md` documents the first-time
   install flow (download → verify signature → verify sha256 → install →
   `hub --version` self-check) and the upgrade/rollback flows.
+- CLI: the release workflow stamps the release version into the
+  `_BUILD_VERSION` anchor in the `hub` artifact at build time, so a
+  released single-file binary (no adjacent `pyproject.toml`, no pip
+  metadata) reports its real version and `hub upgrade`'s self-test passes.

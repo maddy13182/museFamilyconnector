@@ -19,6 +19,14 @@ to existing behavior.
 - No container distribution. The artifact is a single-file `hub` script
   (plus pinned deps), distributed via GitHub Releases.
 - No server-side key escrow. Private keys never leave the client machine.
+- **Build stamp:** a released single-file artifact ships with no adjacent
+  `pyproject.toml` and no pip metadata, so `_cli_version()` would report
+  `0.0.0-dev` and `hub upgrade`'s self-test would always fail. The release
+  workflow therefore stamps the version into the `_BUILD_VERSION` anchor
+  in `hub` at build time (`_BUILD_VERSION = None` in source).
+  `pyproject.toml` remains the single source of truth; the stamp is
+  derived from it. `_cli_version()` prefers the stamp, then installed
+  metadata, then the TOML.
 
 ## 3. Workstream contracts
 

@@ -95,14 +95,24 @@ def _installed_version():
         return None
 
 
+# Set at release-build time by .github/workflows/release.yml. A released
+# single-file artifact has no adjacent pyproject.toml and no pip metadata,
+# so the build stamps the version here. pyproject.toml remains the single
+# source of truth; the stamp is derived from it at build time.
+_BUILD_VERSION = None
+
+
 def _cli_version():
     """CLI version, read from the single source of truth (contract C6).
 
-    `agent-skill/pyproject.toml` owns the version. When installed as the
-    `family-hub-cli` package, installed metadata wins; otherwise the TOML
-    next to the script is read (dev checkout / single-file install).
-    "0.0.0-dev" only when neither is available.
+    `agent-skill/pyproject.toml` owns the version. A release-stamped build
+    reports its stamp; when installed as the `family-hub-cli` package,
+    installed metadata wins; otherwise the TOML next to the script is read
+    (dev checkout / single-file install).
+    "0.0.0-dev" only when none is available.
     """
+    if _BUILD_VERSION:
+        return _BUILD_VERSION
     return _installed_version() or _read_toml_version() or "0.0.0-dev"
 
 
@@ -5083,28 +5093,6 @@ def _script_path():
     """Absolute path of the running `hub` script (symlinks resolved)."""
     here = globals().get("__file__") or sys.argv[0]
     return os.path.realpath(os.path.abspath(here))
-
-
-def _cli_version():
-    """The installed CLI version.
-
-    Contract C6 names ``agent-skill/pyproject.toml`` the single source of
-    truth (WS-A owns the canonical reader). Until that lands, prefer the
-    TOML next to this script and fall back to the legacy ``VERSION``
-    constant, so upgrade works in both states.
-    """
-    pyproject = os.path.join(
-        os.path.dirname(_script_path()), "pyproject.toml"
-    )
-    try:
-        with open(pyproject, "r", encoding="utf-8") as fh:
-            for line in fh:
-                m = re.match(r'\s*version\s*=\s*"([^"]+)"\s*$', line)
-                if m:
-                    return m.group(1)
-    except OSError:
-        pass
-    return VERSION
 
 
 def _parse_version(text):
