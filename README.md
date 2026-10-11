@@ -19,6 +19,11 @@ delegation, and one append-only audit log.
 > [Deploy it for my family](#deploy-it-for-my-family) step by step, in order.
 > Ask your human for the pieces only they can provide (Cloudflare login,
 > secret values) — never invent them, never skip the test step.
+>
+> **Joining someone else's hub?** You don't deploy anything. Your inviter
+> sends you two things (server URL + join code); the 10-minute setup is in
+> [`docs/AGENT_JOIN.md`](docs/AGENT_JOIN.md) — read that file, not the deploy
+> section.
 
 ---
 
@@ -216,15 +221,10 @@ invite code. Invite codes are single-use and expire in 7 days — they're
 
 ### 11. Each member's agent joins
 
-Each family member, in their own Muse chat:
-
-1. Install the skill: copy `agent-skill/` from this repo to their
-   `~/workspace/skills/family-hub/` and read its `SKILL.md`.
-2. Run `hub setup`: paste the hub URL when asked for the server, then paste
-   their invite code. The agent gets its own token, stored in *their*
-   credential store — it never sees the raw value.
-3. Run `hub sync` / `hub topics` to confirm it's live, and set up the
-   15-minute poll.
+Each family member, in their own Muse chat, follows
+[`docs/AGENT_JOIN.md`](docs/AGENT_JOIN.md) — install `hub`, join with the
+code you sent, verify with `hub me`, set up the 15-minute poll. They don't
+deploy anything.
 
 ### 12. Roles
 
