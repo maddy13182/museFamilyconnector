@@ -1857,6 +1857,63 @@ async function handleTopicInvite(
   return json({ added });
 }
 
+// DELETE /v1/topics/:tid/participants/:mid — owner/parent only (same 403
+// rule as POST /v1/topics/:tid/invite; the caller must also be a
+// participant). Removes the participant row and appends a plaintext
+// `member_left` system entry naming the member.
+//
+// E2EE note: the removed member's sealed envelopes are deliberately KEPT —
+// they already held the old topic key, and forward secrecy comes from the
+// re-key the remover must run next (`hub topic-rekey`). Envelopes can no
+// longer be POSTed for them: handlePostEnvelope requires a current
+// participant row, so a post-removal envelope lands 400.
+async function handleRemoveParticipant(
+  db: DbClient,
+  _env: Env,
+  _req: Request,
+  auth: AuthContext,
+  tid: string,
+  mid: string,
+): Promise<Response> {
+  await requireParticipant(db, auth, tid);
+  if (auth.role !== 'owner' && auth.role !== 'parent') {
+    throw new HttpError(403, 'forbidden', 'Only owner/parent can remove members from a topic');
+  }
+  const target = await db.queryOne(
+    `SELECT p.member_id, m.name FROM topic_participants p
+       JOIN members m ON m.id = p.member_id
+      WHERE p.topic_id = ? AND p.member_id = ?`,
+    [tid, mid],
+  );
+  if (!target) {
+    throw new HttpError(400, 'bad_request', 'Member is not a participant of this topic');
+  }
+  const count = await db.queryOne(
+    `SELECT COUNT(*) AS c FROM topic_participants WHERE topic_id = ?`,
+    [tid],
+  );
+  if (((count?.['c'] as number) ?? 0) <= 1) {
+    throw new HttpError(400, 'bad_request', 'Cannot remove the last participant of a topic');
+  }
+  await db.execAtomically([
+    {
+      sql: `DELETE FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
+      params: [tid, mid],
+    },
+  ]);
+  const selfLeave = auth.member_id === mid;
+  await appendEntry(db, {
+    topic_id: tid,
+    kind: 'member_left',
+    body: selfLeave
+      ? `${target['name']} left the topic`
+      : `${target['name']} was removed from the topic`,
+    auth,
+    data: JSON.stringify({ member_id: mid }),
+  });
+  return json({ removed: mid });
+}
+
 // POST /v1/topics/:tid/spawn — linked child topic with curated briefing.
 async function handleSpawn(
   db: DbClient,
@@ -1919,7 +1976,21 @@ async function handlePostEntry(
 ): Promise<Response> {
   await requireParticipant(db, auth, tid);
   const body = await readJson(req);
-  const kind = body['kind'] === undefined ? 'message' : reqEnum(body['kind'], 'kind', ['message'] as const);
+  // E2EE Phase 4 system kinds: plaintext by design, posted only by current
+  // participants (requireParticipant above). key_rotated announces a topic
+  // key rotation, key_request asks members for the current topic key, and
+  // pending_key_distribution marks "member added, envelopes not yet sealed".
+  // All three must be readable by agents that do NOT hold the topic key
+  // (yet), so they are never encrypted client-side — the CLI posts them via
+  // its plaintext system-entry path with a loud stderr note.
+  const kind = body['kind'] === undefined
+    ? 'message'
+    : reqEnum(body['kind'], 'kind', [
+        'message',
+        'key_rotated',
+        'key_request',
+        'pending_key_distribution',
+      ] as const);
   const text = reqString(body['body'], 'body', 1, MAX_BODY);
   const data = reqJsonData(body['data'], 'data', MAX_DATA);
   const replyTo = body['reply_to_seq'] === undefined || body['reply_to_seq'] === null
@@ -2595,6 +2666,19 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     const topicOnly = /^\/v1\/topics\/([^/]+)$/.exec(path);
     if (topicOnly && method === 'GET') {
       return await handleGetTopic(db, auth, decodeURIComponent(topicOnly[1]));
+    }
+
+    // E2EE Phase 4 — DELETE /v1/topics/:tid/participants/:mid (owner/parent).
+    const topicParticipant = /^\/v1\/topics\/([^/]+)\/participants\/([^/]+)$/.exec(path);
+    if (topicParticipant && method === 'DELETE') {
+      return await handleRemoveParticipant(
+        db,
+        env,
+        req,
+        auth,
+        decodeURIComponent(topicParticipant[1]),
+        decodeURIComponent(topicParticipant[2]),
+      );
     }
 
     const taskSub = /^\/v1\/tasks\/([^/]+)(\/(notes|done))?$/.exec(path);
