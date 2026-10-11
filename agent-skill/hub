@@ -19,7 +19,16 @@ The token is NEVER accepted on the command line (it would show up in ``ps``)
 and NEVER printed — not in normal output, not in ``--debug``, not in
 tracebacks. Every byte written to stdout/stderr passes through ``redact()``.
 The sole exception is ``hub dashboard-token``, which prints one stored
-token preceded by a warning (it bypasses redaction deliberately).
+token preceded by a warning (it bypasses redaction deliberately). That
+command is a HUMAN admin command: agents must never run it or transmit
+its output.
+
+The hub server origin is pinned at enrollment (``server_url`` in the
+profile config). ``--server`` no longer silently redirects the stored
+credential: a differing override prints a loud stderr warning and
+requires ``--allow-server-override``. Plain ``http://`` is rejected for
+non-loopback hosts — ``https://`` is required (loopback ``localhost`` /
+``127.0.0.1`` / ``[::1]`` stays allowed for development).
 
 Multi-circle (v0.2.0): the server binds each bearer token to ONE circle, so
 a profile keeps ``circle_tokens: {circle_id: token}`` in the 0600
@@ -38,6 +47,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess  # nosec B404 -- used only for the operator-configured vault helper (shell=False)
@@ -421,6 +431,226 @@ def _friendly_from_http(status, payload):
 
 
 # ---------------------------------------------------------------------------
+# Server origin pinning (F03): https-only, loopback exception
+# ---------------------------------------------------------------------------
+
+# The env var the Secure Vault injects at tool time (sink for --store env).
+ENV_VAR_NAME = "FAMILY_HUB_TOKEN"
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _validate_server_url(url):
+    """Reject server URLs we must never send a credential to.
+
+    Only http/https are allowed, and plain http is accepted solely for
+    loopback hosts (local development). Credentials embedded in the URL
+    (user:pass@host) are always rejected — the bearer token is the only
+    credential and it travels in the Authorization header.
+    Raises HubError on violation; returns the url unchanged otherwise.
+    """
+    try:
+        parts = urlparse.urlsplit(url or "")
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower().rstrip(".")
+        has_userinfo = bool(parts.username or parts.password)
+    except ValueError as exc:
+        raise HubError("config", "Bad hub server URL %r: %s" % (url, exc))
+    if scheme not in ("http", "https"):
+        raise HubError(
+            "config",
+            "Refusing non-HTTP(S) hub server URL %r — check your hub "
+            "server URL." % (url or ""),
+        )
+    if not host:
+        raise HubError("config", "Hub server URL has no host: %r" % url)
+    if has_userinfo:
+        raise HubError(
+            "config",
+            "Refusing hub server URL with embedded credentials — the "
+            "bearer token is the only credential and it travels in the "
+            "Authorization header.",
+        )
+    if scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise HubError(
+            "config",
+            "Refusing plain-HTTP hub server URL for non-loopback host %r — "
+            "use https:// (plain http is only allowed for "
+            "localhost/127.0.0.1/[::1] development)." % host,
+        )
+    return url
+
+
+def _check_server_override(args, pinned, server):
+    """Gate --server overrides of the pinned enrollment origin (F03).
+
+    The profile's server_url is the origin the credential was enrolled
+    against. A *differing* --server would silently send the stored bearer
+    token to another server, so it requires the explicit
+    --allow-server-override flag and always prints a loud stderr warning.
+    Same-origin (or no pinned origin yet) passes quietly.
+    """
+    override = getattr(args, "server", None)
+    if not override or not pinned:
+        return
+    norm = lambda u: (u or "").rstrip("/")
+    if norm(override) == norm(pinned):
+        return
+    if not getattr(args, "allow_server_override", False):
+        raise HubError(
+            "config",
+            "Refusing to override the hub server this profile enrolled "
+            "with (enrolled: %s, --server: %s). If you really mean to send "
+            "your credential to a different server, re-run with "
+            "--allow-server-override." % (pinned, override),
+        )
+    emit_err("=" * 70)
+    emit_err(
+        "WARNING: --server overrides the hub server this profile enrolled with."
+    )
+    emit_err("  Enrolled (pinned): %s" % pinned)
+    emit_err("  Override (--server): %s" % override)
+    emit_err(
+        "You are sending your credential to a DIFFERENT server than the "
+        "one you enrolled with."
+    )
+    emit_err("Only proceed if you configured this override yourself.")
+    emit_err("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# Credential-sink validation + post-enrollment verification (F11)
+#
+# Invite/provisioning codes are single-use: redeeming one and THEN failing
+# to persist the token burns the code and leaves the agent tokenless. So
+# the sink is validated BEFORE the redeem call, and the fresh token is
+# verified (GET /v1/me) before success is reported.
+# ---------------------------------------------------------------------------
+
+
+def _probe_profile_writable(profile):
+    """Fail before redeeming if the profile dir can't take the credential."""
+    d = profile_dir(profile)
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        probe = os.path.join(d, ".sink-probe")
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("probe")
+        os.unlink(probe)
+    except OSError as exc:
+        raise HubError(
+            "config",
+            "Credential sink check failed: cannot write to the profile "
+            "directory %s (%s). Fix permissions before retrying — the "
+            "invite code has NOT been used yet." % (d, exc),
+        )
+
+
+def _validate_env_sink():
+    """Pre-redeem check that the --store env sink is usable.
+
+    --store env means hub never persists the token: the agent harness must
+    inject FAMILY_HUB_TOKEN at runtime. All we can verify up front is that
+    the variable name is defined and the process environment is writable.
+    """
+    if not ENV_VAR_NAME:
+        raise HubError(
+            "config",
+            "No environment variable name is configured for --store env — "
+            "the invite code has NOT been used yet.",
+        )
+    sentinel = object()
+    prev = os.environ.get(ENV_VAR_NAME, sentinel)
+    try:
+        os.environ[ENV_VAR_NAME] = "hub-sink-probe"
+    except Exception as exc:  # noqa: BLE001 - surfaced as a clean error
+        raise HubError(
+            "config",
+            "Credential sink check failed: cannot set %s in this process "
+            "(%s) — the invite code has NOT been used yet."
+            % (ENV_VAR_NAME, exc),
+        )
+    finally:
+        if prev is sentinel:
+            os.environ.pop(ENV_VAR_NAME, None)
+        else:
+            os.environ[ENV_VAR_NAME] = prev
+
+
+def _validate_vault_cmd(vault_cmd):
+    """Pre-redeem sanity check of the operator's vault helper.
+
+    Static only: the command must parse and its binary must exist on PATH.
+    hub cannot test the actual write path without the token, which only
+    exists after redeeming — the operator must verify the helper really
+    returns the stored token (see --vault-cmd help).
+    """
+    try:
+        argv = shlex.split(vault_cmd)
+    except ValueError as exc:
+        raise HubError(
+            "config",
+            "Vault helper command does not parse (%s) — the invite code "
+            "has NOT been used yet." % exc,
+        )
+    if not argv:
+        raise HubError(
+            "config",
+            "Vault helper command is empty — the invite code has NOT been "
+            "used yet.",
+        )
+    if shutil.which(argv[0]) is None:
+        raise HubError(
+            "config",
+            "Credential sink check failed: vault helper %r not found on "
+            "PATH. Install it or fix the command before retrying — the "
+            "invite code has NOT been used yet." % argv[0],
+        )
+
+
+def _verify_new_token(server, transport, debug, token, flow_name):
+    """GET /v1/me with the fresh token; gate success on it.
+
+    Raises HubError spelling out whether the code is likely consumed, so
+    the operator knows whether to ask an owner for a fresh code or just
+    retry the network.
+    """
+    probe = HubClient(server, token, debug=debug, transport=transport)
+    try:
+        me = probe.call("GET", "/v1/me", auth=True, retries=0)
+    except HubError as exc:
+        if exc.code in ("auth", "forbidden"):
+            err = HubError(
+                "auth",
+                "Enrollment failed verification: the server rejected the "
+                "new credential (GET /v1/me: %s). The invite code is "
+                "consumed — ask the family owner for a fresh invite code "
+                "and run `hub %s` again." % (exc, flow_name),
+            )
+            err.exit_code = 3
+            raise err
+        raise HubError(
+            exc.code,
+            "Could not verify the new credential (GET /v1/me: %s). The "
+            "credential WAS stored, so do NOT request a new code yet — "
+            "check your network and retry a command such as "
+            "`hub circles`; if the server keeps rejecting it, ask the "
+            "owner for a fresh code." % exc,
+        )
+    if not isinstance(me, dict) or not me.get("id"):
+        err = HubError(
+            "auth",
+            "Enrollment failed verification: GET /v1/me returned an "
+            "unexpected response. The invite code may be consumed — ask "
+            "the family owner for a fresh invite code and run `hub %s` "
+            "again." % flow_name,
+        )
+        err.exit_code = 3
+        raise err
+
+
+# ---------------------------------------------------------------------------
 # HTTP client (urllib; a fake transport can be injected for tests)
 # ---------------------------------------------------------------------------
 
@@ -494,13 +724,11 @@ class HubClient:
 
     # -- low level ------------------------------------------------------
     def _urllib_transport(self, method, url, headers, body_bytes):
-        # SECURITY: only http(s) is ever requested. The base URL comes from
-        # the operator's own config, but defense in depth costs one line.
-        if urlparse.urlsplit(url).scheme.lower() not in ("http", "https"):
-            raise HubError(
-                "config",
-                "Refusing non-HTTP(S) request URL — check your hub server URL",
-            )
+        # SECURITY: never send the credential to a non-HTTPS origin.
+        # _validate_server_url enforces https-only (loopback http excepted);
+        # the base URL comes from the operator's own config, but defense in
+        # depth costs one call.
+        _validate_server_url(url)
         req = urlrequest.Request(url, data=body_bytes, headers=headers, method=method)
         try:
             with _opener.open(req, timeout=self.timeout) as resp:
@@ -743,13 +971,16 @@ def _member_for_circle(cfg, circle_id):
 def _ctx(args, transport, need_auth=True):
     profile = args.profile
     cfg = load_config(profile)
-    server = (
-        args.server or os.environ.get("FAMILY_HUB_URL") or cfg.get("server_url")
-    )
+    pinned = cfg.get("server_url")
+    server = args.server or os.environ.get("FAMILY_HUB_URL") or pinned
     if not server:
         raise HubError(
             "bad_request", "No server configured. Use --server or run `hub setup`."
         )
+    # F03: the enrollment origin is pinned; a differing --server must be
+    # explicit, and plain http is only for loopback.
+    _check_server_override(args, pinned, server)
+    _validate_server_url(server)
     token = None
     if need_auth:
         token, _source = _token_for_circle(cfg, profile, _active_circle_id(cfg))
@@ -915,6 +1146,25 @@ def cmd_setup(args, transport):
     )
     if not server:
         raise HubError("bad_request", "A server URL is required.")
+    _validate_server_url(server)
+
+    store = args.store or "env"
+    # F11: validate the credential sink BEFORE redeeming. The invite /
+    # provisioning code is single-use: redeeming it and THEN failing to
+    # persist the token would burn the code and leave the agent tokenless.
+    vault_cmd = None
+    if store == "file":
+        _probe_profile_writable(profile)
+    elif store == "vault-cmd":
+        vault_cmd = (args.vault_cmd or "").strip() or input(
+            "Vault helper command (stdout must be the token): "
+        ).strip()
+        if not vault_cmd:
+            raise HubError("bad_request", "A vault helper command is required.")
+        _validate_vault_cmd(vault_cmd)
+    else:  # env
+        _validate_env_sink()
+
     code = args.invite or getpass.getpass("Invite or provisioning code: ").strip()
     if not code:
         raise HubError("bad_request", "An invite or provisioning code is required.")
@@ -950,7 +1200,6 @@ def cmd_setup(args, transport):
     member = resp["member"]
     note_secret(token)  # from here on, the token can never appear in output
 
-    store = args.store or "env"
     new_cfg = {
         "server_url": server.rstrip("/"),
         "member": {
@@ -976,23 +1225,24 @@ def cmd_setup(args, transport):
             "machine user can read it." % token_file
         )
     elif store == "vault-cmd":
-        vault_cmd = args.vault_cmd or input(
-            "Vault helper command (stdout must be the token): "
-        ).strip()
-        if not vault_cmd:
-            raise HubError("bad_request", "A vault helper command is required.")
         new_cfg["vault_cmd"] = vault_cmd
         storage_note = (
             "resolved at runtime via your vault helper. The raw token is "
-            "not stored anywhere by hub."
+            "not stored anywhere by hub — make sure the token is actually "
+            "saved in your vault under the path your helper reads, and "
+            "test the helper before relying on it."
         )
     else:  # env
         storage_note = (
-            "NOT stored by hub. Your agent harness must inject FAMILY_HUB_TOKEN "
-            "from your Secure Vault each time it runs hub. The token was "
-            "returned once by the server and will never be shown again."
+            "NOT stored by hub. Your agent harness must inject "
+            "FAMILY_HUB_TOKEN from your Secure Vault each time it runs "
+            "hub. The token was returned once by the server and will "
+            "never be shown again."
         )
     save_config(profile, new_cfg)
+    # F11: the new credential is only real if the server accepts it —
+    # verify before declaring success.
+    _verify_new_token(server, transport, args.debug, token, "setup")
     # save_config scrubs tokens; assert nothing secret-bearing was written.
     emit("setup complete.")
     emit_json(
@@ -1455,6 +1705,9 @@ def cmd_circle_create(args, transport):
 def cmd_circle_join(args, transport):
     """Join a circle with a provisioning or invite code someone shared."""
     ctx = _ctx(args, transport, need_auth=False)
+    # F11: the redeemed token is persisted to this profile's 0600 config —
+    # prove the sink works BEFORE the single-use code is burned.
+    _probe_profile_writable(ctx.profile)
     code = (args.code or "").strip()
     if not code:
         # Prompt rather than require argv: codes in argv land in shell
@@ -1492,6 +1745,8 @@ def cmd_circle_join(args, transport):
     _store_circle_token(ctx, cid, token, new_member)
     ctx.cfg["active_circle_id"] = cid
     save_config(ctx.profile, ctx.cfg)
+    # F11: report success only after the new token proves it authenticates.
+    _verify_new_token(ctx.server, transport, args.debug, token, "circle join")
     # Friendly output: resolve the circle name with the new token.
     try:
         probe = HubClient(ctx.server, token, transport=transport)
@@ -1524,8 +1779,11 @@ def cmd_circle_use(args, transport):
 def cmd_dashboard_token(args, transport):
     """Print the stored token for a circle (for pasting into the dashboard).
 
-    The ONLY command that prints a token. The warning precedes the token;
-    the token is written raw (bypassing redaction) so it stays usable.
+    The ONLY command that prints a token — and a HUMAN admin command, not
+    an agent command. Agents must never run it or transmit its output: the
+    raw credential goes to stdout, visible to anyone who can see the tool
+    output. The warning precedes the token; the token is written raw
+    (bypassing redaction) so it stays usable.
     """
     ctx = _ctx_loose(args, transport)
     cid = _match_circle(_list_circles(ctx.client), args.circle)
@@ -1574,6 +1832,14 @@ def build_parser():
     )
     parser.add_argument("--server", default=None, help="Override the Hub base URL")
     parser.add_argument(
+        "--allow-server-override",
+        action="store_true",
+        help="Confirm you intend --server to override the server this "
+        "profile enrolled with. Required whenever --server differs from "
+        "the pinned origin: the stored credential would otherwise be sent "
+        "to a different server silently.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print sanitized request/response dumps to stderr "
@@ -1593,7 +1859,12 @@ def build_parser():
         default="env",
         help="Where the credential lives (default: env)",
     )
-    p.add_argument("--vault-cmd", default=None, help="Vault helper for --store vault-cmd")
+    p.add_argument("--vault-cmd", default=None,
+                   help="Vault helper for --store vault-cmd (stdout must be "
+                        "the token). Checked before the code is redeemed: it "
+                        "must parse and exist on PATH. You must still verify "
+                        "the helper actually returns the stored token — hub "
+                        "cannot test the write path without the token.")
     p.set_defaults(func=_wrap_setup)
 
     p = sub.add_parser("sync", help="Print new entries across all visible topics")
