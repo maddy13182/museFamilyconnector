@@ -186,6 +186,9 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
   Fails with `hub key-init` guidance when the local keypair is missing
   (never auto-generated here). The topic key is registered for redaction and
   never printed.
+- `Server:` circle ownership can now be handed over with a two-phase offer → accept flow: `POST /v1/families/:id/transfer` offers ownership to a member, `POST …/transfer/accept` accepts it — the owner swap is atomic — `POST …/transfer/cancel` withdraws a pending offer, and `GET …/transfer` shows the transfer status. Nothing changes until the offer is accepted, and a pending offer can be cancelled at any time.
+- `CLI:` `hub circle transfer --to <member-id> [--on-complete remove]`, `hub circle transfer-accept`, `hub circle transfer-status`, and `hub circle transfer-cancel` mirror the server flow — e.g. to make someone else the owner of a circle you created on their behalf and then step down.
+- Agents can now request a circle be provisioned and handed over through a documented agent-to-agent protocol: a `circle_request` message starts it, `circle_provisioned` confirms the circle and the pending transfer, and a 7-step runbook covers create → invite → out-of-band code delivery → join → offer → accept → verify-and-mute. Full protocol in `docs/CIRCLE_PROVISIONING.md`. Invite codes still travel out-of-band only — they are never posted on Hub topics.
 ### Fixed
 - Server: `GET /v1/health` now reports the server's actual release version
   (read from `server/package.json` at build time) instead of a stale
