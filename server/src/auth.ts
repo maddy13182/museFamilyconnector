@@ -52,8 +52,13 @@ export async function credentialHash(pepper: string, value: string): Promise<str
 
 /**
  * THE choke point. Every authenticated handler calls this first.
- * Returns the caller's (family_id, member_id, role, token_id, agent_label).
- * Throws HttpError 401 for missing/malformed/unknown/revoked tokens.
+ * Returns the caller's (family_id, member_id, role, token_id, agent_label,
+ * principal_id). Throws HttpError 401 for missing/malformed/unknown/revoked
+ * tokens.
+ *
+ * principal_id (F02) is the stable cross-circle identity, read from the
+ * verified member row — never from caller-supplied input. Handlers use it
+ * for authorization; the email string is not an identity key.
  *
  * Rotation grace: a token whose revoked_at is in the FUTURE is still valid
  * (rotate() sets revoked_at = now + 24h on the old token).
@@ -73,7 +78,7 @@ export async function resolveToken(
   const hash = await credentialHash(env.TOKEN_PEPPER, token);
   const row = await db.queryOne(
     `SELECT t.token_id, t.member_id, t.agent_label, t.revoked_at,
-            m.family_id, m.role
+            m.family_id, m.role, m.principal_id
        FROM agent_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?`,
@@ -101,5 +106,6 @@ export async function resolveToken(
     role: row['role'] as AuthContext['role'],
     token_id: row['token_id'] as string,
     agent_label: row['agent_label'] as string,
+    principal_id: row['principal_id'] as string | null,
   };
 }
