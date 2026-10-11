@@ -44,10 +44,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install agent dependencies
-        run: pip install -r agent-skill/requirements.txt
+      - name: Install agent dependencies (reproducible, lockfile only)
+        run: pip install -r agent-skill/requirements.lock
 
       - name: Run agent CLI tests
+        # Includes lockfile-freshness (test_packaging.LockfileTests):
+        # fails if requirements.txt and requirements.lock disagree.
         run: python3 -m unittest discover -s agent-skill/tests
 
       - name: Run repo script tests (changelog + PR check)

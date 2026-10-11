@@ -63,7 +63,65 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.7.0"
+
+def _script_dir():
+    """Directory containing the `hub` script itself."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_toml_version():
+    """Version from the `pyproject.toml` next to the script, or None."""
+    try:
+        with open(
+            os.path.join(_script_dir(), "pyproject.toml"), "r", encoding="utf-8"
+        ) as f:
+            toml_text = f.read()
+    except OSError:
+        return None
+    match = re.search(r'^version\s*=\s*"([^"]+)"', toml_text, re.M)
+    return match.group(1) if match else None
+
+
+def _installed_version():
+    """Installed `family-hub-cli` package version, or None when the CLI was
+    not installed via pip (single-file / dev checkout)."""
+    try:
+        from importlib import metadata
+
+        return metadata.version("family-hub-cli")
+    except Exception:  # noqa: BLE001 -- expected outside pip installs
+        return None
+
+
+def _cli_version():
+    """CLI version, read from the single source of truth (contract C6).
+
+    `agent-skill/pyproject.toml` owns the version. When installed as the
+    `family-hub-cli` package, installed metadata wins; otherwise the TOML
+    next to the script is read (dev checkout / single-file install).
+    "0.0.0-dev" only when neither is available.
+    """
+    return _installed_version() or _read_toml_version() or "0.0.0-dev"
+
+
+def _skill_version():
+    """Skill version from the `<!-- SKILL VERSION: x.y.z -->` header of
+    SKILL.md next to the script. Kept in lockstep with the CLI version;
+    "unknown" only when the header or the file is missing (dev checkout)."""
+    try:
+        with open(
+            os.path.join(_script_dir(), "SKILL.md"), "r", encoding="utf-8"
+        ) as f:
+            head = f.read(2048)
+    except OSError:
+        return "unknown"
+    match = re.search(r"<!--\s*SKILL VERSION:\s*([0-9A-Za-z.\-+]+)\s*-->", head)
+    return match.group(1) if match else "unknown"
+
+
+VERSION = _cli_version()
+SKILL_VERSION = _skill_version()
+
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -2953,7 +3011,9 @@ class HubClient:
             "Accept": "application/json",
             # Cloudflare bot protection (Error 1010) blocks Python-urllib's
             # default UA. Identify honestly as the family-hub agent client.
-            "User-Agent": "family-hub-agent/1.0",
+            # The version is the real CLI version (contract C1); the server
+            # gates stale clients on it (WS-B).
+            "User-Agent": "family-hub-agent/" + VERSION,
         }
         if auth:
             if not self.token:
@@ -4484,7 +4544,13 @@ def build_parser():
         help="Print sanitized request/response dumps to stderr "
         "(credentials are always redacted)",
     )
-    parser.add_argument("--version", action="version", version="hub " + VERSION)
+    # Prints both the CLI and the skill version so a mismatch between the
+    # two (they are versioned in lockstep, contract C6) is detectable.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="hub " + VERSION + " (skill " + SKILL_VERSION + ")",
+    )
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     p = sub.add_parser("setup", help="Accept an invite (or owner provisioning code) and configure this agent")

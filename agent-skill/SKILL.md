@@ -1,3 +1,4 @@
+<!-- SKILL VERSION: 0.6.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
