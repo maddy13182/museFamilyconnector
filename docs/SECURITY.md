@@ -16,9 +16,13 @@ deploying, and keep it next to `docs/INSTALL.md`.
   stored. A leaked D1 export or backup does not yield usable tokens without
   the pepper (which lives only as a worker secret).
 - *Credential guessing.* Tokens are 256-bit, invite/provisioning codes
-  128-bit, all from a CSPRNG. Online guessing is infeasible by construction
-  and rate-limited in practice (§4).
-- *Invite/code replay.* Single-use codes; reuse returns 404. 7-day expiry.
+  128-bit, all from a CSPRNG. Online guessing is infeasible by construction.
+  Note: the worker itself enforces NO rate limits — practical throttling of
+  guessing attempts comes only from the Cloudflare edge rate-limiting rules
+  the operator configures (INSTALL §5). A deployment without those rules has
+  no throttling at all.
+- *Invite/code replay.* Single-use codes; reuse returns 409 (`invite_used` /
+  `code_used`). 7-day expiry.
 - *Privilege creep.* Agents act strictly as their member (SPEC §3). A kid's
   agent cannot invite, spawn into parent topics, or redact — the server
   rejects it, and the attempt is audit-logged.
@@ -53,10 +57,17 @@ deploying, and keep it next to `docs/INSTALL.md`.
 - [ ] **Minimal unauthenticated surface.** Only `/v1/health`,
       `/v1/invites/{code}/accept`, and `/v1/provisioning-codes/{code}/redeem`
       skip the bearer check. Unknown routes → 404, no version banners.
-- [ ] **Rate limits in place** (INSTALL §5): 5/min/IP on family-create,
-      10/min/IP on invite-accept, 60/min/token on the API.
-- [ ] **`SETUP_LOCKED=1` after bootstrap.** Verify `POST /v1/families`
-      returns 403 `setup_locked`.
+- [ ] **Rate limits configured at the Cloudflare edge** (INSTALL §5) —
+      the worker enforces none itself. Free plan gives you ONE rule, so spend
+      it on the highest-value endpoint: provisioning-code redemption
+      (`POST /v1/provisioning-codes/{code}/redeem`). On a paid plan add
+      family-create and per-token API rules from the table in INSTALL §5.
+- [ ] **`SETUP_LOCKED=1` after bootstrap.** Verify: unauthenticated
+      `POST /v1/families` returns 401 `unauthorized`; an authenticated
+      non-owner gets 403 `forbidden`. (There is no `setup_locked` error
+      code.) Hub owners can still create additional circles via
+      `hub circle create` — that is the supported path, not a second
+      deployment.
 - [ ] **Strong pepper.** `TOKEN_PEPPER` is 256-bit random (`openssl rand -hex
       32`), set via `wrangler secret put`, never in the repo, logs, or chat.
 - [ ] **Zero runtime dependencies** in the worker; parameterized SQL only;
@@ -90,12 +101,12 @@ deploying, and keep it next to `docs/INSTALL.md`.
 
 ## 4. Runbook: leaked or suspected-leaked token
 
-1. **Identify** the credential. As owner/parent: `GET /v1/auth/tokens` lists
-   token metadata (`token_id`, `agent_label`, `last_used_at`) — match the
-   label to the agent. (If the label is unknown, list and check `last_used_at`
-   for surprises.)
+1. **Identify** the credential. `GET /v1/auth/tokens` lists token metadata
+   (`token_id`, `agent_label`, `last_used_at`) — match the label to the agent.
+   (Planned — not yet implemented in v0.4.0. Until it ships, record every
+   `token_id` at issuance: mint/redeem/rotate responses all return one.)
 2. **Revoke** immediately:
-   `POST /v1/auth/revoke {"token_id":"tok_…"}` → `{"revoked": true}`.
+   `POST /v1/auth/revoke {"token_id":"tok_…"}` → `{"ok": true}`.
 3. **Verify**: any call with the old token must now return 401.
 4. **Scope the exposure**: query the audit trail for entries with that
    `token_id` (topic histories / export) to see what it read and wrote while
@@ -113,7 +124,8 @@ Worse than a leaked token — assume the attacker had the token *and* the
 vault contents of that host.
 
 1. Revoke **all** tokens for every agent label belonging to that member
-   (`GET /v1/auth/tokens` → revoke each).
+   (`GET /v1/auth/tokens` → revoke each; the listing endpoint is planned but
+   not yet implemented — see the §4 note, keep your own token_id records).
 2. Review the audit trail for those `token_id`s: what was posted, what topics
    were read (assume all visible topics), whether invites/provisions were
    minted (an attacker could have enrolled a new agent — check for unfamiliar
@@ -157,8 +169,10 @@ so the blast radius is small:
 
 ## 8. Ongoing hygiene
 
-- Review `GET /v1/auth/tokens` (owner) quarterly: any label you don't
-  recognize gets revoked and investigated.
+- Review token labels quarterly: any label you don't recognize gets revoked
+  and investigated. (`GET /v1/auth/tokens` will make this a one-call review
+  once it ships — until then, reconcile against the token_ids you recorded at
+  issuance.)
 - Re-run `docs/e2e.sh` after every server upgrade, before family traffic
   resumes.
 - Keep the worker on a supported wrangler/workerd release; with zero runtime

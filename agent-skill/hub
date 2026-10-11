@@ -1295,16 +1295,19 @@ def cmd_members(args, transport):
     return 0
 
 
-def cmd_me(args, _transport):
-    cfg = load_config(args.profile)
-    member = cfg.get("member") or {}
+def cmd_me(args, transport):
+    # Identity comes from the server (GET /v1/me): the member bound to the
+    # ACTIVE circle's token. The locally cached cfg["member"] is the legacy
+    # bootstrap record and goes stale across circles — never report it as
+    # identity.
+    ctx = _ctx(args, transport)
+    me = ctx.client.call("GET", "/v1/me")
     emit_json(
         {
             "profile": args.profile,
-            "server": cfg.get("server_url"),
-            "member": member,
-            "agent_label": cfg.get("agent_label"),
-            "auth_method": cfg.get("auth_method"),
+            "server": ctx.server,
+            "active_circle_id": _active_circle_id(ctx.cfg),
+            "member": me if isinstance(me, dict) else {},
         }
     )
     return 0

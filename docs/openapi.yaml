@@ -8,6 +8,10 @@ info:
     Family Hub v0.1 — family-owned agent coordination service.
     Machine-readable contract for SPEC.md §13. One deployment per family.
 
+    The human dashboard (not part of this API contract) is served at `/`:
+    a single self-contained HTML page — paste a per-circle token, read and
+    post. It uses GET /v1/me to resolve the caller's identity.
+
     Conventions (all from SPEC.md):
     - All paths are under `/v1`. JSON in/out. Timestamps are ISO-8601 UTC strings.
     - Auth: `Authorization: Bearer <token>` on every request except the ones
@@ -17,8 +21,10 @@ info:
       403 not-a-participant or wrong role, 404 unknown id/code, 409 state
       conflict (subtasks_open, already_member, invite_used, code_used),
       410 expired code (invite_expired, code_expired), 422 PII detected,
-      429 rate limited (enforced by the Cloudflare edge ruleset in front of
-      the worker, per SPEC section 7 — not in-worker).
+      429 rate limited. NOTE on 429: the worker itself enforces NO rate
+      limits — a 429 means a Cloudflare edge rate-limiting rule fired. Those
+      rules are configured by the OPERATOR (docs/INSTALL.md §5); they are not
+      part of the worker and not guaranteed to exist on any given deployment.
     - `seq` is per-topic ordering; `gseq` is global family ordering (for /sync).
     - Entries are append-only. The writer's actor_member_id / agent_label /
       token_id are stamped server-side from the token, never from the client.
@@ -70,10 +76,21 @@ paths:
       operationId: bootstrapFamily
       summary: Bootstrap a family (one-time)
       description: |
-        Public. Creates the family, the owner member, and returns a one-time
-        provisioning code for the owner's first agent. After setup this endpoint
-        MUST be disabled via env `SETUP_LOCKED=1`; further calls return 403
-        `setup_locked`. A second family = a second deployment.
+        Two modes, selected by env `SETUP_LOCKED`:
+        - **Open** (`SETUP_LOCKED` unset — first deploy only): public
+          bootstrap. Creates the family, the owner member, and returns a
+          one-time provisioning code for the owner's first agent.
+        - **Locked** (`SETUP_LOCKED=1` — the normal running state): hub-owner
+          circle creation. Requires a bearer token (401 without one); the
+          caller must be a hub owner (an `owner` in at least one circle,
+          matched by email) or the call is 403 `forbidden`. The creator
+          becomes an `owner` member of the new circle and gets a single-use
+          provisioning code for their agent in that circle — the existing
+          token stays bound to the old circle. There is no `setup_locked`
+          error code; unauthenticated calls are 401 `unauthorized`.
+        A second *deployment* is only needed for a truly separate family that
+        must not share an operator or database; additional circles for people
+        you trust are created in locked mode above.
       security: []
       requestBody:
         required: true
@@ -88,30 +105,100 @@ paths:
                 owner_email: { type: string, format: email, maxLength: 254 }
       responses:
         '201':
-          description: Family created
+          description: |
+            Family/circle created. Two shapes: open (bootstrap) mode returns
+            `{family, member, provisioning_code, provisioning_expires_at}`;
+            locked (hub-owner) mode returns the flat
+            `{id, name, kind, created_at, provisioning_code, provisioning_expires_at}`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [family, member, provisioning_code, provisioning_expires_at]
+                    properties:
+                      family: { $ref: '#/components/schemas/Family' }
+                      member: { $ref: '#/components/schemas/Member' }
+                      provisioning_code:
+                        type: string
+                        description: 128-bit random, single-use. Redeem at POST /v1/provision/{code}/accept. Shown once.
+                      provisioning_expires_at: { type: string, format: date-time }
+                  - type: object
+                    description: Locked (hub-owner) circle-creation shape.
+                    required: [id, name, kind, created_at, provisioning_code, provisioning_expires_at]
+                    properties:
+                      id: { type: string }
+                      name: { type: string }
+                      kind: { type: string }
+                      created_at: { type: string, format: date-time }
+                      provisioning_code: { type: string, description: 'Single-use, 24h TTL. Shown once.' }
+                      provisioning_expires_at: { type: string, format: date-time }
+        '200':
+          description: |
+            Locked mode, idempotent retry with a repeated Idempotency-Key —
+            the circle already existed, so a FRESH provisioning code is issued
+            and the orphaned token from the first attempt is revoked.
           content:
             application/json:
               schema:
                 type: object
-                required: [family, member, provisioning_code, provisioning_expires_at]
+                required: [id, name, kind, created_at, provisioning_code, provisioning_expires_at, deduped]
                 properties:
-                  family: { $ref: '#/components/schemas/Family' }
-                  member: { $ref: '#/components/schemas/Member' }
-                  provisioning_code:
-                    type: string
-                    description: 128-bit random, single-use. Redeem at POST /v1/provision/{code}/accept. Shown once.
+                  id: { type: string }
+                  name: { type: string }
+                  kind: { type: string }
+                  created_at: { type: string, format: date-time }
+                  provisioning_code: { type: string, description: 'Single-use, 24h TTL. Shown once.' }
                   provisioning_expires_at: { type: string, format: date-time }
+                  deduped: { type: boolean, example: true }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: Setup is locked (endpoint disabled after bootstrap)
+          description: Locked mode and the caller is not a hub owner
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               example:
-                error: { code: setup_locked, message: "Family bootstrap is disabled on this instance." }
+                error: { code: forbidden, message: "Only hub owners can create a family while setup is locked" }
+        '409':
+          description: Circle name already taken (case-insensitive)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: { code: circle_name_taken, message: 'A circle named "X" already exists' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [families]
+      operationId: listFamilies
+      summary: List circles I am a member of
+      description: |
+        Membership is matched by email (one human, one member row per circle).
+        Each entry carries `my_role` — the caller's role in that circle.
+      responses:
+        '200':
+          description: Circle list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [families]
+                properties:
+                  families:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, kind, my_role, created_at]
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+                        kind: { type: string }
+                        my_role: { $ref: '#/components/schemas/Role' }
+                        created_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/families/{fid}/invites:
     post:
       tags: [invites]
@@ -149,6 +236,20 @@ paths:
                     type: string
                     description: Single-use code. The invitee's agent redeems it at POST /v1/invites/{code}/accept.
                   expires_at: { type: string, format: date-time }
+        '200':
+          description: |
+            Idempotent retry with a repeated Idempotency-Key — a FRESH invite
+            code is minted for the same (email, role) (the original code's
+            plaintext is unrecoverable) instead of duplicating the invite.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invite_code, expires_at, deduped]
+                properties:
+                  invite_code: { type: string }
+                  expires_at: { type: string, format: date-time }
+                  deduped: { type: boolean, example: true }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -202,12 +303,22 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Invite already used
+          description: Invite already used — also returns the member and a flag so the client can tell the user they are already enrolled but hold no token
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-              example:
-                error: { code: invite_used, message: "Invite already used." }
+              schema:
+                type: object
+                required: [error, member, token_already_issued]
+                properties:
+                  error: { $ref: '#/components/schemas/Error' }
+                  member:
+                    $ref: '#/components/schemas/Member'
+                    description: The already-enrolled member (may be null).
+                  token_already_issued: { type: boolean, example: true }
+          example:
+            error: { code: invite_used, message: "Invite already used" }
+            member: { id: "m_…", name: "…", email: "…", role: "kid", created_at: "…" }
+            token_already_issued: true
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
@@ -233,11 +344,14 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [token, token_id, old_token_valid_until]
+                required: [token, token_id, grace_until]
                 properties:
                   token: { type: string, description: 'New bearer token, shown once.' }
                   token_id: { type: string }
-                  old_token_valid_until: { type: string, format: date-time }
+                  grace_until:
+                    type: string
+                    format: date-time
+                    description: The old token stays valid until this time (24h grace), then is revoked automatically.
         '401': { $ref: '#/components/responses/Unauthorized' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
@@ -266,10 +380,9 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [revoked, token_id]
+                required: [ok]
                 properties:
-                  revoked: { type: boolean, example: true }
-                  token_id: { type: string }
+                  ok: { type: boolean, example: true }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -368,12 +481,22 @@ paths:
                   token_id: { type: string }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Code already used
+          description: Code already used — also returns the member and a flag so the client can tell the user they are already enrolled but hold no token
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-              example:
-                error: { code: code_used, message: "Provisioning code already used." }
+              schema:
+                type: object
+                required: [error, member, token_already_issued]
+                properties:
+                  error: { $ref: '#/components/schemas/Error' }
+                  member:
+                    $ref: '#/components/schemas/Member'
+                    description: The member the code was minted for (may be null).
+                  token_already_issued: { type: boolean, example: true }
+          example:
+            error: { code: code_used, message: "Provisioning code already used" }
+            member: { id: "m_…", name: "…", email: "…", role: "owner", created_at: "…" }
+            token_already_issued: true
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
   # ------------------------------------------------------------------ members
@@ -394,6 +517,36 @@ paths:
                   members:
                     type: array
                     items: { $ref: '#/components/schemas/Member' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/me:
+    get:
+      tags: [members]
+      operationId: getSelf
+      summary: My own identity (the member bound to this token)
+      description: |
+        Returns the member record the calling bearer token is bound to,
+        plus the token's `agent_label`. Clients MUST use this — not
+        `/v1/members[0]` — to learn who "I" am: members are ordered by
+        creation time, so `[0]` is typically the owner, not the caller.
+      responses:
+        '200':
+          description: Caller identity
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, family_id, name, email, role, created_at, agent_label]
+                properties:
+                  id: { type: string }
+                  family_id: { type: string }
+                  name: { type: string }
+                  email: { type: string, format: email }
+                  role: { $ref: '#/components/schemas/Role' }
+                  created_at: { type: string, format: date-time }
+                  agent_label:
+                    type: string
+                    description: The agent label recorded when this token was issued.
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ------------------------------------------------------------------- topics
@@ -439,6 +592,16 @@ paths:
                 required: [topic]
                 properties:
                   topic: { $ref: '#/components/schemas/Topic' }
+        '200':
+          description: Idempotent retry with a repeated Idempotency-Key — the already-created topic is returned, nothing is duplicated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic, deduped]
+                properties:
+                  topic: { $ref: '#/components/schemas/Topic' }
+                  deduped: { type: boolean, example: true }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/RateLimited' }
@@ -667,7 +830,7 @@ paths:
       description: |
         Caller must be a participant. Only `kind: message` is client-settable;
         all other kinds are server-generated. Supports `Idempotency-Key` header:
-        retries with the same key return the original entry (`deduplicated: true`)
+        retries with the same key return the original entry (`deduped: true`)
         instead of creating a duplicate. Body is PII-scanned before insert.
       parameters:
         - $ref: '#/components/parameters/TopicId'
@@ -703,10 +866,9 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entry, deduped]
+                required: [entry]
                 properties:
                   entry: { $ref: '#/components/schemas/Entry' }
-                  deduped: { type: boolean, example: false }
         '200':
           description: Idempotent replay — original entry returned, no duplicate created
           content:
@@ -962,10 +1124,13 @@ paths:
                     description: >
                       Pass as after_gseq on the next poll. The server sends the
                       same value in max_gseq and next_after_gseq; clients should
-                      prefer next_after_gseq and fall back to max_gseq. Optional —
-                      omitted when the cursor is already at the head (fall back
-                      to the max gseq seen, or the after_gseq sent).
-                  has_more: { type: boolean }
+                      prefer next_after_gseq and fall back to max_gseq.
+                  has_more:
+                    type: boolean
+                    description: >
+                      True when more entries exist beyond this page (the caller
+                      hit `limit` before reaching the head) — keep polling with
+                      next_after_gseq until it is false.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
@@ -1096,10 +1261,16 @@ components:
 
     Member:
       type: object
-      description: Single-family deployment — the family is implicit, so member objects carry no family_id.
+      description: >
+        family_id is present on roster endpoints (GET /v1/members, GET /v1/me)
+        and absent from enrollment responses (invite accept, bootstrap), which
+        return a narrower shape.
       required: [id, name, email, role, created_at]
       properties:
         id: { type: string }
+        family_id:
+          type: string
+          description: Present on roster/self endpoints; absent on enrollment responses.
         name: { type: string }
         email: { type: string, format: email }
         role: { $ref: '#/components/schemas/Role' }

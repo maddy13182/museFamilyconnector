@@ -105,7 +105,10 @@ Response (save the provisioning code somewhere safe — password manager, not ch
 ```bash
 wrangler deploy
 curl -s -X POST $HUB/v1/families -H 'Content-Type: application/json' -d '{}'
-# → {"error":{"code":"setup_locked",…}}   ← this is what you want to see
+# → {"error":{"code":"unauthorized",…}}   ← this is what you want to see:
+#    anonymous bootstrap is dead. (There is no `setup_locked` error code;
+#    authenticated non-owners get 403 `forbidden`, and hub owners can still
+#    create circles via `hub circle create`.)
 ```
 
 > If you ever need a truly separate family that shouldn't share an operator
@@ -115,17 +118,36 @@ curl -s -X POST $HUB/v1/families -H 'Content-Type: application/json' -d '{}'
 
 ## 5. Rate limiting (Cloudflare dashboard)
 
-SPEC §7 requires three rules. In the dashboard: Workers & Pages → your worker →
-Security → Rate limiting rules:
+**The worker itself enforces no rate limits.** All throttling must be
+configured by you, the operator, as Cloudflare edge rules in front of the
+worker — a deployment without them has no throttling at all. (Blocked
+requests never reach the worker, so they consume no worker invocations.)
+
+What Cloudflare gives you by default: unmetered DDoS mitigation at the edge
+and, on the free plan, **one** rate-limiting rule (counts by IP, short
+measurement periods). Per-header counting keys (e.g. per-token) need a paid
+plan; more rules do too.
+
+With one free rule, spend it on the highest-value endpoint —
+**provisioning-code redemption**: a guessed code mints a live agent token, so
+that endpoint is the most attractive brute-force target. Dashboard:
+Security → Rate limiting rules (or the worker's Security tab):
+
+| Rule | Match | Limit |
+|---|---|---|
+| redeem-guard | URI Path starts with `/v1/provisioning-codes/` AND method POST | 10 req / 1 min per IP |
+
+Set it to "Block". Verify: hammer
+`POST /v1/provisioning-codes/bad-code/redeem` 15 times quickly → expect `429`.
+
+On a paid plan (more rules, header counting keys), add the rest of the
+SPEC §7 set:
 
 | Rule | Match | Limit |
 |---|---|---|
 | family-create | URI Path equals `/v1/families` AND method POST | 5 req / 1 min per IP |
 | invite-accept | URI Path starts with `/v1/invites/` AND method POST | 10 req / 1 min per IP |
-| api-per-token | URI Path starts with `/v1/` | 60 req / 1 min per token (`Authorization` header characteristics) |
-
-Set all to "Block" (or "Challenge" while testing). Verify: hammer
-`POST /v1/invites/bad-code/accept` 15 times quickly → expect `429`.
+| api-per-token | URI Path starts with `/v1/` | 60 req / 1 min per token (count key: `Authorization` header) |
 
 ## 6. Onboard the owner (your agent)
 
@@ -145,7 +167,7 @@ store it in a file the model reads, do not paste it into chat. Confirm:
 ```bash
 # from the agent side (the CLI attaches the vault-held token itself):
 hub sync
-# → {"entries": [], "next_after_gseq": 0, "has_more": false}
+# → {"entries": [], "max_gseq": 0, "next_after_gseq": 0, "has_more": false}
 ```
 
 ## 7. Invite family members
@@ -269,7 +291,7 @@ base URL per person.
 |---|---|
 | `401 unauthorized` on every call | Token revoked or wrong instance. Re-enroll via a fresh provisioning code. |
 | `403 forbidden` on a topic | Not a participant — by design. Ask an owner/parent for access. |
-| `403 setup_locked` on `/v1/families` | Correct after bootstrap. Deploy a second instance for a second family. |
+| `401 unauthorized` on `/v1/families` after locking setup | Correct after bootstrap — anonymous bootstrap is dead. Owners create circles via `hub circle create`. |
 | `422 pii_detected` | Body tripped the PII scan (card/SSN pattern). Rephrase without the number and retry. |
 | `429` | Rate limit (see §5). Back off; the CLI retries with jitter. |
 | Invite code returns 404 | Already used or expired (7 days). Mint a fresh one. |
