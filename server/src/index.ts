@@ -40,13 +40,46 @@ import {
 } from './validate.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
+// Single source of truth for the server version: server/package.json.
+// The skill (agent-skill/hub) carries its own VERSION constant; the two
+// version independently (docs/VERSIONING.md).
+import pkg from '../package.json' with { type: 'json' };
+const SERVER_VERSION: string = pkg.version;
 
-const VERSION = '0.1.0';
 const MAX_BODY = 20000;
 const MAX_DATA = 20000;
 const IDEM_TTL_HOURS = 24;
 const PROVISION_TTL_HOURS = 24;
 const INVITE_TTL_DAYS = 7;
+
+// Structured logging. Every line carries the server version so log streams
+// can be correlated with releases. Never log tokens, codes, or request
+// bodies — paths are redacted via redactPath() and query strings are dropped.
+type LogLevel = 'info' | 'warn' | 'error';
+
+export function logEvent(
+  level: LogLevel,
+  event: string,
+  fields: Record<string, unknown> = {},
+): void {
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    v: SERVER_VERSION,
+    level,
+    event,
+    ...fields,
+  });
+  if (level === 'error') console.error(line);
+  else console.log(line);
+}
+
+// Redact single-use codes from URL paths before logging: on these routes the
+// code IS the credential.
+export function redactPath(path: string): string {
+  return path
+    .replace(/^(\/v1\/invites\/)[^/]+(\/accept)$/, '$1[redacted]$2')
+    .replace(/^(\/v1\/provisioning-codes\/)[^/]+(\/redeem)$/, '$1[redacted]$2');
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -277,7 +310,7 @@ async function assertNoOpenSubtasks(db: DbClient, taskId: string): Promise<void>
 // ---------------------------------------------------------------------------
 
 async function handleHealth(): Promise<Response> {
-  return json({ ok: true, version: VERSION });
+  return json({ ok: true, version: SERVER_VERSION });
 }
 
 // POST /v1/families — bootstrap when unlocked; hub-owner circle creation
@@ -1272,7 +1305,40 @@ async function handleRedact(
 // Router.
 // ---------------------------------------------------------------------------
 
+// Request entry point (what tests drive and what the worker's fetch calls).
+// Logs exactly one structured line per request — method, redacted path,
+// status, duration — with the server version on every line. Error detail
+// (code) is logged by routeRequest's catch below, so failures produce a
+// detail line plus this access line.
 export async function handleRequest(req: Request, db: DbClient, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const path = redactPath(url.pathname);
+  const method = req.method.toUpperCase();
+  const start = Date.now();
+  try {
+    const res = await routeRequest(req, db, env);
+    logEvent(res.status >= 500 ? 'error' : res.status >= 400 ? 'warn' : 'info', 'request', {
+      method,
+      path,
+      status: res.status,
+      ms: Date.now() - start,
+    });
+    return res;
+  } catch (e) {
+    // routeRequest converts all expected errors to responses; this is the
+    // last resort so a request never goes unlogged.
+    logEvent('error', 'request_error', {
+      method,
+      path,
+      status: 500,
+      code: 'internal',
+      ms: Date.now() - start,
+    });
+    return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
+  }
+}
+
+async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
   const method = req.method.toUpperCase();
@@ -1369,10 +1435,19 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
 
     throw new HttpError(404, 'not_found', 'Unknown endpoint');
   } catch (e) {
+    const logPath = redactPath(new URL(req.url).pathname);
     if (e instanceof HttpError) {
+      // 401/403 get their own event so auth probing is visible in log streams.
+      const event = e.status === 401 || e.status === 403 ? 'auth_rejected' : 'request_error';
+      logEvent(e.status >= 500 ? 'error' : 'warn', event, {
+        path: logPath,
+        status: e.status,
+        code: e.code,
+      });
       return json({ error: { code: e.code, message: e.message } }, e.status);
     }
     // Never leak stack traces or SQL to clients.
+    logEvent('error', 'request_error', { path: logPath, status: 500, code: 'internal' });
     return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
   }
 }
@@ -1381,9 +1456,11 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (!env.DB) {
+      logEvent('error', 'misconfigured', { detail: 'D1 binding DB is not configured' });
       return json({ error: { code: 'misconfigured', message: 'D1 binding DB is not configured' } }, 500);
     }
     if (!env.TOKEN_PEPPER) {
+      logEvent('error', 'misconfigured', { detail: 'TOKEN_PEPPER secret is not set' });
       return json({ error: { code: 'misconfigured', message: 'TOKEN_PEPPER secret is not set' } }, 500);
     }
     return await handleRequest(req, d1Client(env.DB), env);

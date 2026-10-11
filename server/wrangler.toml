@@ -15,7 +15,13 @@ database_name = "family-hub"
 # Created 2026-10-09 via `wrangler d1 create family-hub` (not a secret).
 database_id = "38625921-e60b-41de-af8e-da90ba8b41a8"
 
+# Workers Logs: structured request/error logs (with the server version on
+# every line) are delivered to Cloudflare. View with `wrangler tail` or the
+# dashboard's Logs tab.
+[observability]
+enabled = true
+
 [vars]
-# "0" during first bootstrap, then set to "1" and redeploy to lock
-# POST /v1/families forever (SPEC §6).
+# "0" during first bootstrap, then set to "1" and redeploy. Unauthenticated
+# POST /v1/families is then rejected; owners can still create more circles.
 SETUP_LOCKED = "1"
