@@ -773,6 +773,101 @@ def _public_key_b64(priv_bytes):
     return base64.b64encode(pub).decode("ascii")
 
 
+# ---------------------------------------------------------------------------
+# E2EE topics (Phase 2) — topic-key generation, subject encryption, envelopes.
+#
+# Ciphertext formats (frozen for Phase 3; see docs/E2EE_BUILD_SPEC.md):
+#
+# - Subject: XChaCha20-Poly1305 (IETF) under the 32-byte topic key, random
+#   192-bit (24-byte) nonce PREPENDED to the ciphertext+tag, whole blob
+#   standard-base64. AAD is the fixed context b"fh-topic-subject-v1":
+#   the topic_id is not known yet at creation time, so it cannot be bound;
+#   the fixed string keeps the AAD slot non-empty and versioned.
+# - Envelope plaintext: key_id_bytes (16) || topic_key (32), sealed with
+#   libsodium crypto_box_seal to the recipient agent's X25519 public key.
+#   Binding key_id inside the sealed plaintext stops an envelope being
+#   replayed into a different key rotation of the same topic (design §2 L3).
+#   The sealed blob travels as standard base64.
+#
+# The topic key NEVER leaves the machine except inside sealed envelopes,
+# and is never printed or logged: _note_topic_key_secrets() registers every
+# textual encoding with note_secret() for redaction.
+# ---------------------------------------------------------------------------
+
+_E2EE_SUBJECT_AAD = b"fh-topic-subject-v1"
+_E2EE_SUBJECT_NONCE_BYTES = 24  # XChaCha20 nonce
+_E2EE_TOPIC_KEY_BYTES = 32
+_E2EE_KEY_ID_BYTES = 16  # 128-bit, hex-encoded on the wire / in storage
+_E2EE_SUBJECT_PLAINTEXT_MAX = 200  # same user-visible limit as plaintext topics
+
+
+def _note_topic_key_secrets(topic_key):
+    """Register every textual encoding of the topic key for redaction."""
+    note_secret(base64.b64encode(topic_key).decode("ascii"))
+    note_secret(topic_key.hex())
+
+
+def _e2ee_encrypt_subject(subject, topic_key):
+    """Encrypt a topic subject; returns the base64 (nonce || ciphertext) blob."""
+    nacl = _require_nacl()
+    nonce = os.urandom(_E2EE_SUBJECT_NONCE_BYTES)
+    ct = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        subject.encode("utf-8"), _E2EE_SUBJECT_AAD, nonce, topic_key
+    )
+    return base64.b64encode(nonce + ct).decode("ascii")
+
+
+def _e2ee_seal_envelope(key_id_bytes, topic_key, recipient_pubkey_b64):
+    """Seal (key_id || topic_key) to a recipient's public key; base64 out."""
+    nacl = _require_nacl()
+    try:
+        pub = base64.b64decode(recipient_pubkey_b64, validate=True)
+    except ValueError as exc:
+        raise HubError(
+            "error",
+            "Server returned a malformed public key for an envelope recipient (%s)." % exc,
+        )
+    if len(pub) != 32:
+        raise HubError(
+            "error",
+            "Server returned a %d-byte public key for an envelope recipient; expected 32."
+            % len(pub),
+        )
+    sealed = nacl.bindings.crypto_box_seal(key_id_bytes + topic_key, pub)
+    return base64.b64encode(sealed).decode("ascii")
+
+
+def _e2ee_open_envelope(envelope_b64, priv_bytes):
+    """Open a sealed envelope with our identity private key; raw bytes out."""
+    nacl = _require_nacl()
+    pub = bytes(nacl.public.PrivateKey(priv_bytes).public_key)
+    try:
+        sealed = base64.b64decode(envelope_b64, validate=True)
+    except ValueError as exc:
+        raise HubError("error", "Own envelope is not valid base64 (%s)." % exc)
+    try:
+        return nacl.bindings.crypto_box_seal_open(sealed, pub, priv_bytes)
+    except Exception as exc:
+        raise HubError("error", "Failed to open own key envelope (%s)." % exc)
+
+
+def topic_keys_dir(profile):
+    return os.path.join(profile_dir(profile), "topic_keys")
+
+
+def _store_topic_key(profile, topic_id, key_id_hex, topic_key):
+    """Persist key_id -> base64 topic key at 0600; fail loudly on perm failure.
+
+    Uses _write_secret_file_0600, which refuses to leave a private key in a
+    group/world-readable file.
+    """
+    path = os.path.join(topic_keys_dir(profile), topic_id + ".json")
+    payload = json.dumps({key_id_hex: base64.b64encode(topic_key).decode("ascii")},
+                         indent=2, sort_keys=True).encode("utf-8")
+    _write_secret_file_0600(path, payload, "topic key")
+    return path
+
+
 def _load_identity_key(path):
     """Load and validate the 32-byte private key; HubError when unusable."""
     try:
@@ -1827,6 +1922,157 @@ def cmd_post(args, transport):
     return 0
 
 
+def _cmd_new_topic_e2ee(args, ctx, members):
+    """Create an E2EE topic: local keygen, encrypted subject, sealed envelopes.
+
+    1. The identity keypair must already exist — _load_identity_key fails with
+       `hub key-init` guidance when it doesn't. Never auto-generated here.
+    2. Generate the 32-byte topic key + random 128-bit key_id locally.
+    3. Encrypt the subject (XChaCha20-Poly1305, nonce prepended, base64) and
+       POST the topic with e2ee=1. The subject is opaque to the server.
+    4. Read back the authoritative participant list (the server auto-adds the
+       creator, and parents_only auto-adds grownups) and seal one envelope per
+       participant agent from the key directory.
+    5. Fetch our own envelope back and decrypt it: proves the server stored
+       what we sealed and that our private key opens it (round-trip check).
+    6. Persist key_id -> topic key at 0600 under topic_keys/<topic_id>.json.
+
+    The topic key never leaves the machine except inside sealed envelopes and
+    is registered with note_secret() so it can never reach stdout/stderr.
+    """
+    _require_nacl()
+    profile = ctx.profile
+    priv = _load_identity_key(agent_key_path(profile))
+
+    subject = args.subject
+    if len(subject) > _E2EE_SUBJECT_PLAINTEXT_MAX:
+        raise HubError(
+            "bad_request",
+            "--e2ee subjects are limited to %d chars of plaintext (same as plaintext topics)."
+            % _E2EE_SUBJECT_PLAINTEXT_MAX,
+        )
+
+    topic_key = os.urandom(_E2EE_TOPIC_KEY_BYTES)
+    _note_topic_key_secrets(topic_key)
+    key_id_bytes = os.urandom(_E2EE_KEY_ID_BYTES)
+    key_id_hex = key_id_bytes.hex()
+    enc_subject = _e2ee_encrypt_subject(subject, topic_key)
+
+    topic = ctx.client.call(
+        "POST",
+        "/v1/topics",
+        json_body={
+            "subject": enc_subject,
+            "kind": args.kind,
+            "participant_member_ids": members,
+            "parents_only": bool(args.parents_only),
+            "e2ee": 1,
+        },
+    )
+    if not isinstance(topic, dict) or not isinstance(topic.get("topic"), dict):
+        raise HubError("error", "Unexpected response from the server creating the topic.")
+    # NOTE: a deduped retry of this POST (same process, same idempotency
+    # key) returns the already-created topic with the SAME request body, so
+    # the in-memory topic_key still matches the stored subject ciphertext.
+    topic_id = topic["topic"].get("id")
+    if not topic_id:
+        raise HubError("error", "Server did not return a topic id.")
+    quoted_tid = urlparse.quote(str(topic_id), safe="")
+
+    me = ctx.client.call("GET", "/v1/me")
+    if not isinstance(me, dict) or not me.get("id"):
+        raise HubError("error", "Unexpected /v1/me response from the server.")
+    my_member_id = me["id"]
+    my_agent_label = me.get("agent_label") or ""
+
+    detail = ctx.client.call("GET", "/v1/topics/%s" % quoted_tid)
+    participants = _as_list(detail, "participants")
+    participant_ids = sorted(
+        {p["member_id"] for p in participants if isinstance(p, dict) and p.get("member_id")}
+    )
+    if not participant_ids:
+        raise HubError("error", "Server returned no participants for the new topic.")
+
+    posted = 0
+    keyless_members = []
+    failures = []
+    for mid in participant_ids:
+        directory = ctx.client.call("GET", "/v1/agent-keys", query={"member_id": mid})
+        keys = _as_list(directory, "keys")
+        if not keys:
+            keyless_members.append(mid)
+            continue
+        for entry in keys:
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("agent_label") or ""
+            pub_b64 = entry.get("public_key") or ""
+            if not label or not pub_b64:
+                continue
+            envelope = _e2ee_seal_envelope(key_id_bytes, topic_key, pub_b64)
+            try:
+                ctx.client.call(
+                    "POST",
+                    "/v1/topics/%s/envelopes" % quoted_tid,
+                    json_body={
+                        "member_id": mid,
+                        "agent_label": label,
+                        "key_id": key_id_hex,
+                        "envelope": envelope,
+                    },
+                )
+                posted += 1
+            except HubError as exc:
+                failures.append("%s/%s: %s" % (mid, label, exc))
+    if failures:
+        raise HubError(
+            "error",
+            "Created E2EE topic %s but %d envelope(s) failed to post: %s. "
+            "The topic key is NOT stored locally yet — re-run distribution for "
+            "these agents once the cause is fixed." % (topic_id, len(failures), "; ".join(failures)),
+        )
+    if keyless_members:
+        emit_err(
+            "warning: %d participant(s) have no registered agent keys and will see "
+            "only ciphertext until they run `hub key-init`: %s"
+            % (len(keyless_members), ", ".join(keyless_members))
+        )
+
+    # Round-trip check: fetch our own envelope back and open it. Proves the
+    # server stored exactly what we sealed and that our private key opens it.
+    own = ctx.client.call("GET", "/v1/topics/%s/envelopes" % quoted_tid)
+    own_envelopes = [
+        e
+        for e in _as_list(own, "envelopes")
+        if isinstance(e, dict) and e.get("key_id") == key_id_hex
+    ]
+    if not own_envelopes:
+        raise HubError(
+            "error",
+            "Round-trip check failed: our own envelope for topic %s is missing "
+            "server-side. The topic key is NOT stored locally." % topic_id,
+        )
+    opened = _e2ee_open_envelope(own_envelopes[0].get("envelope") or "", priv)
+    if opened != key_id_bytes + topic_key:
+        raise HubError(
+            "error",
+            "Round-trip check failed: our own envelope for topic %s does not "
+            "open to the generated topic key. The topic key is NOT stored "
+            "locally." % topic_id,
+        )
+
+    key_path = _store_topic_key(profile, str(topic_id), key_id_hex, topic_key)
+    result = dict(topic)
+    result["e2ee"] = {
+        "key_id": key_id_hex,
+        "envelopes_posted": posted,
+        "keyless_participants": keyless_members,
+        "topic_key_path": key_path,
+    }
+    emit_json(result)
+    return 0
+
+
 def cmd_new_topic(args, transport):
     ctx = _ctx(args, transport)
     check_pii(args.subject)
@@ -1835,6 +2081,8 @@ def cmd_new_topic(args, transport):
         raise HubError("bad_request", "--kind direct requires exactly 2 member IDs.")
     if not members:
         raise HubError("bad_request", "At least one participant member ID is required.")
+    if args.e2ee:
+        return _cmd_new_topic_e2ee(args, ctx, members)
     topic = ctx.client.call(
         "POST",
         "/v1/topics",
@@ -2399,6 +2647,12 @@ def build_parser():
                  help="Participant member IDs (repeatable, comma-separated)")
     p.add_argument("--kind", choices=["direct", "group"], default="group")
     p.add_argument("--parents-only", action="store_true")
+    p.add_argument("--e2ee", action="store_true",
+                   help="End-to-end-encrypt the topic: subject is encrypted "
+                        "locally, one sealed key envelope is posted per "
+                        "participant agent, and the topic key is stored at "
+                        "0600 under topic_keys/. Requires `hub key-init` "
+                        "first.")
     p.set_defaults(func=cmd_new_topic)
 
     p = sub.add_parser("invite", help="Invite members to a topic you are in")

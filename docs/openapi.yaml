@@ -659,6 +659,14 @@ paths:
         `parents_only: true` auto-includes all parent-role members (and the
         owner) and rejects any kid-role member id; participant_member_ids may
         be omitted in that case. All participants must be family members.
+        E2EE (Phase 2): `e2ee: 1` creates an end-to-end-encrypted topic. The
+        subject may then arrive already encrypted (opaque to the server —
+        stored as-is; up to 1024 chars of base64 ciphertext vs the usual
+        200). Requires the creator's agent to have a registered identity
+        key in `agent_keys` (400 with `hub key-init` guidance otherwise).
+        After creation, distribute the topic key with POST
+        /v1/topics/{tid}/envelopes — one sealed envelope per participant
+        agent. Absent/null `e2ee` (or 0) is a plaintext topic, unchanged.
       requestBody:
         required: true
         content:
@@ -679,6 +687,14 @@ paths:
                     owner+parent roles are auto-included regardless of this list
                     (kid-role ids are rejected with 403).
                 parents_only: { type: boolean, default: false }
+                e2ee:
+                  type: integer
+                  enum: [0, 1]
+                  default: 0
+                  description: >
+                    1 = end-to-end-encrypted topic (subject is opaque
+                    ciphertext; creator must have a registered agent identity
+                    key). 0 / absent = plaintext topic.
       responses:
         '201':
           description: Topic created (caller is added as participant if not listed)
@@ -1043,6 +1059,104 @@ paths:
                   tasks:
                     type: array
                     items: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/envelopes:
+    post:
+      tags: [e2ee]
+      operationId: postTopicEnvelope
+      summary: Store a sealed topic-key envelope for a recipient agent
+      description: |
+        E2EE (Phase 2). Stores one sealed topic-key envelope for the target
+        (member_id, agent_label). The envelope blob is opaque to the server:
+        format-validated (standard base64) and stored, never inspected.
+        The caller must be a current participant of the topic (403
+        otherwise); the target must be a current participant AND hold an
+        ACTIVE (non-superseded) registered public key (400 otherwise —
+        sealing to an agent with no key on file is meaningless; they must
+        run `hub key-init` first). Re-POSTing the same
+        (topic_id, member_id, agent_label, key_id) replaces the stored
+        envelope — idempotent distribution.
+      parameters:
+        - name: tid
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [member_id, agent_label, key_id, envelope]
+              properties:
+                member_id: { type: string }
+                agent_label: { type: string }
+                key_id:
+                  type: string
+                  description: Random 128-bit topic-key id, 32 hex chars.
+                envelope:
+                  type: string
+                  description: >
+                    Standard base64 crypto_box_seal of (key_id_bytes ||
+                    topic_key) to the target agent's X25519 public key.
+                    Opaque to the server.
+      responses:
+        '201':
+          description: Envelope stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic_id, member_id, agent_label, key_id, created_at]
+                properties:
+                  topic_id: { type: string }
+                  member_id: { type: string }
+                  agent_label: { type: string }
+                  key_id: { type: string }
+                  created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      tags: [e2ee]
+      operationId: listTopicEnvelopes
+      summary: Fetch my own key envelopes for a topic
+      description: |
+        E2EE (Phase 2). Returns ONLY the caller's own envelopes — rows are
+        matched on the caller's (member_id, agent_label) from the Bearer
+        token, never on caller-supplied input. One agent can never fetch
+        another agent's envelopes. 403 when the caller is not a participant
+        of the topic.
+      parameters:
+        - name: tid
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The caller's envelopes for this topic
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [envelopes]
+                properties:
+                  envelopes:
+                    type: array
+                    items:
+                      type: object
+                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at]
+                      properties:
+                        topic_id: { type: string }
+                        member_id: { type: string }
+                        agent_label: { type: string }
+                        key_id: { type: string }
+                        envelope: { type: string }
+                        created_at: { type: string, format: date-time }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1425,6 +1539,12 @@ components:
         link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
         created_by: { type: string }
         created_at: { type: string, format: date-time }
+        e2ee:
+          type: integer
+          enum: [0, 1]
+          description: >
+            1 = end-to-end-encrypted topic (subject is opaque ciphertext;
+            entries are ciphertext — see Phase 3). 0 = plaintext topic.
 
     Entry:
       type: object
