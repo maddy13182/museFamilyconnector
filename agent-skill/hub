@@ -557,7 +557,7 @@ class HubClient:
             last_status, last_text = status, resp_text
             if attempt >= retries:
                 break
-            delay = min(2 ** attempt, 8) + random.uniform(0, 1)
+            delay = min(2 ** attempt, 8) + random.uniform(0, 1)  # nosec B311 -- retry jitter is not a security use
             if self.debug:
                 emit_err(
                     "hub debug [%s]: %s %s failed (%s); retry %d/%d in %.1fs"
