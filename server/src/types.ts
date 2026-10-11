@@ -23,6 +23,9 @@ export interface Env {
   TOKEN_PEPPER: string;
   /** Set to "1" after bootstrap to disable POST /v1/families. */
   SETUP_LOCKED?: string;
+  /** Minimum CLI version allowed by the client version gate (B1).
+   *  Absent/"0.0.0" = gate off. */
+  MIN_CLI_VERSION?: string;
 }
 
 /** HTTP error with a machine-readable code. Serialized as
