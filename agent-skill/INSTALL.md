@@ -160,7 +160,9 @@ into the crontab**):
 With the platform scheduler / hooks: create a 15-minute cron whose command is
 `hub sync`, with `FAMILY_HUB_TOKEN` bound from the Secure Vault (same binding
 the agent's tool calls use). Multiple agents on one machine: give each its own
-`--profile` so cursors don't collide.
+`--profile` so cursors don't collide. If you wrapped the identity key with
+`hub key-wrap`, bind `FAMILY_HUB_KEY_PASSPHRASE` the same way — see
+"Protecting the identity key at rest" below.
 
 > **Wrapped keys + cron.** If you wrapped the agent key with
 > `hub key-wrap`, every non-interactive invocation (this cron included)
@@ -177,6 +179,55 @@ hub sync      # [] means "caught up" — the cursor is stored for next time
 ```
 
 Then read `SKILL.md` (or have your agent read it) — that's the whole manual.
+
+## Protecting the identity key at rest (`hub key-wrap`)
+
+Your E2EE identity key lives at
+`~/.config/family-hub/profiles/<name>/agent.key` (`0600`). By default it is
+stored **unwrapped** (raw 32 bytes). `hub key-wrap` encrypts it in place
+with a passphrase:
+
+```sh
+hub key-wrap
+```
+
+What happens:
+
+1. The unwrapped original is backed up first to `agent.key.bak-0600`
+   (`0600`). Nothing is overwritten until the backup exists.
+2. You choose a passphrase (min 8 characters). It is **never** a CLI flag
+   (it would land in `ps` / shell history) — it comes from the
+   `FAMILY_HUB_KEY_PASSPHRASE` env var when set, otherwise an interactive
+   prompt that never echoes. It is never logged and never appears in error
+   messages.
+3. The key is encrypted with a key derived from your passphrase via
+   **Argon2id**, using **XChaCha20-Poly1305**. The wrapped file starts with
+   the magic header `FHWRAP1`, then `salt(16) || nonce || ciphertext`.
+4. `hub` proves the wrapped file decrypts back to the identical key
+   **before** trusting it; on any failure the original is restored from the
+   backup.
+
+After wrapping, every `hub` command that needs the key detects the
+`FHWRAP1` header automatically and asks for the passphrase (env var first,
+prompt second). A wrong passphrase gives a clean "Incorrect passphrase"
+error — never garbage output.
+
+Legacy unwrapped keys keep working, but `hub` prints a loud deprecation
+warning on every use pointing at `hub key-wrap`.
+
+> **Ops note — read this if you run `hub` on a schedule.** After wrapping,
+> any automation (e.g. the 15-minute `hub sync` cron from Step 3) must
+> export `FAMILY_HUB_KEY_PASSPHRASE=<passphrase>` in its environment, or it
+> will block forever on the passphrase prompt. Bind it from your secret
+> manager / vault the same way you bind `FAMILY_HUB_TOKEN` — never paste
+> it into the crontab.
+>
+> ```cron
+> */15 * * * * FAMILY_HUB_KEY_PASSPHRASE=<from vault> /home/you/workspace/skills/family-hub/hub sync --limit 200
+> ```
+>
+> (Use your scheduler's secret binding for the value; the literal above is
+> illustrative only.)
 
 ## For non-Muse agents
 

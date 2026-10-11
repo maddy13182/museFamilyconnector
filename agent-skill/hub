@@ -37,7 +37,7 @@ falling back to the single-token chain above when a circle has no stored
 token (bootstrap-family backwards compatibility).
 
 Python 3. The E2EE key commands (`key-init`, `key-backup`, `key-restore`,
-and key generation during `setup`) need PyNaCl + the `mnemonic` package
+`key-wrap`, and key generation during `setup`) need PyNaCl + the `mnemonic` package
 (pinned in agent-skill/requirements.txt); everything else is standard
 library only, and every non-key command keeps working when PyNaCl is
 missing.
@@ -2663,7 +2663,13 @@ def _decrypt_entries_for_display(client, profile, entries, e2ee_flags=None):
 
 
 def _load_identity_key(path):
-    """Load and validate the 32-byte private key; HubError when unusable."""
+    """Load and validate the 32-byte private key; HubError when unusable.
+
+    Auto-detects the passphrase-wrapped form (FHWRAP1 magic header) and
+    unwraps it, sourcing the passphrase from FAMILY_HUB_KEY_PASSPHRASE or
+    an interactive getpass prompt (see `hub key-wrap`). Legacy unwrapped
+    keys keep working but emit a loud deprecation warning on every use.
+    """
     try:
         with open(path, "rb") as fh:
             data = fh.read()
@@ -2685,6 +2691,17 @@ def _load_identity_key(path):
             )
     except OSError:
         pass
+    if data.startswith(_KEYWRAP_MAGIC):
+        priv = _unwrap_identity_key(data)
+        _note_key_secrets(priv)
+        return priv
+    emit_err(
+        "warning: identity key at %s is stored UNWRAPPED on disk — anyone "
+        "who can read this file can impersonate this agent's E2EE identity. "
+        "Run `hub key-wrap` to encrypt it with a passphrase, then export "
+        "FAMILY_HUB_KEY_PASSPHRASE=<passphrase> for non-interactive use "
+        "(cron, agents). See agent-skill/INSTALL.md." % path
+    )
     if len(data) != 32:
         raise HubError(
             "config",
@@ -2851,6 +2868,236 @@ def _decrypt_key_backup(blob, password):
     if len(priv) != 32:
         raise HubError("bad_request", "Backup decrypted to %d bytes, expected 32." % len(priv))
     return priv
+
+
+# ---------------------------------------------------------------------------
+# Key wrapping at rest (passphrase-encrypted agent.key; `hub key-wrap`)
+#
+# Migrates an unwrapped 32-byte agent.key to the wrapped form:
+#
+#   FHWRAP1\n || salt(16) || nonce(24) || ciphertext
+#
+# where ciphertext is the 32-byte private key encrypted with
+# XChaCha20-Poly1305 (IETF) under a 32-byte key derived from the
+# operator's passphrase with Argon2id (libsodium MODERATE ops/mem limits,
+# frozen by this format — there is no parameter field, so wrap and unwrap
+# always use the same constants). Every primitive comes from
+# PyNaCl/libsodium; no custom constructions. A wrong passphrase fails the
+# Poly1305 MAC and surfaces as a clean "Incorrect passphrase" HubError —
+# never garbage bytes.
+#
+# Passphrase sourcing, in order:
+#   1. FAMILY_HUB_KEY_PASSPHRASE env var (agents/cron — non-interactive),
+#   2. interactive getpass prompt (never echoed).
+# It is NEVER a CLI flag (it would land in `ps` / shell history), NEVER
+# logged, and NEVER included in error messages. It is registered with
+# note_secret() so redact() scrubs it from all output.
+# ---------------------------------------------------------------------------
+
+_KEYWRAP_MAGIC = b"FHWRAP1\n"
+_KEYWRAP_ENV_VAR = "FAMILY_HUB_KEY_PASSPHRASE"
+_KEYWRAP_MIN_PASSPHRASE_LEN = 8  # same floor as `hub key-backup`
+
+
+def _key_wrap_passphrase():
+    """Return the key-wrapping passphrase: env var first, else getpass.
+
+    The value is registered with note_secret() so it can never leak into
+    output, and is never echoed, logged, or placed in error messages.
+    """
+    pw = os.environ.get(_KEYWRAP_ENV_VAR)
+    if pw:
+        note_secret(pw)
+        return pw
+    pw = getpass.getpass("Identity key passphrase: ")
+    note_secret(pw)
+    return pw
+
+
+def _key_wrap_derive(passphrase, salt):
+    """Derive the 32-byte wrapping key from passphrase+salt (Argon2id)."""
+    nacl = _require_nacl()
+    return nacl.pwhash.argon2id.kdf(
+        32,
+        passphrase.encode("utf-8"),
+        salt,
+        opslimit=nacl.pwhash.argon2id.OPSLIMIT_MODERATE,
+        memlimit=nacl.pwhash.argon2id.MEMLIMIT_MODERATE,
+    )
+
+
+def _wrap_identity_key(priv_bytes, passphrase):
+    """Encrypt a 32-byte private key; returns magic || salt || nonce || ct."""
+    nacl = _require_nacl()
+    if len(priv_bytes) != 32:
+        raise HubError(
+            "bad_request",
+            "Cannot wrap: expected a 32-byte private key, got %d bytes."
+            % len(priv_bytes),
+        )
+    salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+    nonce = nacl.utils.random(
+        nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+    )
+    key = _key_wrap_derive(passphrase, salt)
+    ct = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        priv_bytes, None, nonce, key
+    )
+    return _KEYWRAP_MAGIC + salt + nonce + ct
+
+
+def _unwrap_identity_key_with(blob, passphrase):
+    """Decrypt a wrapped blob with an explicit passphrase (no prompting).
+
+    Raises HubError("auth") with a clean "Incorrect passphrase" message on
+    MAC failure, HubError("config") on truncated/malformed blobs. Never
+    returns garbage.
+    """
+    nacl = _require_nacl()
+    salt_len = nacl.pwhash.argon2id.SALTBYTES
+    nonce_len = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+    off = len(_KEYWRAP_MAGIC)
+    if len(blob) < off + salt_len + nonce_len + 16:  # 16 = Poly1305 tag
+        raise HubError(
+            "config",
+            "Wrapped identity key is truncated or corrupt (%d bytes) — it "
+            "cannot be unwrapped. Restore from backup with `hub key-restore`."
+            % len(blob),
+        )
+    salt = blob[off : off + salt_len]
+    nonce = blob[off + salt_len : off + salt_len + nonce_len]
+    ct = blob[off + salt_len + nonce_len :]
+    key = _key_wrap_derive(passphrase, salt)
+    try:
+        priv = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            ct, None, nonce, key
+        )
+    except Exception:
+        raise HubError(
+            "auth",
+            "Incorrect passphrase — the wrapped identity key could not be "
+            "decrypted.",
+        )
+    if len(priv) != 32:
+        raise HubError(
+            "config",
+            "Wrapped identity key decrypted to %d bytes, expected 32 — it "
+            "is corrupt. Restore from backup with `hub key-restore`."
+            % len(priv),
+        )
+    return priv
+
+
+def _unwrap_identity_key(blob):
+    """Decrypt a wrapped blob, sourcing the passphrase (env var / prompt)."""
+    return _unwrap_identity_key_with(blob, _key_wrap_passphrase())
+
+
+def _prompt_new_key_wrap_passphrase():
+    """Get + confirm the passphrase for `hub key-wrap`.
+
+    From the env var when set (automation), else a double getpass prompt.
+    Enforces the minimum length so the wrap is real protection.
+    """
+    pw = os.environ.get(_KEYWRAP_ENV_VAR)
+    if pw:
+        note_secret(pw)
+    else:
+        pw1 = getpass.getpass(
+            "New key passphrase (min %d characters): "
+            % _KEYWRAP_MIN_PASSPHRASE_LEN
+        )
+        pw2 = getpass.getpass("Confirm key passphrase: ")
+        note_secret(pw1)
+        note_secret(pw2)
+        if pw1 != pw2:
+            raise HubError(
+                "bad_request", "Passphrases do not match — key not wrapped."
+            )
+        pw = pw1
+    if len(pw) < _KEYWRAP_MIN_PASSPHRASE_LEN:
+        raise HubError(
+            "bad_request",
+            "Passphrase must be at least %d characters — key not wrapped."
+            % _KEYWRAP_MIN_PASSPHRASE_LEN,
+        )
+    return pw
+
+
+def cmd_key_wrap(args, transport):
+    """Wrap the identity private key with a passphrase (Argon2id + XChaCha20-Poly1305).
+
+    Migrates agent.key in place: backs the unwrapped original up to
+    agent.key.bak-0600 FIRST, writes the wrapped blob at 0600, then proves
+    the wrapped file on disk round-trips to the identical key before the
+    job is done. On any verification failure the original is restored
+    from the backup and the error is loud — the agent is never stranded.
+    Idempotent: an already-wrapped key is a no-op.
+    """
+    _require_nacl()
+    profile = args.profile
+    key_path = agent_key_path(profile)
+    try:
+        with open(key_path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise HubError(
+            "config",
+            "No identity key at %s (%s). Run `hub key-init` first."
+            % (key_path, exc),
+        )
+    if data.startswith(_KEYWRAP_MAGIC):
+        emit(
+            "Identity key at %s is already passphrase-wrapped — nothing to do."
+            % key_path
+        )
+        return 0
+    if len(data) != 32:
+        raise HubError(
+            "config",
+            "Identity key at %s is %d bytes, expected 32 — it is corrupt. "
+            "Restore from backup with `hub key-restore`." % (key_path, len(data)),
+        )
+    bak_path = key_path + ".bak-0600"
+    if os.path.exists(bak_path) and not args.force:
+        raise HubError(
+            "bad_request",
+            "Refusing to overwrite existing backup %s (use --force to "
+            "overwrite — it still holds the unwrapped key)." % bak_path,
+        )
+    passphrase = _prompt_new_key_wrap_passphrase()
+    # 1. Back up the unwrapped original FIRST (0600, verified like any secret).
+    _write_secret_file_0600(bak_path, data, "unwrapped identity key backup")
+    # 2. Wrap and write the new agent.key (0600).
+    wrapped = _wrap_identity_key(data, passphrase)
+    _write_secret_file_0600(key_path, wrapped, "passphrase-wrapped identity key")
+    # 3. Prove the wrapped file round-trips BEFORE trusting it: decrypt what
+    #    is actually on disk with the same passphrase.
+    with open(key_path, "rb") as fh:
+        on_disk = fh.read()
+    if _unwrap_identity_key_with(on_disk, passphrase) != data:
+        # Restore the original so the agent keeps working, then fail loudly.
+        _write_secret_file_0600(key_path, data, "identity private key")
+        raise HubError(
+            "config",
+            "Wrapped key verification failed for %s: the file on disk does "
+            "not decrypt to the original key. The original was restored "
+            "from backup — nothing was lost." % key_path,
+        )
+    _note_key_secrets(data)
+    emit(
+        "Identity key wrapped with a passphrase at %s (0600). The unwrapped "
+        "original is backed up at %s (0600) — move it somewhere safe; once "
+        "the passphrase is stored safely (password manager / vault), delete "
+        "the on-machine backup, since an unwrapped copy on disk defeats the "
+        "wrap." % (key_path, bak_path)
+    )
+    emit(
+        "Ops note: non-interactive use (cron, agents) must now export "
+        "%s=<passphrase> — without it, hub blocks on a passphrase prompt. "
+        "See agent-skill/INSTALL.md." % _KEYWRAP_ENV_VAR
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -5071,6 +5318,15 @@ def build_parser():
     p.add_argument("--force", action="store_true",
                    help="Overwrite an existing identity key")
     p.set_defaults(func=cmd_key_restore)
+
+    p = sub.add_parser(
+        "key-wrap",
+        help="Encrypt the identity private key at rest with a passphrase "
+             "(Argon2id + XChaCha20-Poly1305)",
+    )
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite an existing agent.key.bak-0600 backup")
+    p.set_defaults(func=cmd_key_wrap)
 
     p = sub.add_parser("sync", help="Print new entries across all visible topics")
     p.add_argument("--limit", type=int, default=200)
