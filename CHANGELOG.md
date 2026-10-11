@@ -45,6 +45,11 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 - `npm test` now wipes `dist/` first (`pretest`), so stale build artifacts
   from earlier checkouts can no longer poison the suite or race concurrent
   runs.
+## [0.1.1] - 2026-10-10
+
+### Fixed
+- Bandit `nosec` annotations in the agent CLI (`import subprocess` and the
+  vault-helper call) so the CI security scan passes clean. No behavior change.
 
 ## [0.1.0] - 2026-10-10
 
