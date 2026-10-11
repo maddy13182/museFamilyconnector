@@ -39,7 +39,7 @@ spec.loader.exec_module(hub)
 # ---------------------------------------------------------------------------
 
 
-def make_manifest(version="0.7.0", sha256="0" * 64):
+def make_manifest(version="0.9.0", sha256="0" * 64):
     return {
         "version": version,
         "min_cli_version": "0.0.0",
@@ -66,15 +66,20 @@ class FakeTransport:
         return 200, json.dumps(self.manifest)
 
 
-def bump_version(source_bytes, new_version):
-    """Simulate a released artifact: the same script, new VERSION."""
+def stamp_version(source_bytes, new_version):
+    """Simulate a released artifact: the build-stamped _BUILD_VERSION.
+
+    Mirrors the stamping step in .github/workflows/release.yml: a released
+    single-file artifact carries its version in the _BUILD_VERSION anchor
+    because it ships without pyproject.toml or pip metadata.
+    """
     text = source_bytes.decode("utf-8")
     new_text, n = re.subn(
-        r'^VERSION = "[^"]+"$', 'VERSION = "%s"' % new_version, text, count=1,
+        r'^_BUILD_VERSION = None$', '_BUILD_VERSION = "%s"' % new_version, text, count=1,
         flags=re.MULTILINE,
     )
     if n != 1:
-        raise AssertionError("expected exactly one VERSION constant")
+        raise AssertionError("expected exactly one _BUILD_VERSION anchor")
     return new_text.encode("utf-8")
 
 
@@ -92,6 +97,10 @@ class UpgradeFixture:
         with open(self.target, "wb") as fh:
             fh.write(self.old_bytes)
         os.chmod(self.target, 0o755)  # nosec B103 -- test fixture: fake installed CLI in a temp dir
+        # Sibling pyproject.toml so _cli_version() resolves (contract C6).
+        # Start at an older version so upgrades have somewhere to go.
+        with open(os.path.join(self.tmp, "pyproject.toml"), "w", encoding="utf-8") as fh:
+            fh.write('[project]\nname = "family-hub-cli"\nversion = "0.7.0"\n')
 
         # Profile config so _ctx() resolves the server without a token.
         self.config_home = os.path.join(self.tmp, "config")
@@ -193,7 +202,7 @@ class VersionCompareTest(unittest.TestCase):
                 fh.write("# fake\n")
             with open(os.path.join(d, "pyproject.toml"), "w") as fh:
                 fh.write('[project]\nname = "x"\nversion = "9.9.9"\n')
-            with mock.patch.object(hub, "_script_path", return_value=script):
+            with mock.patch.object(hub, "_script_dir", return_value=d):
                 self.assertEqual(hub._cli_version(), "9.9.9")
 
 
@@ -290,12 +299,12 @@ class UpgradeTest(unittest.TestCase):
 
     def test_full_upgrade_flow(self):
         fx = UpgradeFixture(self)
-        new_version = "0.7.0"
-        new_bytes = bump_version(fx.old_bytes, new_version)
+        new_version = "0.9.0"
+        new_bytes = stamp_version(fx.old_bytes, new_version)
         manifest, downloads = self._downloads_for(new_version, new_bytes)
         rc, out = fx.run_upgrade(manifest, downloads)
         self.assertEqual(rc, 0)
-        self.assertIn("Upgraded hub %s → %s" % (hub.VERSION, new_version), out)
+        self.assertIn("Upgraded hub 0.8.0 → %s" % new_version, out)
         # Atomic cut-over: the installed file is byte-identical.
         self.assertEqual(fx.read_target(), new_bytes)
         # Previous binary kept for rollback.
@@ -312,8 +321,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_sha_mismatch_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = bump_version(fx.old_bytes, "0.7.0")
-        manifest = make_manifest(version="0.7.0", sha256="f" * 64)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
+        manifest = make_manifest(version="0.9.0", sha256="f" * 64)
         base = manifest["download_url"][: -len("/hub")]
         downloads = {manifest["download_url"]: new_bytes}
         with self.assertRaises(hub.HubError) as ctx:
@@ -324,9 +333,9 @@ class UpgradeTest(unittest.TestCase):
 
     def test_release_manifest_disagreement_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = bump_version(fx.old_bytes, "0.7.0")
+        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
         digest = hashlib.sha256(new_bytes).hexdigest()
-        manifest = make_manifest(version="0.7.0", sha256=digest)
+        manifest = make_manifest(version="0.9.0", sha256=digest)
         base = manifest["download_url"][: -len("/hub")]
         downloads = {
             manifest["download_url"]: new_bytes,
@@ -343,8 +352,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_bad_signature_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = bump_version(fx.old_bytes, "0.7.0")
-        manifest, downloads = self._downloads_for("0.7.0", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
+        manifest, downloads = self._downloads_for("0.9.0", new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -357,8 +366,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_missing_sigstore_package_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = bump_version(fx.old_bytes, "0.7.0")
-        manifest, downloads = self._downloads_for("0.7.0", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
+        manifest, downloads = self._downloads_for("0.9.0", new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -370,8 +379,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_failed_self_test_restores_previous(self):
         fx = UpgradeFixture(self)
-        new_bytes = bump_version(fx.old_bytes, "0.7.0")
-        manifest, downloads = self._downloads_for("0.7.0", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
+        manifest, downloads = self._downloads_for("0.9.0", new_bytes)
         real_self_test = hub._self_test
 
         def flaky_self_test(path, expect_version=None):
@@ -405,7 +414,7 @@ class RollbackTest(unittest.TestCase):
     def test_rollback_restores_previous(self):
         fx = UpgradeFixture(self)
         # Simulate a completed upgrade: current = 0.7.0, prev = 0.6.0.
-        new_bytes = bump_version(fx.old_bytes, "0.7.0")
+        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
         with open(fx.target, "wb") as fh:
             fh.write(new_bytes)
         self._with_prev(fx, fx.old_bytes)
