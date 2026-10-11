@@ -38,10 +38,20 @@ class FakeHub:
 
     def __init__(self):
         self.routes = {}
+        self.seqs = {}
         self.calls = []
 
     def add(self, method, path, status, body):
         self.routes[(method.upper(), path)] = (status, body)
+
+    def add_seq(self, method, path, responses):
+        """Serve canned (status, body) responses in call order for (method, path).
+
+        Useful when the same route must behave differently on successive
+        calls (e.g. circle A succeeds while circle B fails a sync poll).
+        Falls back to `add()` routes once the sequence is exhausted.
+        """
+        self.seqs[(method.upper(), path)] = list(responses)
 
     def __call__(self, method, url, headers, body_bytes):
         self.calls.append(
@@ -54,7 +64,9 @@ class FakeHub:
         )
         path = urlparse.urlparse(url).path
         key = (method.upper(), path)
-        if key in self.routes:
+        if key in self.seqs and self.seqs[key]:
+            status, body = self.seqs[key].pop(0)
+        elif key in self.routes:
             status, body = self.routes[key]
         else:
             status, body = 404, {"error": {"code": "not_found", "message": "no route"}}
@@ -967,6 +979,78 @@ class TestCircleTokens(HubTestBase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out), [])
         self.assertIn("no new entries", err)
+
+    def test_sync_partial_failure_emits_without_advancing_cursors(self):
+        # Circle A (c111) returns events; circle B (c222) 500s. A's events
+        # must still be emitted, no cursor may advance (so a retry
+        # re-delivers them), and the exit code must be non-zero with a
+        # per-circle error naming the failed circle.
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add_seq("GET", "/v1/sync", [
+            (200, {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}],
+                    "next_after_gseq": 3, "has_more": False}),
+            (500, {"error": {"code": "internal", "message": "boom"}}),
+        ])
+        rc, out, err = self.run_cli(["sync"])
+        self.assertNotEqual(rc, 0)
+        entries = json.loads(out)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["body"], "hello")
+        self.assertEqual(entries[0]["circle_id"], "c111")
+        self.assertEqual(entries[0]["circle_name"], "Family")
+        self.assertIn("sync failed for circle", err)
+        self.assertIn("Friends", err)
+        # Neither circle's cursor advanced: the retry re-delivers A's events.
+        for cid in ("c111", "c222"):
+            self.assertFalse(
+                os.path.exists(hub.cursor_path("default", cid)),
+                "cursor file for %s must not exist after a failed sync" % cid,
+            )
+        self.assertTokenAbsent(out, err)
+
+    def test_sync_retry_after_partial_failure_redelivers(self):
+        # After the failure above, the same events come back on retry.
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add_seq("GET", "/v1/sync", [
+            (200, {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}],
+                    "next_after_gseq": 3, "has_more": False}),
+            (500, {"error": {"code": "internal", "message": "boom"}}),
+        ])
+        rc, out, _ = self.run_cli(["sync"])
+        self.assertNotEqual(rc, 0)
+        # Retry: both circles healthy now; A's event is re-delivered and
+        # this time both cursors advance.
+        self.fake.add("GET", "/v1/sync", 200,
+                      {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}],
+                       "next_after_gseq": 3, "has_more": False})
+        rc, out, _ = self.run_cli(["sync"])
+        self.assertEqual(rc, 0)
+        entries = json.loads(out)
+        self.assertEqual(len(entries), 2)  # one per circle
+        for cid in ("c111", "c222"):
+            with open(hub.cursor_path("default", cid)) as fh:
+                self.assertEqual(fh.read().strip(), "3")
+
+    def test_sync_one_circle_empty_others_advance(self):
+        # A healthy circle with no new entries does not block cursor
+        # acknowledgement for a healthy circle that did return entries.
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
+        self.fake.add_seq("GET", "/v1/sync", [
+            (200, {"entries": [], "next_after_gseq": 0, "has_more": False}),
+            (200, {"entries": [{"gseq": 7, "seq": 1, "body": "yo"}],
+                    "next_after_gseq": 7, "has_more": False}),
+        ])
+        rc, out, _ = self.run_cli(["sync"])
+        self.assertEqual(rc, 0)
+        entries = json.loads(out)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["circle_id"], "c222")
+        with open(hub.cursor_path("default", "c222")) as fh:
+            self.assertEqual(fh.read().strip(), "7")
+        self.assertFalse(os.path.exists(hub.cursor_path("default", "c111")))
 
     # -- circle use warnings ---------------------------------------------------
 
