@@ -37,13 +37,18 @@ export class HttpError extends Error {
   }
 }
 
-/** Result of the single auth choke point (auth.ts resolveToken). */
+/** Result of the single auth choke point (auth.ts resolveToken).
+ * principal_id is the stable cross-circle identity (F02): it is set at
+ * member creation and never changes. Authorization joins use it, never the
+ * email string. NULL only for rows that predate migration 0005 in a DB
+ * where the backfill did not run — handlers treat that as fail-closed. */
 export interface AuthContext {
   family_id: string;
   member_id: string;
   role: 'owner' | 'parent' | 'kid';
   token_id: string;
   agent_label: string;
+  principal_id: string | null;
 }
 
 export const ENTRY_KINDS = [

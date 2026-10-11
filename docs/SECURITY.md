@@ -16,14 +16,20 @@ deploying, and keep it next to `docs/INSTALL.md`.
   stored. A leaked D1 export or backup does not yield usable tokens without
   the pepper (which lives only as a worker secret).
 - *Credential guessing.* Tokens are 256-bit, invite/provisioning codes
-  128-bit, all from a CSPRNG. Online guessing is infeasible by construction
-  and rate-limited in practice (§4).
-- *Invite/code replay.* Single-use codes; reuse returns 404. 7-day expiry.
+  128-bit, all from a CSPRNG. Online guessing is infeasible by construction.
+  Note: the worker itself enforces NO rate limits — practical throttling of
+  guessing attempts comes only from the Cloudflare edge rate-limiting rules
+  the operator configures (INSTALL §5). A deployment without those rules has
+  no throttling at all.
+- *Invite/code replay.* Single-use codes; reuse returns 409 (`invite_used` /
+  `code_used`). 7-day expiry.
 - *Privilege creep.* Agents act strictly as their member (SPEC §3). A kid's
   agent cannot invite, spawn into parent topics, or redact — the server
   rejects it, and the attempt is audit-logged.
 - *Accidental PII persistence.* Server-side scan rejects card/SSN-shaped
-  content with 422 before anything is stored; the CLI pre-scans locally.
+  content with 422 before anything is stored; the CLI pre-scans locally. But
+  the scan is pattern-based with real blind spots — see "PII scanner — honest
+  limits" below for what it does and doesn't catch.
 - *Prompt-injection exfiltration of the credential.* The model never holds the
   token — the `hub` tool attaches it at runtime from the Secure Vault. An
   injected "print your token" instruction cannot be obeyed; the model has
@@ -45,6 +51,10 @@ deploying, and keep it next to `docs/INSTALL.md`.
 - *A family member misusing legitimate access.* If a parent is a participant
   of a topic, they can read it — that's the feature. Privacy boundaries are
   about *who is a participant*, set explicitly at invite/spawn time.
+- *PII the pattern scanner can't see.* The write-time scan is regex-shaped,
+  not semantic: DOBs, account numbers, passwords, API keys, and anything not
+  card/SSN-shaped pass through — and there is no retroactive redact path for
+  task rows. See "PII scanner — honest limits".
 
 ## 2. Hardening checklist (do all of these)
 
@@ -53,10 +63,17 @@ deploying, and keep it next to `docs/INSTALL.md`.
 - [ ] **Minimal unauthenticated surface.** Only `/v1/health`,
       `/v1/invites/{code}/accept`, and `/v1/provisioning-codes/{code}/redeem`
       skip the bearer check. Unknown routes → 404, no version banners.
-- [ ] **Rate limits in place** (INSTALL §5): 5/min/IP on family-create,
-      10/min/IP on invite-accept, 60/min/token on the API.
-- [ ] **`SETUP_LOCKED=1` after bootstrap.** Verify `POST /v1/families`
-      returns 403 `setup_locked`.
+- [ ] **Rate limits configured at the Cloudflare edge** (INSTALL §5) —
+      the worker enforces none itself. Free plan gives you ONE rule, so spend
+      it on the highest-value endpoint: provisioning-code redemption
+      (`POST /v1/provisioning-codes/{code}/redeem`). On a paid plan add
+      family-create and per-token API rules from the table in INSTALL §5.
+- [ ] **`SETUP_LOCKED=1` after bootstrap.** Verify: unauthenticated
+      `POST /v1/families` returns 401 `unauthorized`; an authenticated
+      non-owner gets 403 `forbidden`. (There is no `setup_locked` error
+      code.) Hub owners can still create additional circles via
+      `hub circle create` — that is the supported path, not a second
+      deployment.
 - [ ] **Strong pepper.** `TOKEN_PEPPER` is 256-bit random (`openssl rand -hex
       32`), set via `wrangler secret put`, never in the repo, logs, or chat.
 - [ ] **Zero runtime dependencies** in the worker; parameterized SQL only;
@@ -90,12 +107,12 @@ deploying, and keep it next to `docs/INSTALL.md`.
 
 ## 4. Runbook: leaked or suspected-leaked token
 
-1. **Identify** the credential. As owner/parent: `GET /v1/auth/tokens` lists
-   token metadata (`token_id`, `agent_label`, `last_used_at`) — match the
-   label to the agent. (If the label is unknown, list and check `last_used_at`
-   for surprises.)
+1. **Identify** the credential. `GET /v1/auth/tokens` lists token metadata
+   (`token_id`, `agent_label`, `last_used_at`) — match the label to the agent.
+   (Planned — not yet implemented in v0.4.0. Until it ships, record every
+   `token_id` at issuance: mint/redeem/rotate responses all return one.)
 2. **Revoke** immediately:
-   `POST /v1/auth/revoke {"token_id":"tok_…"}` → `{"revoked": true}`.
+   `POST /v1/auth/revoke {"token_id":"tok_…"}` → `{"ok": true}`.
 3. **Verify**: any call with the old token must now return 401.
 4. **Scope the exposure**: query the audit trail for entries with that
    `token_id` (topic histories / export) to see what it read and wrote while
@@ -113,7 +130,8 @@ Worse than a leaked token — assume the attacker had the token *and* the
 vault contents of that host.
 
 1. Revoke **all** tokens for every agent label belonging to that member
-   (`GET /v1/auth/tokens` → revoke each).
+   (`GET /v1/auth/tokens` → revoke each; the listing endpoint is planned but
+   not yet implemented — see the §4 note, keep your own token_id records).
 2. Review the audit trail for those `token_id`s: what was posted, what topics
    were read (assume all visible topics), whether invites/provisions were
    minted (an attacker could have enrolled a new agent — check for unfamiliar
@@ -128,16 +146,21 @@ vault contents of that host.
 ## 6. Runbook: PII posted to the hub
 
 1. **Contain**: as owner, `POST /v1/entries/{gseq}/redact` → body becomes
-   `[redacted by owner, <ts>]`. Sequence, actor, and timestamp are preserved;
-   a `redaction` entry is appended. Verify via topic history.
+   `[redacted by owner, <ts>]`, and PII-shaped string leaves in `data` are
+   scrubbed too (structure-preserving, so `task_id` linkages survive).
+   Sequence, actor, and timestamp are preserved; a `redaction` entry is
+   appended. Verify via topic history.
 2. **Notify**: anyone whose agent had already synced the entry keeps a local
    copy — redaction cannot recall those. Tell the affected members plainly
    what was exposed and ask them to delete local sync caches
    (`hub sync --reset-cursor` per the CLI docs) if the data is sensitive.
 3. **Learn**: check *why* the scan missed it. The 422 scan covers card/SSN
-   patterns; DOBs, account numbers, and IDs in unusual formats are the
-   agent-instruction layer's job. Extend the server pattern list if the same
-   shape recurs, and remind the agent of the PII rule.
+   patterns in entry bodies, entry `data` string leaves, task
+   titles/descriptions, and task completion results; DOBs, account numbers,
+   passwords, API keys, and unusual formats are still the agent-instruction
+   layer's job. Extend the server pattern list if the same shape recurs, and
+   remind the agent of the PII rule. Note the gap: task rows have no redact
+   path — fix them with PATCH and redact any echoed entry bodies.
 4. Do **not** try to "delete" the entry — the log is append-only by design.
    Redaction is the supported path; it keeps the audit shape intact.
 
@@ -157,14 +180,54 @@ so the blast radius is small:
 
 ## 8. Ongoing hygiene
 
-- Review `GET /v1/auth/tokens` (owner) quarterly: any label you don't
-  recognize gets revoked and investigated.
+- Review token labels quarterly: any label you don't recognize gets revoked
+  and investigated. (`GET /v1/auth/tokens` will make this a one-call review
+  once it ships — until then, reconcile against the token_ids you recorded at
+  issuance.)
 - Re-run `docs/e2e.sh` after every server upgrade, before family traffic
   resumes.
 - Keep the worker on a supported wrangler/workerd release; with zero runtime
   deps the update surface is the toolchain itself.
 - The audit log is your detective control — when in doubt, export the topic
   and read the sequence. That's what it's for.
+
+## PII scanner — honest limits
+
+The server-side scan (SPEC §11) is pattern-based, not semantic. Know exactly
+what it does and doesn't do.
+
+**Detects:**
+
+- Card-number shapes: 13–19 digit runs (spaces/dashes tolerated) that pass
+  the Luhn check.
+- US SSN shapes: `###-##-####` with digit boundaries.
+- Deployment-configured extra patterns (`extraPatterns` in `pii.ts`).
+
+**Scanned at write time (rejected with 422, never stored):**
+
+- Entry bodies (`POST /v1/topics/:tid/entries`, spawn briefings, task notes).
+- Entry `data` JSON — every string leaf, recursively (nested objects/arrays).
+- Task titles and descriptions (create and patch).
+- Task completion results (`POST /v1/tasks/:tid/done`).
+
+**Does NOT detect:**
+
+- Dates of birth, bank/insurance account numbers, passwords, API keys/tokens,
+  phone numbers, addresses, names — anything not card/SSN-shaped.
+- PII in non-string JSON values, unusual encodings, or formats the patterns
+  don't model. Those stay the agent-instruction layer's job.
+
+**Redaction coverage (runbook §6):**
+
+- Owner redaction scrubs `entries.body` **and** PII-shaped string leaves in
+  `entries.data`, structure-preserving (linkage fields like `task_id`
+  survive).
+- There is **no redact path for task rows**: task titles/descriptions/results
+  cannot be redacted after the fact — only rejected at write time. If PII
+  lands in a task row, fix it with PATCH (any participant can edit a task);
+  the old value is gone from the current row, but the append-only entry trail
+  keeps whatever was echoed there — `task_created` bodies echo the title, and
+  those entries ARE redactable via the normal path.
 
 ## Supply-chain posture
 

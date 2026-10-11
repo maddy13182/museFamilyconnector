@@ -300,10 +300,13 @@ $('createTopic').onclick = async () => {
   const subject = $('newSubject').value.trim();
   if (!subject) return alert('Subject required');
   try {
-    const me = await api('/v1/members');
-    const self = me.members[0];
+    // Identity comes from GET /v1/me — the member bound to THIS token. Never
+    // /v1/members[0]: the server orders members by creation time, so [0] is
+    // typically the owner, and a kid clicking this would otherwise create a
+    // topic that discloses to the owner.
+    const me = await api('/v1/me');
     const { topic } = await api('/v1/topics', { method: 'POST',
-      body: JSON.stringify({ subject, kind: 'group', participant_member_ids: [self.id] }) });
+      body: JSON.stringify({ subject, kind: 'group', participant_member_ids: [me.id] }) });
     $('newSubject').value = '';
     await loadTopics();
     loadTopic(topic.id, topic.subject);

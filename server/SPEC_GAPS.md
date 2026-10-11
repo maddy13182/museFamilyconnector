@@ -45,8 +45,13 @@ documented here for review before merge to main.
    participant-only → `{"tasks": [...]}`. Assignee/status filtering stays
    client-side.
 
-10. **`/v1/sync` envelope.** Returns `{entries, max_gseq, next_after_gseq}`
-    (the two cursor fields carry the same value; both kept for compatibility).
+10. **`/v1/sync` envelope.** Returns `{entries, max_gseq, next_after_gseq,
+    has_more}` (the two cursor fields carry the same value — the last
+    returned entry's gseq, or the input `after_gseq` on an empty page — and
+    both are kept for compatibility). Pagination is page-based: the server
+    fetches `limit`+1 rows, returns `has_more: true` while backlog remains,
+    and `next_after_gseq` never jumps past undelivered entries, so a backlog
+    deeper than `limit` drains without gaps.
 
 11. **Spawn briefing required.** `POST /v1/topics/:tid/spawn` requires a
     non-empty `briefing` (it is the only content carried into the child topic)

@@ -24,7 +24,7 @@ import {
   newProvisioningCode,
   resolveToken,
 } from './auth.js';
-import { scanPii } from './pii.js';
+import { scanPii, type PiiHit } from './pii.js';
 import {
   reqString,
   optString,
@@ -101,22 +101,38 @@ async function recordCreateIdem(
   logEvent('info', 'idempotency_stored', { scope, key });
 }
 
-// Mint a single-use provisioning code. Shared by circle creation, the manual
-// mint endpoint, and the dedup path (which issues a FRESH code — the original
-// code's plaintext is unrecoverable once stored as a hash).
+// Mint a single-use provisioning code. Shared by the manual mint endpoint
+// and the dedup path (which issues a FRESH code — the original code's
+// plaintext is unrecoverable once stored as a hash).
+// F17: issuedByTokenId records the token under whose authority the code is
+// minted (the caller's auth.token_id); NULL when no auth context exists.
 async function mintProvisioningCode(
   db: DbClient,
   env: Env,
-  opts: { familyId: string; memberId: string; agentLabel: string; createdBy: string },
+  opts: {
+    familyId: string;
+    memberId: string;
+    agentLabel: string;
+    createdBy: string;
+    issuedByTokenId?: string | null;
+  },
 ): Promise<{ code: string; codeHash: string; expiresAt: string }> {
   const code = newProvisioningCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const expiresAt = hoursFromNow(PROVISION_TTL_HOURS);
   await db.execAtomically([
     {
-      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
-            VALUES (?,?,?,?,?,?,NULL)`,
-      params: [codeHash, opts.familyId, opts.memberId, opts.agentLabel, opts.createdBy, expiresAt],
+      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at, issued_by_token_id)
+            VALUES (?,?,?,?,?,?,NULL,?)`,
+      params: [
+        codeHash,
+        opts.familyId,
+        opts.memberId,
+        opts.agentLabel,
+        opts.createdBy,
+        expiresAt,
+        opts.issuedByTokenId ?? null,
+      ],
     },
   ]);
   logEvent('info', 'provisioning_code_minted', {});
@@ -179,11 +195,67 @@ function newId(): string {
   return crypto.randomUUID();
 }
 
+// Identity principals (F02). A principal is the stable cross-circle identity
+// behind member rows; authorization joins use it, never the email string.
+// New member rows get a FRESH principal, inserted in the same atomic batch as
+// the member row so a failed create leaves no orphan behind. The ONLY path
+// that reuses an existing principal is locked circle creation, which carries
+// the already-verified caller's principal onto the new member row —
+// hub-owner power must derive from a verified credential, never from an
+// email string the caller supplies.
+function newPrincipalId(): string {
+  return 'pr_' + newId().replace(/-/g, '');
+}
+function principalInsertOp(
+  principalId: string,
+  ts: string,
+): { sql: string; params: (string | number | null)[] } {
+  return {
+    sql: `INSERT INTO principals(id, created_at) VALUES (?,?)`,
+    params: [principalId, ts],
+  };
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
   });
+}
+
+// Security headers, applied to EVERY response in handleRequest() (the worker
+// has no other response path). CSP notes — kept restrictive without breaking
+// the dashboard (/), which is a single self-contained HTML page:
+// - script-src/style-src 'unsafe-inline': the dashboard ships one inline
+//   <script> and one inline <style> and has no build step, so a nonce would
+//   require per-request HTML rewriting. Inline code is ours (ui.ts escapes
+//   all entry text before rendering), so the residual inline-XSS risk is
+//   accepted and documented here. No external script/style/object sources
+//   are allowed at all.
+// - connect-src 'self' https:: the dashboard's "API base" field lets the
+//   operator point it at a different origin (e.g. a custom domain); 'self'
+//   alone would break that feature. https: still blocks cleartext exfil.
+// - frame-ancestors 'none' (+ X-Frame-Options: DENY for legacy browsers):
+//   the dashboard must never be framed (clickjacking a token-paste page).
+function securityHeaders(): Record<string, string> {
+  return {
+    'content-security-policy':
+      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+      "connect-src 'self' https:; base-uri 'self'; form-action 'self'; " +
+      "frame-ancestors 'none'",
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+  };
+}
+
+/** Stamp the security headers onto a response (mutates and returns it). */
+function withSecurityHeaders(res: Response): Response {
+  const headers = securityHeaders();
+  for (const name of Object.keys(headers)) {
+    res.headers.set(name, headers[name] as string);
+  }
+  return res;
 }
 
 async function readJson(req: Request): Promise<Record<string, unknown>> {
@@ -209,6 +281,66 @@ function piiGuard(text: string): void {
       `Message rejected: ${hit.description}. Please remove it and retry.`,
     );
   }
+}
+
+/**
+ * Pattern-based deep scan of a JSON value (F08): every string leaf is run
+ * through scanPii. Iterative to avoid recursion-depth issues on hostile
+ * input; cycle-safe for good measure. Never returns the matched value.
+ */
+function scanPiiDeep(value: unknown): PiiHit | null {
+  const stack: unknown[] = [value];
+  const seen = new Set<object>();
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v === 'string') {
+      const hit = scanPii(v);
+      if (hit) return hit;
+    } else if (v !== null && typeof v === 'object') {
+      if (seen.has(v)) continue;
+      seen.add(v);
+      for (const k of Object.keys(v)) stack.push((v as Record<string, unknown>)[k]);
+    }
+    // Non-string primitives (numbers, booleans, null) carry no PII text.
+  }
+  return null;
+}
+
+/** Reject on PII hit in any string leaf of a JSON value (F08: entry data,
+ *  task completion results). Never logs the match. */
+function piiGuardJson(value: unknown): void {
+  const hit = scanPiiDeep(value);
+  if (hit) {
+    throw new HttpError(
+      422,
+      'pii_detected',
+      `Message rejected: ${hit.description}. Please remove it and retry.`,
+    );
+  }
+}
+
+const PII_REDACTED_LEAF = '[redacted]';
+
+/**
+ * Structure-preserving PII scrub of a JSON value (F08): string leaves that
+ * scanPii flags are replaced with a marker; everything else (including
+ * linkage fields like task_id) is untouched.
+ */
+function redactPiiLeaves<T>(value: T): T {
+  if (typeof value === 'string') {
+    return (scanPii(value) ? PII_REDACTED_LEAF : value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactPiiLeaves) as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value)) {
+      out[k] = redactPiiLeaves((value as Record<string, unknown>)[k]);
+    }
+    return out as T;
+  }
+  return value;
 }
 
 function parseDataField(row: Row): unknown {
@@ -314,6 +446,23 @@ async function requireFamilyMembers(
 }
 
 /**
+ * Task visibility predicate (F06): a member may see a task only when its
+ * `task_created` entry sits at or after their `history_from_seq` floor, so a
+ * from_join member never sees tasks created before they joined. Every task
+ * row has exactly one task_created entry (appended by handleCreateTask), so
+ * EXISTS is exact — no migration needed.
+ * The single `?` binds the caller's member_id.
+ */
+const TASK_VISIBLE_TO_MEMBER = `EXISTS (
+  SELECT 1 FROM entries e
+    JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
+   WHERE e.topic_id = tasks.topic_id
+     AND e.kind = 'task_created'
+     AND json_extract(e.data, '$.task_id') = tasks.id
+     AND e.seq >= p.history_from_seq
+)`;
+
+/**
  * Append an entry, assigning per-topic seq = MAX(seq)+1 atomically.
  * Retries once on seq collision (UNIQUE constraint).
  */
@@ -375,6 +524,91 @@ async function appendEntry(
   throw new HttpError(500, 'internal', 'Could not append entry');
 }
 
+/** One statement inside an execAtomically batch. */
+type BatchOp = { sql: string; params: (string | number | null)[] };
+
+/**
+ * F12: build an entry INSERT that computes its per-topic seq INSIDE the
+ * statement (COALESCE(MAX(seq),0)+1), so the insert can share one atomic
+ * batch with the state change it records — no read-then-write seq race and
+ * no state-without-event window. An optional HAVING pin gates the insert on
+ * a condition evaluated after the earlier statements in the same batch
+ * (e.g. "the task row actually flipped to done"), so the event is written
+ * exactly when its state change applied. Aggregate-without-GROUP-BY still
+ * yields one row for an empty topic (seq 1); a false pin yields zero rows.
+ */
+function entryInsertOp(args: {
+  topicId: string;
+  kind: string;
+  body: string;
+  auth: AuthContext;
+  data: string | null;
+  ts: string;
+  replyToSeq?: number | null;
+  pin?: string;
+  pinParams?: (string | number | null)[];
+}): BatchOp {
+  const pin = args.pin ? ` HAVING ${args.pin}` : '';
+  return {
+    sql: `INSERT INTO entries(topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body, data, reply_to_seq)
+          SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+            FROM entries WHERE topic_id = ?${pin}`,
+    params: [
+      args.topicId,
+      args.ts,
+      args.auth.member_id,
+      args.auth.agent_label,
+      args.auth.token_id,
+      args.kind,
+      args.body,
+      args.data,
+      args.replyToSeq ?? null,
+      args.topicId,
+      ...(args.pinParams ?? []),
+    ],
+  };
+}
+
+/**
+ * F12: run an atomic batch that contains entry inserts, retrying once when
+ * the batch dies on a UNIQUE/constraint violation — a concurrent writer won
+ * the same per-topic seq, and the seq subquery is re-evaluated on retry.
+ * The batch is all-or-nothing, so a failed attempt never leaves partial
+ * state behind for the retry to duplicate.
+ */
+async function execBatchWithRetry(db: DbClient, buildOps: () => BatchOp[]): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await db.execAtomically(buildOps());
+      return;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (attempt === 0 && /unique|constraint/i.test(msg)) continue; // seq race: retry
+      throw e;
+    }
+  }
+  throw new HttpError(500, 'internal', 'Could not commit batch');
+}
+
+/**
+ * F14: read an OPTIONAL JSON object body. An absent/empty body is fine ({});
+ * a present-but-malformed body is 400 — never silently swallowed.
+ */
+async function readOptionalJson(req: Request): Promise<Record<string, unknown>> {
+  const text = await req.text();
+  if (text.trim() === '') return {};
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new HttpError(400, 'bad_request', 'Request body must be valid JSON');
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new HttpError(400, 'bad_request', 'Request body must be a JSON object');
+  }
+  return body as Record<string, unknown>;
+}
+
 /** Server rule: a task cannot be done while it has open subtasks. */
 async function assertNoOpenSubtasks(db: DbClient, taskId: string): Promise<void> {
   const open = await db.queryAll(
@@ -419,16 +653,18 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
 
   const familyId = newId();
   const memberId = newId();
+  const principalId = newPrincipalId();
   const ts = nowIso();
   const code = newProvisioningCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const provisionExpiresAt = hoursFromNow(PROVISION_TTL_HOURS);
   try {
     await db.execAtomically([
+      principalInsertOp(principalId, ts),
       { sql: `INSERT INTO families(id, name, created_at) VALUES (?,?,?)`, params: [familyId, name, ts] },
       {
-        sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-        params: [memberId, familyId, ownerName, ownerEmail, 'owner', ts],
+        sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at) VALUES (?,?,?,?,?,?,?)`,
+        params: [memberId, familyId, ownerName, ownerEmail, 'owner', principalId, ts],
       },
       {
         sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
@@ -454,17 +690,19 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
 }
 
 /**
- * True when the caller is a hub owner: holds the 'owner' role in at least
- * one family. Identity is matched by email, since one human has one member
- * row per family but a single email across them.
+ * True when the caller is a hub owner: the principal behind the verified
+ * calling token holds the 'owner' role in at least one circle (F02).
+ * Identity is matched by principal_id — never by the email string — so a
+ * member row that merely shares an email with another circle's owner gains
+ * no hub-owner powers. Fail closed: no principal, no power.
  */
 async function isHubOwner(db: DbClient, auth: AuthContext): Promise<boolean> {
   if (auth.role === 'owner') return true;
-  const me = await db.queryOne(`SELECT email FROM members WHERE id = ?`, [auth.member_id]);
-  if (!me) return false;
+  const pid = auth.principal_id;
+  if (!pid) return false;
   const row = await db.queryOne(
-    `SELECT 1 FROM members WHERE email = ? AND role = 'owner' LIMIT 1`,
-    [me['email'] as string],
+    `SELECT 1 FROM members WHERE principal_id = ? AND role = 'owner' LIMIT 1`,
+    [pid],
   );
   return row !== null;
 }
@@ -497,6 +735,14 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
   if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
   const creatorName = me['name'] as string;
   const creatorEmail = me['email'] as string;
+  // F02: the new member row inherits the caller's already-verified principal
+  // (bound to the token by resolveToken, never from caller input). This is
+  // the one legitimate cross-circle linking path: the caller's identity was
+  // proven by their credential, so their new membership is the same person.
+  const callerPrincipal = auth.principal_id;
+  if (!callerPrincipal) {
+    throw new HttpError(500, 'internal', 'Calling member has no principal');
+  }
 
   // Idempotent retry: the client never got the first response, but the work
   // is done. Return the existing circle with a FRESH provisioning code (the
@@ -532,8 +778,8 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
       params: [familyId, name, kind, ts],
     },
     {
-      sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-      params: [memberId, familyId, creatorName, creatorEmail, 'owner', ts],
+      sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at) VALUES (?,?,?,?,?,?,?)`,
+      params: [memberId, familyId, creatorName, creatorEmail, 'owner', callerPrincipal, ts],
     },
     {
       sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
@@ -597,7 +843,9 @@ async function dedupFamilyCreate(
   const family = await db.queryOne(`SELECT * FROM families WHERE id = ?`, [familyId]);
   if (!family) throw new HttpError(500, 'internal', 'Idempotency record points at a missing circle');
   const member = await db.queryOne(
-    `SELECT * FROM members WHERE family_id = ? AND email = (SELECT email FROM members WHERE id = ?)`,
+    // F02: match the caller's member row in the new circle by principal_id —
+    // the verified identity — never by the email string.
+    `SELECT * FROM members WHERE family_id = ? AND principal_id = (SELECT principal_id FROM members WHERE id = ?)`,
     [familyId, auth.member_id],
   );
   if (!member) throw new HttpError(500, 'internal', 'Idempotency record points at a missing member');
@@ -622,6 +870,7 @@ async function dedupFamilyCreate(
     memberId: member['id'] as string,
     agentLabel: 'owner-agent',
     createdBy: auth.member_id,
+    issuedByTokenId: auth.token_id,
   });
   await recordCreateIdem(db, 'family', auth.member_id, idemKey, familyId, minted.codeHash);
   return json(
@@ -638,18 +887,21 @@ async function dedupFamilyCreate(
   );
 }
 
-// GET /v1/families — list families the caller is a member of (v0.2.0+).
-// Membership is matched by email: one human, one member row per family.
+// GET /v1/families — list circles the caller is a member of (v0.2.0+).
+// Membership is matched by principal_id (F02): the stable identity behind
+// the verified calling token. A member row that merely shares an email with
+// a member of another circle is NOT linked to it — emails are attributes,
+// not identity keys. Fail closed: no principal, no circles.
 async function handleListFamilies(db: DbClient, auth: AuthContext): Promise<Response> {
-  const me = await db.queryOne(`SELECT email FROM members WHERE id = ?`, [auth.member_id]);
-  if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
+  const pid = auth.principal_id;
+  if (!pid) return json({ families: [] });
   const rows = await db.queryAll(
     `SELECT f.id, f.name, f.kind, f.created_at, m.role AS my_role
        FROM families f
        JOIN members m ON m.family_id = f.id
-      WHERE m.email = ?
+      WHERE m.principal_id = ?
       ORDER BY f.created_at ASC`,
-    [me['email'] as string],
+    [pid],
   );
   return json({
     families: rows.map((r) => ({
@@ -783,22 +1035,58 @@ async function handleAcceptInvite(
   if (dup) throw new HttpError(409, 'already_member', 'This email is already a family member');
 
   const memberId = newId();
+  const principalId = newPrincipalId();
   const token = newAgentToken();
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
   const ts = nowIso();
+  // F05: atomic conditional consume. The member and token INSERTs only fire
+  // while the invite is still unused, and the UPDATE consumes it — one atomic
+  // batch, in this order (the conditional INSERTs must run before the consume
+  // UPDATE so they see pre-consume state). Concurrent accepts of the same
+  // code therefore create exactly one member and one token; the winner is the
+  // call whose member row exists afterwards.
+  // F02: the new member gets a FRESH principal. An invite code proves code
+  // possession, not email ownership, so the row must never inherit another
+  // circle's principal by email match — even when the same email already has
+  // a member elsewhere. (If the conditional member INSERT below does not
+  // fire, the principals row is an inert orphan: nothing references
+  // principals outward.)
   await db.execAtomically([
+    principalInsertOp(principalId, ts),
     {
-      sql: `INSERT INTO members(id, family_id, name, email, role, created_at) VALUES (?,?,?,?,?,?)`,
-      params: [memberId, inviteFamilyId, displayName, email, inviteRole, ts],
+      sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at)
+            SELECT ?,?,?,?,?,?,?
+             WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
+      params: [memberId, inviteFamilyId, displayName, email, inviteRole, principalId, ts, codeHash],
     },
-    { sql: `UPDATE invites SET used_at = ? WHERE code_hash = ?`, params: [ts, codeHash] },
     {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?, ?,?,NULL,NULL)`,
-      params: [tokenHash, tokenId, memberId, agentLabel, ts],
+      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
+            SELECT ?,?,?,?,?,NULL,NULL,NULL
+             WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
+      params: [tokenHash, tokenId, memberId, agentLabel, ts, codeHash],
+    },
+    {
+      sql: `UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL`,
+      params: [ts, codeHash],
     },
   ]);
+  const won = await db.queryOne(`SELECT id FROM members WHERE id = ?`, [memberId]);
+  if (!won) {
+    // Lost a concurrent-accept race: the winner's member row holds this email.
+    const winnerMember = await db.queryOne(
+      `SELECT * FROM members WHERE family_id = ? AND email = ?`,
+      [inviteFamilyId, email],
+    );
+    return json(
+      {
+        error: { code: 'invite_used', message: 'Invite already used' },
+        member: winnerMember ? publicMember(winnerMember) : null,
+        token_already_issued: true,
+      },
+      409,
+    );
+  }
   // Token is returned ONCE here and never again.
   return json(
     {
@@ -833,14 +1121,18 @@ async function handleMintProvisioning(
   );
   if (!target) throw new HttpError(404, 'not_found', 'Member not found');
   const selfMint = memberId === auth.member_id;
-  if (!selfMint && auth.role !== 'owner' && auth.role !== 'parent') {
-    throw new HttpError(403, 'forbidden', 'Only owner/parent can mint codes for other members');
+  // F01: only the owner can mint a credential for another member. Self-mint
+  // is always allowed, for every role. In particular a parent can never mint
+  // for an owner-role member (or for any other member at all).
+  if (!selfMint && auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only the owner can mint codes for other members');
   }
   const minted = await mintProvisioningCode(db, env, {
     familyId: auth.family_id,
     memberId,
     agentLabel,
     createdBy: auth.member_id,
+    issuedByTokenId: auth.token_id,
   });
   return json({ provisioning_code: minted.code, expires_at: minted.expiresAt }, 201);
 }
@@ -880,17 +1172,42 @@ async function handleRedeemProvisioning(
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
   const ts = nowIso();
+  // F05: atomic conditional consume + issue in a single batch. The token
+  // INSERT only fires while the code is still unused (the conditional
+  // INSERT...SELECT runs before the consume UPDATE so it sees pre-consume
+  // state); the UPDATE then consumes the code iff still unused. Concurrent
+  // redeems of the same code therefore mint exactly one token — the winner
+  // is the call whose token_id the code row records as redeemed_token_id.
+  // F17: the new token inherits the code's issued_by_token_id, so revoking
+  // the minter's token cascades to it.
   await db.execAtomically([
     {
-      sql: `UPDATE provisioning_codes SET used_at = ?, redeemed_token_id = ? WHERE code_hash = ?`,
-      params: [ts, tokenId, codeHash],
+      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
+            SELECT ?, ?, pc.member_id, pc.agent_label, ?, NULL, NULL, pc.issued_by_token_id
+              FROM provisioning_codes pc
+             WHERE pc.code_hash = ? AND pc.used_at IS NULL`,
+      params: [tokenHash, tokenId, ts, codeHash],
     },
     {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?, ?,?,NULL,NULL)`,
-      params: [tokenHash, tokenId, pc['member_id'] as string, pc['agent_label'] as string, ts],
+      sql: `UPDATE provisioning_codes SET used_at = ?, redeemed_token_id = ? WHERE code_hash = ? AND used_at IS NULL`,
+      params: [ts, tokenId, codeHash],
     },
   ]);
+  const consumed = await db.queryOne(
+    `SELECT redeemed_token_id FROM provisioning_codes WHERE code_hash = ?`,
+    [codeHash],
+  );
+  if (!consumed || consumed['redeemed_token_id'] !== tokenId) {
+    // Lost a concurrent-redeem race: another call consumed the code first.
+    return json(
+      {
+        error: { code: 'code_used', message: 'Provisioning code already used' },
+        member: member ? publicMember(member) : null,
+        token_already_issued: true,
+      },
+      409,
+    );
+  }
   return json({ token, token_id: tokenId, member: publicMember(member) }, 201);
 }
 
@@ -903,6 +1220,15 @@ async function handleRotate(
 ): Promise<Response> {
   const raw = req.headers.get('authorization')!.slice('Bearer '.length).trim();
   const oldHash = await credentialHash(env.TOKEN_PEPPER, raw);
+  // F04: a retired credential cannot be rotated again. A fully-revoked token
+  // never reaches here (the auth choke point rejects it with 401); this
+  // covers a token already carrying revoked_at, e.g. inside its
+  // rotation-grace window. Rotate the current token instead.
+  const old = await db.queryOne(`SELECT revoked_at FROM agent_tokens WHERE token_hash = ?`, [oldHash]);
+  if (!old) throw new HttpError(401, 'unauthorized', 'Unknown token');
+  if (old['revoked_at']) {
+    throw new HttpError(403, 'forbidden', 'Token is retired; rotate using the current token instead');
+  }
   const token = newAgentToken();
   const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
   const tokenId = newId();
@@ -911,15 +1237,23 @@ async function handleRotate(
   await db.execAtomically([
     { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_hash = ?`, params: [graceUntil, oldHash] },
     {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?, ?,?,NULL,NULL)`,
+      // issued_by_token_id stays NULL: rotation replaces a credential rather
+      // than delegating authority, so the new token is deliberately NOT a
+      // cascade target when the old token is revoked (F17).
+      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
+            VALUES (?,?,?, ?,?,NULL,NULL,NULL)`,
       params: [tokenHash, tokenId, auth.member_id, auth.agent_label, ts],
     },
   ]);
   return json({ token, token_id: tokenId, grace_until: graceUntil });
 }
 
-// POST /v1/auth/revoke {token_id} — self, or owner/parent for any family token.
+// POST /v1/auth/revoke {token_id} — self-revoke always; owner/parent for
+// other members' tokens, except a parent can NEVER revoke an owner's token
+// (F01). Revocation is immediate and unconditional: it overwrites any future
+// rotation-grace timestamp (F04), expires pending provisioning codes issued
+// under the token, and revokes one-level descendant tokens (F17; the
+// one-level limit is documented — grandchildren survive).
 async function handleRevoke(
   db: DbClient,
   _env: Env,
@@ -929,20 +1263,46 @@ async function handleRevoke(
   const body = await readJson(req);
   const tokenId = reqString(body['token_id'], 'token_id', 1, 128);
   const target = await db.queryOne(
-    `SELECT t.*, m.family_id AS fam FROM agent_tokens t JOIN members m ON m.id = t.member_id WHERE t.token_id = ?`,
+    `SELECT t.*, m.family_id AS fam, m.role AS member_role
+       FROM agent_tokens t JOIN members m ON m.id = t.member_id
+      WHERE t.token_id = ?`,
     [tokenId],
   );
   if (!target || target['fam'] !== auth.family_id) {
     throw new HttpError(404, 'not_found', 'Token not found');
   }
   const selfRevoke = (target['member_id'] as string) === auth.member_id;
-  if (!selfRevoke && auth.role !== 'owner' && auth.role !== 'parent') {
-    throw new HttpError(403, 'forbidden', 'Only owner/parent can revoke other members\u2019 tokens');
+  if (!selfRevoke) {
+    if (auth.role !== 'owner' && auth.role !== 'parent') {
+      throw new HttpError(403, 'forbidden', 'Only owner/parent can revoke other members\u2019 tokens');
+    }
+    if (target['member_role'] === 'owner' && auth.role !== 'owner') {
+      throw new HttpError(403, 'forbidden', 'Only an owner can revoke an owner\u2019s token');
+    }
   }
+  const now = nowIso();
+  // F17: transitive revocation via the credential lineage. A recursive CTE
+  // computes the full descendant closure, so revoking T1 also revokes T2 and
+  // T3 in a T1 -> T2 -> T3 chain. Rotated tokens have issued_by_token_id
+  // NULL (rotation replaces rather than delegates), so they are excluded.
+  const lineage = `WITH RECURSIVE lineage(id) AS (
+    SELECT ? UNION ALL
+    SELECT t.token_id FROM agent_tokens t JOIN lineage l ON t.issued_by_token_id = l.id
+  ) SELECT id FROM lineage`;
   await db.execAtomically([
+    // F04: unconditional — overwrites a future rotation-grace revoked_at.
+    { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ?`, params: [now, tokenId] },
+    // F17: expire pending (unused, unexpired) codes issued anywhere under
+    // the revoked lineage. Redeeming them afterwards yields 410 code_expired.
     {
-      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL`,
-      params: [nowIso(), tokenId],
+      sql: `UPDATE provisioning_codes SET expires_at = ?
+             WHERE issued_by_token_id IN (${lineage}) AND used_at IS NULL AND expires_at > ?`,
+      params: [now, tokenId, now],
+    },
+    // F17: transitive cascade to all descendant tokens.
+    {
+      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id IN (${lineage})`,
+      params: [now, tokenId],
     },
   ]);
   return json({ ok: true });
@@ -1131,9 +1491,12 @@ async function handleExport(db: DbClient, auth: AuthContext, tid: string): Promi
     `SELECT * FROM entries WHERE topic_id = ? AND seq >= ? ORDER BY seq ASC`,
     [tid, history_from_seq],
   );
-  const tasks = await db.queryAll(`SELECT * FROM tasks WHERE topic_id = ? ORDER BY created_at ASC`, [
-    tid,
-  ]);
+  // F06: tasks are filtered by the caller's history floor — same rule as entry
+  // reads. A from_join member must not see tasks created before they joined.
+  const tasks = await db.queryAll(
+    `SELECT * FROM tasks WHERE topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER} ORDER BY created_at ASC`,
+    [tid, auth.member_id],
+  );
   return json({
     topic,
     participants: parts,
@@ -1167,8 +1530,11 @@ async function handleTopicInvite(
       }
     }
   }
-  const maxRow = await db.queryOne(`SELECT MAX(seq) AS m FROM entries WHERE topic_id = ?`, [tid]);
-  const fromSeq = historyFrom === 'full' ? 1 : ((maxRow?.['m'] as number | null) ?? 0) + 1;
+  // F06: the visibility cutoff is computed INSIDE the membership insert, as part
+  // of the same atomic batch (D1 batch / SQLite BEGIN..COMMIT). Reading
+  // MAX(seq) beforehand raced with concurrent appends and could set a stale
+  // floor that leaked entries posted between the read and the insert.
+  const fullFloor = historyFrom === 'full' ? 1 : 0;
   const ts = nowIso();
   const existing = await db.queryAll(`SELECT member_id FROM topic_participants WHERE topic_id = ?`, [
     tid,
@@ -1176,8 +1542,10 @@ async function handleTopicInvite(
   const existingIds = new Set(existing.map((r) => r['member_id'] as string));
   const added = memberIds.filter((id) => !existingIds.has(id));
   const ops = added.map((mid) => ({
-    sql: `INSERT INTO topic_participants(topic_id, member_id, joined_at, history_from_seq) VALUES (?,?,?,?)`,
-    params: [tid, mid, ts, fromSeq] as (string | number | null)[],
+    sql: `INSERT INTO topic_participants(topic_id, member_id, joined_at, history_from_seq)
+          SELECT ?, ?, ?, CASE WHEN ? = 1 THEN 1
+                               ELSE COALESCE((SELECT MAX(seq) FROM entries WHERE topic_id = ?), 0) + 1 END`,
+    params: [tid, mid, ts, fullFloor, tid] as (string | number | null)[],
   }));
   await db.execAtomically(ops);
   for (const mid of added) {
@@ -1268,6 +1636,8 @@ async function handlePostEntry(
         return n as number;
       })();
   piiGuard(text);
+  // F08: entry data (JSON) is scanned too — string leaves, recursively.
+  if (data) piiGuardJson(JSON.parse(data));
 
   const idemKey = req.headers.get('idempotency-key');
   if (idemKey !== null) {
@@ -1286,27 +1656,45 @@ async function handlePostEntry(
     }
   }
 
-  const entry = await appendEntry(db, {
-    topic_id: tid,
-    kind,
-    body: text,
-    auth,
-    data,
-    reply_to_seq: replyTo,
-  });
+  // F12: the entry and its idempotency record commit in the SAME atomic
+  // batch — a crash between the two can no longer leave an entry with no
+  // retry key (or a key pointing at nothing).
+  const ts = nowIso();
+  const ops: BatchOp[] = [
+    entryInsertOp({ topicId: tid, kind, body: text, auth, data, ts, replyToSeq: replyTo }),
+  ];
   if (idemKey !== null) {
-    await db.execAtomically([
-      {
-        sql: `INSERT OR REPLACE INTO idempotency_keys(token_id, key, entry_gseq, created_at, expires_at)
-              VALUES (?,?,?,?,?)`,
-        params: [auth.token_id, idemKey, entry['gseq'] as number, nowIso(), hoursFromNow(IDEM_TTL_HOURS)],
-      },
-    ]);
+    ops.push({
+      // gseq is located via the just-inserted row: inside the batch our own
+      // write is visible and holds the topic's max seq, so ORDER BY seq DESC
+      // LIMIT 1 pinpoints this request's entry (ts pins it further).
+      sql: `INSERT OR REPLACE INTO idempotency_keys(token_id, key, entry_gseq, created_at, expires_at)
+            SELECT ?, ?, e.gseq, ?, ?
+              FROM entries e
+             WHERE e.topic_id = ? AND e.ts = ?
+             ORDER BY e.seq DESC LIMIT 1`,
+      params: [auth.token_id, idemKey, ts, hoursFromNow(IDEM_TTL_HOURS), tid, ts],
+    });
   }
+  await execBatchWithRetry(db, () => ops);
+  // ts is generated per request, so (topic_id, ts) identifies the new row.
+  const entry = await db.queryOne(
+    `SELECT * FROM entries WHERE topic_id = ? AND ts = ? ORDER BY seq DESC LIMIT 1`,
+    [tid, ts],
+  );
+  if (!entry) throw new HttpError(500, 'internal', 'Failed to read back inserted entry');
   return json({ entry: publicEntry(entry) }, 201);
 }
 
 // GET /v1/sync?after_gseq=&limit= — one call per poll, all visible topics.
+//
+// Pagination is page-based, never head-based: fetch limit+1 rows; when the
+// extra row is present there is more backlog to drain (has_more=true) and
+// only the first `limit` rows are returned. next_after_gseq is always the
+// last RETURNED entry's gseq — or the input cursor when the page is empty —
+// so a client paging through an arbitrarily deep backlog can never skip
+// entries (the old MAX-based cursor jumped past undelivered rows). No second
+// query: one SELECT per sync poll.
 async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promise<Response> {
   const url = new URL(req.url);
   const after = parseSeqCursor(url.searchParams.get('after_gseq'));
@@ -1316,16 +1704,16 @@ async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promis
        JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
       WHERE e.gseq > ? AND e.seq >= p.history_from_seq
       ORDER BY e.gseq ASC LIMIT ?`,
-    [auth.member_id, after, limit],
+    [auth.member_id, after, limit + 1],
   );
-  const maxRow = await db.queryOne(
-    `SELECT MAX(e.gseq) AS m FROM entries e
-       JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
-      WHERE e.seq >= p.history_from_seq`,
-    [auth.member_id],
-  );
-  const maxGseq = (maxRow?.['m'] as number | null) ?? 0;
-  return json({ entries: rows.map(publicEntry), max_gseq: maxGseq, next_after_gseq: maxGseq });
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const entries = page.map(publicEntry);
+  const nextAfter = page.length > 0 ? (page[page.length - 1]['gseq'] as number) : after;
+  // max_gseq stays for contract compatibility: the highest gseq in THIS
+  // page (clients MUST prefer next_after_gseq as their poll cursor).
+  const maxGseq = nextAfter;
+  return json({ entries, max_gseq: maxGseq, next_after_gseq: nextAfter, has_more: hasMore });
 }
 
 // POST /v1/topics/:tid/tasks
@@ -1361,60 +1749,139 @@ async function handleCreateTask(
     }
   }
   if (description) piiGuard(description);
+  piiGuard(title); // F08: task titles are scanned too.
 
   const taskId = newId();
   const ts = nowIso();
-  await db.execAtomically([
+  // F13: task_created carries the full task fields, so the log can
+  // reconstruct task state. The F06 visibility predicate reads task_id out
+  // of this same payload — it must stay.
+  const createdData = JSON.stringify({
+    task_id: taskId,
+    title,
+    description,
+    due_at: dueAt,
+    status: 'open',
+    owner_member_id: auth.member_id,
+    assignee_member_id: assignee,
+    parent_task_id: parentTask,
+    created_by: auth.member_id,
+    created_at: ts,
+  });
+  // F12: task row + task_created event commit in the SAME batch — the audit's
+  // fault injection (event write fails) must leave no orphan task.
+  // F14: the child insert is conditional on the parent still being open, so
+  // a parent completed between validation and this batch cannot gain an
+  // open child. The event is pinned to the insert actually applying.
+  const ops: BatchOp[] = [
     {
       sql: `INSERT INTO tasks(id, topic_id, title, description, status, owner_member_id, assignee_member_id,
                               parent_task_id, due_at, result, created_by, created_at, updated_at)
-            VALUES (?,?,?,?, 'open', ?,?,?,?,?, ?,?,?)`,
-      params: [taskId, tid, title, description, auth.member_id, assignee, parentTask, dueAt, null, auth.member_id, ts, ts],
+            SELECT ?,?,?,?, 'open',?,?,?,?,?,?,?,?
+             WHERE ? IS NULL
+                OR NOT EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status IN ('done','cancelled'))`,
+      params: [
+        taskId, tid, title, description, auth.member_id, assignee, parentTask, dueAt,
+        null, auth.member_id, ts, ts, parentTask, parentTask,
+      ],
     },
-  ]);
-  await appendEntry(db, {
-    topic_id: tid,
-    kind: 'task_created',
-    body: `Task created: ${title}`,
-    auth,
-    data: JSON.stringify({ task_id: taskId, assignee_member_id: assignee, parent_task_id: parentTask }),
-  });
+    entryInsertOp({
+      topicId: tid,
+      kind: 'task_created',
+      body: `Task created: ${title}`,
+      auth,
+      data: createdData,
+      ts,
+      pin: `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND created_at = ?)`,
+      pinParams: [taskId, ts],
+    }),
+  ];
+  await execBatchWithRetry(db, () => ops);
   const task = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
-  return json({ task: publicTask(task!) }, 201);
+  if (!task) {
+    // The conditional insert refused: re-read the parent for an accurate error.
+    const p = parentTask
+      ? await db.queryOne(`SELECT status FROM tasks WHERE id = ?`, [parentTask])
+      : null;
+    const pstatus = p?.['status'] as string | undefined;
+    if (pstatus === 'done' || pstatus === 'cancelled') {
+      throw new HttpError(
+        409,
+        'parent_completed',
+        'Cannot create a subtask under a completed or cancelled parent task',
+      );
+    }
+    throw new HttpError(500, 'internal', 'Task creation did not persist');
+  }
+  return json({ task: publicTask(task) }, 201);
 }
 
 async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): Promise<Row> {
-  const task = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
+  // F06: enforce the from-join visibility floor on every task path (read AND
+  // write) — a member who joined after the task was created gets 404, so a
+  // PATCH with an empty body can't be used as a read oracle for pre-join
+  // task snapshots.
+  const task = await db.queryOne(
+    `SELECT * FROM tasks WHERE id = ? AND ${TASK_VISIBLE_TO_MEMBER}`,
+    [taskId, auth.member_id],
+  );
   if (!task) throw new HttpError(404, 'not_found', 'Task not found');
   await requireParticipant(db, auth, task['topic_id'] as string);
   return task;
 }
 
-// GET /v1/tasks/:tid — task + its entry trail.
-async function handleGetTask(db: DbClient, auth: AuthContext, taskId: string): Promise<Response> {
+// GET /v1/tasks/:tid?after_seq=&limit= — task + its entry trail.
+// F13: the trail is one indexed SQL query (idx_entries_task_trail),
+// paginated like /history — the old code fetched 5,000 topic entries and
+// filtered by task_id in JS.
+async function handleGetTask(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+  taskId: string,
+): Promise<Response> {
   const task = await getTaskInScope(db, auth, taskId);
   const topicId = task['topic_id'] as string;
+  // F06: a from_join member must not read task snapshots created before they
+  // joined. 404 (same as a missing task) so existence doesn't leak.
+  const visible = await db.queryOne(
+    `SELECT 1 AS ok FROM tasks WHERE id = ? AND topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER}`,
+    [taskId, topicId, auth.member_id],
+  );
+  if (!visible) throw new HttpError(404, 'not_found', 'Task not found');
   const part = await db.queryOne(
     `SELECT history_from_seq FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
     [topicId, auth.member_id],
   );
+  const url = new URL(req.url);
+  const after = parseSeqCursor(url.searchParams.get('after_seq'));
+  const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
   const rows = await db.queryAll(
-    `SELECT * FROM entries WHERE topic_id = ? AND seq >= ? ORDER BY seq ASC LIMIT 5000`,
-    [topicId, part!['history_from_seq'] as number],
+    `SELECT * FROM entries
+      WHERE topic_id = ? AND seq > ? AND seq >= ?
+        AND json_extract(data, '$.task_id') = ?
+      ORDER BY seq ASC LIMIT ?`,
+    [topicId, after, part!['history_from_seq'] as number, taskId, limit + 1],
   );
-  const trail = rows.filter((r) => {
-    const d = parseDataField(r) as Record<string, unknown> | null;
-    return d !== null && typeof d === 'object' && (d as Record<string, unknown>)['task_id'] === taskId;
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const nextAfter = page.length > 0 ? (page[page.length - 1]['seq'] as number) : after;
+  return json({
+    task: publicTask(task),
+    trail: page.map(publicEntry),
+    has_more: hasMore,
+    next_after_seq: nextAfter,
   });
-  return json({ task: publicTask(task), trail: trail.map(publicEntry) });
 }
 
 // GET /v1/topics/:tid/tasks — list tasks in a topic.
 async function handleListTopicTasks(db: DbClient, auth: AuthContext, tid: string): Promise<Response> {
   await requireParticipant(db, auth, tid);
+  // F06: same history floor as entry reads — from_join members don't see
+  // tasks whose task_created entry predates their join.
   const rows = await db.queryAll(
-    `SELECT * FROM tasks WHERE topic_id = ? ORDER BY created_at ASC`,
-    [tid],
+    `SELECT * FROM tasks WHERE topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER} ORDER BY created_at ASC`,
+    [tid, auth.member_id],
   );
   return json({ tasks: rows.map(publicTask) });
 }
@@ -1434,22 +1901,28 @@ async function handlePatchTask(
   const params: (string | number | null)[] = [];
   let statusChanged: string | null = null;
   let assigneeChanged: string | null | undefined;
+  // F13: fields that previously changed silently; emitted as task_updated.
+  const updatedFields: Record<string, string | null> = {};
 
   if (body['title'] !== undefined) {
     const title = reqString(body['title'], 'title', 1, 200);
+    piiGuard(title); // F08: task titles are scanned too.
     sets.push('title = ?');
     params.push(title);
+    updatedFields['title'] = title;
   }
   if (body['description'] !== undefined) {
     const description = optString(body['description'], 'description', MAX_BODY);
     if (description) piiGuard(description);
     sets.push('description = ?');
     params.push(description);
+    updatedFields['description'] = description;
   }
   if (body['due_at'] !== undefined) {
     const dueAt = body['due_at'] === null ? null : reqIsoDate(body['due_at'], 'due_at');
     sets.push('due_at = ?');
     params.push(dueAt);
+    updatedFields['due_at'] = dueAt;
   }
   if (body['assignee_member_id'] !== undefined) {
     const raw = body['assignee_member_id'];
@@ -1480,31 +1953,88 @@ async function handlePatchTask(
     const fresh = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
     return json({ task: publicTask(fresh!) });
   }
+  const ts = nowIso();
   sets.push('updated_at = ?');
-  params.push(nowIso());
-  params.push(taskId);
-  await db.execAtomically([
-    { sql: `UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`, params },
-  ]);
+  params.push(ts);
+  // F14: completing via PATCH is guarded INSIDE the update — the write only
+  // applies while no open subtask exists, in the same batch as the events.
+  // The pre-check above preserves the old fast-path 409; this guard closes
+  // the race between that check and the write.
+  let where = `WHERE id = ?`;
+  const whereParams: (string | number | null)[] = [taskId];
+  const completing = statusChanged === 'done';
+  if (completing) {
+    where += ` AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled'))`;
+    whereParams.push(taskId);
+  }
+  // F12: the state change and its events commit in the SAME batch. Each event
+  // is pinned to the update actually applying (updated_at flip), so a
+  // guard-blocked completion emits no phantom events.
+  const pin = `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`;
+  const pinParams: (string | number | null)[] = [taskId, ts];
+  const ops: BatchOp[] = [
+    { sql: `UPDATE tasks SET ${sets.join(', ')} ${where}`, params: [...params, ...whereParams] },
+  ];
+  if (Object.keys(updatedFields).length > 0) {
+    ops.push(
+      entryInsertOp({
+        topicId,
+        kind: 'task_updated',
+        body: `Task updated`,
+        auth,
+        data: JSON.stringify({ task_id: taskId, ...updatedFields }),
+        ts,
+        pin,
+        pinParams,
+      }),
+    );
+  }
   if (assigneeChanged !== undefined) {
-    await appendEntry(db, {
-      topic_id: topicId,
-      kind: 'task_assigned',
-      body: assigneeChanged ? `Task assigned` : `Task unassigned`,
-      auth,
-      data: JSON.stringify({ task_id: taskId, assignee_member_id: assigneeChanged }),
-    });
+    ops.push(
+      entryInsertOp({
+        topicId,
+        kind: 'task_assigned',
+        body: assigneeChanged ? `Task assigned` : `Task unassigned`,
+        auth,
+        data: JSON.stringify({ task_id: taskId, assignee_member_id: assigneeChanged }),
+        ts,
+        pin,
+        pinParams,
+      }),
+    );
   }
   if (statusChanged) {
-    await appendEntry(db, {
-      topic_id: topicId,
-      kind: 'task_status',
-      body: `Task status → ${statusChanged}`,
-      auth,
-      data: JSON.stringify({ task_id: taskId, status: statusChanged }),
-    });
+    ops.push(
+      entryInsertOp({
+        topicId,
+        kind: 'task_status',
+        body: `Task status → ${statusChanged}`,
+        auth,
+        data: JSON.stringify({ task_id: taskId, status: statusChanged }),
+        ts,
+        pin,
+        pinParams,
+      }),
+    );
   }
+  await execBatchWithRetry(db, () => ops);
   const updated = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
+  if (completing && updated!['status'] !== 'done') {
+    // The atomic guard refused the completion after the pre-check passed
+    // (a subtask was created in between): confirm for an accurate 409.
+    const open = await db.queryAll(
+      `SELECT id FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled')`,
+      [taskId],
+    );
+    if (open.length > 0) {
+      throw new HttpError(
+        409,
+        'subtasks_open',
+        `Cannot complete task: ${open.length} subtask(s) still open`,
+      );
+    }
+    throw new HttpError(500, 'internal', 'Task completion did not apply');
+  }
   return json({ task: publicTask(updated!) });
 }
 
@@ -1540,24 +2070,51 @@ async function handleTaskDone(
 ): Promise<Response> {
   const task = await getTaskInScope(db, auth, taskId);
   const topicId = task['topic_id'] as string;
-  const body = await readJson(req).catch((): Record<string, unknown> => ({}));
+  // F14: an absent body is fine; malformed JSON is 400 (no longer swallowed).
+  const body = await readOptionalJson(req);
   const result = reqJsonData(body['result'], 'result', MAX_DATA);
+  // F08: completion results (JSON) are scanned too — string leaves, recursively.
+  if (result) piiGuardJson(JSON.parse(result));
   await assertNoOpenSubtasks(db, taskId);
   const ts = nowIso();
-  await db.execAtomically([
+  // F12+F14: the completion and its task_done event commit in the SAME
+  // batch, and the open-subtask check is part of the UPDATE itself — a
+  // subtask created between the pre-check above and this write can no longer
+  // slip through. The event is pinned to the update actually applying, so a
+  // guard-blocked completion emits no phantom task_done.
+  await execBatchWithRetry(db, () => [
     {
-      sql: `UPDATE tasks SET status = 'done', result = ?, updated_at = ? WHERE id = ?`,
-      params: [result, ts, taskId],
+      sql: `UPDATE tasks SET status = 'done', result = ?, updated_at = ? WHERE id = ?
+             AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled'))`,
+      params: [result, ts, taskId, taskId],
     },
+    entryInsertOp({
+      topicId,
+      kind: 'task_done',
+      body: `Task completed`,
+      auth,
+      data: JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
+      ts,
+      pin: `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`,
+      pinParams: [taskId, ts],
+    }),
   ]);
-  await appendEntry(db, {
-    topic_id: topicId,
-    kind: 'task_done',
-    body: `Task completed`,
-    auth,
-    data: JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
-  });
   const updated = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
+  if (updated!['status'] !== 'done') {
+    // The atomic guard refused: a subtask opened after the pre-check.
+    const open = await db.queryAll(
+      `SELECT id FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled')`,
+      [taskId],
+    );
+    if (open.length > 0) {
+      throw new HttpError(
+        409,
+        'subtasks_open',
+        `Cannot complete task: ${open.length} subtask(s) still open`,
+      );
+    }
+    throw new HttpError(500, 'internal', 'Task completion did not apply');
+  }
   return json({ task: publicTask(updated!) });
 }
 
@@ -1584,8 +2141,19 @@ async function handleRedact(
   if (!entry) throw new HttpError(404, 'not_found', 'Entry not found');
   const ts = nowIso();
   const scrubbed = `[redacted by owner, ${ts}]`;
+  // F08: also scrub PII-shaped string leaves in data, structure-preserving
+  // (linkage fields like task_id survive). NULL data stays NULL.
+  let newData = entry['data'] as string | null;
+  if (newData !== null) {
+    try {
+      newData = JSON.stringify(redactPiiLeaves(JSON.parse(newData)));
+    } catch {
+      // data is always JSON (validated at write); keep the original rather
+      // than lose it if parsing ever fails.
+    }
+  }
   await db.execAtomically([
-    { sql: `UPDATE entries SET body = ? WHERE gseq = ?`, params: [scrubbed, gseq] },
+    { sql: `UPDATE entries SET body = ?, data = ? WHERE gseq = ?`, params: [scrubbed, newData, gseq] },
   ]);
   await appendEntry(db, {
     topic_id: entry['topic_id'] as string,
@@ -1621,7 +2189,7 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
       status: res.status,
       ms: Date.now() - start,
     });
-    return res;
+    return withSecurityHeaders(res);
   } catch (e) {
     // routeRequest converts all expected errors to responses; this is the
     // last resort so a request never goes unlogged.
@@ -1632,7 +2200,9 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
       code: 'internal',
       ms: Date.now() - start,
     });
-    return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
+    return withSecurityHeaders(
+      json({ error: { code: 'internal', message: 'Internal server error' } }, 500),
+    );
   }
 }
 
@@ -1715,7 +2285,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       const taskId = decodeURIComponent(taskSub[1]);
       if (!taskSub[2] && (method === 'GET' || method === 'PATCH')) {
         return method === 'GET'
-          ? await handleGetTask(db, auth, taskId)
+          ? await handleGetTask(db, req, auth, taskId)
           : await handlePatchTask(db, env, req, auth, taskId);
       }
       if (taskSub[3] === 'notes' && method === 'POST') {
@@ -1755,11 +2325,15 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (!env.DB) {
       logEvent('error', 'misconfigured', { detail: 'D1 binding DB is not configured' });
-      return json({ error: { code: 'misconfigured', message: 'D1 binding DB is not configured' } }, 500);
+      return withSecurityHeaders(
+        json({ error: { code: 'misconfigured', message: 'D1 binding DB is not configured' } }, 500),
+      );
     }
     if (!env.TOKEN_PEPPER) {
       logEvent('error', 'misconfigured', { detail: 'TOKEN_PEPPER secret is not set' });
-      return json({ error: { code: 'misconfigured', message: 'TOKEN_PEPPER secret is not set' } }, 500);
+      return withSecurityHeaders(
+        json({ error: { code: 'misconfigured', message: 'TOKEN_PEPPER secret is not set' } }, 500),
+      );
     }
     return await handleRequest(req, d1Client(env.DB), env);
   },
