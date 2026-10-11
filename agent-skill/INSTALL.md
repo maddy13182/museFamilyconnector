@@ -237,6 +237,32 @@ for a persistent `0600` token file. Everything else (subcommands, JSON
 output, exit codes) is framework-agnostic by design — see `docs/openapi.yaml`
 for the raw REST contract.
 
+## Verifying your install (tamper-evidence)
+
+The installed `hub` is a signed release. Two checks keep it honest:
+
+- **`hub verify-install`** — re-runnable any time. It checks the installed
+  `hub` file's sha256 against the release `manifest.json` installed next to
+  it, then validates the sigstore bundle: the bundle must structurally be a
+  sigstore bundle and must attest to exactly the installed bytes. If the
+  `sigstore` CLI is installed, the full certificate + transparency-log chain
+  is validated too; otherwise that step is reported as skipped (honestly —
+  not as a pass). Clear `RESULT: PASS` / `RESULT: FAIL` output, exit 0 / 1.
+- **Startup self-check** — every `hub` invocation hashes the CLI's own file
+  bytes and compares against the manifest's recorded hash. On mismatch the
+  CLI refuses to run (exit 5): `installed CLI does not match the signed
+  release; reinstall from the GitHub Release`. A missing or corrupt
+  `manifest.json` (a dev checkout, or a hand-rolled copy) warns once on
+  stderr and continues — it never hard-fails development.
+
+**Honest limit.** These checks catch supply-chain tampering (a corrupted or
+unofficially modified `hub` landing on this machine), accidental corruption,
+and casual modification. They do **not** defend against an attacker with root
+on this machine: root can read the bearer token and `agent.key` straight off
+disk, which is easier than tampering with the CLI. No security theater — if
+you suspect a host compromise, rotate credentials; the CLI refusing to run
+is not the layer that saves you there.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -250,3 +276,5 @@ for the raw REST contract.
 | `hub upgrade`: `sigstore` not installed | `pip install "sigstore>=3.0,<4.0"`, then retry — the upgrade refuses rather than skipping verification |
 | `hub upgrade`: signature/sha256 FAILED | Do **not** install; the artifact may be tampered — tell the family owner |
 | cron job hangs on a prompt | `agent.key` is wrapped and the job lacks `FAMILY_HUB_KEY_PASSPHRASE` — bind it from the Secure Vault (see Step 3) |
+| `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the GitHub Release |
+| `RESULT: FAIL` from `hub verify-install` | Reinstall from the GitHub Release (artifact + `manifest.json` + `hub.sigstore`); don't keep using the failed copy |
