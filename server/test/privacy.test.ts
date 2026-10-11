@@ -134,8 +134,46 @@ test('F06: from_join member cannot read pre-join tasks via list, get, or export'
   assert.ok((expK1.body.tasks as any[]).some((t) => t.id === t1id), 'original member still sees pre-join task in export');
 });
 
-test('F06: history_from=full invite still sees pre-join tasks', async () => {
+test('F06: from_join member cannot use write paths as a read oracle for pre-join tasks', async () => {
   const { app, famId, ownerToken, ownerId } = await bootstrap();
+  const kid1 = await inviteMember(app, famId, ownerToken, 'k1@t.dev', 'Kid1');
+  const tid = await makeTopic(app, ownerToken, ownerId, [kid1.id]);
+
+  const t1 = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+    token: ownerToken,
+    body: { title: 'Pre-join task' },
+  });
+  assert.equal(t1.status, 201);
+  const t1id = t1.body.task.id as string;
+
+  const kid2 = await inviteMember(app, famId, ownerToken, 'k2@t.dev', 'Kid2');
+  const inv = await app.call('POST', `/v1/topics/${tid}/invite`, {
+    token: ownerToken,
+    body: { member_ids: [kid2.id], history_from: 'from_join' },
+  });
+  assert.equal(inv.status, 200);
+
+  // PATCH with an empty body changes nothing but must not disclose the task.
+  const patch = await app.call('PATCH', `/v1/tasks/${t1id}`, {
+    token: kid2.token,
+    body: {},
+  });
+  assert.equal(patch.status, 404);
+
+  // done and note paths are also gated.
+  const done = await app.call('POST', `/v1/tasks/${t1id}/done`, {
+    token: kid2.token,
+    body: {},
+  });
+  assert.equal(done.status, 404);
+  const note = await app.call('POST', `/v1/tasks/${t1id}/notes`, {
+    token: kid2.token,
+    body: { body: 'hello' },
+  });
+  assert.equal(note.status, 404);
+});
+
+test('F06: history_from=full invite still sees pre-join tasks', async () => {  const { app, famId, ownerToken, ownerId } = await bootstrap();
   const kid1 = await inviteMember(app, famId, ownerToken, 'k1@t.dev', 'Kid1');
   const tid = await makeTopic(app, ownerToken, ownerId, [kid1.id]);
   const t1 = await app.call('POST', `/v1/topics/${tid}/tasks`, {

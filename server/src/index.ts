@@ -1281,19 +1281,27 @@ async function handleRevoke(
     }
   }
   const now = nowIso();
+  // F17: transitive revocation via the credential lineage. A recursive CTE
+  // computes the full descendant closure, so revoking T1 also revokes T2 and
+  // T3 in a T1 -> T2 -> T3 chain. Rotated tokens have issued_by_token_id
+  // NULL (rotation replaces rather than delegates), so they are excluded.
+  const lineage = `WITH RECURSIVE lineage(id) AS (
+    SELECT ? UNION ALL
+    SELECT t.token_id FROM agent_tokens t JOIN lineage l ON t.issued_by_token_id = l.id
+  ) SELECT id FROM lineage`;
   await db.execAtomically([
     // F04: unconditional — overwrites a future rotation-grace revoked_at.
     { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ?`, params: [now, tokenId] },
-    // F17: expire pending (unused, unexpired) codes issued under this token.
-    // Redeeming them afterwards yields 410 code_expired.
+    // F17: expire pending (unused, unexpired) codes issued anywhere under
+    // the revoked lineage. Redeeming them afterwards yields 410 code_expired.
     {
       sql: `UPDATE provisioning_codes SET expires_at = ?
-             WHERE issued_by_token_id = ? AND used_at IS NULL AND expires_at > ?`,
+             WHERE issued_by_token_id IN (${lineage}) AND used_at IS NULL AND expires_at > ?`,
       params: [now, tokenId, now],
     },
-    // F17: one-level cascade to descendant tokens issued under this token.
+    // F17: transitive cascade to all descendant tokens.
     {
-      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE issued_by_token_id = ?`,
+      sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id IN (${lineage})`,
       params: [now, tokenId],
     },
   ]);
@@ -1809,7 +1817,14 @@ async function handleCreateTask(
 }
 
 async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): Promise<Row> {
-  const task = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
+  // F06: enforce the from-join visibility floor on every task path (read AND
+  // write) — a member who joined after the task was created gets 404, so a
+  // PATCH with an empty body can't be used as a read oracle for pre-join
+  // task snapshots.
+  const task = await db.queryOne(
+    `SELECT * FROM tasks WHERE id = ? AND ${TASK_VISIBLE_TO_MEMBER}`,
+    [taskId, auth.member_id],
+  );
   if (!task) throw new HttpError(404, 'not_found', 'Task not found');
   await requireParticipant(db, auth, task['topic_id'] as string);
   return task;

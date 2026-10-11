@@ -17,6 +17,7 @@ import tempfile
 import unittest
 import urllib.parse as urlparse
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HUB_PATH = os.path.join(HERE, "..", "hub")
@@ -1328,6 +1329,32 @@ class TestEnrollHardening(HubTestBase):
         self.assertIn("DIFFERENT", err)
         self.assertIn("enrolled with", err)
         self.assertIn("https://other.example", self.fake.last_url())
+
+    def test_env_var_override_requires_flag(self):
+        self.seed_config()  # pinned https://hub.example
+        with mock.patch.dict(os.environ, {"FAMILY_HUB_URL": "https://evil.example"}):
+            rc, out, err = self.run_cli(["topics"])
+        self.assertEqual(rc, 1)
+        self.assertIn("--allow-server-override", err)
+        self.assertIn("FAMILY_HUB_URL", err)
+        self.assertEqual(self.fake.calls, [])  # nothing hit the wire
+
+    def test_env_var_override_with_flag_warns(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        with mock.patch.dict(os.environ, {"FAMILY_HUB_URL": "https://other.example"}):
+            rc, out, err = self.run_cli(["--allow-server-override", "topics"])
+        self.assertEqual(rc, 0)
+        self.assertIn("DIFFERENT", err)
+        self.assertIn("FAMILY_HUB_URL", err)
+
+    def test_env_var_same_origin_passes_quietly(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        with mock.patch.dict(os.environ, {"FAMILY_HUB_URL": "https://hub.example/"}):
+            rc, out, err = self.run_cli(["topics"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("DIFFERENT", err)
 
     def test_server_override_same_origin_is_quiet(self):
         self.seed_config()

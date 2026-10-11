@@ -314,7 +314,7 @@ test('F17: revoking a token expires its pending provisioning codes', async () =>
   assert.equal(live.status, 201);
 });
 
-test('F17: revoking a token revokes one-level descendant tokens only', async () => {
+test('F17: revoking a token revokes the full transitive descendant closure', async () => {
   const { app, owner, parent } = await setupRoles();
 
   // A (owner token) mints a code; redeeming it yields B, a child of A
@@ -352,8 +352,7 @@ test('F17: revoking a token revokes one-level descendant tokens only', async () 
 
   for (const t of [owner.token, bToken, cToken]) assert.equal(await meStatus(app, t), 200);
 
-  // revoke A: B (one level down) is revoked; C (two levels) survives —
-  // the documented one-level cascade limit
+  // revoke A: the transitive closure (B and C) is revoked
   const rev = await app.call('POST', '/v1/auth/revoke', {
     token: owner.token,
     body: { token_id: owner.tokenId },
@@ -361,5 +360,5 @@ test('F17: revoking a token revokes one-level descendant tokens only', async () 
   assert.equal(rev.status, 200);
   assert.equal(await meStatus(app, owner.token), 401);
   assert.equal(await meStatus(app, bToken), 401);
-  assert.equal(await meStatus(app, cToken), 200);
+  assert.equal(await meStatus(app, cToken), 401);
 });

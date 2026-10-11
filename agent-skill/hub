@@ -485,31 +485,35 @@ def _check_server_override(args, pinned, server):
     """Gate --server overrides of the pinned enrollment origin (F03).
 
     The profile's server_url is the origin the credential was enrolled
-    against. A *differing* --server would silently send the stored bearer
-    token to another server, so it requires the explicit
-    --allow-server-override flag and always prints a loud stderr warning.
-    Same-origin (or no pinned origin yet) passes quietly.
+    against. A *differing* server — via --server OR the FAMILY_HUB_URL env
+    var — would silently send the stored bearer token to another server, so
+    it requires the explicit --allow-server-override flag and always prints
+    a loud stderr warning. Same-origin (or no pinned origin yet) passes
+    quietly.
     """
-    override = getattr(args, "server", None)
+    flag_override = getattr(args, "server", None)
+    env_override = os.environ.get("FAMILY_HUB_URL")
+    override = flag_override or env_override
     if not override or not pinned:
         return
     norm = lambda u: (u or "").rstrip("/")
     if norm(override) == norm(pinned):
         return
+    via = "--server" if flag_override else "FAMILY_HUB_URL"
     if not getattr(args, "allow_server_override", False):
         raise HubError(
             "config",
             "Refusing to override the hub server this profile enrolled "
-            "with (enrolled: %s, --server: %s). If you really mean to send "
+            "with (enrolled: %s, %s: %s). If you really mean to send "
             "your credential to a different server, re-run with "
-            "--allow-server-override." % (pinned, override),
+            "--allow-server-override." % (pinned, via, override),
         )
     emit_err("=" * 70)
     emit_err(
-        "WARNING: --server overrides the hub server this profile enrolled with."
+        "WARNING: %s overrides the hub server this profile enrolled with." % via
     )
     emit_err("  Enrolled (pinned): %s" % pinned)
-    emit_err("  Override (--server): %s" % override)
+    emit_err("  Override (%s): %s" % (via, override))
     emit_err(
         "You are sending your credential to a DIFFERENT server than the "
         "one you enrolled with."
