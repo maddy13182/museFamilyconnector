@@ -17,7 +17,7 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -38,7 +38,7 @@ jobs:
     name: agent CLI tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -51,7 +51,7 @@ jobs:
     name: security scan (semgrep + bandit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -71,11 +71,11 @@ jobs:
     name: secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -83,7 +83,7 @@ jobs:
     name: version bump gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -104,7 +104,17 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_REF" ]; then
             base="origin/${BASE_REF}"
             functional="$(git diff --name-only "${base}...HEAD" -- server/src server/migrations agent-skill/hub agent-skill/tests || true)"
-            versioned="$(git diff --name-only "${base}...HEAD" -- VERSION server/package.json || true)"
+            # A "version bump" means the project's own version value changed,
+            # not merely that a version-carrying file was touched (a Dependabot
+            # dependency bump edits server/package.json without bumping the
+            # project version). Compare field values, not file diffs.
+            v_base_file="$(git show "${base}:VERSION" 2>/dev/null || true)"
+            v_base_pkg="$(git show "${base}:server/package.json" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" 2>/dev/null || true)"
+            v_base_hub="$(git show "${base}:agent-skill/hub" 2>/dev/null | grep -E '^VERSION = ' | cut -d'"' -f2 || true)"
+            versioned=""
+            if [ "$v_base_file" != "$v_file" ] || [ "$v_base_pkg" != "$v_pkg" ] || [ "$v_base_hub" != "$v_hub" ]; then
+              versioned="1"
+            fi
             changelog="$(git diff --name-only "${base}...HEAD" -- CHANGELOG.md || true)"
             if [ -n "$functional" ] && [ -z "$versioned" ]; then
               echo "::error::This PR changes functional code but does not bump the version. Update VERSION, server/package.json, agent-skill/hub and CHANGELOG.md per docs/VERSIONING.md."

@@ -11,6 +11,6 @@
     "test": "npm run build && rm -rf dist/migrations && cp -r migrations dist/migrations && node --test 'dist/test/*.test.js'"
   },
   "devDependencies": {
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   }
 }
