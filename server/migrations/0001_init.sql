@@ -4,6 +4,12 @@
 --   provisioning_codes — SPEC §6 step 4 requires mint/redeem of per-agent
 --     provisioning codes, but §13 lists no endpoints; both are implemented.
 --   idempotency_keys — backs the Idempotency-Key header on POST entries (§9).
+--
+-- E2EE (v0.7.0+, clean slate): the agent_keys and topic_key_envelopes
+-- tables and the topics.e2ee column below are part of the BASE schema.
+-- They are NOT backfilled onto existing databases — E2EE requires a fresh
+-- database (production D1 is wiped at the v0.7.0 deploy, on the owner's
+-- explicit go-ahead). There is deliberately no 0008 migration.
 
 CREATE TABLE families(
   id TEXT PRIMARY KEY,
@@ -67,6 +73,9 @@ CREATE TABLE topics(
   parent_topic_id TEXT NULL REFERENCES topics(id),
   link_visibility TEXT NOT NULL DEFAULT 'placeholder'
     CHECK(link_visibility IN ('placeholder','hidden')),
+  -- E2EE (v0.7.0+, clean slate): 1 = end-to-end encrypted topic, 0 =
+  -- plaintext. Per-topic opt-in; plaintext topics behave exactly as before.
+  e2ee INTEGER NOT NULL DEFAULT 0,
   created_by TEXT NOT NULL REFERENCES members(id),
   created_at TEXT NOT NULL
 );
@@ -131,3 +140,40 @@ CREATE TABLE idempotency_keys(
   expires_at TEXT NOT NULL,
   PRIMARY KEY(token_id, key)
 );
+
+-- E2EE agent identity public keys (Phase 1). Public keys are public: no
+-- secrecy is needed and the column is deliberately NOT hashed. Rows are
+-- never deleted — rotation marks the old row superseded so envelopes
+-- sealed to it (Phase 2+) still resolve. At most one ACTIVE
+-- (superseded_at IS NULL) row per (member_id, agent_label), enforced by
+-- the partial unique index below.
+CREATE TABLE agent_keys(
+  id TEXT PRIMARY KEY,
+  member_id TEXT NOT NULL REFERENCES members(id),
+  agent_label TEXT NOT NULL,
+  public_key TEXT NOT NULL,      -- base64; must decode to exactly 32 bytes (X25519)
+  created_at TEXT NOT NULL,
+  superseded_at TEXT NULL        -- NULL = active; set when rotated
+);
+CREATE UNIQUE INDEX idx_agent_keys_active
+  ON agent_keys(member_id, agent_label) WHERE superseded_at IS NULL;
+CREATE INDEX idx_agent_keys_member ON agent_keys(member_id);
+
+-- E2EE key envelopes (Phase 2; endpoints land in a later phase). A dumb,
+-- access-controlled blob store: the server stores and serves sealed
+-- envelopes but never inspects them.
+-- NOTE: the design doc (research/e2ee-design.md §2 L3) calls the envelope
+-- column BLOB; it is TEXT carrying base64 because the DbClient parameter
+-- type (SqlParam) has no blob variant, and base64 matches the
+-- entries.body/data ciphertext convention (design §4: ciphertext travels
+-- as base64 in existing columns).
+CREATE TABLE topic_key_envelopes(
+  topic_id TEXT NOT NULL REFERENCES topics(id),
+  member_id TEXT NOT NULL REFERENCES members(id),
+  agent_label TEXT NOT NULL,
+  key_id TEXT NOT NULL,          -- random 128-bit topic-key id (hex)
+  envelope TEXT NOT NULL,        -- base64 crypto_box_seal of the topic key; opaque to the server
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(topic_id, member_id, agent_label, key_id)
+);
+CREATE INDEX idx_envelopes_member ON topic_key_envelopes(member_id, agent_label);

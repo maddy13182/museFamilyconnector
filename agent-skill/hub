@@ -36,10 +36,15 @@ config.json. Every API call authenticates with the active circle's token,
 falling back to the single-token chain above when a circle has no stored
 token (bootstrap-family backwards compatibility).
 
-Python 3, standard library only.
+Python 3. The E2EE key commands (`key-init`, `key-backup`, `key-restore`,
+and key generation during `setup`) need PyNaCl + the `mnemonic` package
+(pinned in agent-skill/requirements.txt); everything else is standard
+library only, and every non-key command keeps working when PyNaCl is
+missing.
 """
 
 import argparse
+import base64
 import getpass
 import http.client
 import json
@@ -655,6 +660,281 @@ def _verify_new_token(server, transport, debug, token, flow_name):
 
 
 # ---------------------------------------------------------------------------
+# E2EE identity keys (Phase 1)
+#
+# One X25519 keypair per profile. The private key lives in the profile dir
+# (agent.key, mode 0600) and NEVER leaves the machine: it is never sent to
+# the server, never printed (the 24-word recovery phrase is the deliberate,
+# user-facing exception — it encodes the same key for disaster recovery),
+# and never appears in logs or --debug output. Every textual encoding of
+# the raw key is registered with note_secret() so redact() scrubs it from
+# all output paths.
+#
+# Requires PyNaCl (+ the `mnemonic` package for BIP-39 phrases), pinned in
+# agent-skill/requirements.txt. This ended the stdlib-only property — see
+# agent-skill/INSTALL.md. All imports are lazy: every non-key command keeps
+# working when PyNaCl is missing, and key commands fail with a clear
+# install instruction instead of an ImportError traceback.
+# ---------------------------------------------------------------------------
+
+_MISSING_CRYPTO_MSG = (
+    "PyNaCl is required for E2EE key commands but is not installed. "
+    "Install it with: pip install -r <skill-dir>/requirements.txt "
+    "(or: pip install 'PyNaCl==1.6.2' 'mnemonic==0.21'). "
+    "All non-key hub commands keep working without it."
+)
+
+
+def _require_nacl():
+    """Import PyNaCl lazily; raise a helpful HubError when it is missing."""
+    try:
+        import nacl.bindings
+        import nacl.pwhash
+        import nacl.public
+        import nacl.utils
+    except ImportError:
+        raise HubError("config", _MISSING_CRYPTO_MSG)
+    import nacl  # noqa: F401  (re-exported for callers)
+
+    return nacl
+
+
+def _require_mnemonic():
+    """Import the BIP-39 helper lazily; helpful error when missing."""
+    try:
+        from mnemonic import Mnemonic
+    except ImportError:
+        raise HubError("config", _MISSING_CRYPTO_MSG)
+    return Mnemonic
+
+
+def agent_key_path(profile):
+    return os.path.join(profile_dir(profile), "agent.key")
+
+
+def _note_key_secrets(priv_bytes):
+    """Register every textual encoding of the raw key for redaction."""
+    note_secret(base64.b64encode(priv_bytes).decode("ascii"))
+    note_secret(priv_bytes.hex())
+
+
+def _write_secret_file_0600(path, data, what):
+    """Write bytes to path with mode 0600; fail loudly if perms can't hold.
+
+    os.open's mode is masked by the umask (and O_TRUNC keeps an existing
+    file's mode), so the mode is verified after the write and repaired with
+    chmod when needed. If 0600 still can't be enforced, the write is
+    refused — a private key must never rest in a group/world-readable file.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        # Don't leave a half-written secret behind.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode != 0o600:
+        try:
+            os.chmod(path, 0o600)
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            pass
+    if mode != 0o600:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise HubError(
+            "config",
+            "Refusing to store the %s: could not enforce 0600 permissions "
+            "on %s (mode is %o). Fix the filesystem/umask and retry." % (what, path, mode),
+        )
+
+
+def _generate_identity_keypair():
+    """Generate a fresh X25519 keypair. Returns the 32-byte private key."""
+    nacl = _require_nacl()
+    # PrivateKey.generate() draws 32 bytes from the OS CSPRNG via libsodium.
+    return bytes(nacl.public.PrivateKey.generate())
+
+
+def _public_key_b64(priv_bytes):
+    """Derive the X25519 public key (standard base64) from private bytes."""
+    nacl = _require_nacl()
+    pub = bytes(nacl.public.PrivateKey(priv_bytes).public_key)
+    return base64.b64encode(pub).decode("ascii")
+
+
+def _load_identity_key(path):
+    """Load and validate the 32-byte private key; HubError when unusable."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise HubError(
+            "config",
+            "Cannot read the identity key at %s (%s). If this agent never "
+            "had one, run `hub key-init`; if the file was lost, run "
+            "`hub key-restore`." % (path, exc),
+        )
+    # Warn (don't fail) when the file is readable by others — same posture
+    # as the token file check in load_token().
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            emit_err(
+                "warning: identity key file %s is readable by others (mode %o); "
+                "run: chmod 600 %s" % (path, mode, path)
+            )
+    except OSError:
+        pass
+    if len(data) != 32:
+        raise HubError(
+            "config",
+            "Identity key at %s is %d bytes, expected 32 — it is corrupt. "
+            "Restore from backup with `hub key-restore`." % (path, len(data)),
+        )
+    _note_key_secrets(data)
+    return data
+
+
+def _ensure_identity_keypair(profile):
+    """Return (priv_bytes, public_b64, is_new), generating + storing when missing.
+
+    Never overwrites an existing key: re-running enrollment for a profile
+    reuses its identity. The write happens BEFORE any server call that
+    would register the key, so a storage failure can never strand the agent.
+    """
+    _require_nacl()
+    path = agent_key_path(profile)
+    if os.path.exists(path):
+        priv = _load_identity_key(path)
+        return priv, _public_key_b64(priv), False
+    priv = _generate_identity_keypair()
+    _note_key_secrets(priv)
+    _write_secret_file_0600(path, priv, "identity private key")
+    # Prove the file round-trips before anyone depends on it.
+    if _load_identity_key(path) != priv:
+        raise HubError(
+            "config",
+            "Identity key write verification failed for %s — the file does "
+            "not read back identically. Not proceeding." % path,
+        )
+    return priv, _public_key_b64(priv), True
+
+
+def _recovery_phrase(priv_bytes):
+    """24-word BIP-39 phrase encoding the 32-byte private key."""
+    Mnemonic = _require_mnemonic()
+    return Mnemonic("english").to_mnemonic(priv_bytes)
+
+
+def _privkey_from_phrase(phrase):
+    """Decode + checksum-verify a 24-word phrase back to 32 key bytes."""
+    Mnemonic = _require_mnemonic()
+    words = phrase.strip().split()
+    if len(words) != 24:
+        raise HubError(
+            "bad_request",
+            "Recovery phrase must be exactly 24 words (got %d)." % len(words),
+        )
+    try:
+        entropy = Mnemonic("english").to_entropy(" ".join(words))
+    except Exception:
+        raise HubError(
+            "bad_request",
+            "Recovery phrase is invalid (checksum failed). Check the words "
+            "against what was written down and try again.",
+        )
+    if len(entropy) != 32:
+        raise HubError(
+            "bad_request",
+            "Recovery phrase decoded to %d bytes, expected 32." % len(entropy),
+        )
+    return entropy
+
+
+def _print_recovery_phrase(priv_bytes):
+    """Show the 24-word phrase ONCE, deliberately bypassing redaction.
+
+    Mirrors cmd_dashboard_token: the warning precedes the secret, the secret
+    is written raw so it stays usable, and note_secret() is registered
+    afterwards so the phrase can never leak into later output.
+    """
+    phrase = _recovery_phrase(priv_bytes)
+    emit(
+        "Write these 24 words down NOW and keep them somewhere safe (a "
+        "password manager, or paper in a drawer). Anyone holding them can "
+        "recreate this agent's identity key and read its encrypted topics. "
+        "hub shows them once and never stores them."
+    )
+    sys.stdout.write(phrase + "\n")
+    note_secret(phrase)
+
+
+# Argon2id parameters for key backups. MODERATE (~256 MiB, ~0.5-1 s) is the
+# balance between brute-force resistance and small/old machines; the exact
+# values are stored in the backup file so restore always re-derives with
+# the same parameters.
+_BACKUP_KDF = "argon2id"
+
+
+def _encrypt_key_backup(priv_bytes, password):
+    """Encrypt the 32-byte private key with Argon2id(password) → JSON blob."""
+    nacl = _require_nacl()
+    pw = password.encode("utf-8")
+    salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+    ops = nacl.pwhash.argon2id.OPSLIMIT_MODERATE
+    mem = nacl.pwhash.argon2id.MEMLIMIT_MODERATE
+    key = nacl.pwhash.argon2id.kdf(32, pw, salt, opslimit=ops, memlimit=mem)
+    nonce = nacl.utils.random(nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES)
+    ct = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(priv_bytes, None, nonce, key)
+    return {
+        "kdf": _BACKUP_KDF,
+        "opslimit": ops,
+        "memlimit": mem,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ct).decode("ascii"),
+    }
+
+
+def _decrypt_key_backup(blob, password):
+    """Reverse _encrypt_key_backup; HubError on wrong password / bad blob."""
+    nacl = _require_nacl()
+    if not isinstance(blob, dict) or blob.get("kdf") != _BACKUP_KDF:
+        raise HubError("bad_request", "Not a hub identity-key backup file.")
+    try:
+        ops = int(blob["opslimit"])
+        mem = int(blob["memlimit"])
+        salt = base64.b64decode(blob["salt"])
+        nonce = base64.b64decode(blob["nonce"])
+        ct = base64.b64decode(blob["ciphertext"])
+    except Exception:
+        raise HubError("bad_request", "Backup file is malformed.")
+    if len(salt) != nacl.pwhash.argon2id.SALTBYTES:
+        raise HubError("bad_request", "Backup file is malformed (bad salt).")
+    key = nacl.pwhash.argon2id.kdf(
+        32, password.encode("utf-8"), salt, opslimit=ops, memlimit=mem
+    )
+    try:
+        priv = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(ct, None, nonce, key)
+    except Exception:
+        raise HubError("auth", "Wrong password — the backup could not be decrypted.")
+    if len(priv) != 32:
+        raise HubError("bad_request", "Backup decrypted to %d bytes, expected 32." % len(priv))
+    return priv
+
+
+# ---------------------------------------------------------------------------
 # HTTP client (urllib; a fake transport can be injected for tests)
 # ---------------------------------------------------------------------------
 
@@ -1173,6 +1453,7 @@ def cmd_setup(args, transport):
     if not code:
         raise HubError("bad_request", "An invite or provisioning code is required.")
     note_secret(code)  # bearer code: keep it out of --debug URL dumps etc.
+    _key_priv, _key_pub_b64, _key_is_new = None, None, False
     if code.startswith("fhp_"):
         # Owner bootstrap flow: the member already exists; the provisioning
         # code mints this agent's token directly (label set at bootstrap).
@@ -1180,6 +1461,13 @@ def cmd_setup(args, transport):
         accept_body = {}
         display_name = ""
         agent_label = "owner-agent"
+        # E2EE (Phase 1): every agent gets an identity keypair at
+        # enrollment. Generate + persist BEFORE the single-use code is
+        # redeemed — a storage failure here must not burn the code (F11).
+        # The public key rides along in the redeem body; the server binds it
+        # to the same (member_id, agent_label) atomically with the token.
+        _key_priv, _key_pub_b64, _key_is_new = _ensure_identity_keypair(profile)
+        accept_body["agent_public_key"] = _key_pub_b64
     else:
         display_name = args.name or input("Your display name: ").strip()
         if not display_name:
@@ -1259,6 +1547,135 @@ def cmd_setup(args, transport):
             "note": storage_note,
         }
     )
+    if code.startswith("fhp_") and _key_is_new:
+        # The identity keypair was just created: show the recovery phrase
+        # once, now that enrollment fully succeeded.
+        _print_recovery_phrase(_key_priv)
+    elif not code.startswith("fhp_"):
+        emit(
+            "note: this agent has no E2EE identity key yet — run `hub "
+            "key-init` to generate one and register it with the hub."
+        )
+    return 0
+
+
+def cmd_key_init(args, transport):
+    """Generate (if needed) and register this agent's E2EE identity key.
+
+    Works as the initial registration when the agent has no key yet, and
+    as a no-op when the local key is already registered. The bearer token
+    is the bootstrap: it authenticates WHO the agent is while the keypair
+    becomes WHAT the agent can decrypt.
+    """
+    ctx = _ctx(args, transport)
+    _require_nacl()
+    priv, pub_b64, is_new = _ensure_identity_keypair(ctx.profile)
+    if is_new:
+        _print_recovery_phrase(priv)
+    me = ctx.client.call("GET", "/v1/me")
+    if not isinstance(me, dict) or not me.get("id"):
+        raise HubError("error", "Unexpected /v1/me response from the server.")
+    member_id = me["id"]
+    agent_label = me.get("agent_label") or ""
+    directory = ctx.client.call("GET", "/v1/agent-keys", query={"member_id": member_id})
+    for entry in _as_list(directory, "keys"):
+        if (
+            isinstance(entry, dict)
+            and entry.get("agent_label") == agent_label
+            and entry.get("public_key") == pub_b64
+        ):
+            emit("E2EE identity key is already registered for this agent — nothing to do.")
+            return 0
+    resp = ctx.client.call(
+        "POST", "/v1/agent-keys/rotate", json_body={"agent_public_key": pub_b64}
+    )
+    if not isinstance(resp, dict) or "public_key" not in resp:
+        raise HubError("error", "Unexpected response from the server.")
+    emit("E2EE identity key registered.")
+    emit_json(
+        {
+            "member_id": resp.get("member_id"),
+            "agent_label": resp.get("agent_label"),
+            "created_at": resp.get("created_at"),
+        }
+    )
+    return 0
+
+
+def cmd_key_backup(args, transport):
+    """Write an Argon2id-encrypted backup of the identity private key.
+
+    The password never leaves the machine; the backup file is 0600. Keep
+    the file somewhere other than this machine (or the recovery phrase
+    somewhere safe) — either one restores the key via `hub key-restore`.
+    """
+    _require_nacl()
+    profile = args.profile
+    priv = _load_identity_key(agent_key_path(profile))
+    out = (args.out or "").strip() or input("Backup file path: ").strip()
+    if not out:
+        raise HubError("bad_request", "A backup file path is required.")
+    if os.path.exists(out) and not args.force:
+        raise HubError(
+            "bad_request",
+            "Refusing to overwrite existing file %s (use --force to overwrite)." % out,
+        )
+    pw1 = getpass.getpass("Backup password: ")
+    pw2 = getpass.getpass("Confirm backup password: ")
+    note_secret(pw1)
+    note_secret(pw2)
+    if pw1 != pw2:
+        raise HubError("bad_request", "Passwords do not match — backup not written.")
+    if len(pw1) < 8:
+        raise HubError("bad_request", "Password must be at least 8 characters.")
+    blob = _encrypt_key_backup(priv, pw1)
+    _write_secret_file_0600(out, json.dumps(blob, indent=2).encode("utf-8"), "backup")
+    emit("Backup written to %s (mode 0600). Keep it somewhere safe." % out)
+    return 0
+
+
+def cmd_key_restore(args, transport):
+    """Restore the identity private key from a recovery phrase or backup file.
+
+    The phrase is never taken on the command line (it would land in shell
+    history): paste it at the prompt or pass --phrase-file. Restoring does
+    not register anything — run `hub key-init` afterwards; it is idempotent
+    and registers the key only if needed.
+    """
+    _require_nacl()
+    profile = args.profile
+    key_path = agent_key_path(profile)
+    if os.path.exists(key_path) and not args.force:
+        raise HubError(
+            "bad_request",
+            "An identity key already exists at %s (use --force to overwrite "
+            "it — the current key will be unrecoverable without its own "
+            "backup)." % key_path,
+        )
+    if args.backup_file:
+        try:
+            with open(args.backup_file, "r", encoding="utf-8") as fh:
+                blob = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise HubError("bad_request", "Cannot read backup file: %s" % exc)
+        password = getpass.getpass("Backup password: ")
+        note_secret(password)
+        priv = _decrypt_key_backup(blob, password)
+    else:
+        if args.phrase_file:
+            try:
+                with open(args.phrase_file, "r", encoding="utf-8") as fh:
+                    phrase = fh.read()
+            except OSError as exc:
+                raise HubError("bad_request", "Cannot read phrase file: %s" % exc)
+        else:
+            phrase = getpass.getpass("Recovery phrase (24 words): ")
+        note_secret(phrase)
+        priv = _privkey_from_phrase(phrase)
+    _note_key_secrets(priv)
+    _write_secret_file_0600(key_path, priv, "identity private key")
+    emit("Identity key restored to %s (mode 0600)." % key_path)
+    emit("Run `hub key-init` to register its public key with the hub.")
     return 0
 
 
@@ -1919,6 +2336,34 @@ def build_parser():
                         "the helper actually returns the stored token — hub "
                         "cannot test the write path without the token.")
     p.set_defaults(func=_wrap_setup)
+
+    p = sub.add_parser(
+        "key-init",
+        help="Generate (if needed) and register this agent's E2EE identity key",
+    )
+    p.set_defaults(func=cmd_key_init)
+
+    p = sub.add_parser(
+        "key-backup",
+        help="Write an Argon2id-encrypted backup of the identity private key",
+    )
+    p.add_argument("--out", default=None, help="Backup file path (else prompted)")
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite an existing backup file")
+    p.set_defaults(func=cmd_key_backup)
+
+    p = sub.add_parser(
+        "key-restore",
+        help="Restore the identity private key from a recovery phrase or backup file",
+    )
+    p.add_argument("--backup-file", default=None,
+                   help="Restore from an encrypted backup file (else paste "
+                        "the 24-word recovery phrase at the prompt)")
+    p.add_argument("--phrase-file", default=None,
+                   help="Read the recovery phrase from a file instead of prompting")
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite an existing identity key")
+    p.set_defaults(func=cmd_key_restore)
 
     p = sub.add_parser("sync", help="Print new entries across all visible topics")
     p.add_argument("--limit", type=int, default=200)

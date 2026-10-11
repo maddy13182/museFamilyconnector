@@ -1,0 +1,15 @@
+# Pinned runtime dependencies for the `hub` CLI (agent-skill/hub).
+#
+# The stdlib-only property ended with E2EE Phase 1 (identity keys):
+# Python's standard library has no AEAD and no X25519, so key generation
+# and backup encryption need libsodium bindings.
+#
+# - PyNaCl: X25519 keypairs, Argon2id KDF, XChaCha20-Poly1305 (all via
+#   libsodium; the sealed-box construction is NOT hand-rolled).
+# - mnemonic: BIP-39 24-word recovery phrases. Using the package instead
+#   of an inlined wordlist + hand-rolled checksum keeps the
+#   error-prone part (BIP-39 checksum/wordlist handling) in tested code.
+#
+# Install: pip install -r requirements.txt
+PyNaCl==1.6.2
+mnemonic==0.21
