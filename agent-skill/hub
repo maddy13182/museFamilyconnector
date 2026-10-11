@@ -32,20 +32,23 @@ Python 3, standard library only.
 
 import argparse
 import getpass
+import http.client
 import json
 import os
+import random
 import re
 import shlex
 import socket
 import stat
 import subprocess  # nosec B404 -- used only for the operator-configured vault helper (shell=False)
 import sys
+import time
 import uuid
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -323,10 +326,17 @@ def check_pii(*texts):
 class HubError(Exception):
     """A failure talking to the Hub. exit_code maps to process exit status."""
 
-    def __init__(self, code, message, http_status=None):
+    def __init__(self, code, message, http_status=None, server_code=None):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+        # The server's own error.code (e.g. "code_used", "circle_name_taken"),
+        # preserved verbatim for programmatic handling. `code` stays the
+        # friendly mapped value.
+        self.server_code = server_code
+        # The raw response payload (if any), for recovery flows that need
+        # fields beyond the error (e.g. the member on already_redeemed).
+        self.details = {}
         self.exit_code = 1
 
     def friendly(self):
@@ -399,12 +409,44 @@ def _friendly_from_http(status, payload):
         code = short
     exc = HubError(code, "%s (http %d)" % (message, status), http_status=status)
     exc.exit_code = exit_code
+    # Preserve the server's verbatim error code for programmatic handling
+    # (retry/recovery decisions). Not part of the friendly message.
+    if isinstance(payload, dict):
+        server_code = (payload.get("error") or {}).get("code")
+        if isinstance(server_code, str) and server_code:
+            exc.server_code = server_code
+    if isinstance(payload, dict):
+        exc.details = payload
     return exc
 
 
 # ---------------------------------------------------------------------------
 # HTTP client (urllib; a fake transport can be injected for tests)
 # ---------------------------------------------------------------------------
+
+
+def _auto_idem_key(path):
+    """True when a POST to this path should auto-carry an idempotency key.
+
+    Covers the create operations (circle/topic/invite/provisioning-code).
+    Redeem/accept paths are deliberately excluded: their codes are single-use
+    by design, and a key would give a false sense of retry safety.
+    """
+    if path in ("/v1/families", "/v1/topics", "/v1/provisioning-codes"):
+        return True
+    return bool(re.match(r"^/v1/families/[^/]+/invites$", path))
+
+
+# Network-level failures worth retrying. Note http.client.RemoteDisconnected
+# ("Remote end closed connection without response") is NOT wrapped in
+# URLError by urlopen — it propagates raw, which is exactly what bit the
+# circle-create flow.
+_RETRYABLE_EXC = (
+    OSError,
+    http.client.HTTPException,
+    TimeoutError,
+    socket.timeout,
+)
 
 
 class _NoRedirect(urlrequest.HTTPRedirectHandler):
@@ -459,7 +501,7 @@ class HubClient:
             k: ("[redacted]" if k.lower() == "authorization" else v)
             for k, v in headers.items()
         }
-        emit_err("--- hub debug ---")
+        emit_err("--- hub debug [%s] ---" % time.strftime("%H:%M:%S"))
         emit_err("%s %s" % (method, _scrub_url(url)))
         emit_err("request headers: %s" % json.dumps(safe_headers))
         if body_bytes:
@@ -472,8 +514,53 @@ class HubClient:
         emit_err("--- end debug ---")
 
     # -- public ---------------------------------------------------------
+    def _transport_with_retry(self, method, url, headers, body_bytes, retries):
+        """Run the transport with exponential backoff.
+
+        Retries network-level failures (dropped connections, timeouts),
+        HTTP 429 (honoring Retry-After) and 5xx. Never retries 4xx: those are
+        deterministic. Every retry reuses the same idempotency key (set by the
+        caller), so retried creates cannot duplicate.
+        """
+        last_status = None
+        last_text = None
+        for attempt in range(retries + 1):
+            try:
+                status, resp_text = self.transport(method, url, headers, body_bytes)
+            except _RETRYABLE_EXC as exc:
+                reason = "network error: %s" % exc
+                status, resp_text = None, None
+            except HubError as exc:
+                if exc.code != "connection":
+                    raise
+                reason = "connection error: %s" % exc
+                status, resp_text = None, None
+            else:
+                if status == 429 or status >= 500:
+                    reason = "http %d" % status
+                else:
+                    return status, resp_text
+            last_status, last_text = status, resp_text
+            if attempt >= retries:
+                break
+            delay = min(2 ** attempt, 8) + random.uniform(0, 1)
+            if self.debug:
+                emit_err(
+                    "hub debug [%s]: %s %s failed (%s); retry %d/%d in %.1fs"
+                    % (time.strftime("%H:%M:%S"), method, _scrub_url(url), reason,
+                       attempt + 1, retries, delay)
+                )
+            time.sleep(delay)
+        if last_status is not None:
+            return last_status, last_text
+        raise HubError(
+            "connection",
+            "Cannot reach %s after %d attempts (%s)"
+            % (self.base_url, retries + 1, reason),
+        )
+
     def call(self, method, path, query=None, json_body=None,
-             idempotency_key=None, auth=True):
+             idempotency_key=None, auth=True, retries=3):
         url = self.base_url + path
         if query:
             url += "?" + urlparse.urlencode(query)
@@ -491,9 +578,16 @@ class HubClient:
         if json_body is not None:
             body_bytes = json.dumps(json_body).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        # Mutating POSTs always carry an idempotency key so a retried request
+        # can never duplicate the operation. Generated once per call, shared
+        # across all retry attempts. Redeem/accept paths are excluded: their
+        # codes are single-use by design.
+        if idempotency_key is None and method == "POST" and _auto_idem_key(path):
+            idempotency_key = uuid.uuid4().hex
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        status, resp_text = self.transport(method, url, headers, body_bytes)
+        status, resp_text = self._transport_with_retry(
+            method, url, headers, body_bytes, retries)
         if self.debug:
             self._debug_dump(method, url, headers, body_bytes, status, resp_text)
         if 200 <= status < 300:
@@ -1266,25 +1360,59 @@ def cmd_circle_create(args, transport):
     if not name:
         raise HubError("bad_request", "A non-empty --name is required.")
     check_pii(name)
-    circle = ctx.client.call(
-        "POST",
-        "/v1/families",
-        json_body={"name": name, "kind": args.kind},
-    ) or {}
-    cid = circle.get("id")
-    if not cid:
-        raise HubError("error", "Server did not return a circle id.")
-    code = circle.get("provisioning_code")
-    if not code:
-        # Older server: no auto-redeem possible; fall back to manual steps.
-        emit('created circle "%s" (id=%s)' % (circle.get("name", name), cid))
-        emit("select it with: hub circle use %s" % cid)
-        return 0
-    # Auto-redeem: mint this agent's token for the new circle immediately,
-    # so the creator can use it without a second round-trip.
-    token, member = _redeem_code(
-        ctx.server, transport, args.debug, code,
-    )
+    # One idempotency key for the whole create→redeem flow, generated up
+    # front: any retry (dropped connection, lost response) reuses it, so the
+    # server returns the already-created circle instead of duplicating it.
+    idem_key = uuid.uuid4().hex
+    circle = None
+    for cycle in range(3):
+        try:
+            circle = ctx.client.call(
+                "POST",
+                "/v1/families",
+                json_body={"name": name, "kind": args.kind},
+                idempotency_key=idem_key,
+            ) or {}
+        except HubError as exc:
+            if exc.server_code == "circle_name_taken":
+                raise HubError(
+                    "bad_request",
+                    'A circle named "%s" already exists. Circle names are '
+                    "unique — pick another name or join the existing one with "
+                    "`hub circles`." % name,
+                )
+            raise
+        cid = circle.get("id")
+        if not cid:
+            raise HubError("error", "Server did not return a circle id.")
+        code = circle.get("provisioning_code")
+        if not code:
+            # Older server: no auto-redeem possible; fall back to manual steps.
+            emit('created circle "%s" (id=%s)' % (circle.get("name", name), cid))
+            emit("select it with: hub circle use %s" % cid)
+            return 0
+        if circle.get("deduped") and args.debug:
+            emit_err("hub debug: create dedup hit — server re-issued a fresh code")
+        # Auto-redeem: mint this agent's token for the new circle immediately,
+        # so the creator can use it without a second round-trip.
+        try:
+            token, member = _redeem_code(
+                ctx.server, transport, args.debug, code,
+            )
+        except HubError as exc:
+            # The redeem landed but its response was lost: the code is spent
+            # and we hold no token. Loop back — the keyed create dedups and
+            # hands us a fresh code.
+            if exc.server_code == "code_used" and cycle < 2:
+                if args.debug:
+                    emit_err("hub debug: redeem already applied; re-issuing via dedup")
+                continue
+            raise
+        break
+    else:
+        raise HubError("error", "Circle created but the token could not be issued; "
+                                "run `hub circles` to check, then `hub circle join --code` "
+                                "with a fresh code from an owner.")
     if member.get("family_id") and member.get("family_id") != cid:
         raise HubError(
             "error",
@@ -1311,10 +1439,27 @@ def cmd_circle_join(args, transport):
     member = ctx.cfg.get("member") or {}
     display_name = (args.name or member.get("name") or "").strip()
     agent_label = (args.label or ctx.cfg.get("agent_label") or "").strip()
-    token, new_member = _redeem_code(
-        ctx.server, transport, args.debug, code,
-        display_name=display_name, agent_label=agent_label,
-    )
+    try:
+        token, new_member = _redeem_code(
+            ctx.server, transport, args.debug, code,
+            display_name=display_name, agent_label=agent_label,
+        )
+    except HubError as exc:
+        # The redeem landed but its response was lost: this code is spent and
+        # we hold no token. The server tells us who the member is — surface a
+        # precise recovery step instead of a cryptic error.
+        if exc.server_code in ("code_used", "invite_used"):
+            member_info = (exc.details or {}).get("member") or {}
+            who = member_info.get("name") or display_name or "you"
+            where = member_info.get("family_id") or "the circle"
+            raise HubError(
+                "auth",
+                "This code was already used — %s is already a member (%s) but "
+                "this device holds no token for it. Ask an owner for a fresh "
+                "invite code and run `hub circle join --code` again."
+                % (who, where),
+            )
+        raise
     cid = new_member.get("family_id")
     if not cid:
         raise HubError("error", "Redeem response did not identify a circle.")

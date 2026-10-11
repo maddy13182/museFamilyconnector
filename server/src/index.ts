@@ -49,8 +49,85 @@ const SERVER_VERSION: string = pkg.version;
 const MAX_BODY = 20000;
 const MAX_DATA = 20000;
 const IDEM_TTL_HOURS = 24;
+const IDEM_CREATE_TTL_HOURS = 24;
 const PROVISION_TTL_HOURS = 24;
 const INVITE_TTL_DAYS = 7;
+
+// Idempotency for create operations (family/topic/invite). Entries use the
+// separate idempotency_keys table; creates use create_idempotency, which also
+// remembers the provisioning code so a deduped retry can mint a fresh one
+// and revoke the orphaned token from the first attempt.
+type CreateScope = 'family' | 'topic' | 'invite';
+
+function readIdemKey(req: Request): string | null {
+  const k = req.headers.get('idempotency-key');
+  if (k === null) return null;
+  if (k.length === 0 || k.length > 128) {
+    throw new HttpError(400, 'bad_request', 'Idempotency-Key must be 1-128 chars');
+  }
+  return k;
+}
+
+async function findCreateIdem(
+  db: DbClient,
+  scope: CreateScope,
+  memberId: string,
+  key: string,
+): Promise<Record<string, unknown> | null> {
+  return await db.queryOne(
+    `SELECT * FROM create_idempotency
+       WHERE scope = ? AND member_id = ? AND key = ? AND expires_at > ?`,
+    [scope, memberId, key, nowIso()],
+  );
+}
+
+async function recordCreateIdem(
+  db: DbClient,
+  scope: CreateScope,
+  memberId: string,
+  key: string,
+  resourceId: string,
+  codeHash: string | null,
+): Promise<void> {
+  const ts = nowIso();
+  await db.execAtomically([
+    {
+      sql: `INSERT OR REPLACE INTO create_idempotency
+              (scope, member_id, key, resource_id, code_hash, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      params: [scope, memberId, key, resourceId, codeHash, ts, hoursFromNow(IDEM_CREATE_TTL_HOURS)],
+    },
+  ]);
+  logEvent('info', 'idempotency_stored', { scope, key });
+}
+
+// Mint a single-use provisioning code. Shared by circle creation, the manual
+// mint endpoint, and the dedup path (which issues a FRESH code — the original
+// code's plaintext is unrecoverable once stored as a hash).
+async function mintProvisioningCode(
+  db: DbClient,
+  env: Env,
+  opts: { familyId: string; memberId: string; agentLabel: string; createdBy: string },
+): Promise<{ code: string; codeHash: string; expiresAt: string }> {
+  const code = newProvisioningCode();
+  const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
+  const expiresAt = hoursFromNow(PROVISION_TTL_HOURS);
+  await db.execAtomically([
+    {
+      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
+            VALUES (?,?,?,?,?,?,NULL)`,
+      params: [codeHash, opts.familyId, opts.memberId, opts.agentLabel, opts.createdBy, expiresAt],
+    },
+  ]);
+  logEvent('info', 'provisioning_code_minted', {});
+  return { code, codeHash, expiresAt };
+}
+
+// True when the DB error is a UNIQUE constraint violation (used to convert
+// racy inserts into clean 409s instead of 500s).
+function isUniqueViolation(e: unknown): boolean {
+  return e instanceof Error && /unique constraint failed/i.test(e.message);
+}
 
 // Structured logging. Every line carries the server version so log streams
 // can be correlated with releases. Never log tokens, codes, or request
@@ -332,6 +409,14 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
   const ownerName = reqString(body['owner_name'], 'owner_name', 1, 120);
   const ownerEmail = reqEmail(body['owner_email'], 'owner_email');
 
+  const nameTaken = await db.queryOne(
+    `SELECT 1 FROM families WHERE name = ? COLLATE NOCASE LIMIT 1`,
+    [name],
+  );
+  if (nameTaken) {
+    throw new HttpError(409, 'circle_name_taken', `A circle named "${name}" already exists`);
+  }
+
   const familyId = newId();
   const memberId = newId();
   const ts = nowIso();
@@ -399,11 +484,34 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
   }
   const kind =
     body['kind'] === undefined ? 'family' : reqEnum(body['kind'], 'kind', FAMILY_KINDS);
+  const idemKey = readIdemKey(req);
 
   const me = await db.queryOne(`SELECT name, email FROM members WHERE id = ?`, [auth.member_id]);
   if (!me) throw new HttpError(401, 'unauthorized', 'Unknown token');
   const creatorName = me['name'] as string;
   const creatorEmail = me['email'] as string;
+
+  // Idempotent retry: the client never got the first response, but the work
+  // is done. Return the existing circle with a FRESH provisioning code (the
+  // original code's plaintext is unrecoverable) instead of duplicating it.
+  if (idemKey) {
+    const prior = await findCreateIdem(db, 'family', auth.member_id, idemKey);
+    if (prior) {
+      logEvent('info', 'idempotency_hit', { scope: 'family', key: idemKey });
+      return await dedupFamilyCreate(db, env, auth, prior['resource_id'] as string, idemKey, prior['code_hash'] as string | null);
+    }
+  }
+
+  // Circle names are unique (case-insensitive) — identical names are almost
+  // always an accident, and ambiguity here is dangerous.
+  const nameTaken = await db.queryOne(
+    `SELECT 1 FROM families WHERE name = ? COLLATE NOCASE LIMIT 1`,
+    [name],
+  );
+  if (nameTaken) {
+    logEvent('warn', 'circle_name_conflict', {});
+    throw new HttpError(409, 'circle_name_taken', `A circle named "${name}" already exists`);
+  }
 
   const familyId = newId();
   const memberId = newId();
@@ -411,7 +519,7 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
   const code = newProvisioningCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const provisionExpiresAt = hoursFromNow(PROVISION_TTL_HOURS);
-  await db.execAtomically([
+  const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
       sql: `INSERT INTO families(id, name, kind, created_at) VALUES (?,?,?,?)`,
       params: [familyId, name, kind, ts],
@@ -425,7 +533,35 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
             VALUES (?,?,?,?,?,?,NULL)`,
       params: [codeHash, familyId, memberId, 'owner-agent', auth.member_id, provisionExpiresAt],
     },
-  ]);
+  ];
+  if (idemKey) {
+    ops.push({
+      sql: `INSERT OR REPLACE INTO create_idempotency
+              (scope, member_id, key, resource_id, code_hash, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?)`,
+      params: ['family', auth.member_id, idemKey, familyId, codeHash, ts, hoursFromNow(IDEM_CREATE_TTL_HOURS)],
+    });
+  }
+  try {
+    await db.execAtomically(ops);
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      // Lost a race: re-read to find out whether it was the name or the key.
+      if (idemKey) {
+        const prior = await findCreateIdem(db, 'family', auth.member_id, idemKey);
+        if (prior) {
+          return await dedupFamilyCreate(db, env, auth, prior['resource_id'] as string, idemKey, prior['code_hash'] as string | null);
+        }
+      }
+      const taken = await db.queryOne(
+        `SELECT 1 FROM families WHERE name = ? COLLATE NOCASE LIMIT 1`,
+        [name],
+      );
+      if (taken) throw new HttpError(409, 'circle_name_taken', `A circle named "${name}" already exists`);
+    }
+    throw e;
+  }
+  logEvent('info', 'idempotency_stored', { scope: 'family', key: idemKey ?? '(none)' });
   return json(
     {
       id: familyId,
@@ -436,6 +572,62 @@ async function handleCreateFamilyLocked(db: DbClient, env: Env, req: Request): P
       provisioning_expires_at: provisionExpiresAt,
     },
     201,
+  );
+}
+
+// Shared dedup response for POST /v1/families with a repeated idempotency key.
+// Issues a FRESH provisioning code for the already-created circle and revokes
+// the orphaned token if the original code was redeemed — the retry proves the
+// client never received that token.
+async function dedupFamilyCreate(
+  db: DbClient,
+  env: Env,
+  auth: AuthContext,
+  familyId: string,
+  idemKey: string,
+  origCodeHash: string | null,
+): Promise<Response> {
+  const family = await db.queryOne(`SELECT * FROM families WHERE id = ?`, [familyId]);
+  if (!family) throw new HttpError(500, 'internal', 'Idempotency record points at a missing circle');
+  const member = await db.queryOne(
+    `SELECT * FROM members WHERE family_id = ? AND email = (SELECT email FROM members WHERE id = ?)`,
+    [familyId, auth.member_id],
+  );
+  if (!member) throw new HttpError(500, 'internal', 'Idempotency record points at a missing member');
+  if (origCodeHash) {
+    const pc = await db.queryOne(
+      `SELECT redeemed_token_id FROM provisioning_codes WHERE code_hash = ?`,
+      [origCodeHash],
+    );
+    const orphanTid = pc?.['redeemed_token_id'] as string | null;
+    if (orphanTid) {
+      await db.execAtomically([
+        {
+          sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL`,
+          params: [nowIso(), orphanTid],
+        },
+      ]);
+      logEvent('info', 'orphan_token_revoked', {});
+    }
+  }
+  const minted = await mintProvisioningCode(db, env, {
+    familyId,
+    memberId: member['id'] as string,
+    agentLabel: 'owner-agent',
+    createdBy: auth.member_id,
+  });
+  await recordCreateIdem(db, 'family', auth.member_id, idemKey, familyId, minted.codeHash);
+  return json(
+    {
+      id: familyId,
+      name: family['name'],
+      kind: family['kind'],
+      created_at: family['created_at'],
+      provisioning_code: minted.code,
+      provisioning_expires_at: minted.expiresAt,
+      deduped: true,
+    },
+    200,
   );
 }
 
@@ -481,6 +673,27 @@ async function handleCreateInvite(
   if (role === 'owner' && auth.role !== 'owner') {
     throw new HttpError(403, 'forbidden', 'Only the owner can invite another owner');
   }
+  const idemKey = readIdemKey(req);
+  if (idemKey) {
+    const prior = await findCreateIdem(db, 'invite', auth.member_id, idemKey);
+    if (prior) {
+      // Fresh invite code for the same (email, role): the original code's
+      // plaintext is unrecoverable, and the invitee never got it.
+      logEvent('info', 'idempotency_hit', { scope: 'invite', key: idemKey });
+      const code = newInviteCode();
+      const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
+      const expiresAt = daysFromNow(INVITE_TTL_DAYS);
+      await db.execAtomically([
+        {
+          sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
+                VALUES (?,?,?,?,?,?,NULL)`,
+          params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
+        },
+      ]);
+      await recordCreateIdem(db, 'invite', auth.member_id, idemKey, codeHash, null);
+      return json({ invite_code: code, expires_at: expiresAt, deduped: true });
+    }
+  }
   const existing = await db.queryOne(
     `SELECT id FROM members WHERE family_id = ? AND email = ?`,
     [auth.family_id, email],
@@ -497,6 +710,7 @@ async function handleCreateInvite(
       params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
     },
   ]);
+  if (idemKey) await recordCreateIdem(db, 'invite', auth.member_id, idemKey, codeHash, null);
   return json({ invite_code: code, expires_at: expiresAt }, 201);
 }
 
@@ -514,7 +728,20 @@ async function handleAcceptInvite(
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const invite = await db.queryOne(`SELECT * FROM invites WHERE code_hash = ?`, [codeHash]);
   if (!invite) throw new HttpError(404, 'not_found', 'Invite not found');
-  if (invite['used_at']) throw new HttpError(409, 'invite_used', 'Invite already used');
+  if (invite['used_at']) {
+    const existingMember = await db.queryOne(
+      `SELECT * FROM members WHERE family_id = ? AND email = ?`,
+      [invite['family_id'] as string, invite['email'] as string],
+    );
+    return json(
+      {
+        error: { code: 'invite_used', message: 'Invite already used' },
+        member: existingMember ? publicMember(existingMember) : null,
+        token_already_issued: true,
+      },
+      409,
+    );
+  }
   if ((invite['expires_at'] as string) <= nowIso()) {
     throw new HttpError(410, 'invite_expired', 'Invite expired');
   }
@@ -581,17 +808,13 @@ async function handleMintProvisioning(
   if (!selfMint && auth.role !== 'owner' && auth.role !== 'parent') {
     throw new HttpError(403, 'forbidden', 'Only owner/parent can mint codes for other members');
   }
-  const code = newProvisioningCode();
-  const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
-  const expiresAt = hoursFromNow(PROVISION_TTL_HOURS);
-  await db.execAtomically([
-    {
-      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at)
-            VALUES (?,?,?,?,?,?,NULL)`,
-      params: [codeHash, auth.family_id, memberId, agentLabel, auth.member_id, expiresAt],
-    },
-  ]);
-  return json({ provisioning_code: code, expires_at: expiresAt }, 201);
+  const minted = await mintProvisioningCode(db, env, {
+    familyId: auth.family_id,
+    memberId,
+    agentLabel,
+    createdBy: auth.member_id,
+  });
+  return json({ provisioning_code: minted.code, expires_at: minted.expiresAt }, 201);
 }
 
 // POST /v1/provisioning-codes/:code/redeem — no auth; the code is the credential.
@@ -605,7 +828,20 @@ async function handleRedeemProvisioning(
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const pc = await db.queryOne(`SELECT * FROM provisioning_codes WHERE code_hash = ?`, [codeHash]);
   if (!pc) throw new HttpError(404, 'not_found', 'Provisioning code not found');
-  if (pc['used_at']) throw new HttpError(409, 'code_used', 'Provisioning code already used');
+  if (pc['used_at']) {
+    // Explicit, actionable shape (not a generic 409): the client can tell the
+    // user they are already a member but this device holds no token, and ask
+    // an owner for a fresh code.
+    const member = await db.queryOne(`SELECT * FROM members WHERE id = ?`, [pc['member_id'] as string]);
+    return json(
+      {
+        error: { code: 'code_used', message: 'Provisioning code already used' },
+        member: member ? publicMember(member) : null,
+        token_already_issued: true,
+      },
+      409,
+    );
+  }
   if ((pc['expires_at'] as string) <= nowIso()) {
     throw new HttpError(410, 'code_expired', 'Provisioning code expired');
   }
@@ -617,7 +853,10 @@ async function handleRedeemProvisioning(
   const tokenId = newId();
   const ts = nowIso();
   await db.execAtomically([
-    { sql: `UPDATE provisioning_codes SET used_at = ? WHERE code_hash = ?`, params: [ts, codeHash] },
+    {
+      sql: `UPDATE provisioning_codes SET used_at = ?, redeemed_token_id = ? WHERE code_hash = ?`,
+      params: [ts, tokenId, codeHash],
+    },
     {
       sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
             VALUES (?,?,?, ?,?,NULL,NULL)`,
@@ -712,6 +951,16 @@ async function handleCreateTopic(
   const subject = reqString(body['subject'], 'subject', 1, 200);
   const kind = reqEnum(body['kind'], 'kind', ['direct', 'group'] as const);
   const parentsOnly = body['parents_only'] === true;
+  const idemKey = readIdemKey(req);
+  if (idemKey) {
+    const prior = await findCreateIdem(db, 'topic', auth.member_id, idemKey);
+    if (prior) {
+      logEvent('info', 'idempotency_hit', { scope: 'topic', key: idemKey });
+      const topic = await db.queryOne(`SELECT * FROM topics WHERE id = ?`, [prior['resource_id'] as string]);
+      if (!topic) throw new HttpError(500, 'internal', 'Idempotency record points at a missing topic');
+      return json({ topic, deduped: true });
+    }
+  }
   // Group topics may pass an empty list: the creator is auto-added below.
   // Direct topics still require exactly 2 participants (checked after).
   let ids = reqIdArray(body['participant_member_ids'], 'participant_member_ids', 20, 0);
@@ -764,6 +1013,7 @@ async function handleCreateTopic(
     })),
   ];
   await db.execAtomically(ops);
+  if (idemKey) await recordCreateIdem(db, 'topic', auth.member_id, idemKey, topicId, null);
   const topic = await db.queryOne(`SELECT * FROM topics WHERE id = ?`, [topicId]);
   return json({ topic }, 201);
 }
