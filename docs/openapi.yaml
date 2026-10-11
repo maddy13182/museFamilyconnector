@@ -883,6 +883,43 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/topics/{tid}/participants/{mid}:
+    delete:
+      tags: [topics]
+      operationId: removeTopicParticipant
+      summary: Remove a member from a topic
+      description: |
+        Caller must be a participant AND have role owner/parent (same 403 rule
+        as the topic invite endpoint). The removal is logged as a `member_left`
+        entry naming the member. Cannot remove the last participant.
+        E2EE note: the removed member's sealed envelopes are kept (they
+        already held the old key), but no NEW envelopes can be posted for
+        them — run a key rotation (`hub topic-rekey`) immediately after to
+        lock them out of new content.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+        - name: mid
+          in: path
+          required: true
+          schema: { type: string }
+          description: Member id to remove.
+      responses:
+        '200':
+          description: Member removed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed:
+                    type: string
+                    description: Member id removed from the topic.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/topics/{tid}/spawn:
     post:
       tags: [topics]
@@ -941,10 +978,14 @@ paths:
       operationId: postEntry
       summary: Post an entry (message)
       description: |
-        Caller must be a participant. Only `kind: message` is client-settable;
-        all other kinds are server-generated. Supports `Idempotency-Key` header:
-        retries with the same key return the original entry (`deduped: true`)
-        instead of creating a duplicate. Body is PII-scanned before insert.
+        Caller must be a participant. Client-settable kinds: `message` plus
+        the E2EE Phase 4 plaintext system kinds `key_rotated`,
+        `key_request`, and `pending_key_distribution` — these MUST stay
+        plaintext (even on E2EE topics) so agents without the topic key can
+        read them; all other kinds are server-generated. Supports
+        `Idempotency-Key` header: retries with the same key return the
+        original entry (`deduped: true`) instead of creating a duplicate.
+        Body is PII-scanned before insert.
       parameters:
         - $ref: '#/components/parameters/TopicId'
         - name: Idempotency-Key
@@ -962,7 +1003,7 @@ paths:
               properties:
                 kind:
                   type: string
-                  enum: [message]
+                  enum: [message, key_rotated, key_request, pending_key_distribution]
                   default: message
                 body: { type: string, minLength: 1, maxLength: 20000 }
                 reply_to_seq:
@@ -1452,7 +1493,7 @@ components:
       enum: [full, from_join]
     EntryKind:
       type: string
-      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction]
+      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction, key_rotated, key_request, pending_key_distribution]
     TaskStatus:
       type: string
       enum: [open, in_progress, blocked, done, cancelled]

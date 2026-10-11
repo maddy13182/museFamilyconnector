@@ -39,7 +39,13 @@ CREATE TABLE entries_new(
   kind TEXT NOT NULL CHECK(kind IN (
     'message','briefing','member_joined','member_left','topic_spawned',
     'task_created','task_assigned','task_status','task_updated','task_note','task_done',
-    'redaction')),
+    'redaction',
+    -- E2EE Phase 4 system kinds (client-posted, plaintext by design):
+    -- key_rotated announces a topic-key rotation, key_request asks members
+    -- for the current topic key, pending_key_distribution marks "member
+    -- added, envelopes not yet sealed". Added here (not 0001) because this
+    -- rebuild defines the effective constraint.
+    'key_rotated','key_request','pending_key_distribution')),
   body TEXT NOT NULL,
   data TEXT NULL,            -- JSON, machine payloads
   reply_to_seq INTEGER NULL,
