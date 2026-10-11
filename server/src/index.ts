@@ -202,6 +202,41 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+// Security headers, applied to EVERY response in handleRequest() (the worker
+// has no other response path). CSP notes — kept restrictive without breaking
+// the dashboard (/), which is a single self-contained HTML page:
+// - script-src/style-src 'unsafe-inline': the dashboard ships one inline
+//   <script> and one inline <style> and has no build step, so a nonce would
+//   require per-request HTML rewriting. Inline code is ours (ui.ts escapes
+//   all entry text before rendering), so the residual inline-XSS risk is
+//   accepted and documented here. No external script/style/object sources
+//   are allowed at all.
+// - connect-src 'self' https:: the dashboard's "API base" field lets the
+//   operator point it at a different origin (e.g. a custom domain); 'self'
+//   alone would break that feature. https: still blocks cleartext exfil.
+// - frame-ancestors 'none' (+ X-Frame-Options: DENY for legacy browsers):
+//   the dashboard must never be framed (clickjacking a token-paste page).
+function securityHeaders(): Record<string, string> {
+  return {
+    'content-security-policy':
+      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+      "connect-src 'self' https:; base-uri 'self'; form-action 'self'; " +
+      "frame-ancestors 'none'",
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+  };
+}
+
+/** Stamp the security headers onto a response (mutates and returns it). */
+function withSecurityHeaders(res: Response): Response {
+  const headers = securityHeaders();
+  for (const name of Object.keys(headers)) {
+    res.headers.set(name, headers[name] as string);
+  }
+  return res;
+}
+
 async function readJson(req: Request): Promise<Record<string, unknown>> {
   let body: unknown;
   try {
@@ -1849,7 +1884,7 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
       status: res.status,
       ms: Date.now() - start,
     });
-    return res;
+    return withSecurityHeaders(res);
   } catch (e) {
     // routeRequest converts all expected errors to responses; this is the
     // last resort so a request never goes unlogged.
@@ -1860,7 +1895,9 @@ export async function handleRequest(req: Request, db: DbClient, env: Env): Promi
       code: 'internal',
       ms: Date.now() - start,
     });
-    return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
+    return withSecurityHeaders(
+      json({ error: { code: 'internal', message: 'Internal server error' } }, 500),
+    );
   }
 }
 
@@ -1983,11 +2020,15 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (!env.DB) {
       logEvent('error', 'misconfigured', { detail: 'D1 binding DB is not configured' });
-      return json({ error: { code: 'misconfigured', message: 'D1 binding DB is not configured' } }, 500);
+      return withSecurityHeaders(
+        json({ error: { code: 'misconfigured', message: 'D1 binding DB is not configured' } }, 500),
+      );
     }
     if (!env.TOKEN_PEPPER) {
       logEvent('error', 'misconfigured', { detail: 'TOKEN_PEPPER secret is not set' });
-      return json({ error: { code: 'misconfigured', message: 'TOKEN_PEPPER secret is not set' } }, 500);
+      return withSecurityHeaders(
+        json({ error: { code: 'misconfigured', message: 'TOKEN_PEPPER secret is not set' } }, 500),
+      );
     }
     return await handleRequest(req, d1Client(env.DB), env);
   },

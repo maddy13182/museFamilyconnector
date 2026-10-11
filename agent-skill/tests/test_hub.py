@@ -548,14 +548,27 @@ class TestCommands(HubTestBase):
         self.assertEqual(rc, 1)
         self.assertIn("exactly 2", err)
 
-    def test_me_needs_no_token(self):
-        os.environ.pop("FAMILY_HUB_TOKEN")
-        self.seed_config()
+    def test_me_reflects_server_identity_not_local_config(self):
+        # The local config caches the legacy bootstrap member, which goes
+        # stale across circles. /v1/me is the truth: a kid's agent must never
+        # report the owner's cached record as itself.
+        self.seed_config(
+            member={"id": "stale-owner", "name": "Owner", "role": "owner"})
+        self.fake.add("GET", "/v1/me", 200, {
+            "id": "m-kid", "family_id": "f1", "name": "Kid",
+            "email": "kid@example.com", "role": "kid",
+            "created_at": "2026-01-01T00:00:00Z", "agent_label": "kid-agent",
+        })
         rc, out, _ = self.run_cli(["me"])
         self.assertEqual(rc, 0)
         me = json.loads(out)
-        self.assertEqual(me["member"]["id"], "m1")
-        self.assertNotIn("FAMILY_HUB_TOKEN", out)
+        self.assertEqual(me["member"]["id"], "m-kid")
+        self.assertEqual(me["member"]["role"], "kid")
+        self.assertEqual(me["member"]["agent_label"], "kid-agent")
+        self.assertTrue(self.fake.last_url().endswith("/v1/me"),
+                        "hub me must query GET /v1/me")
+        self.assertNotIn("stale-owner", out)
+        self.assertTokenAbsent(out)
 
     def test_missing_server(self):
         os.environ.pop("FAMILY_HUB_TOKEN", None)
