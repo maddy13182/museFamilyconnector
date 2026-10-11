@@ -43,28 +43,45 @@ rotation marks superseded, directory access control.
 ## Phase 2 — E2EE topics + envelopes
 
 **Server:**
-- Migration `0009`: `topics.e2ee INTEGER DEFAULT 0`; new table
-  `topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope BLOB, created_at)`.
+- Base schema (folded into `0001_init.sql`; clean slate, no 0008/0009):
+  `topics.e2ee INTEGER DEFAULT 0`, `topics.current_key_id TEXT NULL`, and
+  `topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope TEXT, created_at)`.
 - `POST /v1/topics` gains `e2ee: 0|1`. `e2ee=1` requires the creator's agent
-  to have a registered public key (else 400 with guidance).
+  to have a registered public key (else 400 with guidance) AND
+  `initial_key_id` (the creator's 32-hex topic key id) — recorded as
+  `topics.current_key_id`, the single source of truth clients use to elect
+  the encryption key (secfix F1).
 - `POST /v1/topics/:id/envelopes` — accepts `{member_id, agent_label, key_id,
   envelope}`. Server enforces: caller is a current participant; target is a
-  current participant with a registered key. The envelope blob is opaque —
-  stored, never inspected.
+  current participant with a registered key; a `key_id` different from
+  `current_key_id` introduces a new key (rotation) — owner/parent only (403
+  otherwise) — and advances `current_key_id` atomically (secfix F1). The
+  envelope blob is opaque — stored, never inspected. Re-POST preserves the
+  original `created_at` (secfix F3: `ON CONFLICT DO UPDATE SET
+  envelope=excluded.envelope`).
 - `GET /v1/topics/:id/envelopes` — returns the *caller's own* envelopes only
   (one agent can't fetch another's).
+- `PATCH /v1/topics/:id/subject` — participant-only, E2EE-only subject
+  replacement so the CLI can re-encrypt the subject with the topic-bound
+  AAD immediately after creation (secfix F4).
 - Plaintext topics behave byte-identically to today (design §9).
 
 **CLI:**
 - `hub new-topic --e2ee --subject … --with …`: generates 32-byte topic key +
-  128-bit key_id locally, encrypts the subject, fetches participants' public
-  keys from the directory, seals one envelope per agent, POSTs topic +
+  128-bit key_id locally, encrypts the subject, POSTs topic with `e2ee: 1`
+  and `initial_key_id`, PATCHes the subject re-encrypted with the
+  topic-bound AAD `b"fh-topic-subject-v1" + 0x00 + topic_id` (secfix F4),
+  fetches participants' public keys from the directory, seals one envelope
+  per agent (`topic_id || 0x00 || key_id || topic_key`, secfix F2), POSTs
   envelopes.
 - Key storage: `~/.config/family-hub/profiles/<name>/topic_keys/<topic_id>.json`
-  (0600), mapping key_id → key.
+  (0600), mapping key_id → key. Key election reads the server-advertised
+  `current_key_id`, never envelope recency (secfix F1); `hub topic-rekey`
+  requires owner/parent role client-side too.
 
 **Tests:** E2EE topic create, envelope distribution, non-participant 403,
-plaintext topics unaffected.
+plaintext topics unaffected; secfix regressions (rotation privilege,
+created_at preservation, subject PATCH, transplant rejection, KDF bounds).
 
 ## Phase 3 — Encrypted messaging
 

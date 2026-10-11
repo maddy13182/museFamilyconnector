@@ -79,7 +79,14 @@ async function addMember(
 async function makeTopic(app: TestApp, token: string, e2ee: number): Promise<string> {
   const topic = await app.call('POST', '/v1/topics', {
     token,
-    body: { subject: e2ee ? b64(64) : 'plain subject', kind: 'group', participant_member_ids: [], e2ee },
+    body: {
+      subject: e2ee ? b64(64) : 'plain subject',
+      kind: 'group',
+      participant_member_ids: [],
+      e2ee,
+      // secfix F1: E2EE creation carries the creator's key_id.
+      ...(e2ee === 1 ? { initial_key_id: hex(16) } : {}),
+    },
   });
   assert.equal(topic.status, 201);
   return topic.body.topic.id as string;

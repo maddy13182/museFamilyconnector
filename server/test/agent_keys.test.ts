@@ -74,6 +74,10 @@ test('fresh DB from the full migration chain carries the E2EE schema', async () 
   ]);
   const topicsCols = columnNames(app, 'topics');
   assert.ok(topicsCols.includes('e2ee'), 'topics must have the e2ee column');
+  assert.ok(
+    topicsCols.includes('current_key_id'),
+    'topics must have the current_key_id column (secfix F1 key election)',
+  );
   const e2eeDef = (
     app.raw.prepare(`PRAGMA table_info(topics)`).all() as Array<{
       name: string;

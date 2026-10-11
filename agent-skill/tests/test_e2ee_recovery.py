@@ -94,7 +94,7 @@ class RecoveryFakeHub:
 
     def seal_for(self, tid, pub_b64):
         kid_hex, key = self.topic_keys[tid]
-        return hub._e2ee_seal_envelope(bytes.fromhex(kid_hex), key, pub_b64)
+        return hub._e2ee_seal_envelope(tid, bytes.fromhex(kid_hex), key, pub_b64)
 
     def add_envelope(self, tid, member_id, agent_label, pub_b64):
         self.envelopes.append(
@@ -377,6 +377,53 @@ class TestRecoverRung1(E2eeRecoveryTestBase):
         self.assertEqual(rc, 2, "stderr: %s" % err)
         self.assertIn("[rung 1/3] skipped", err)
         self.assertIn("[rung 2/3]", err)
+
+
+# ---------------------------------------------------------------------------
+# secfix F5 — Argon2 parameters from the backup file are bounds-checked
+# ---------------------------------------------------------------------------
+
+
+class TestKeyBackupKdfBounds(unittest.TestCase):
+    """A tampered backup file must not be able to force a huge KDF allocation.
+
+    _decrypt_key_backup clamps opslimit/memlimit to [libsodium minimum, 64 /
+    1 GiB] and raises a loud HubError on violation; a KDF allocation failure
+    surfaces as HubError, never a crash. Valid backups still restore.
+    """
+
+    def setUp(self):
+        self.priv = bytes(PrivateKey.generate())
+        self.password = "correct horse"
+        self.blob = hub._encrypt_key_backup(self.priv, self.password)
+
+    def test_valid_backup_restores(self):
+        self.assertEqual(
+            hub._decrypt_key_backup(dict(self.blob), self.password), self.priv)
+
+    def test_huge_memlimit_rejected(self):
+        bad = dict(self.blob, memlimit=1 << 40)
+        with self.assertRaises(hub.HubError) as cm:
+            hub._decrypt_key_backup(bad, self.password)
+        self.assertIn("memlimit", str(cm.exception))
+
+    def test_huge_opslimit_rejected(self):
+        bad = dict(self.blob, opslimit=10 ** 6)
+        with self.assertRaises(hub.HubError) as cm:
+            hub._decrypt_key_backup(bad, self.password)
+        self.assertIn("opslimit", str(cm.exception))
+
+    def test_below_minimum_rejected(self):
+        for field in ("opslimit", "memlimit"):
+            bad = dict(self.blob, **{field: 0})
+            with self.assertRaises(hub.HubError, msg=field):
+                hub._decrypt_key_backup(bad, self.password)
+
+    def test_wrong_password_still_loud(self):
+        # Bounds checks run before the KDF; a wrong password still fails
+        # loudly (not silently) after them.
+        with self.assertRaises(hub.HubError):
+            hub._decrypt_key_backup(dict(self.blob), "wrong password")
 
 
 class TestRecoverRung2(E2eeRecoveryTestBase):
