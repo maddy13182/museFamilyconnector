@@ -40,6 +40,14 @@ export function newInviteCode(): string {
   return 'fhi_' + randomBase62(22);
 }
 
+/** Invite onboarding page token: 'fhip_' + 256 bits of entropy. The page URL
+ *  is the credential — unguessable, single-use; only
+ *  sha256(pepper || token) is ever stored. Returned to the inviter ONCE
+ *  inside the invite's `onboarding_url`; never again. */
+export function newInvitePageToken(): string {
+  return 'fhip_' + randomBase62(43);
+}
+
 /** Provisioning code: 'fhp_' + 128 bits. Single-use, short-lived. */
 export function newProvisioningCode(): string {
   return 'fhp_' + randomBase62(22);

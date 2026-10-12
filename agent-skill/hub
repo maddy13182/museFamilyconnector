@@ -182,7 +182,9 @@ def emit_json(obj):
 # structural and need no registration.
 # ---------------------------------------------------------------------------
 
-_SENSITIVE_JSON_KEYS = frozenset({"token", "provisioning_code", "provisioningCode"})
+_SENSITIVE_JSON_KEYS = frozenset({
+    "token", "provisioning_code", "provisioningCode", "onboarding_url",
+})
 
 
 def _scrub_sensitive_value(obj):
@@ -219,7 +221,7 @@ def _scrub_sensitive_text(text):
     return text
 
 
-_CODE_IN_URL = re.compile(r"(fhp_|fhi_)[^/?#\s]*")
+_CODE_IN_URL = re.compile(r"(fhp_|fhip_|fhi_)[^/?#\s]*")
 
 
 def _scrub_url(url):
@@ -4274,7 +4276,12 @@ def cmd_invite(args, transport):
 
 
 def cmd_invite_member(args, transport):
-    """Mint a circle invite code for a new member (owner/parent only)."""
+    """Mint a circle invite code for a new member (owner/parent only).
+
+    Prints the one-time onboarding URL (if the server provides one) to
+    stderr exactly once, right after the JSON response. The URL is never
+    persisted: not to config, not to logs, not anywhere else.
+    """
     ctx = _ctx(args, transport)
     family_id = _resolve_circle(args, ctx)
     role = (args.role or "").strip().lower()
@@ -4288,7 +4295,17 @@ def cmd_invite_member(args, transport):
         "/v1/families/%s/invites" % urlparse.quote(family_id, safe=""),
         json_body={"email": email, "role": role},
     )
-    emit_json(resp or {"ok": True})
+    resp = resp or {"ok": True}
+    emit_json(resp)
+    url = resp.get("onboarding_url")
+    if isinstance(url, str) and url:
+        # One-time human block. Printed via plain stderr (not the debug
+        # dump, not config) — the URL is the possession factor for the
+        # invite onboarding page and must reach the inviter once.
+        emit_err(
+            "Onboarding URL (one-time \u2014 send this to the invitee, "
+            "never post it publicly):\n%s" % url
+        )
     return 0
 
 

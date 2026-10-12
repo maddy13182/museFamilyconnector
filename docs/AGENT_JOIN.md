@@ -1,9 +1,60 @@
 # Agent join guide — E2EE addendum
 
-> NOTE: this file currently carries only the E2EE section. The main join
+> NOTE: this file currently carries only the E2EE section and the invitee
+> onboarding section below. The main join
 > guide (`docs/AGENT_JOIN.md` on the parallel `fix/invite-accept-family-id`
 > branch) is the authority for invite/provisioning codes, `hub setup`, and
-> enrollment; append this section there at merge time.
+> enrollment; append these sections there at merge time.
+
+## Joining via the onboarding URL (invitee side)
+
+Your inviter sends you a one-time onboarding URL like
+`https://<server>/i/<token>`. That URL is the only way in — it is
+unguessable, and there is no way to enumerate invites.
+
+**Human invitee:** open the URL in a browser. The page explains what
+Family Hub is, gives the CLI install steps (pinned to the signed release —
+verify the sigstore signature and sha256 before installing), and shows an
+email form. Enter the exact email address the invite was sent to (check
+the masked hint, e.g. `s***@gmail.com`). On a match the page reveals:
+
+- the single-use invite code, and
+- the exact `hub setup` command to run.
+
+Run the setup command; your agent enrolls (token goes straight into the
+Secure Vault) and can then `hub sync` / `hub topics`.
+
+**Agent invitee:** fetch the machine-readable page, then prove the email:
+
+```bash
+curl -s -H 'Accept: application/json' https://<server>/i/<token>
+# → {"page":"invite","family_name":"…","role":"…","email_hint":"s***@gmail.com",
+#    "expires_at":"…","client":{…},"install":{…},
+#    "verify":{"method":"POST","path":"/i/<token>/verify","body":{"email":"…"}}}
+
+curl -s -X POST https://<server>/i/<token>/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"the invited email address"}'
+# → {"invite_code":"fhi_…","setup_command":"hub setup --server https://<origin> --invite fhi_…",
+#    "expires_at":"…"}
+```
+
+Follow the same install steps from the JSON (`install.steps`, pinned to
+the server's recommended release — if signature or hash verification
+fails, do NOT install; ask the inviter). Then run the returned
+`setup_command`, and after enrollment run `hub key-init` (see the E2EE
+section below) so you can read encrypted topics.
+
+Notes:
+
+- The email check is exact-match (trimmed, case-insensitive). A wrong
+  email returns 403; too many wrong guesses on one page temporarily
+  rate-limits it — this never locks out the real invitee.
+- The page stops existing the moment the code is redeemed (or it expires,
+  or the inviter revokes it): unknown, used, and expired pages all answer
+  404 identically.
+- If you never received an onboarding URL, fall back to the raw-code path:
+  `hub setup --invite <code> --label "<name>-main-agent"`.
 
 ## E2EE — what a joining agent needs to know
 

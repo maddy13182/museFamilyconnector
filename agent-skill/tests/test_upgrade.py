@@ -39,7 +39,7 @@ spec.loader.exec_module(hub)
 # ---------------------------------------------------------------------------
 
 
-def make_manifest(version="0.9.0", sha256="0" * 64):
+def make_manifest(version="0.9.1", sha256="0" * 64):
     return {
         "version": version,
         "min_cli_version": "0.0.0",
@@ -299,12 +299,12 @@ class UpgradeTest(unittest.TestCase):
 
     def test_full_upgrade_flow(self):
         fx = UpgradeFixture(self)
-        new_version = "0.9.0"
+        new_version = "0.9.1"
         new_bytes = stamp_version(fx.old_bytes, new_version)
         manifest, downloads = self._downloads_for(new_version, new_bytes)
         rc, out = fx.run_upgrade(manifest, downloads)
         self.assertEqual(rc, 0)
-        self.assertIn("Upgraded hub 0.8.0 → %s" % new_version, out)
+        self.assertIn("Upgraded hub 0.9.0 → %s" % new_version, out)
         # Atomic cut-over: the installed file is byte-identical.
         self.assertEqual(fx.read_target(), new_bytes)
         # Previous binary kept for rollback.
@@ -321,8 +321,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_sha_mismatch_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
-        manifest = make_manifest(version="0.9.0", sha256="f" * 64)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
+        manifest = make_manifest(version="0.9.1", sha256="f" * 64)
         base = manifest["download_url"][: -len("/hub")]
         downloads = {manifest["download_url"]: new_bytes}
         with self.assertRaises(hub.HubError) as ctx:
@@ -333,9 +333,9 @@ class UpgradeTest(unittest.TestCase):
 
     def test_release_manifest_disagreement_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
+        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
         digest = hashlib.sha256(new_bytes).hexdigest()
-        manifest = make_manifest(version="0.9.0", sha256=digest)
+        manifest = make_manifest(version="0.9.1", sha256=digest)
         base = manifest["download_url"][: -len("/hub")]
         downloads = {
             manifest["download_url"]: new_bytes,
@@ -352,8 +352,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_bad_signature_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
-        manifest, downloads = self._downloads_for("0.9.0", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
+        manifest, downloads = self._downloads_for("0.9.1", new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -366,8 +366,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_missing_sigstore_package_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
-        manifest, downloads = self._downloads_for("0.9.0", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
+        manifest, downloads = self._downloads_for("0.9.1", new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -379,8 +379,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_failed_self_test_restores_previous(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
-        manifest, downloads = self._downloads_for("0.9.0", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
+        manifest, downloads = self._downloads_for("0.9.1", new_bytes)
         real_self_test = hub._self_test
 
         def flaky_self_test(path, expect_version=None):
@@ -414,7 +414,7 @@ class RollbackTest(unittest.TestCase):
     def test_rollback_restores_previous(self):
         fx = UpgradeFixture(self)
         # Simulate a completed upgrade: current = 0.7.0, prev = 0.6.0.
-        new_bytes = stamp_version(fx.old_bytes, "0.9.0")
+        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
         with open(fx.target, "wb") as fh:
             fh.write(new_bytes)
         self._with_prev(fx, fx.old_bytes)
