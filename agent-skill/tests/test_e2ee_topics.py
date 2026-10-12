@@ -54,6 +54,7 @@ class E2eeFakeHub:
 
     def __init__(self, keys_by_member, participants, corrupt_own_envelope=False):
         self.calls = []
+        self.health_calls = []
         self.keys_by_member = keys_by_member  # member_id -> [(agent_label, pub_b64)]
         self.participants = participants  # [member_id]
         self.envelopes = []
@@ -73,17 +74,28 @@ class E2eeFakeHub:
         )
 
     def __call__(self, method, url, headers, body_bytes):
-        self._record(method, url, headers, body_bytes)
         parts = urlparse.urlparse(url)
         path = parts.path
         query = urlparse.parse_qs(parts.query)
         method = method.upper()
-        # The fake server is a current (0.12.0) server: answer the
-        # per-invocation version check in main() before any command runs.
+
+        # The fake models a current (0.12.0) server: auto-answer the
+        # per-invocation version check in main(). Recorded separately so
+        # command-traffic assertions keep their meaning.
         if method == "GET" and path == "/v1/health":
+            self.health_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": dict(headers),
+                    "body": body_bytes.decode("utf-8") if body_bytes else None,
+                }
+            )
             return 200, json.dumps(
                 {"ok": True, "version": "0.12.0", "api_versions": ["v1"]}
             )
+
+        self._record(method, url, headers, body_bytes)
 
         if method == "POST" and path == "/v1/topics":
             body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}

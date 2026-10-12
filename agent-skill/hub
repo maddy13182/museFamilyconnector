@@ -5657,6 +5657,11 @@ def _require_server_version(args, transport):
     config error.
     """
     global _api_major
+    # `setup` names its server flag --server but argparse stores it as
+    # setup_server (normalized by _wrap_setup when the command runs).
+    # Mirror that here so the pre-command check uses the same server.
+    if getattr(args, "setup_server", None):
+        args.server = args.setup_server
     ctx = _ctx(args, transport, need_auth=False)
     cached = _version_check_cache.get(ctx.server)
     if cached is not None:
