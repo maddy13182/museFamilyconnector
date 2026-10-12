@@ -1,9 +1,9 @@
 {
-  "version": "0.12.0",
+  "version": "0.12.1",
   "min_cli_version": "0.10.0",
-  "download_url": "https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v0.12.0/hub",
-  "sha256": "0207624925b287fb0612b8df9372d93c7bf24321f5b49ef3db6feef29ff95a25",
-  "skill_sha256": "2a7366729060585494e8e06b59350799090f686ae5ccd8b12b03174bdd4c41ef",
-  "skill_version": "0.12.0",
-  "released_at": "2026-10-12T07:04:59Z"
+  "download_url": "https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v0.12.1/hub",
+  "sha256": "fc0ad5750c3d118e4de2ddf7f8e9b62829b45928c1284f05cab39c871d898de7",
+  "skill_sha256": "8136bc856fa3f7522b5af85dc10528cc5ec5984c64cfc4f4aeae8b53686b1d05",
+  "skill_version": "0.12.1",
+  "released_at": "2026-10-12T07:31:10Z"
 }
