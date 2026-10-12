@@ -8,8 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "bundle:client": "node scripts/bundle-client.mjs",
     "prebuild": "npm run bundle:client",
-    "pretest": "rm -rf dist && npm run bundle:client",
-    "test": "npm run build && rm -rf dist/migrations && cp -r migrations dist/migrations && cp package.json dist/package.json && cp client-manifest.json dist/client-manifest.json && node --test 'dist/test/*.test.js'",
+    "pretest": "rm -rf dist && node scripts/make-test-fixtures.mjs",
+    "test": "tsc -p tsconfig.json && rm -rf dist/migrations && cp -r migrations dist/migrations && cp package.json dist/package.json && cp .test-fixtures/pin.json dist/client-manifest.json && node --test 'dist/test/*.test.js'",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {

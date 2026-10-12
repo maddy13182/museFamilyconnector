@@ -37,6 +37,12 @@
  * deploy — it is equivalent to changing the manifest pin, so it buys an
  * attacker nothing they don't already have, but it must stay a test-only
  * knob.
+ *
+ * `npm test` never hits the network: server/scripts/make-test-fixtures.mjs
+ * builds a complete fixture release, serves it over loopback HTTP, and runs
+ * this script with BUNDLE_CLIENT_MANIFEST_PATH + BUNDLE_CLIENT_BASE_URL, so
+ * the real verification code executes against fixtures. See that script's
+ * header for the chicken-and-egg reason.
  */
 
 import { createHash } from 'node:crypto';
