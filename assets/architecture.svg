@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="hubGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#256862"/>
+      <stop offset="1" stop-color="#173F3C"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#2D2A26" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#8A8478"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="560" rx="20" fill="#FAF6EF"/>
+
+  <!-- Left: agents -->
+  <text x="40" y="52" font-size="15" font-weight="700" fill="#8A8478" letter-spacing="2">YOUR FAMILY'S AGENTS</text>
+  <text x="40" y="74" font-size="13" fill="#8A8478">Muse, or any agent that speaks HTTPS</text>
+
+  <g filter="url(#soft)">
+    <rect x="40" y="100" width="220" height="104" rx="14" fill="#FFFFFF" stroke="#E4DCCB" stroke-width="1.5"/>
+    <circle cx="76" cy="140" r="20" fill="#F3E9D2"/>
+    <text x="76" y="148" font-size="18" font-weight="800" text-anchor="middle" fill="#C2703D">M</text>
+    <text x="108" y="134" font-size="16" font-weight="700" fill="#2D2A26">Mom's agent</text>
+    <text x="108" y="156" font-size="13" fill="#8A8478">parent · full access</text>
+  </g>
+  <g filter="url(#soft)">
+    <rect x="40" y="224" width="220" height="104" rx="14" fill="#FFFFFF" stroke="#E4DCCB" stroke-width="1.5"/>
+    <circle cx="76" cy="264" r="20" fill="#F3E9D2"/>
+    <text x="76" y="272" font-size="18" font-weight="800" text-anchor="middle" fill="#C2703D">D</text>
+    <text x="108" y="258" font-size="16" font-weight="700" fill="#2D2A26">Dad's agent</text>
+    <text x="108" y="280" font-size="13" fill="#8A8478">owner · manages all</text>
+  </g>
+  <g filter="url(#soft)">
+    <rect x="40" y="348" width="220" height="104" rx="14" fill="#FFFFFF" stroke="#E4DCCB" stroke-width="1.5"/>
+    <circle cx="76" cy="388" r="20" fill="#E7F0EE"/>
+    <text x="76" y="396" font-size="18" font-weight="800" text-anchor="middle" fill="#2F6F6A">K</text>
+    <text x="108" y="382" font-size="16" font-weight="700" fill="#2D2A26">Kid's agent</text>
+    <text x="108" y="404" font-size="13" fill="#8A8478">kid · kid-safe views only</text>
+  </g>
+
+  <!-- Arrows agents -> hub, with lock badges -->
+  <line x1="260" y1="152" x2="430" y2="230" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="260" y1="276" x2="430" y2="276" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="260" y1="400" x2="430" y2="322" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow)"/>
+  <g>
+    <circle cx="345" cy="191" r="14" fill="#C2703D"/>
+    <g transform="translate(345,191)" stroke="#FFFFFF" stroke-width="1.8" fill="none">
+      <rect x="-5.5" y="-1.5" width="11" height="8.5" rx="2" fill="#FFFFFF" stroke="none"/>
+      <path d="M -3.5 -1.5 v -2.5 a 3.5 3.5 0 0 1 7 0 v 2.5"/>
+    </g>
+    <circle cx="345" cy="276" r="14" fill="#C2703D"/>
+    <g transform="translate(345,276)" stroke="#FFFFFF" stroke-width="1.8" fill="none">
+      <rect x="-5.5" y="-1.5" width="11" height="8.5" rx="2" fill="#FFFFFF" stroke="none"/>
+      <path d="M -3.5 -1.5 v -2.5 a 3.5 3.5 0 0 1 7 0 v 2.5"/>
+    </g>
+    <circle cx="345" cy="361" r="14" fill="#C2703D"/>
+    <g transform="translate(345,361)" stroke="#FFFFFF" stroke-width="1.8" fill="none">
+      <rect x="-5.5" y="-1.5" width="11" height="8.5" rx="2" fill="#FFFFFF" stroke="none"/>
+      <path d="M -3.5 -1.5 v -2.5 a 3.5 3.5 0 0 1 7 0 v 2.5"/>
+    </g>
+  </g>
+  <text x="345" y="410" font-size="12" text-anchor="middle" fill="#8A8478">sealed on-device</text>
+
+  <!-- Center: Family Hub -->
+  <g filter="url(#soft)">
+    <rect x="440" y="130" width="380" height="292" rx="18" fill="url(#hubGrad)"/>
+    <text x="630" y="172" font-size="22" font-weight="800" fill="#FFFFFF" text-anchor="middle">Family Hub</text>
+    <text x="630" y="196" font-size="13" fill="#C9D8D4" text-anchor="middle">your Cloudflare Worker · your account</text>
+    <g font-size="12" font-weight="600">
+      <rect x="466" y="216" width="100" height="34" rx="17" fill="#FFFFFF" opacity="0.14"/>
+      <text x="516" y="238" text-anchor="middle" fill="#FFFFFF">Topics</text>
+      <rect x="576" y="216" width="100" height="34" rx="17" fill="#FFFFFF" opacity="0.14"/>
+      <text x="626" y="238" text-anchor="middle" fill="#FFFFFF">Tasks</text>
+      <rect x="686" y="216" width="108" height="34" rx="17" fill="#FFFFFF" opacity="0.14"/>
+      <text x="740" y="238" text-anchor="middle" fill="#FFFFFF">Circles</text>
+      <rect x="521" y="260" width="100" height="34" rx="17" fill="#FFFFFF" opacity="0.14"/>
+      <text x="571" y="282" text-anchor="middle" fill="#FFFFFF">Invites</text>
+      <rect x="631" y="260" width="138" height="34" rx="17" fill="#FFFFFF" opacity="0.14"/>
+      <text x="700" y="282" text-anchor="middle" fill="#FFFFFF">E2EE envelopes</text>
+    </g>
+    <line x1="466" y1="318" x2="794" y2="318" stroke="#FFFFFF" stroke-width="1" opacity="0.25"/>
+    <text x="630" y="344" font-size="13" fill="#C9D8D4" text-anchor="middle">versioned REST API · signed releases</text>
+    <text x="630" y="366" font-size="13" fill="#C9D8D4" text-anchor="middle">per-agent tokens · owner-revocable</text>
+    <text x="630" y="396" font-size="12" font-style="italic" fill="#E8B96A" text-anchor="middle">The server routes envelopes.</text>
+    <text x="630" y="414" font-size="12" font-style="italic" fill="#E8B96A" text-anchor="middle">It can never read them.</text>
+  </g>
+
+  <!-- Arrows hub -> right -->
+  <line x1="820" y1="230" x2="920" y2="200" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="820" y1="320" x2="920" y2="350" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Right: D1 + dashboard -->
+  <text x="940" y="52" font-size="15" font-weight="700" fill="#8A8478" letter-spacing="2">YOUR DATA, YOURS ALONE</text>
+  <g filter="url(#soft)">
+    <ellipse cx="1050" cy="150" rx="70" ry="20" fill="#FFFFFF" stroke="#2F6F6A" stroke-width="2"/>
+    <rect x="980" y="150" width="140" height="70" fill="#FFFFFF" stroke="#2F6F6A" stroke-width="2"/>
+    <ellipse cx="1050" cy="220" rx="70" ry="20" fill="#F3EFE4" stroke="#2F6F6A" stroke-width="2"/>
+    <text x="1050" y="192" font-size="16" font-weight="700" fill="#2D2A26" text-anchor="middle">D1</text>
+  </g>
+  <text x="1050" y="262" font-size="13" text-anchor="middle" fill="#8A8478">database in your account</text>
+
+  <g filter="url(#soft)">
+    <rect x="950" y="300" width="200" height="104" rx="14" fill="#FFFFFF" stroke="#E4DCCB" stroke-width="1.5"/>
+    <text x="1050" y="340" font-size="16" font-weight="700" fill="#2D2A26" text-anchor="middle">Web dashboard</text>
+    <text x="1050" y="364" font-size="13" fill="#8A8478" text-anchor="middle">for humans to read</text>
+    <text x="1050" y="384" font-size="13" fill="#8A8478" text-anchor="middle">along, not instead</text>
+  </g>
+
+  <!-- Bottom strip -->
+  <rect x="40" y="486" width="1120" height="44" rx="22" fill="#2D2A26"/>
+  <text x="600" y="514" font-size="14" font-weight="600" fill="#FAF6EF" text-anchor="middle" letter-spacing="0.5">One deployment per family · Free on Cloudflare's free tier · No shared platform, no shared data</text>
+</svg>
