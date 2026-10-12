@@ -1250,11 +1250,15 @@ async function handleAcceptInvite(
   const tokenId = newId();
   const ts = nowIso();
   // F05: atomic conditional consume. The member and token INSERTs only fire
-  // while the invite is still unused, and the UPDATE consumes it — one atomic
-  // batch, in this order (the conditional INSERTs must run before the consume
-  // UPDATE so they see pre-consume state). Concurrent accepts of the same
-  // code therefore create exactly one member and one token; the winner is the
-  // call whose member row exists afterwards.
+  // while an invite for this (family_id, email) is still unused, and the
+  // UPDATE consumes it — one atomic batch, in this order (the conditional
+  // INSERTs must run before the consume UPDATE so they see pre-consume
+  // state). Scoped by (family_id, email) rather than the presented code
+  // hash: several live codes can exist for one email (the raw fallback plus
+  // codes minted by email verifies), and concurrent accepts of DIFFERENT
+  // codes must still create exactly one member and one token — the
+  // pre-batch duplicate guard is TOCTOU. The winner is the call whose
+  // member row exists afterwards; the loser falls into the 409 path below.
   // F02: the new member gets a FRESH principal. An invite code proves code
   // possession, not email ownership, so the row must never inherit another
   // circle's principal by email match — even when the same email already has
@@ -1266,18 +1270,20 @@ async function handleAcceptInvite(
     {
       sql: `INSERT INTO members(id, family_id, name, email, role, principal_id, created_at)
             SELECT ?,?,?,?,?,?,?
-             WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
-      params: [memberId, inviteFamilyId, displayName, email, inviteRole, principalId, ts, codeHash],
+             WHERE EXISTS (SELECT 1 FROM invites WHERE family_id = ? AND email = ? AND used_at IS NULL)`,
+      params: [memberId, inviteFamilyId, displayName, email, inviteRole, principalId, ts, inviteFamilyId, email],
     },
     {
       sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
             SELECT ?,?,?,?,?,NULL,NULL,NULL
-             WHERE EXISTS (SELECT 1 FROM invites WHERE code_hash = ? AND used_at IS NULL)`,
-      params: [tokenHash, tokenId, memberId, agentLabel, ts, codeHash],
+             WHERE EXISTS (SELECT 1 FROM invites WHERE family_id = ? AND email = ? AND used_at IS NULL)`,
+      params: [tokenHash, tokenId, memberId, agentLabel, ts, inviteFamilyId, email],
     },
     {
-      sql: `UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL`,
-      params: [ts, codeHash],
+      // Consume EVERY live code for this (family_id, email): the email has
+      // joined, so sibling codes (raw fallback, verify-minted) are spent.
+      sql: `UPDATE invites SET used_at = ? WHERE family_id = ? AND email = ? AND used_at IS NULL`,
+      params: [ts, inviteFamilyId, email],
     },
     {
       // Self-destruct the onboarding page (v0.11.0) in the same atomic
@@ -1474,9 +1480,12 @@ function clientArtifactUrls(downloadUrl: string): { sigstore: string; manifest: 
   return { sigstore: `${base}/hub.sigstore`, manifest: `${base}/manifest.json` };
 }
 
-/** The agent-facing JSON page. Contains no invite code and no page token —
- *  the agent already holds the token in the URL it fetched. */
-function invitePageJson(page: InvitePage): Record<string, unknown> {
+/** The agent-facing JSON page. Contains no invite code. The verify path is
+ *  absolute and embeds the page token the agent already holds (it fetched
+ *  this very URL): a relative './verify' would resolve against /i/ and drop
+ *  the token segment, 404ing. Echoing the token back to its holder is not a
+ *  leak, and /i/ paths are redacted from logs. */
+function invitePageJson(page: InvitePage, rawToken: string): Record<string, unknown> {
   const downloadUrl = clientManifest.download_url as string;
   const artifacts = clientArtifactUrls(downloadUrl);
   return {
@@ -1503,11 +1512,11 @@ function invitePageJson(page: InvitePage): Record<string, unknown> {
       ],
       verify_note: 'If signature or hash verification fails, do NOT install — ask the inviter.',
     },
-    // Relative on purpose: posting to ./verify resolves correctly from both
-    // /i/<token> and /i/<token>.json, and the page token is never echoed.
+    // Absolute path: the agent POSTs here directly. (A relative './verify'
+    // would resolve to /i/verify and drop the token segment.)
     verify: {
       method: 'POST',
-      path: './verify',
+      path: `/i/${rawToken}/verify`,
       body: { email: 'the invited email address' },
     },
   };
@@ -1516,7 +1525,8 @@ function invitePageJson(page: InvitePage): Record<string, unknown> {
 /** The human-facing HTML page. All interpolated values are HTML-escaped;
  *  the inline script renders the verify response via textContent only
  *  (never innerHTML with server data). */
-function invitePageHtml(page: InvitePage): Response {
+function invitePageHtml(page: InvitePage, rawToken: string): Response {
+  const verifyPath = `/i/${rawToken}/verify`;
   const downloadUrl = clientManifest.download_url as string;
   const artifacts = clientArtifactUrls(downloadUrl);
   const steps = [
@@ -1560,7 +1570,7 @@ document.getElementById('verify-form').addEventListener('submit', async (event) 
   const out = document.getElementById('result');
   out.textContent = 'Checking\u2026';
   try {
-    const res = await fetch('./verify', {
+    const res = await fetch('${verifyPath}', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ email: document.getElementById('email').value }),
@@ -1605,14 +1615,17 @@ async function handleInvitePageGet(
   segment: string,
 ): Promise<Response> {
   const token = extractPageToken(segment);
-  const page = await loadInvitePage(db, env, token);
+  // Rate-limit BEFORE the token lookup: the lookup burns a peppered hash +
+  // D1 read, and unknown-token floods must hit the IP bucket, not the DB.
+  // A 429 reveals only the caller's own budget, never token validity.
   const limited = await checkRateLimit(db, req, 'invite_page');
   if (limited) return limited;
+  const page = await loadInvitePage(db, env, token);
   const accept = req.headers.get('accept') ?? '';
   if (segment.endsWith('.json') || accept.includes('application/json')) {
-    return json(invitePageJson(page));
+    return json(invitePageJson(page, token));
   }
-  return invitePageHtml(page);
+  return invitePageHtml(page, token);
 }
 
 // POST /i/:token/verify — body {"email": "..."}. On a match, mints a FRESH
@@ -1632,13 +1645,15 @@ async function handleInvitePageVerify(
   segment: string,
 ): Promise<Response> {
   const token = extractPageToken(segment);
-  const page = await loadInvitePage(db, env, token);
+  // Rate-limit BEFORE the token lookup: see handleInvitePageGet.
   const limited = await checkRateLimit(db, req, 'invite_page');
   if (limited) return limited;
+  const page = await loadInvitePage(db, env, token);
 
   const body = await readJson(req);
-  // Shape validation only (string, 3-254 chars): a malformed candidate is
-  // just a wrong guess — 403, never a distinguishing 400.
+  // Shape validation only (string, 3-254 chars). Malformed bodies are a
+  // 400 bad_request (reqString); that distinguishes request shape only,
+  // never token or email validity.
   const email = reqString(body['email'], 'email', 3, 254);
 
   // Per-page attempt budget with backoff. Attempts older than an hour decay
@@ -1676,7 +1691,10 @@ async function handleInvitePageVerify(
   }
 
   // Match: mint a fresh code (the stored code's plaintext is unrecoverable),
-  // insert it, and repoint the page at it — one atomic batch.
+  // insert it, and repoint the page at it — one atomic batch. The success
+  // also counts toward the per-page attempt budget (same as a mismatch):
+  // the invitee only ever needs one code, and unbounded minting would let
+  // a URL+email holder stockpile sibling codes.
   const code = newInviteCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   await db.execAtomically([
@@ -1686,8 +1704,8 @@ async function handleInvitePageVerify(
       params: [codeHash, page.familyId, page.email, page.role, page.createdBy, page.expiresAt],
     },
     {
-      sql: `UPDATE invite_pages SET invite_code_hash = ? WHERE page_token_hash = ?`,
-      params: [codeHash, page.pageTokenHash],
+      sql: `UPDATE invite_pages SET invite_code_hash = ?, verify_attempts = ?, last_attempt_at = ? WHERE page_token_hash = ?`,
+      params: [codeHash, attempts + 1, new Date(nowMs).toISOString(), page.pageTokenHash],
     },
   ]);
   logEvent('info', 'invite_page_verified', {});

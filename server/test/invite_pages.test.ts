@@ -101,7 +101,9 @@ test('non-owner/parent creating invite -> 403', async () => {
 });
 
 // 4. GET JSON (Accept header and .json suffix) -> 200 with the agent shape;
-// no code, no token echo, masked hint present.
+// no code; the page token appears ONLY in the absolute verify path (echoed
+// back to its holder, who supplied it — a relative './verify' would resolve
+// to /i/verify and drop the token segment). Masked hint present.
 test('GET page as JSON returns the agent page shape without secrets', async () => {
   const app = makeApp();
   const { famId, token } = await bootstrapOwner(app, 'Page Fam 4', 'owner4@t.dev');
@@ -131,10 +133,14 @@ test('GET page as JSON returns the agent page shape without secrets', async () =
       `${label}: install steps mention signature verification`,
     );
     assert.equal(b.verify.method, 'POST', label);
-    assert.equal(b.verify.path, './verify', label);
+    assert.equal(b.verify.path, `/i/${pageToken}/verify`, label);
     const serialized = JSON.stringify(b);
     assert.ok(!serialized.includes(inv.invite_code), `${label}: must not leak the invite code`);
-    assert.ok(!serialized.includes(pageToken), `${label}: must not echo the page token`);
+    const withoutPath = serialized.split(`/i/${pageToken}/verify`).join('');
+    assert.ok(
+      !withoutPath.includes(pageToken),
+      `${label}: page token appears only in the verify path`,
+    );
   }
 });
 
@@ -150,9 +156,14 @@ test('GET page as HTML renders install steps and the masked hint', async () => {
   assert.ok(html.includes('<!doctype html>'), 'is an HTML document');
   assert.ok(html.includes('i***@t.dev'), 'masked hint present');
   assert.ok(html.includes('sigstore'), 'install steps present');
-  assert.ok(html.includes('./verify'), 'verify form posts to ./verify');
+  const pt = pageTokenOf(inv.onboarding_url);
+  assert.ok(
+    html.includes(`fetch('/i/${pt}/verify'`),
+    'verify form posts to the absolute verify path',
+  );
   assert.ok(!html.includes(inv.invite_code), 'must not leak the invite code');
-  assert.ok(!html.includes(pageTokenOf(inv.onboarding_url)), 'must not echo the page token');
+  const htmlWithoutFetch = html.split(`fetch('/i/${pt}/verify'`).join('');
+  assert.ok(!htmlWithoutFetch.includes(pt), 'page token appears only in the form target');
 });
 
 // 6. Unknown token, used invite's page, expired invite's page -> identical
@@ -303,6 +314,53 @@ test('page self-destructs on invite accept', async () => {
     assert.equal(r.status, 404, `${label}: page must 404 after accept`);
     assert.deepEqual(r.body, { error: { code: 'not_found', message: 'Not found' } }, label);
   }
+});
+
+// 9b. HIGH-1 regression: two live codes for one email (the raw fallback +
+// a verify-minted fresh code) must still yield exactly one member.
+// Accepting one code consumes ALL sibling codes for that (family, email),
+// so concurrent accepts of different codes cannot double-join.
+test('accepting one code consumes sibling codes for the same email', async () => {
+  const app = makeApp();
+  const { famId, token } = await bootstrapOwner(app, 'Page Fam 9b', 'owner9b@t.dev');
+  const inv = await createInvite(app, token, famId, 'invitee9b@t.dev');
+  const pageToken = pageTokenOf(inv.onboarding_url);
+
+  // Mint a second live code via email verify; the raw fallback stays live.
+  const verified = await app.call('POST', `/i/${pageToken}/verify`, {
+    ...ip(96),
+    body: { email: 'invitee9b@t.dev' },
+  });
+  assert.equal(verified.status, 200);
+  const freshCode = verified.body.invite_code as string;
+  assert.match(freshCode, CODE_RE);
+  assert.notEqual(freshCode, inv.invite_code);
+
+  // Accept with the ORIGINAL code -> 201.
+  const acc = await app.call(
+    'POST',
+    `/v1/invites/${encodeURIComponent(inv.invite_code)}/accept`,
+    { body: { display_name: 'NineB', agent_label: 'nineb-agent' } },
+  );
+  assert.equal(acc.status, 201);
+
+  // The sibling code is spent: exactly one member row, second accept 409s.
+  const members = await app.db.queryAll(
+    `SELECT id FROM members WHERE family_id = ? AND email = ?`,
+    [famId, 'invitee9b@t.dev'],
+  );
+  assert.equal(members.length, 1);
+  const second = await app.call(
+    'POST',
+    `/v1/invites/${encodeURIComponent(freshCode)}/accept`,
+    { body: { display_name: 'NineB Two', agent_label: 'nineb-agent-2' } },
+  );
+  assert.equal(second.status, 409);
+  const membersAfter = await app.db.queryAll(
+    `SELECT id FROM members WHERE family_id = ? AND email = ?`,
+    [famId, 'invitee9b@t.dev'],
+  );
+  assert.equal(membersAfter.length, 1);
 });
 
 // 10. redactPath covers /i/ shapes (unit).

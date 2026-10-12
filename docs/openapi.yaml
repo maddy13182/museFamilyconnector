@@ -406,8 +406,8 @@ paths:
                       method: { type: string, example: "POST" }
                       path:
                         type: string
-                        example: "./verify"
-                        description: Relative to the fetched page URL; resolves from both /i/{token} and /i/{token}.json.
+                        example: "/i/{token}/verify"
+                        description: Absolute path with the page token echoed back to its holder (the party that presented it in the request URL). A relative ./verify would resolve to /i/verify and 404.
                       body:
                         type: object
                         properties:
