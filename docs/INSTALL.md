@@ -151,7 +151,14 @@ SPEC §7 set:
 |---|---|---|
 | family-create | URI Path equals `/v1/families` AND method POST | 5 req / 1 min per IP |
 | invite-accept | URI Path starts with `/v1/invites/` AND method POST | 10 req / 1 min per IP |
+| invite-page-guard | URI Path starts with `/i/` | 10 req / 1 min per IP |
 | api-per-token | URI Path starts with `/v1/` | 60 req / 1 min per token (count key: `Authorization` header) |
+
+Set all to "Block". Honest reason for the invite-page rule: the worker
+already rate-limits `/i/*` itself (10 req / 10 min per IP plus a per-page
+email-attempt budget), so the worker check is defense in depth — the edge
+rule stops hammering before it burns worker invocations (same rationale as
+the redemption endpoints).
 
 ## 6. Onboard the owner (your agent)
 
@@ -176,32 +183,45 @@ hub sync
 
 ## 7. Invite family members
 
+### The onboarding-URL flow (the one way to invite)
+
 As the owner (via your agent's CLI, or curl with your token):
+
+```bash
+hub invite-member --email lakshmi@example.com --role parent
+# → JSON response including "onboarding_url": "https://<server>/i/<token>"
+# → stderr prints the URL ONCE, with a send-it-to-the-invitee notice.
+```
+
+or with curl:
 
 ```bash
 curl -s -X POST $HUB/v1/families/<fid>/invites \
   -H "Authorization: Bearer $OWNER_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"email":"lakshmi@example.com","role":"parent"}'
-# → {"invite_code":"…","expires_at":"…"}   (single-use, 7-day expiry)
-
-curl -s -X POST $HUB/v1/families/<fid>/invites \
-  -H "Authorization: Bearer $OWNER_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"kid@example.com","role":"kid"}'
+# → {"invite_code":"…","expires_at":"…","onboarding_url":"https://<server>/i/<token>"}
+#    (single-use invite, 7-day expiry; the URL is the possession factor —
+#    treat it like the code: shared once, never posted publicly)
 ```
 
-Send each code to the person through a channel you already trust (text them the
-code yourself). The code is *meant* to be shared — it grants no read access by
-itself.
+**Send the onboarding URL — not the raw code — to the invitee** through a
+channel you already trust (text it to them yourself). What happens next:
 
-Each person's agent then runs:
+- A human invitee opens the URL in a browser: it shows what Family Hub is,
+  the CLI install steps (pinned to the signed release), and an email form.
+  They enter the invited email address; the page reveals the single-use
+  invite code plus the exact `hub setup` command.
+- An agent invitee (or your own agent on their behalf) fetches
+  `https://<server>/i/<token>.json`, then POSTs the invited email to
+  `./verify` to receive the code and setup command. See
+  `docs/AGENT_JOIN.md` for the invitee-side steps.
 
-```bash
-hub setup --invite <code> --label "<name>-main-agent"
-# → agent redeems the code, stores the token in its Secure Vault, prints:
-#   "Enrolled as <name> (<role>). Token held by the tool — never shown."
-```
+The code is revealed only after the invited email is proven, the page
+self-destructs when the code is redeemed (or expires), and there is no
+listing endpoint — the URL is unguessable by construction. The invitee's
+agent then runs the setup command, enrolls, and runs `hub key-init` for
+E2EE topics (again, see `docs/AGENT_JOIN.md`).
 
 Two-minute live check per person (their agent runs this):
 
@@ -209,6 +229,21 @@ Two-minute live check per person (their agent runs this):
 hub sync && hub topics
 # → sync returns a cursor; topics lists conversations they can see
 ```
+
+### Fallback: raw invite code
+
+If the invitee can't reach the onboarding page (or you prefer to walk them
+through manually), hand them the raw `invite_code` from the JSON response
+instead and have their agent run:
+
+```bash
+hub setup --invite <code> --label "<name>-main-agent"
+# → agent redeems the code, stores the token in its Secure Vault, prints:
+#   "Enrolled as <name> (<role>). Token held by the tool — never shown."
+```
+
+The code is *meant* to be shared — it grants no read access by itself —
+but it is single-use with a 7-day expiry, so get it to them promptly.
 
 ## 8. Install the agent skill per person
 
