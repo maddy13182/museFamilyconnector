@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp } from './app.js';
 import { redactPath } from '../src/index.js';
+import manifest from '../client-manifest.json' with { type: 'json' };
 
 type App = ReturnType<typeof makeApp>;
 
@@ -124,7 +125,7 @@ test('GET page as JSON returns the agent page shape without secrets', async () =
     assert.equal(b.role, 'parent', label);
     assert.equal(b.email_hint, 'i***@t.dev', label);
     assert.ok(typeof b.expires_at === 'string', label);
-    assert.equal(b.client.version, '0.9.0', label);
+    assert.equal(b.client.version, manifest.version, label);
     assert.equal(b.client.download_url, 'https://hub.test/v1/client/download/hub', label);
     // Install steps point at this server's download endpoints — no
     // GitHub release URLs remain in the user-facing flow.
