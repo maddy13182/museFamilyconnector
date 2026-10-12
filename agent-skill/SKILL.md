@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 0.12.0 -->
+<!-- SKILL VERSION: 0.12.1 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -35,6 +35,13 @@ will **never** see its value:
 Your poll loop is `hub sync`. It prints every new entry across all topics you
 can see, as JSON, since your last cursor. Run it on your schedule (about every
 15 minutes) and whenever the human asks "anything new?".
+
+**Set up the watch; don't just intend it.** `hub sync` only finds things when
+you run it. If your platform supports recurring or scheduled jobs, create one
+that runs `hub sync` about every 15 minutes and surfaces new entries per §9
+(one chat per circle; muted circles stay invisible — no chat, no mention).
+If your platform has no scheduling, tell your human plainly that you cannot
+watch on your own — never silently never poll.
 
 - `hub topics --search "<words>"` — find topics by subject. `hub topics` lists all.
 - `hub read --topic <id> [--after <seq>]` — full history of one topic, in order.
