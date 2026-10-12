@@ -48,6 +48,7 @@ import base64
 import getpass
 import hashlib
 import http.client
+import io
 import json
 import os
 import random
@@ -58,6 +59,7 @@ import socket
 import stat
 import subprocess  # nosec B404 -- used only for the operator-configured vault helper (shell=False)
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -135,10 +137,11 @@ VERSION = _cli_version()
 SKILL_VERSION = _skill_version()
 
 # Floor of the API version contract (spec §1, §4.1): the oldest server
-# this CLI will talk to. Bumped deliberately; covered by a test. No
-# backcompat with server 0.11.0 (which reports no `api_versions` and is
-# rejected by the per-invocation check below).
-_MIN_SERVER_VERSION = "0.12.0"
+# this CLI will talk to. Bumped deliberately; covered by a test. Clean
+# break — no backcompat: 0.13.0 is the first server that serves the
+# skill bundle (`/v1/client/download/skill.tar.gz`, manifest `skill`
+# block, contract §3.6), which `hub upgrade` now requires.
+_MIN_SERVER_VERSION = "0.13.0"
 
 # API majors this CLI implements, highest first. The per-invocation check
 # selects the highest one the server advertises (v1 today) and prefixes
@@ -5169,11 +5172,49 @@ def _is_newer(candidate, current):
     return cand[3] > cur[3]
 
 
+def _validate_skill_block(manifest):
+    """Validate the manifest's `skill` block (contract §3.6, server 0.13.0+).
+
+    Shape: {url, sha256, version} — the server-hosted skill bundle
+    (skill.tar.gz) advertised by GET /v1/client/latest. `url` must be an
+    absolute https URL; the same-origin pin to the configured server is
+    enforced at download time by `_download_bytes` (exactly like the
+    release assets) before a single byte is fetched. `sha256` is the
+    64-hex digest the tarball must match; `version` is the skill version
+    (SKILL.md header) used for the newer-than-installed comparison.
+    Raises HubError on anything missing or malformed — fail loud, never
+    a partial or unverified refresh.
+    """
+    skill = manifest.get("skill")
+    if not isinstance(skill, dict):
+        raise HubError(
+            "bad_request", "Client manifest is missing the 'skill' object."
+        )
+    for field in ("url", "sha256", "version"):
+        if not skill.get(field):
+            raise HubError(
+                "bad_request", "Client manifest 'skill' is missing %r." % (field,)
+            )
+    url = str(skill["url"])
+    if not _ABSOLUTE_HTTPS_URL_RE.match(url):
+        raise HubError(
+            "bad_request",
+            "Client manifest skill.url is not an absolute https URL: %r." % url,
+        )
+    _parse_version(skill["version"])  # raises on garbage
+    if not _SHA256_RE.match(str(skill["sha256"])):
+        raise HubError(
+            "bad_request", "Client manifest skill.sha256 is not 64 hex chars."
+        )
+    return skill
+
+
 def _validate_client_manifest(obj):
     """Validate a GET /v1/client/latest payload (contract C2).
 
-    New shape (spec §3.5): {version, min_cli_version, server_version,
-    sha256, released_at, download_url, assets: {hub, sigstore, manifest}}.
+    New shape (spec §3.5 + §3.6): {version, min_cli_version,
+    server_version, sha256, released_at, download_url,
+    assets: {hub, sigstore, manifest}, skill: {url, sha256, version}}.
     The CLI downloads from `assets.*` (this server's download endpoints);
     `download_url` is kept for field continuity and validated too.
     Returns the manifest dict; raises HubError on any schema violation.
@@ -5210,6 +5251,7 @@ def _validate_client_manifest(obj):
         raise HubError(
             "bad_request", "Client manifest sha256 is not 64 hex chars."
         )
+    _validate_skill_block(obj)
     return obj
 
 
@@ -5426,6 +5468,247 @@ def _write_integrity_manifest(install_dir, version, sha256):
     os.replace(tmp, os.path.join(install_dir, "manifest.json"))
 
 
+# ---------------------------------------------------------------------------
+# Skill-docs refresh (skill bundle distribution, contract §3.6)
+# ---------------------------------------------------------------------------
+#
+# GET /v1/client/latest advertises a versioned skill bundle (the full
+# installable skill: SKILL.md, references/, INSTALL.md, requirements.txt,
+# plus the signed hub + hub.sigstore + manifest.json) at
+# /v1/client/download/skill.tar.gz, in the manifest's `skill` block:
+# {url, sha256, version}. `hub upgrade` refreshes the doc files when the
+# server's skill version is newer than the installed one — whether or not
+# the binary was upgraded, because skill and CLI versions are independent.
+#
+# Trust model: the tarball is bytes from the hub server, exactly like the
+# release assets. Its sha256 (from the already-validated manifest) is
+# verified BEFORE extraction, and extraction is fail-closed (see
+# _safe_extract_skill_bundle). Only the doc allowlist is ever copied into
+# the skill dir — the binary flow owns hub/hub.sigstore/manifest.json, and
+# credentials (config.json, token files, *.key, profiles) are never within
+# reach of the copy.
+
+# Doc files/dirs the refresh may copy, relative to the skill dir (the dir
+# containing the running `hub` script).
+_SKILL_DOC_FILES = ("SKILL.md", "INSTALL.md", "requirements.txt")
+_SKILL_DOC_DIR = "references"
+# Files the refresh must never write, even if the tarball contains them —
+# the binary flow owns the release artifacts. Disjoint from the allowlist
+# by construction (covered by a test).
+_SKILL_BUNDLE_NEVER_WRITE = ("hub", "hub.sigstore", "manifest.json")
+
+_UNSAFE_TAR_NAME_RE = re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)")
+_UNSAFE_TAR_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _check_tar_member(member):
+    """Fail-closed safety check for one skill-bundle tar member.
+
+    Rejects, with HubError and before anything is written:
+      - absolute paths ("/etc/x", "\\x", "C:/x" — the drive-letter form
+        matters on Windows, where os.path.join would otherwise resolve
+        it outside the staging dir),
+      - any `..` path component (tarball-slip),
+      - symlinks and hardlinks — rejected outright rather than
+        resolve-then-contain, because skill docs are plain files: any
+        link member is either a build bug or an attack,
+      - anything that is not a regular file or a directory
+        (devices, FIFOs, sockets).
+    """
+    name = member.name
+    if (
+        not name
+        or name in (".", "./")
+        or name.startswith(("/", "\\"))
+        or _UNSAFE_TAR_DRIVE_RE.match(name)
+        or _UNSAFE_TAR_NAME_RE.search(name)
+    ):
+        raise HubError(
+            "config",
+            "The skill bundle contains an unsafe path %r; refusing to extract."
+            % (name,),
+        )
+    if member.issym() or member.islnk():
+        raise HubError(
+            "config",
+            "The skill bundle contains a symlink/hardlink %r; "
+            "refusing to extract." % (name,),
+        )
+    if not (member.isreg() or member.isdir()):
+        raise HubError(
+            "config",
+            "The skill bundle contains a non-regular member %r; "
+            "refusing to extract." % (name,),
+        )
+
+
+def _safe_extract_skill_bundle(tarball_bytes, staging_dir):
+    """Extract sha256-verified tarball bytes into staging_dir, fail-closed.
+
+    Every member passes _check_tar_member before anything is written, and
+    extraction is manual (member file objects -> plain files via
+    copyfileobj), never tarfile.extract(): no member can trigger a
+    privileged operation or escape the staging dir. A final commonpath
+    containment check is defense in depth under the name checks. On any
+    failure nothing in the skill dir has been touched — extraction happens
+    in the temp staging dir only, which the caller cleans up.
+    """
+    staging_abs = os.path.abspath(staging_dir)
+    try:
+        tfile = tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:*")
+    except tarfile.TarError as exc:
+        raise HubError(
+            "config", "The skill bundle is not a readable tar archive: %s" % exc
+        )
+    try:
+        members = tfile.getmembers()
+        for member in members:
+            _check_tar_member(member)
+        for member in members:
+            target = os.path.abspath(os.path.join(staging_abs, member.name))
+            if os.path.commonpath([staging_abs, target]) != staging_abs:
+                raise HubError(
+                    "config",
+                    "The skill bundle would write outside its staging area "
+                    "(%r); refusing." % (member.name,),
+                )
+            if member.isdir():
+                os.makedirs(target, exist_ok=True)
+            else:
+                parent = os.path.dirname(target) or staging_abs
+                os.makedirs(parent, exist_ok=True)
+                with tfile.extractfile(member) as fin, open(target, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+    except HubError:
+        raise
+    except (tarfile.TarError, OSError) as exc:
+        raise HubError(
+            "config", "The skill bundle could not be extracted: %s" % exc
+        )
+    finally:
+        tfile.close()
+
+
+def _install_skill_docs(staging_dir, skill_dir):
+    """Copy only the doc allowlist from staging into the skill dir.
+
+    Files: SKILL.md, INSTALL.md, requirements.txt — each copied (via an
+    atomic temp+rename) when present. SKILL.md must be present: it carries
+    the version signal, so a bundle without it is rejected.
+    Directory: references/ is replaced wholesale (rmtree + copytree).
+    Everything else in the bundle — hub, hub.sigstore, manifest.json,
+    config.json, token files, *.key, profiles — is never written: the
+    allowlist is the credential-safety boundary. Modes: docs 0644,
+    dirs 0755. Returns the refreshed items for the summary emit.
+    """
+    if not set(_SKILL_DOC_FILES).isdisjoint(_SKILL_BUNDLE_NEVER_WRITE):
+        raise AssertionError("skill-doc allowlist overlaps NEVER_WRITE")
+    refreshed = []
+    for fname in _SKILL_DOC_FILES:
+        src = os.path.join(staging_dir, fname)
+        if not os.path.isfile(src):
+            if fname == "SKILL.md":
+                raise HubError(
+                    "config",
+                    "The skill bundle has no SKILL.md; refusing to install "
+                    "a versionless skill.",
+                )
+            emit("Skill bundle has no %s; keeping the installed one." % fname)
+            continue
+        dst = os.path.join(skill_dir, fname)
+        tmp = dst + ".tmp"
+        try:
+            shutil.copyfile(src, tmp)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dst)
+        except OSError as exc:
+            raise HubError(
+                "config",
+                "Could not refresh %s (%s); the skill docs may be partial — "
+                "re-run `hub upgrade`." % (fname, exc),
+            )
+        refreshed.append(fname)
+    ref_src = os.path.join(staging_dir, _SKILL_DOC_DIR)
+    if os.path.isdir(ref_src):
+        ref_dst = os.path.join(skill_dir, _SKILL_DOC_DIR)
+        try:
+            shutil.rmtree(ref_dst, ignore_errors=True)
+            shutil.copytree(ref_src, ref_dst)
+        except OSError as exc:
+            raise HubError(
+                "config",
+                "Could not refresh references/ (%s); the skill docs may be "
+                "partial — re-run `hub upgrade`." % exc,
+            )
+        for root, dirs, files in os.walk(ref_dst):
+            for d in dirs:
+                # 0755 on doc dirs: the x bit is required for traversal; no
+                # executables live here (the allowlist is docs only).
+                os.chmod(os.path.join(root, d), 0o755)  # nosec B103
+            for f in files:
+                os.chmod(os.path.join(root, f), 0o644)
+        refreshed.append(_SKILL_DOC_DIR + "/")
+    else:
+        emit("Skill bundle has no references/; keeping the installed tree.")
+    return refreshed
+
+
+def _refresh_skill_docs(ctx, manifest):
+    """Refresh the skill's doc files from the server-hosted skill bundle.
+
+    Runs at the end of `hub upgrade`, whether or not the binary was
+    upgraded (skill and CLI versions are independent). When the server's
+    skill version is newer than the installed skill's, the tarball is
+    downloaded (same-origin pinned https via _download_bytes), its sha256
+    is verified against the manifest BEFORE extraction — the hash covers
+    the exact bytes that are then extracted from memory, so there is no
+    TOCTOU between check and use — and only the doc allowlist is copied
+    into the skill dir.
+
+    Fail-closed throughout: hash mismatch, unsafe tarball, or a bundle
+    without SKILL.md raises HubError and touches nothing in the skill dir.
+    """
+    skill = manifest["skill"]  # validated by _validate_client_manifest
+    server_version = str(skill["version"])
+    skill_dir = _script_dir()
+    installed = _skill_version()
+    if installed == "unknown":
+        emit(
+            "No SKILL.md next to the CLI (not a skill install); "
+            "skipping the skill-docs refresh."
+        )
+        return 0
+    if not _is_newer(server_version, installed):
+        emit(
+            "Skill docs are current: installed skill %s, server advertises %s."
+            % (installed, server_version)
+        )
+        return 0
+    emit("New skill docs available: skill %s → %s." % (installed, server_version))
+    tarball = _download_bytes(
+        str(skill["url"]), "skill bundle %s" % server_version, ctx.server
+    )
+    want = str(skill["sha256"]).lower()
+    got = hashlib.sha256(tarball).hexdigest()
+    if got != want:
+        raise HubError(
+            "config",
+            "sha256 MISMATCH for the downloaded skill bundle %s: expected %s, "
+            "got %s. The installed skill files are NOT touched."
+            % (server_version, want, got),
+        )
+    tmpdir = tempfile.mkdtemp(prefix="hub-skill-")
+    try:
+        staging = os.path.join(tmpdir, "bundle")
+        os.makedirs(staging)
+        _safe_extract_skill_bundle(tarball, staging)
+        refreshed = _install_skill_docs(staging, skill_dir)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    emit("Skill docs refreshed to %s: %s." % (server_version, ", ".join(refreshed)))
+    return 0
+
+
 def _latest_release(client):
     """Fetch and validate GET /v1/client/latest (unauthenticated)."""
     try:
@@ -5453,11 +5736,32 @@ def cmd_upgrade(args, transport):
     Verification is unchanged: sha256 against both the server manifest and
     the release manifest, mandatory sigstore check, self-test before AND
     after the atomic cutover.
+
+    After the binary flow, a skill-docs refresh phase runs: when the
+    server's skill bundle (manifest `skill` block, contract §3.6) is newer
+    than the installed skill docs, the verified tarball's doc files
+    (SKILL.md, INSTALL.md, requirements.txt, references/) are refreshed.
+    It runs whether or not the binary was upgraded — skill and CLI versions
+    are independent.
     """
     current = _cli_version()
     emit("hub %s — checking for updates…" % current)
     ctx = _ctx(args, transport, need_auth=False)
     manifest = _latest_release(ctx.client)
+    _binary_upgrade_flow(current, ctx, manifest)
+    _refresh_skill_docs(ctx, manifest)
+    return 0
+
+
+def _binary_upgrade_flow(current, ctx, manifest):
+    """The binary-upgrade flow for `hub upgrade`.
+
+    Moved verbatim out of cmd_upgrade (only indentation changed) so the
+    skill-docs refresh phase can run after it on every path — both when the
+    binary was upgraded and when it was already current. The flow itself is
+    unchanged: same checks, same messages, same atomic-swap + rollback
+    behavior.
+    """
     new_version = str(manifest["version"])
     emit("This server requires CLI ≥ %s." % manifest["min_cli_version"])
     if not _is_newer(new_version, current):
@@ -5561,6 +5865,8 @@ def cmd_upgrade(args, transport):
         return 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 
 
 def cmd_rollback(args, transport):
@@ -6463,7 +6769,10 @@ def build_parser():
         "swap it in atomically (previous binary kept as hub.prev for "
         "`hub rollback`). Refuses — rather than skipping verification — "
         "when the `sigstore` package is missing. No-op when already "
-        "current.",
+        "current. Afterwards, refreshes the skill docs (SKILL.md, "
+        "INSTALL.md, requirements.txt, references/) from the server's "
+        "versioned skill bundle when it is newer than the installed "
+        "ones — skill and CLI versions are independent.",
         epilog="example:\n  hub upgrade",
     )
     p.set_defaults(func=cmd_upgrade)
