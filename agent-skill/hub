@@ -5223,10 +5223,17 @@ def _validate_download_url(url, server):
     the server URL itself (F03). The sha256 + sigstore verification after
     the download remains the real trust anchor — this is defense in depth.
     """
-    parts = urlparse.urlsplit(str(url))
-    srv = urlparse.urlsplit(str(server))
-    host = (parts.hostname or "").lower().rstrip(".")
-    srv_host = (srv.hostname or "").lower().rstrip(".")
+    try:
+        parts = urlparse.urlsplit(str(url))
+        srv = urlparse.urlsplit(str(server))
+        host = (parts.hostname or "").lower().rstrip(".")
+        srv_host = (srv.hostname or "").lower().rstrip(".")
+        port = parts.port
+        srv_port = srv.port
+    except ValueError as exc:
+        raise HubError(
+            "bad_request", "Malformed download URL %r: %s" % (url, exc)
+        )
     if parts.scheme not in ("http", "https"):
         raise HubError(
             "bad_request",
@@ -5238,11 +5245,18 @@ def _validate_download_url(url, server):
             "Refusing to download over plain http from non-loopback host "
             "%r." % host,
         )
+    if parts.username or parts.password:
+        raise HubError(
+            "bad_request",
+            "Refusing download URL with embedded credentials — the Bearer "
+            "token is the only credential and it travels in the "
+            "Authorization header.",
+        )
     # Same origin as the configured server (default ports normalized):
     # the server's own /v1/client/download/* endpoints.
     default_port = {"http": 80, "https": 443}
-    port = parts.port or default_port[parts.scheme]
-    srv_port = srv.port or default_port.get(srv.scheme)
+    port = port or default_port[parts.scheme]
+    srv_port = srv_port or default_port.get(srv.scheme)
     if not host or host != srv_host or port != srv_port:
         raise HubError(
             "bad_request",

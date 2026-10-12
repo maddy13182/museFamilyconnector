@@ -307,6 +307,19 @@ class ManifestSchemaTest(unittest.TestCase):
                 "http://127.0.0.1:8080/v1/client/download/hub",
                 "https://hub.example.test")
 
+    def test_download_url_rejects_embedded_credentials(self):
+        with self.assertRaises(hub.HubError):
+            hub._validate_download_url(
+                "https://user:pass@hub.example.test/v1/client/download/hub",
+                "https://hub.example.test")
+
+    def test_download_url_rejects_malformed(self):
+        for bad in ("https://hub.example.test:abc/hub",
+                    "https://[::1/hub",
+                    "not a url at all"):
+            with self.assertRaises(hub.HubError):
+                hub._validate_download_url(bad, "https://hub.example.test")
+
 
 # ---------------------------------------------------------------------------
 # Upgrade flows

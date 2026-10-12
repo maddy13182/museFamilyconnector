@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -387,6 +388,101 @@ class NoBypassTest(unittest.TestCase):
             self.assertIn("needs server 0.12.0+", err)
         finally:
             base.tearDown()
+
+
+# ---------------------------------------------------------------------------
+# hub upgrade through main(): version check passes, server assets used
+# ---------------------------------------------------------------------------
+
+
+class UpgradeThroughMainTest(VersionCheckBase):
+    def _stamp(self, data, version):
+        text = data.decode("utf-8")
+        new_text, n = re.subn(
+            r'^_BUILD_VERSION = None$',
+            '_BUILD_VERSION = "%s"' % version, text, count=1, flags=re.MULTILINE,
+        )
+        assert n == 1
+        return new_text.encode("utf-8")
+
+    def test_upgrade_via_main_on_current_server(self):
+        import hashlib
+        from unittest import mock
+
+        self.seed_config()
+        with open(HUB_PATH, "rb") as fh:
+            old_bytes = fh.read()
+        target = os.path.join(self.tmp, "hub")
+        with open(target, "wb") as fh:
+            fh.write(old_bytes)
+        os.chmod(target, 0o755)
+
+        new_version = "0.10.1"
+        new_bytes = self._stamp(old_bytes, new_version)
+        digest = hashlib.sha256(new_bytes).hexdigest()
+        server = "https://hub.example.test"
+        manifest = {
+            "version": new_version,
+            "min_cli_version": "0.10.0",
+            "server_version": "0.12.0",
+            "download_url": server + "/v1/client/download/hub",
+            "sha256": digest,
+            "released_at": "2026-10-11T22:00:00Z",
+            "assets": {
+                "hub": server + "/v1/client/download/hub",
+                "sigstore": server + "/v1/client/download/hub.sigstore",
+                "manifest": server + "/v1/client/download/manifest.json",
+            },
+        }
+        downloads = {
+            manifest["assets"]["hub"]: new_bytes,
+            manifest["assets"]["sigstore"]: b"fake-bundle",
+            manifest["assets"]["manifest"]: json.dumps(
+                {"version": new_version, "sha256": digest}).encode("utf-8"),
+        }
+        requested = []
+
+        def fake_download(url, what, srv=None, timeout=90):
+            requested.append((url, srv))
+            return downloads[url]
+
+        self.fake = FakeHub(health=HEALTH_OK)
+        self.fake.add("GET", "/v1/client/latest", 200, manifest)
+        with mock.patch.object(hub, "_script_path", return_value=target), \
+             mock.patch.object(hub, "_download_bytes",
+                               side_effect=fake_download), \
+             mock.patch.object(hub, "_verify_sigstore", return_value=None):
+            with captured() as (out, err):
+                rc = hub.main(["upgrade"], transport=self.fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("This server requires CLI ≥ 0.10.0", out.getvalue())
+        # Assets came from the server's endpoints, pinned to its origin.
+        self.assertEqual(
+            [u for u, _ in requested],
+            [manifest["assets"]["hub"], manifest["assets"]["sigstore"],
+             manifest["assets"]["manifest"]],
+        )
+        for _url, srv in requested:
+            self.assertEqual(srv, server)
+        # The real install happened: target is the new bytes, prev kept.
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), new_bytes)
+        self.assertTrue(os.path.exists(target + ".prev"))
+        self.assertEqual(len(self.fake.health_calls()), 1)
+
+    def test_upgrade_via_main_blocked_on_old_server(self):
+        self.seed_config()
+        self.fake = FakeHub(health=HEALTH_OLD)
+        with captured() as (out, err):
+            rc = hub.main(["upgrade"], transport=self.fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("needs server 0.12.0+", err.getvalue())
+        # The command never reached /v1/client/latest.
+        self.assertEqual(
+            [c for c in self.fake.calls
+             if urlparse.urlparse(c["url"]).path == "/v1/client/latest"],
+            [],
+        )
 
 
 if __name__ == "__main__":
