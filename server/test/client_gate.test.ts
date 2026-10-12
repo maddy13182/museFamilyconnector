@@ -1,7 +1,7 @@
 // WS-B — client version gate (B1), GET /v1/client/latest (B2), and key
 // lineage in the audit log (B3).
 //
-// Covers: below-minimum 400 with the guidance message, the legacy
+// Covers: below-minimum 426 with the guidance message, the legacy
 // `family-hub-agent/1.0` sentinel, non-CLI user-agent passthrough, gate-off
 // default, /v1/client/latest shape + gate exemption, and key-fingerprint
 // audit entries on registration / rotation (old fp → new fp) / revocation.
@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp, TestApp } from './app.js';
 import manifest from '../client-manifest.json' with { type: 'json' };
+import pkg from '../package.json' with { type: 'json' };
 
 // No @types/node in this repo: random bytes via WebCrypto (DOM lib) and
 // base64 via btoa (each input byte becomes one char — safe for 32 bytes).
@@ -96,13 +97,13 @@ test('gate is off by default: outdated CLI UA passes', async () => {
   assert.equal(res.status, 200);
 });
 
-test('below-minimum CLI is rejected with 400 and the guidance message', async () => {
+test('below-minimum CLI is rejected with 426 and the guidance message', async () => {
   const app = makeApp();
   gateOn(app);
   const res = await app.call('GET', '/v1/me', {
     headers: { 'user-agent': 'family-hub-agent/0.5.0' },
   });
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 426);
   assert.equal(res.body.error.code, 'client_too_old');
   assert.equal(
     res.body.error.message,
@@ -117,7 +118,7 @@ test('legacy family-hub-agent/1.0 sentinel is treated as 0.0.0', async () => {
   const res = await app.call('GET', '/v1/me', {
     headers: { 'user-agent': 'family-hub-agent/1.0' },
   });
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 426);
   assert.equal(res.body.error.code, 'client_too_old');
   assert.match(res.body.error.message, /Client version 0\.0\.0 is below the required minimum 0\.7\.0/);
 });
@@ -159,27 +160,34 @@ test('non-CLI user agents are never gated', async () => {
   assert.equal(none.status, 200);
 });
 
-test('gate fires before auth (400, not 401) for old clients', async () => {
+test('gate fires before auth (426, not 401) for old clients', async () => {
   const app = makeApp();
   gateOn(app);
   const res = await app.call('GET', '/v1/me', {
     headers: { 'user-agent': 'family-hub-agent/0.1.0' },
   });
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 426);
   assert.equal(res.body.error.code, 'client_too_old');
 });
 
-test('/v1/client/latest and /v1/health are exempt from the gate', async () => {
+test('/v1/client/latest, /v1/health, and /v1/client/download/* are exempt from the gate', async () => {
   const app = makeApp();
   gateOn(app);
-  const latest = await app.call('GET', '/v1/client/latest', {
-    headers: { 'user-agent': 'family-hub-agent/0.0.1' },
-  });
+  const oldUA = { headers: { 'user-agent': 'family-hub-agent/0.0.1' } };
+  const latest = await app.call('GET', '/v1/client/latest', oldUA);
   assert.equal(latest.status, 200);
   const health = await app.call('GET', '/v1/health', {
     headers: { 'user-agent': 'family-hub-agent/1.0' },
   });
   assert.equal(health.status, 200);
+  for (const p of [
+    '/v1/client/download/hub',
+    '/v1/client/download/hub.sigstore',
+    '/v1/client/download/manifest.json',
+  ]) {
+    const r = await app.call('GET', p, oldUA);
+    assert.equal(r.status, 200, `${p} must stay reachable by outdated clients`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -191,17 +199,27 @@ test('/v1/client/latest serves the manifest shape, publicly', async () => {
   const res = await app.call('GET', '/v1/client/latest');
   assert.equal(res.status, 200);
   assert.deepEqual(Object.keys(res.body).sort(), [
+    'assets',
     'download_url',
     'min_cli_version',
     'released_at',
+    'server_version',
     'sha256',
     'version',
   ]);
   assert.equal(res.body.version, manifest.version);
   assert.equal(res.body.min_cli_version, manifest.min_cli_version);
-  assert.equal(res.body.download_url, manifest.download_url);
+  assert.equal(res.body.server_version, pkg.version);
   assert.equal(res.body.sha256, manifest.sha256);
   assert.equal(res.body.released_at, manifest.released_at);
+  // Self-referential: URLs point at THIS server's download endpoints,
+  // derived from the request origin.
+  assert.equal(res.body.download_url, 'https://hub.test/v1/client/download/hub');
+  assert.deepEqual(res.body.assets, {
+    hub: 'https://hub.test/v1/client/download/hub',
+    sigstore: 'https://hub.test/v1/client/download/hub.sigstore',
+    manifest: 'https://hub.test/v1/client/download/manifest.json',
+  });
   assert.match(res.body.version, /^\d+\.\d+\.\d+$/);
   assert.match(res.body.min_cli_version, /^\d+\.\d+\.\d+$/);
 });

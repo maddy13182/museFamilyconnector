@@ -124,8 +124,15 @@ test('GET page as JSON returns the agent page shape without secrets', async () =
     assert.equal(b.role, 'parent', label);
     assert.equal(b.email_hint, 'i***@t.dev', label);
     assert.ok(typeof b.expires_at === 'string', label);
-    assert.equal(b.client.version, '0.6.0', label);
-    assert.ok((b.client.download_url as string).endsWith('/hub'), label);
+    assert.equal(b.client.version, '0.9.0', label);
+    assert.equal(b.client.download_url, 'https://hub.test/v1/client/download/hub', label);
+    // Install steps point at this server's download endpoints — no
+    // GitHub release URLs remain in the user-facing flow.
+    const stepsText = (b.install.steps as string[]).join('\n');
+    assert.ok(stepsText.includes('https://hub.test/v1/client/download/hub'), label);
+    assert.ok(stepsText.includes('https://hub.test/v1/client/download/hub.sigstore'), label);
+    assert.ok(stepsText.includes('https://hub.test/v1/client/download/manifest.json'), label);
+    assert.ok(!stepsText.includes('github.com/maddy13182/museFamilyconnector/releases'), label);
     assert.ok(typeof b.client.sha256 === 'string' && b.client.sha256.length > 0, label);
     assert.ok(Array.isArray(b.install.steps) && b.install.steps.length === 6, label);
     assert.ok(
@@ -156,6 +163,14 @@ test('GET page as HTML renders install steps and the masked hint', async () => {
   assert.ok(html.includes('<!doctype html>'), 'is an HTML document');
   assert.ok(html.includes('i***@t.dev'), 'masked hint present');
   assert.ok(html.includes('sigstore'), 'install steps present');
+  assert.ok(
+    html.includes('https://hub.test/v1/client/download/hub'),
+    'install steps use this server download endpoints',
+  );
+  assert.ok(
+    !html.includes('github.com/maddy13182/museFamilyconnector/releases/download'),
+    'no GitHub release download URLs in the user-facing flow',
+  );
   const pt = pageTokenOf(inv.onboarding_url);
   assert.ok(
     html.includes(`fetch('/i/${pt}/verify'`),
