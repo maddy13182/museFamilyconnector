@@ -158,7 +158,7 @@ class TestVerifyInstall(TamperEvidenceTestBase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] sha256", out)
         self.assertIn("RESULT: FAIL", out)
-        self.assertIn("reinstall from the GitHub Release", out)
+        self.assertIn("reinstall from the server", out)
 
     def test_missing_manifest(self):
         mod, _ = self.make_install(manifest="missing")

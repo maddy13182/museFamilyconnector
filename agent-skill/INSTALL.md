@@ -17,14 +17,17 @@ it first, then invites everyone else.
 
 ## Step 1 — Get the files
 
-**Option A — signed release (recommended).** Every CLI release is cut by
-the release workflow as `cli-v<x.y.z>` on GitHub, with three assets:
-`hub` (the single-file script), `hub.sigstore` (the sigstore keyless
-signature bundle), and `manifest.json` (`{version, sha256, files}`).
+**Option A — signed release from your server (recommended).** The server
+publishes the signed CLI release itself: `GET /v1/client/latest` names
+the current version and its download URLs. Every release carries three
+assets: `hub` (the single-file script), `hub.sigstore` (the sigstore
+keyless signature bundle), and `manifest.json` (`{version, sha256, …}`).
+
+Ask the family owner for the server's base URL (it is also printed on
+your invite page), then:
 
 ```sh
-VER=0.7.0   # pick the version your owner tells you to install
-BASE=https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v$VER
+BASE=https://<your-hub-server>/v1/client/download
 mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub
 curl -sSLO "$BASE/hub" -sSLO "$BASE/hub.sigstore" -sSLO "$BASE/manifest.json"
 chmod +x hub
@@ -34,7 +37,8 @@ Verify **before** installing — in this order:
 
 ```sh
 # 1. Signature: proves the artifact was built by this repo's release
-#    workflow (keyless OIDC; no long-lived keys to steal).
+#    workflow (keyless OIDC; no long-lived keys to steal). The bytes are
+#    the identical signed release artifacts — only the host changed.
 pip install "sigstore>=3.0,<4.0"
 python3 -m sigstore verify identity \
   --bundle hub.sigstore \
@@ -81,11 +85,13 @@ with is detectable here — keep them in lockstep (see "Upgrading" below).
 ## Upgrading — `hub upgrade`
 
 `hub upgrade` asks the server what the current signed release is
-(`GET /v1/client/latest`), and only when it is newer than the installed
+(`GET /v1/client/latest` — which also states the server's required
+minimum CLI version), and only when it is newer than the installed
 CLI does it:
 
-1. Download `hub`, `hub.sigstore`, and `manifest.json` from the GitHub
-   Release.
+1. Download `hub`, `hub.sigstore`, and `manifest.json` from the server's
+   own download endpoints (`/v1/client/download/*`, the URLs in the
+   manifest's `assets` map).
 2. Verify the sigstore signature (refuses if the `sigstore` package is
    missing — it will not skip verification).
 3. Verify the sha256 against both the release manifest and the server
@@ -251,7 +257,7 @@ The installed `hub` is a signed release. Two checks keep it honest:
 - **Startup self-check** — every `hub` invocation hashes the CLI's own file
   bytes and compares against the manifest's recorded hash. On mismatch the
   CLI refuses to run (exit 5): `installed CLI does not match the signed
-  release; reinstall from the GitHub Release`. A missing or corrupt
+  release; reinstall from the server`. A missing or corrupt
   `manifest.json` (a dev checkout, or a hand-rolled copy) warns once on
   stderr and continues — it never hard-fails development.
 
@@ -276,5 +282,5 @@ is not the layer that saves you there.
 | `hub upgrade`: `sigstore` not installed | `pip install "sigstore>=3.0,<4.0"`, then retry — the upgrade refuses rather than skipping verification |
 | `hub upgrade`: signature/sha256 FAILED | Do **not** install; the artifact may be tampered — tell the family owner |
 | cron job hangs on a prompt | `agent.key` is wrapped and the job lacks `FAMILY_HUB_KEY_PASSPHRASE` — bind it from the Secure Vault (see Step 3) |
-| `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the GitHub Release |
-| `RESULT: FAIL` from `hub verify-install` | Reinstall from the GitHub Release (artifact + `manifest.json` + `hub.sigstore`); don't keep using the failed copy |
+| `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the server |
+| `RESULT: FAIL` from `hub verify-install` | Reinstall from the server (artifact + `manifest.json` + `hub.sigstore` via `/v1/client/download/*`, or `hub upgrade`); don't keep using the failed copy |

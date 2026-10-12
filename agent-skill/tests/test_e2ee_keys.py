@@ -101,6 +101,13 @@ class E2EETestBase(unittest.TestCase):
         os.environ["FAMILY_HUB_TOKEN"] = FAKE_TOKEN
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
         self.fake = FakeHub()
+        # The fake server is a current (0.12.0) server: the per-invocation
+        # version check in main() must pass before any command runs.
+        hub._reset_server_version_cache()
+        self.fake.add(
+            "GET", "/v1/health", 200,
+            {"ok": True, "version": "0.12.0", "api_versions": ["v1"]},
+        )
 
     def tearDown(self):
         os.environ.clear()

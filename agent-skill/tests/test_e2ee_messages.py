@@ -94,6 +94,13 @@ class MsgFakeHub:
         path = parts.path
         method = method.upper()
 
+        # The fake server is a current (0.12.0) server: answer the
+        # per-invocation version check in main() before any command runs.
+        if method == "GET" and path == "/v1/health":
+            return 200, json.dumps(
+                {"ok": True, "version": "0.12.0", "api_versions": ["v1"]}
+            )
+
         if method == "GET" and path == "/v1/topics":
             return 200, json.dumps(
                 {"topics": [dict(t) for t in self.topics.values()]})
@@ -171,6 +178,8 @@ class E2eeMsgTestBase(unittest.TestCase):
         os.environ["FAMILY_HUB_TOKEN"] = FAKE_TOKEN
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
         self.fake = MsgFakeHub()
+        # Fresh version-check state: the fake models a current server.
+        hub._reset_server_version_cache()
         self.seed_config()
 
     def tearDown(self):

@@ -113,6 +113,12 @@ class RecoveryFakeHub:
         path = parts.path
         query = urlparse.parse_qs(parts.query)
         method = method.upper()
+        # The fake server is a current (0.12.0) server: answer the
+        # per-invocation version check in main() before any command runs.
+        if method == "GET" and path == "/v1/health":
+            return 200, json.dumps(
+                {"ok": True, "version": "0.12.0", "api_versions": ["v1"]}
+            )
         body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
         mid, label = self.caller
 
@@ -236,6 +242,8 @@ class E2eeRecoveryTestBase(unittest.TestCase):
         os.environ["HOME"] = self.tmp
         os.environ["FAMILY_HUB_TOKEN"] = FAKE_TOKEN
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
+        # Fresh version-check state: the fake models a current server.
+        hub._reset_server_version_cache()
         self.privs = {}
         self.pubs = {}
         for mid, label in [("m1", "owner-agent"), ("m2", "bee-agent")]:
