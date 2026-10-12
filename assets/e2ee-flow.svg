@@ -1,58 +1,63 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 980" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
   <defs>
-    <filter id="soft2" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#2D2A26" flood-opacity="0.12"/>
+    <filter id="soft3" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#000000" flood-opacity="0.25"/>
     </filter>
-    <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 1 L 9 5 L 0 9 z" fill="#8A8478"/>
+    <marker id="arrowD" viewBox="0 0 10 10" refX="5" refY="9" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 1 0 L 5 9 L 9 0 z" fill="#8A8478"/>
     </marker>
   </defs>
 
-  <rect x="0" y="0" width="1200" height="320" rx="20" fill="#122E2C"/>
-  <text x="600" y="44" font-size="18" font-weight="800" fill="#FAF6EF" text-anchor="middle" letter-spacing="1">END-TO-END ENCRYPTION — WHAT THE SERVER SEES</text>
+  <rect x="0" y="0" width="640" height="980" rx="24" fill="#122E2C"/>
+  <text x="320" y="62" font-size="24" font-weight="800" fill="#FAF6EF" text-anchor="middle" letter-spacing="1">END-TO-END ENCRYPTION</text>
+  <text x="320" y="94" font-size="16" fill="#C9D8D4" text-anchor="middle">What the server sees: sealed envelopes, never plaintext</text>
 
   <!-- Step 1 -->
-  <g filter="url(#soft2)">
-    <rect x="40" y="80" width="230" height="150" rx="14" fill="#FAF6EF"/>
-    <text x="155" y="112" font-size="14" font-weight="800" fill="#C2703D" text-anchor="middle">1 · SEAL</text>
-    <text x="155" y="140" font-size="15" font-weight="700" fill="#2D2A26" text-anchor="middle">Mom's agent</text>
-    <text x="155" y="164" font-size="13" fill="#5A554C" text-anchor="middle">locks the message with</text>
-    <text x="155" y="184" font-size="13" fill="#5A554C" text-anchor="middle">the topic's sealed key</text>
-    <text x="155" y="210" font-size="12" fill="#8A8478" text-anchor="middle">on her own device</text>
+  <g filter="url(#soft3)">
+    <rect x="60" y="130" width="520" height="150" rx="18" fill="#FAF6EF"/>
+    <circle cx="120" cy="205" r="30" fill="#C2703D"/>
+    <text x="120" y="216" font-size="28" font-weight="800" fill="#FFFFFF" text-anchor="middle">1</text>
+    <text x="172" y="188" font-size="22" font-weight="800" fill="#C2703D">SEAL</text>
+    <text x="172" y="220" font-size="18" font-weight="700" fill="#2D2A26">Mom's agent locks the message</text>
+    <text x="172" y="248" font-size="15" fill="#5A554C">with the topic's sealed key — on her own device</text>
   </g>
+
+  <line x1="320" y1="280" x2="320" y2="326" stroke="#8A8478" stroke-width="3" marker-end="url(#arrowD)"/>
 
   <!-- Step 2 -->
-  <line x1="270" y1="155" x2="330" y2="155" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow2)"/>
-  <g filter="url(#soft2)">
-    <rect x="340" y="80" width="230" height="150" rx="14" fill="#1E4A46" stroke="#3A6B66" stroke-width="1.5"/>
-    <text x="455" y="112" font-size="14" font-weight="800" fill="#E8B96A" text-anchor="middle">2 · STORE</text>
-    <text x="455" y="140" font-size="15" font-weight="700" fill="#FAF6EF" text-anchor="middle">Family Hub</text>
-    <text x="455" y="164" font-size="13" fill="#C9D8D4" text-anchor="middle">stores only ciphertext</text>
-    <text x="455" y="184" font-size="13" fill="#C9D8D4" text-anchor="middle">— a sealed envelope</text>
-    <text x="455" y="210" font-size="12" fill="#E8B96A" text-anchor="middle">it cannot open it</text>
+  <g filter="url(#soft3)">
+    <rect x="60" y="336" width="520" height="150" rx="18" fill="#1E4A46" stroke="#3A6B66" stroke-width="2"/>
+    <circle cx="120" cy="411" r="30" fill="#E8B96A"/>
+    <text x="120" y="422" font-size="28" font-weight="800" fill="#122E2C" text-anchor="middle">2</text>
+    <text x="172" y="394" font-size="22" font-weight="800" fill="#E8B96A">STORE</text>
+    <text x="172" y="426" font-size="18" font-weight="700" fill="#FAF6EF">Family Hub stores only ciphertext</text>
+    <text x="172" y="454" font-size="15" fill="#E8B96A">a sealed envelope it cannot open</text>
   </g>
+
+  <line x1="320" y1="486" x2="320" y2="532" stroke="#8A8478" stroke-width="3" marker-end="url(#arrowD)"/>
 
   <!-- Step 3 -->
-  <line x1="570" y1="155" x2="630" y2="155" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow2)"/>
-  <g filter="url(#soft2)">
-    <rect x="640" y="80" width="230" height="150" rx="14" fill="#1E4A46" stroke="#3A6B66" stroke-width="1.5"/>
-    <text x="755" y="112" font-size="14" font-weight="800" fill="#E8B96A" text-anchor="middle">3 · DELIVER</text>
-    <text x="755" y="140" font-size="15" font-weight="700" fill="#FAF6EF" text-anchor="middle">Dad's agent</text>
-    <text x="755" y="164" font-size="13" fill="#C9D8D4" text-anchor="middle">fetches the envelope</text>
-    <text x="755" y="184" font-size="13" fill="#C9D8D4" text-anchor="middle">on his next sync</text>
-    <text x="755" y="210" font-size="12" fill="#E8B96A" text-anchor="middle">still sealed in transit</text>
+  <g filter="url(#soft3)">
+    <rect x="60" y="542" width="520" height="150" rx="18" fill="#1E4A46" stroke="#3A6B66" stroke-width="2"/>
+    <circle cx="120" cy="617" r="30" fill="#E8B96A"/>
+    <text x="120" y="628" font-size="28" font-weight="800" fill="#122E2C" text-anchor="middle">3</text>
+    <text x="172" y="600" font-size="22" font-weight="800" fill="#E8B96A">DELIVER</text>
+    <text x="172" y="632" font-size="18" font-weight="700" fill="#FAF6EF">Dad's agent fetches the envelope</text>
+    <text x="172" y="660" font-size="15" fill="#E8B96A">still sealed in transit, on his next sync</text>
   </g>
+
+  <line x1="320" y1="692" x2="320" y2="738" stroke="#8A8478" stroke-width="3" marker-end="url(#arrowD)"/>
 
   <!-- Step 4 -->
-  <line x1="870" y1="155" x2="930" y2="155" stroke="#8A8478" stroke-width="2" marker-end="url(#arrow2)"/>
-  <g filter="url(#soft2)">
-    <rect x="940" y="80" width="230" height="150" rx="14" fill="#FAF6EF"/>
-    <text x="1055" y="112" font-size="14" font-weight="800" fill="#2F6F6A" text-anchor="middle">4 · OPEN</text>
-    <text x="1055" y="140" font-size="15" font-weight="700" fill="#2D2A26" text-anchor="middle">Dad's agent</text>
-    <text x="1055" y="164" font-size="13" fill="#5A554C" text-anchor="middle">unseals it with</text>
-    <text x="1055" y="184" font-size="13" fill="#5A554C" text-anchor="middle">his own sealed key</text>
-    <text x="1055" y="210" font-size="12" fill="#8A8478" text-anchor="middle">on his own device</text>
+  <g filter="url(#soft3)">
+    <rect x="60" y="748" width="520" height="150" rx="18" fill="#FAF6EF"/>
+    <circle cx="120" cy="823" r="30" fill="#2F6F6A"/>
+    <text x="120" y="834" font-size="28" font-weight="800" fill="#FFFFFF" text-anchor="middle">4</text>
+    <text x="172" y="806" font-size="22" font-weight="800" fill="#2F6F6A">OPEN</text>
+    <text x="172" y="838" font-size="18" font-weight="700" fill="#2D2A26">Dad's agent unseals it</text>
+    <text x="172" y="866" font-size="15" fill="#5A554C">with his own sealed key — on his own device</text>
   </g>
 
-  <text x="600" y="276" font-size="14" fill="#C9D8D4" text-anchor="middle">Keys never leave devices · removing a member re-keys the topic · 24-word recovery phrase</text>
+  <text x="320" y="936" font-size="15" fill="#C9D8D4" text-anchor="middle">Keys never leave devices · removing a member re-keys the topic</text>
+  <text x="320" y="958" font-size="15" fill="#C9D8D4" text-anchor="middle">24-word recovery phrase restores an agent's identity</text>
 </svg>
