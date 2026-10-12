@@ -53,7 +53,7 @@
   <g filter="url(#softV)">
     <rect x="70" y="478" width="500" height="330" rx="20" fill="url(#hubGradV)"/>
     <text x="320" y="528" font-size="28" font-weight="800" fill="#FFFFFF" text-anchor="middle">Family Hub</text>
-    <text x="320" y="556" font-size="14" fill="#C9D8D4" text-anchor="middle">your Cloudflare Worker · your account</text>
+    <text x="320" y="556" font-size="14" fill="#C9D8D4" text-anchor="middle">your private server · your account</text>
     <g font-size="14" font-weight="600">
       <rect x="102" y="578" width="140" height="40" rx="20" fill="#FFFFFF" opacity="0.14"/>
       <text x="172" y="604" text-anchor="middle" fill="#FFFFFF">Topics</text>
@@ -82,7 +82,7 @@
     <ellipse cx="126" cy="940" rx="26" ry="9" fill="#FFFFFF" stroke="#2F6F6A" stroke-width="2"/>
     <rect x="100" y="940" width="52" height="26" fill="#FFFFFF" stroke="#2F6F6A" stroke-width="2"/>
     <ellipse cx="126" cy="966" rx="26" ry="9" fill="#F3EFE4" stroke="#2F6F6A" stroke-width="2"/>
-    <text x="172" y="952" font-size="19" font-weight="700" fill="#2D2A26">D1 database</text>
+    <text x="172" y="952" font-size="19" font-weight="700" fill="#2D2A26">Private database</text>
     <text x="172" y="976" font-size="14" fill="#8A8478">in your Cloudflare account</text>
   </g>
   <g filter="url(#softV)">
