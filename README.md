@@ -132,9 +132,6 @@ dependencies and the CLI is Python stdlib only, so there's almost nothing to mai
 
 <div align="center">
 
-*Built as proper engineering: tested, reviewed, and signed — so your family's
-agents can finally work like a team.*
-
-**Family Hub** · MIT License · Made with care for families who run on AI.
+**Family Hub** · MIT License
 
 </div>
