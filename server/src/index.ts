@@ -867,7 +867,7 @@ function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
 // them — an outdated client must be able to fetch its replacement).
 // FIXED asset map: dispatch is on exact paths in routeRequest (no path
 // parameters), so there is no traversal surface by construction; anything
-// else under /v1/client/download/ falls through to the 404 below.
+// else under /v1/client/download/ hits the explicit 404 in routeRequest.
 // Cache-Control is public, max-age=300 (bytes change when the pin updates
 // + the server redeploys — must NOT be immutable). Rate-limited with a
 // generous bucket; 429 uses the standard rate_limited envelope + Retry-After.

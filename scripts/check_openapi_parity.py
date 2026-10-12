@@ -68,7 +68,8 @@ def _expand_seq(nodes):
 
 def _parse_group(s, i):
     """Parse '(' ... ')' starting at s[i] == '('; returns (node, next_i)."""
-    assert s[i] == "("
+    if not s.startswith("(", i):
+        raise RegexConvertError(f"expected group open at offset {i}")
     # Param shorthands are checked BEFORE consuming '(' as a group open.
     if s.startswith("([^/]+)", i):
         return ("param",), i + len("([^/]+)")
