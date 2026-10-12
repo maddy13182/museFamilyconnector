@@ -209,7 +209,9 @@ curl -s -X POST $HUB/v1/families/<fid>/invites \
 channel you already trust (text it to them yourself). What happens next:
 
 - A human invitee opens the URL in a browser: it shows what Family Hub is,
-  the CLI install steps (pinned to the signed release), and an email form.
+  the CLI install steps (pinned to the signed release — the artifacts are
+  downloaded from the server's own `/v1/client/download/*` endpoints, not
+  from GitHub), and an email form.
   They enter the invited email address; the page reveals the single-use
   invite code plus the exact `hub setup` command.
 - An agent invitee (or your own agent on their behalf) fetches

@@ -138,14 +138,14 @@ apply (correct — an un-enrolled invitee has no client version to gate).
   "expires_at": "<iso>",
   "client": {
     "version": "<from client-manifest>",
-    "download_url": "<.../hub>",
+    "download_url": "https://<this-server>/v1/client/download/hub",
     "sha256": "<...>"
   },
   "install": {
     "summary": "Install the Family Hub CLI + skill, verify the release signature, then run hub setup.",
     "steps": [
       "mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub",
-      "curl -sSLO <download_url> -sSLO <download_url→hub.sigstore> -sSLO <download_url→manifest.json>",
+      "curl -sSLO https://<this-server>/v1/client/download/hub -sSLO https://<this-server>/v1/client/download/hub.sigstore -sSLO https://<this-server>/v1/client/download/manifest.json",
       "chmod +x hub",
       "pip install \"sigstore>=3.0,<4.0\" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity \"https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main\" --cert-oidc-issuer \"https://token.actions.githubusercontent.com\" hub",
       "python3 -c \"import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']\"",
@@ -157,8 +157,11 @@ apply (correct — an un-enrolled invitee has no client version to gate).
 }
 ```
 
-Derive `hub.sigstore` / `manifest.json` URLs from `download_url` by
-replacing the trailing `/hub` (same pattern as `agent-skill/INSTALL.md`).
+Derive the install-step URLs from the request origin as
+`https://<this-server>/v1/client/download/{hub,hub.sigstore,manifest.json}`
+— the server serves its own build-bundled artifacts (spec
+API_VERSIONING_SPEC §3.4); the GitHub Release URL in the pin file is
+provenance only and never surfaces in the user-facing flow.
 `email_hint`: first char of local part + `***@` + domain.
 
 ### 3.4 HTML page (humans)

@@ -364,11 +364,12 @@ paths:
         from POST /v1/families/{fid}/invites; the invitee (human or their
         agent) opens it here. Content negotiation: `Accept: application/json`
         or the `/i/{token}.json` form returns the agent JSON page (install
-        steps pinned to the server's recommended CLI release, masked email
-        hint, verify instructions); otherwise an HTML page with an email form
-        is returned. Never reveals the invite code. Unknown, used, or expired
-        pages return identical 404s. Rate-limited per IP. Not under /v1/, so
-        the client version gate does not apply.
+        steps pinned to the server's recommended CLI release — artifacts
+        download from this server's `/v1/client/download/*` endpoints,
+        masked email hint, verify instructions); otherwise an HTML page with
+        an email form is returned. Never reveals the invite code. Unknown,
+        used, or expired pages return identical 404s. Rate-limited per IP.
+        Not under /v1/, so the client version gate does not apply.
       security: []
       parameters:
         - name: token

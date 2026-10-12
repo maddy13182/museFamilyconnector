@@ -71,3 +71,82 @@ bodies are never logged.
 Per SemVer, anything may break before `1.0.0`, but we still bump MINOR for
 features and PATCH for fixes during `0.x` so families can tell releases
 apart. The jump to `1.0.0` marks the API as stable.
+
+## The version contract ("one CLI, versioned protocol")
+
+- **One CLI, one v1 API.** An agent installs exactly one CLI and never asks
+  "which CLI for which server."
+- **Compatibility rule.** The CLI declares a floor, `_MIN_SERVER_VERSION`.
+  A CLI supports a server iff:
+  1. `server_version >= _MIN_SERVER_VERSION`, AND
+  2. the server's advertised `api_versions` (from `GET /v1/health`) includes
+     an API major the CLI implements (v1 today).
+  Outside this, **both sides fail loudly** with plain-language upgrade
+  instructions. No silent breakage, no guessing.
+- **Additive-only within v1.** New endpoints and new optional
+  request/response fields are free. Existing shapes never change.
+- **Breaking changes graduate to /v2.** The mechanism is built in:
+  `GET /v1/health` advertises `api_versions`, and the router dispatches on
+  the API-major prefix. When v2 arrives, v1 handlers are frozen
+  (bug/security fixes only).
+- **No museum of old versions.** A server that falls outside the window gets
+  **upgraded** (code-only deploy; additive DB migrations — data is never at
+  risk), never worked around with an old CLI.
+
+(The earlier "[x.y−1, x.y+1] minor window" sketch was rejected: server and
+CLI have independent minor sequences (0.12.0 vs 0.10.0), so minor arithmetic
+across the two is incoherent. Floor + API-major negotiation is the
+mechanism.)
+
+## Maintainer runbook: cutting a release
+
+### Server release
+
+1. Decide the bump per the table above; bump `server/package.json`.
+2. Add `changelog.d/` fragment(s).
+3. Open a PR. CI enforces the version gate, the build, the full test suite,
+   semgrep/bandit, and the openapi parity check.
+4. Merge via PR only.
+
+### CLI release → manifest PR → deploy
+
+1. Bump `agent-skill/pyproject.toml`; add fragment(s); merge to `main`.
+2. The **Release CLI** workflow (`.github/workflows/release.yml`) builds the
+   `hub` artifact, signs it with sigstore (keyless OIDC), and cuts the
+   `cli-v<x.y.z>` GitHub Release with `hub`, `hub.sigstore`, `manifest.json`.
+   It then opens a PR (`release/manifest-cli-v<x.y.z>`) updating
+   `server/client-manifest.json` — never a direct push to `main` (branch
+   protection rejects those, GH006). The workflow only acts when
+   `pyproject.toml` is newer than the latest `cli-v*` tag, so merging the
+   manifest PR triggers one no-op run — no loop.
+3. **Owner merges the manifest PR.** `min_cli_version` in the pin is never
+   raised automatically — raise it deliberately, only after the fleet
+   reports at-or-above the new CLI version.
+4. **Deploy the server.** The build runs `npm run bundle:client` first
+   (`prebuild`): it downloads the three artifacts for the pinned version,
+   verifies `sha256(hub)` against BOTH the pin and the release manifest,
+   and embeds them into the worker (`server/src/client-dist.generated.ts`,
+   gitignored). The build **fails closed** — network error, 404,
+   placeholder hash, or mismatch stops the deploy with a clear message, so
+   the worker never serves placeholders.
+5. **Set the production `MIN_CLI_VERSION` binding** (`server/wrangler.toml`
+   `[vars]`, or the dashboard) to the new CLI version — only after the
+   fleet has upgraded. The gate rejects outdated clients with
+   **426 `client_too_old`** and a plain-language upgrade message;
+   `/v1/health`, `/v1/client/latest`, and `/v1/client/download/*` stay
+   reachable so an outdated client can always fetch its replacement.
+6. Agents run `hub upgrade`, which downloads the new artifacts **from the
+   server** (`/v1/client/latest` → `assets.*`) and verifies the sigstore
+   seal + sha256 client-side before installing — the trust anchor is
+   unchanged by the server-hosted transport (see
+   `docs/API_VERSIONING_SPEC.md` §5).
+
+### How the server↔CLI pairing is declared
+
+`server/client-manifest.json` is the single pairing record:
+`{version, sha256, min_cli_version, released_at, download_url}`.
+`download_url` is **provenance** (the GitHub Release URL the build fetched
+from) — the server's *responses* always use its own URLs
+(`GET /v1/client/latest` derives absolute `/v1/client/download/*` URLs
+from the request origin). To refresh the pairing without a code change:
+update the pin, rebuild, redeploy.

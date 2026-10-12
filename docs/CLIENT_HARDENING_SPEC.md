@@ -64,10 +64,14 @@ to existing behavior.
   curl) are never gated.
 - If the parsed version is below the configured minimum
   (`MIN_CLI_VERSION` in `server/wrangler.toml`, default `"0.0.0"` =
-  gate off), reject with **400** and a guidance message following the
-  existing pattern, e.g.:
+  gate off), reject with **426** (`client_too_old`) and a guidance message
+  following the existing pattern, e.g.:
   `Client version 0.5.0 is below the required minimum 0.7.0. Update
   your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry.`
+  (426 since server 0.12.0; was 400.)
+- The gate never blocks `GET /v1/health`, `GET /v1/client/latest`, or
+  `GET /v1/client/download/*` — an outdated client must always reach the
+  upgrade metadata and the replacement artifacts.
 - Rollout note: the default stays off until agents have upgraded; the
   deploy runbook raises it deliberately. Never ship a deploy that
   bricks the currently-installed fleet.
@@ -78,13 +82,25 @@ to existing behavior.
   at worker startup; no D1 read on the hot path):
   ```json
   {
-    "version": "0.7.0",
-    "min_cli_version": "0.7.0",
-    "download_url": "https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v0.7.0/hub",
+    "version": "0.9.0",
+    "min_cli_version": "0.9.0",
+    "server_version": "0.12.0",
     "sha256": "<hex of the released hub artifact>",
-    "released_at": "2026-10-11T22:00:00Z"
+    "released_at": "2026-10-12T00:55:22Z",
+    "download_url": "https://<this-server>/v1/client/download/hub",
+    "assets": {
+      "hub": "https://<this-server>/v1/client/download/hub",
+      "sigstore": "https://<this-server>/v1/client/download/hub.sigstore",
+      "manifest": "https://<this-server>/v1/client/download/manifest.json"
+    }
   }
   ```
+- All URLs are absolute and self-referential: since server 0.12.0 the
+  worker bundles the pinned CLI artifacts at build time
+  (`npm run bundle:client`, fail-closed) and serves them from
+  `GET /v1/client/download/{hub,hub.sigstore,manifest.json}` (public,
+  exact paths only). `download_url` in the pin file itself remains the
+  GitHub Release provenance URL; responses always use this server's URLs.
 - This ties the CLI release to the deployed server: the manifest is
   updated by the release workflow (WS-C), and the server only
   advertises what the manifest says.
@@ -110,17 +126,24 @@ to existing behavior.
   3. Create GitHub Release `cli-v<x.y.z>` with the artifact, the
      `.sigstore` bundle, and a `manifest.json`
      (`{version, sha256, files}`).
-  4. Update `server/client-manifest.json` in the repo with the new
-     version/url/sha256 and commit back to `main` with `[skip ci]` in
-     the message (must not trigger a second release run).
+  4. Open a PR (`release/manifest-cli-v<x.y.z>`) updating
+     `server/client-manifest.json` in the repo with the new
+     version/url/sha256. Direct pushes to `main` are rejected by branch
+     protection (GH006), so the manifest update goes through PR review;
+     the version-newer-than-tag guard means merging it triggers one no-op
+     release run (no loop). The owner merges, then deploys the server —
+     the build bundles the newly pinned CLI artifacts
+     (`npm run bundle:client`, fail-closed).
 - The workflow must request only the permissions it needs
   (`contents: write`, `id-token: write`).
 - Update `agent-skill/INSTALL.md` with two flows:
-  - **First-time install:** download artifact from the GitHub Release
-    → verify sigstore signature → verify sha256 against the release
-    manifest → install → run `hub --version` self-check.
+  - **First-time install:** download the three artifacts from the server's
+    `/v1/client/download/*` endpoints (URLs from the invite onboarding page
+    or `GET /v1/client/latest`) → verify sigstore signature → verify sha256
+    against the release manifest → install → run `hub --version` self-check.
   - **Upgrade:** `hub upgrade` checks `GET /v1/client/latest`, compares
-    versions, downloads the new artifact, verifies signature+hash,
+    versions, downloads the new artifacts from the server's `assets.*` URLs,
+    verifies signature+hash,
     swaps it in **atomically**, keeps the previous binary for
     rollback (`hub rollback`), and runs the CLI self-test before
     cutting over.
