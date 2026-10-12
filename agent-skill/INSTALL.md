@@ -17,28 +17,39 @@ it first, then invites everyone else.
 
 ## Step 1 — Get the files
 
-**Option A — signed release from your server (recommended).** The server
-publishes the signed CLI release itself: `GET /v1/client/latest` names
-the current version and its download URLs. Every release carries three
-assets: `hub` (the single-file script), `hub.sigstore` (the sigstore
-keyless signature bundle), and `manifest.json` (`{version, sha256, …}`).
+**The one-bundle flow (recommended).** The server publishes the whole
+installable skill as one signed bundle: `GET /v1/client/latest` names the
+current skill version and its download URL (the manifest's `skill` block:
+`{url, sha256, version}`). The bundle is `skill.tar.gz` — `SKILL.md`,
+`references/`, `INSTALL.md`, `requirements.txt`, plus the signed `hub`
+binary, its `hub.sigstore` signature bundle, and `manifest.json`.
 
-Ask the family owner for the server's base URL (it is also printed on
-your invite page), then:
+Get the bundle URL and its expected sha256 from the family owner (both are
+printed on your invite page), then:
 
 ```sh
-BASE=https://<your-hub-server>/v1/client/download
 mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub
-curl -sSLO "$BASE/hub" -sSLO "$BASE/hub.sigstore" -sSLO "$BASE/manifest.json"
-chmod +x hub
+curl -sSLO "<skill-bundle-url>"          # skill.tar.gz from your server
 ```
 
-Verify **before** installing — in this order:
+Verify **before** extracting or installing — in this order:
 
 ```sh
-# 1. Signature: proves the artifact was built by this repo's release
-#    workflow (keyless OIDC; no long-lived keys to steal). The bytes are
-#    the identical signed release artifacts — only the host changed.
+# 1. Hash: proves the bytes are exactly the published bundle.
+python3 - <<'EOF'
+import hashlib
+want = "<sha256-from-the-invite-page>"   # or from GET /v1/client/latest
+got = hashlib.sha256(open("skill.tar.gz", "rb").read()).hexdigest()
+assert got == want, "sha256 MISMATCH — do not install"
+print("sha256 OK:", got)
+EOF
+
+# 2. Extract, then verify the binary inside the bundle.
+tar -xzf skill.tar.gz
+chmod +x hub
+
+# 3. Signature: proves the binary was built by this repo's release
+#    workflow (keyless OIDC; no long-lived keys to steal).
 pip install "sigstore>=3.0,<4.0"
 python3 -m sigstore verify identity \
   --bundle hub.sigstore \
@@ -46,7 +57,7 @@ python3 -m sigstore verify identity \
   --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
   hub
 
-# 2. Hash: proves the bytes are exactly the released ones.
+# 4. Hash: proves the binary bytes are exactly the released ones.
 python3 - <<'EOF'
 import hashlib, json
 want = json.load(open("manifest.json"))["sha256"]
@@ -56,7 +67,15 @@ print("sha256 OK:", got)
 EOF
 ```
 
-If either check fails, **do not install** — tell the family owner.
+If **any** check fails, **do not install** — delete the files and tell the
+family owner.
+
+Then install the pinned dependencies (the bundle carries no installed
+deps — they install from the lockfile at install time):
+
+```sh
+pip install -r ~/workspace/skills/family-hub/requirements.txt
+```
 
 **Option B — copy from a checkout** (dev / owner machines only):
 
@@ -107,6 +126,16 @@ No-op when already current:
 ```sh
 hub upgrade
 ```
+
+After the binary flow — whether or not the binary was upgraded — a
+skill-docs refresh phase runs: when the server's skill bundle (the
+manifest's `skill` block: `{url, sha256, version}`) is newer than the
+installed skill docs, the tarball is downloaded (same-origin pinned),
+its sha256 verified **before** extraction, and only the doc files —
+`SKILL.md`, `INSTALL.md`, `requirements.txt`, `references/` — are
+refreshed. Skill and CLI versions are independent, so docs can update
+while the binary stays put. The refresh never touches `hub`,
+`hub.sigstore`, `manifest.json`, or any credential files.
 
 If the new binary fails its post-install self-test, the previous binary
 is restored automatically. To go back manually at any time:
