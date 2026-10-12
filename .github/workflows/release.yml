@@ -224,7 +224,10 @@ jobs:
           find dist/skill-stage/references \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
           cp dist/hub dist/hub.sigstore dist/skill-stage/
           cp dist/manifest.json dist/skill-stage/manifest.json  # phase-1
-          tar -czf dist/skill.tar.gz -C dist/skill-stage \
+          # Ownership is normalized to root:root so a non-root invitee can
+          # extract with plain `tar -xzf` (otherwise tar tries to chown to
+          # the release runner's uid/gid and exits non-zero for them).
+          tar --owner=0 --group=0 --numeric-owner -czf dist/skill.tar.gz -C dist/skill-stage \
             SKILL.md references INSTALL.md requirements.txt hub hub.sigstore manifest.json
           rm -rf dist/skill-stage
           # Structural assertion: every member is a relative path inside the
@@ -245,6 +248,10 @@ jobs:
                   sys.exit("refusing: bundle member has unsafe path %r" % n)
               if m.issym() or m.islnk():
                   sys.exit("refusing: bundle member is a link %r" % n)
+              if m.uid != 0 or m.gid != 0:
+                  sys.exit("refusing: bundle member %r has non-root ownership %d:%d "
+                           "(tar must use --owner=0 --group=0 --numeric-owner so "
+                           "non-root invitees can extract)" % (n, m.uid, m.gid))
               segs = n.split("/")
               if ("tests" in segs or "__pycache__" in segs
                       or n.endswith("pyproject.toml") or n.endswith("requirements.lock")
