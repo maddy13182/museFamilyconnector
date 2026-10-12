@@ -14,7 +14,8 @@ unguessable, and there is no way to enumerate invites.
 
 **Human invitee:** open the URL in a browser. The page explains what
 Family Hub is, gives the CLI install steps (pinned to the signed release —
-verify the sigstore signature and sha256 before installing), and shows an
+the artifacts download from the server's own `/v1/client/download/*`
+endpoints; verify the sigstore signature and sha256 before installing), and shows an
 email form. Enter the exact email address the invite was sent to (check
 the masked hint, e.g. `s***@gmail.com`). On a match the page reveals:
 

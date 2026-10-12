@@ -20,6 +20,7 @@ import shutil
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HUB_PATH = os.path.join(HERE, "..", "hub")
@@ -142,15 +143,44 @@ class TamperEvidenceTestBase(unittest.TestCase):
 
 class TestVerifyInstall(TamperEvidenceTestBase):
     def test_pass(self):
+        # The fixture bundle carries a fake certificate: it is structurally
+        # a bundle (so the sha256/bundle-attests checks pass) but it can
+        # never validate a real trust chain. Correct behavior therefore
+        # depends on the environment:
+        #   - sigstore CLI absent → chain step honestly skipped → PASS.
+        #   - sigstore CLI present → the fake cert is rejected by the real
+        #     chain validation (sigstore >= 3.6 parses strictly) → the
+        #     install fails closed at the trust-chain step.
         mod, _ = self.make_install()
         rc, out, err = self.run_verify(mod)
-        self.assertEqual(rc, 0)
-        self.assertIn("RESULT: PASS", out)
         self.assertIn("[ OK ] sha256 matches manifest", out)
         self.assertIn("[ OK ] bundle attests to exactly these bytes", out)
-        self.assertIn("installed CLI matches the signed release", out)
         if shutil.which("sigstore") is None:
+            self.assertEqual(rc, 0)
             self.assertIn("[SKIP] sigstore trust chain", out)
+            self.assertIn("RESULT: PASS", out)
+            self.assertIn("installed CLI matches the signed release", out)
+        else:
+            self.assertEqual(rc, 1)
+            self.assertIn("[FAIL] sigstore trust chain", out)
+            self.assertIn("RESULT: FAIL", out)
+
+    def test_chain_rejection_fails_closed(self):
+        # Deterministic (no sigstore binary needed): when the trust-chain
+        # step rejects the bundle, verify-install must fail closed even
+        # though every structural check passed.
+        mod, _ = self.make_install()
+        with mock.patch.object(
+            mod,
+            "_sigstore_chain_verify",
+            return_value=("fail", "sigstore rejected the bundle: test"),
+        ):
+            rc, out, err = self.run_verify(mod)
+        self.assertEqual(rc, 1)
+        self.assertIn("[ OK ] sha256 matches manifest", out)
+        self.assertIn("[ OK ] bundle attests to exactly these bytes", out)
+        self.assertIn("[FAIL] sigstore trust chain", out)
+        self.assertIn("RESULT: FAIL", out)
 
     def test_hash_mismatch(self):
         mod, _ = self.make_install(tamper=True)
@@ -158,7 +188,7 @@ class TestVerifyInstall(TamperEvidenceTestBase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] sha256", out)
         self.assertIn("RESULT: FAIL", out)
-        self.assertIn("reinstall from the GitHub Release", out)
+        self.assertIn("reinstall from the server", out)
 
     def test_missing_manifest(self):
         mod, _ = self.make_install(manifest="missing")

@@ -49,6 +49,7 @@ class MsgFakeHub:
 
     def __init__(self):
         self.calls = []
+        self.health_calls = []
         self.topics = {}
         self.entries = {}
         self.envelopes = {}  # tid -> [envelope dicts]
@@ -82,6 +83,26 @@ class MsgFakeHub:
              "envelope": "opaque"})
 
     def __call__(self, method, url, headers, body_bytes):
+        parts = urlparse.urlparse(url)
+        path = parts.path
+        method = method.upper()
+
+        # The fake models a current (0.12.0) server: auto-answer the
+        # per-invocation version check in main(). Recorded separately so
+        # command-traffic assertions keep their meaning.
+        if method == "GET" and path == "/v1/health":
+            self.health_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": dict(headers),
+                    "body": body_bytes.decode("utf-8") if body_bytes else None,
+                }
+            )
+            return 200, json.dumps(
+                {"ok": True, "version": "0.12.0", "api_versions": ["v1"]}
+            )
+
         self.calls.append(
             {
                 "method": method,
@@ -90,9 +111,6 @@ class MsgFakeHub:
                 "body": body_bytes.decode("utf-8") if body_bytes else None,
             }
         )
-        parts = urlparse.urlparse(url)
-        path = parts.path
-        method = method.upper()
 
         if method == "GET" and path == "/v1/topics":
             return 200, json.dumps(
@@ -171,6 +189,8 @@ class E2eeMsgTestBase(unittest.TestCase):
         os.environ["FAMILY_HUB_TOKEN"] = FAKE_TOKEN
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
         self.fake = MsgFakeHub()
+        # Fresh version-check state: the fake models a current server.
+        hub._reset_server_version_cache()
         self.seed_config()
 
     def tearDown(self):

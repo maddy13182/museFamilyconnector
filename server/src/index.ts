@@ -57,6 +57,11 @@ const SERVER_VERSION: string = pkg.version;
 // Bundled at build time = loaded at worker startup; no D1 read on the hot
 // path. The release workflow is the only writer.
 import clientManifest from '../client-manifest.json' with { type: 'json' };
+// §3.6: the pinned CLI artifacts, bundled at build time by
+// server/scripts/bundle-client.mjs (npm run bundle:client, wired as
+// 'prebuild' and in 'pretest'). Gitignored; the build fails closed without
+// it, so these endpoints never serve placeholders.
+import { CLIENT_DIST } from './client-dist.generated.js';
 
 const MAX_BODY = 20000;
 const MAX_DATA = 20000;
@@ -230,7 +235,10 @@ function clientIp(req: Request): string {
 async function checkRateLimit(
   db: DbClient,
   req: Request,
-  endpoint: 'invite_accept' | 'code_redeem' | 'invite_page',
+  endpoint: 'invite_accept' | 'code_redeem' | 'invite_page' | 'client_download',
+  // Per-endpoint bucket override. Credential endpoints use the tight default
+  // (10/10min); public download endpoints get a generous bucket (spec §3.4).
+  max: number = RATE_LIMIT_MAX,
 ): Promise<Response | null> {
   const ip = clientIp(req);
   const now = Date.now();
@@ -253,7 +261,7 @@ async function checkRateLimit(
   ]);
   const row = await db.queryOne(`SELECT count FROM rate_limits WHERE key = ?`, [key]);
   const count = (row?.['count'] as number) ?? 1;
-  if (count > RATE_LIMIT_MAX) {
+  if (count > max) {
     const retryAfter = Math.max(1, Math.ceil((new Date(expiresAt).getTime() - now) / 1000));
     const res = json(
       {
@@ -723,6 +731,26 @@ const CLI_UA_RE = /^family-hub-agent\/(\S+)$/;
 // always treated as 0.0.0 (below any minimum) when the gate is on.
 const LEGACY_CLI_UA_VERSION = '1.0';
 
+/** API-major prefix of a request path (spec §1, §3.3), or null for non-API
+ *  paths (`/`, `/i/...`). Dispatch in routeRequest branches on this so a
+ *  breaking change later adds a parallel v2 block; v1 shapes stay frozen. */
+function apiMajorOf(path: string): 'v1' | 'v2' | null {
+  if (path === '/v1' || path.startsWith('/v1/')) return 'v1';
+  if (path === '/v2' || path.startsWith('/v2/')) return 'v2';
+  return null;
+}
+
+/** Paths the client version gate never blocks: liveness, the upgrade
+ *  metadata, and the replacement artifacts — an outdated client must always
+ *  be able to reach what it needs in order to update. */
+function isGateExempt(path: string): boolean {
+  return (
+    path === '/v1/health' ||
+    path === '/v1/client/latest' ||
+    path.startsWith('/v1/client/download/')
+  );
+}
+
 type Semver = [number, number, number];
 
 /** Strict x.y.z parse; null when the string is not a semver. */
@@ -747,10 +775,12 @@ function compareSemver(a: Semver, b: Semver): number {
  * - Default MIN_CLI_VERSION "0.0.0" = gate off.
  * - Unparseable versions fail closed (treated as 0.0.0): a client that
  *   cannot prove its version is treated as outdated.
- * Called for /v1/... requests EXCEPT /v1/health and /v1/client/latest —
- * an outdated client must always be able to reach liveness checks and the
- * upgrade metadata (`hub upgrade` reads /v1/client/latest) it needs in
- * order to update.
+ * - Rejection is HTTP 426 (Upgrade Required), code `client_too_old`
+ *   (spec §3.2 — was 400; the plain-language upgrade message is kept).
+ * Called for /v1/... requests EXCEPT /v1/health, /v1/client/latest, and
+ * /v1/client/download/* — an outdated client must always be able to reach
+ * liveness checks and the upgrade metadata + replacement artifacts
+ * (`hub upgrade` reads /v1/client/latest) it needs in order to update.
  */
 function gateClientVersion(req: Request, env: Env): void {
   const ua = req.headers.get('user-agent');
@@ -763,7 +793,7 @@ function gateClientVersion(req: Request, env: Env): void {
   const min: Semver = parseSemver(minRaw) ?? [0, 0, 0];
   if (compareSemver(client, min) < 0) {
     throw new HttpError(
-      400,
+      426,
       'client_too_old',
       `Client version ${raw} is below the required minimum ${minRaw}. ` +
         'Update your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry.',
@@ -785,21 +815,105 @@ async function keyFingerprint(publicKey: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 async function handleHealth(): Promise<Response> {
-  return json({ ok: true, version: SERVER_VERSION });
+  return json({ ok: true, version: SERVER_VERSION, api_versions: ['v1'] });
+}
+
+/** Absolute URLs for this server's own CLI download endpoints, derived
+ *  from the request origin (spec §3.5 — the server's responses always use
+ *  this server's URLs, never the GitHub provenance URL in the pin). */
+function clientDownloadUrls(origin: string): { hub: string; sigstore: string; manifest: string } {
+  return {
+    hub: `${origin}/v1/client/download/hub`,
+    sigstore: `${origin}/v1/client/download/hub.sigstore`,
+    manifest: `${origin}/v1/client/download/manifest.json`,
+  };
 }
 
 // B2: GET /v1/client/latest — the CLI release the deployed server knows
 // about, sourced from the repo-controlled server/client-manifest.json
 // (bundled at build time; no D1 read on the hot path; the release workflow
 // is the only writer). Public: `hub upgrade` reads this before/without a
-// token, and the client version gate never blocks it.
-async function handleClientLatest(): Promise<Response> {
+// token, and the client version gate never blocks it. All URLs are absolute
+// and self-referential: this server serves its own bundled artifacts.
+async function handleClientLatest(req: Request): Promise<Response> {
+  const origin = new URL(req.url).origin;
+  const assets = clientDownloadUrls(origin);
   return json({
     version: clientManifest.version,
     min_cli_version: clientManifest.min_cli_version,
-    download_url: clientManifest.download_url,
+    server_version: SERVER_VERSION,
     sha256: clientManifest.sha256,
     released_at: clientManifest.released_at,
+    download_url: assets.hub,
+    assets: {
+      hub: assets.hub,
+      sigstore: assets.sigstore,
+      manifest: assets.manifest,
+    },
+  });
+}
+
+/** Decode base64 → bytes without Node's Buffer: atob exists in both the
+ *  Workers runtime and Node 16+, and its binary string maps 1:1 to bytes. */
+function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64);
+  const out = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// §3.4: GET /v1/client/download/{hub,hub.sigstore,manifest.json} — the
+// build-bundled CLI artifacts (public; the client version gate never blocks
+// them — an outdated client must be able to fetch its replacement).
+// FIXED asset map: dispatch is on exact paths in routeRequest (no path
+// parameters), so there is no traversal surface by construction; anything
+// else under /v1/client/download/ hits the explicit 404 in routeRequest.
+// Cache-Control is public, max-age=300 (bytes change when the pin updates
+// + the server redeploys — must NOT be immutable). Rate-limited with a
+// generous bucket; 429 uses the standard rate_limited envelope + Retry-After.
+const CLIENT_DOWNLOAD_MAX_PER_WINDOW = 100;
+
+function clientDownloadAsset(
+  asset: 'hub' | 'sigstore' | 'manifest',
+): { filename: string; contentType: string; bytes: Uint8Array<ArrayBuffer> } {
+  switch (asset) {
+    case 'hub':
+      return {
+        filename: 'hub',
+        contentType: 'application/octet-stream',
+        bytes: b64ToBytes(CLIENT_DIST.hubB64),
+      };
+    case 'sigstore':
+      return {
+        filename: 'hub.sigstore',
+        contentType: 'application/json',
+        bytes: b64ToBytes(CLIENT_DIST.sigstoreB64),
+      };
+    case 'manifest':
+      return {
+        filename: 'manifest.json',
+        contentType: 'application/json',
+        bytes: b64ToBytes(CLIENT_DIST.manifestB64),
+      };
+  }
+}
+
+async function handleClientDownload(
+  db: DbClient,
+  req: Request,
+  asset: 'hub' | 'sigstore' | 'manifest',
+): Promise<Response> {
+  const limited = await checkRateLimit(db, req, 'client_download', CLIENT_DOWNLOAD_MAX_PER_WINDOW);
+  if (limited) return limited;
+  const { filename, contentType, bytes } = clientDownloadAsset(asset);
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      'content-type': contentType,
+      'content-disposition': `attachment; filename="${filename}"`,
+      'content-length': String(bytes.length),
+      'cache-control': 'public, max-age=300',
+    },
   });
 }
 
@@ -1472,22 +1586,14 @@ function escapeHtml(s: string): string {
   });
 }
 
-/** Sibling artifact URLs for the CLI release, derived from the manifest's
- *  download URL by stripping the trailing `/hub` (same pattern as
- *  agent-skill/INSTALL.md). */
-function clientArtifactUrls(downloadUrl: string): { sigstore: string; manifest: string } {
-  const base = downloadUrl.endsWith('/hub') ? downloadUrl.slice(0, -'/hub'.length) : downloadUrl;
-  return { sigstore: `${base}/hub.sigstore`, manifest: `${base}/manifest.json` };
-}
-
 /** The agent-facing JSON page. Contains no invite code. The verify path is
  *  absolute and embeds the page token the agent already holds (it fetched
  *  this very URL): a relative './verify' would resolve against /i/ and drop
  *  the token segment, 404ing. Echoing the token back to its holder is not a
- *  leak, and /i/ paths are redacted from logs. */
-function invitePageJson(page: InvitePage, rawToken: string): Record<string, unknown> {
-  const downloadUrl = clientManifest.download_url as string;
-  const artifacts = clientArtifactUrls(downloadUrl);
+ *  leak, and /i/ paths are redacted from logs. CLI download URLs point at
+ *  THIS server's /v1/client/download/* endpoints (spec §3.11). */
+function invitePageJson(page: InvitePage, rawToken: string, origin: string): Record<string, unknown> {
+  const urls = clientDownloadUrls(origin);
   return {
     page: 'invite',
     family_name: page.familyName,
@@ -1496,7 +1602,7 @@ function invitePageJson(page: InvitePage, rawToken: string): Record<string, unkn
     expires_at: page.expiresAt,
     client: {
       version: clientManifest.version,
-      download_url: downloadUrl,
+      download_url: urls.hub,
       sha256: clientManifest.sha256,
     },
     install: {
@@ -1504,7 +1610,7 @@ function invitePageJson(page: InvitePage, rawToken: string): Record<string, unkn
         'Install the Family Hub CLI + skill, verify the release signature, then run hub setup.',
       steps: [
         'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
-        `curl -sSLO ${downloadUrl} -sSLO ${artifacts.sigstore} -sSLO ${artifacts.manifest}`,
+        `curl -sSLO ${urls.hub} -sSLO ${urls.sigstore} -sSLO ${urls.manifest}`,
         'chmod +x hub',
         'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
         `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
@@ -1525,13 +1631,12 @@ function invitePageJson(page: InvitePage, rawToken: string): Record<string, unkn
 /** The human-facing HTML page. All interpolated values are HTML-escaped;
  *  the inline script renders the verify response via textContent only
  *  (never innerHTML with server data). */
-function invitePageHtml(page: InvitePage, rawToken: string): Response {
+function invitePageHtml(page: InvitePage, rawToken: string, origin: string): Response {
   const verifyPath = `/i/${rawToken}/verify`;
-  const downloadUrl = clientManifest.download_url as string;
-  const artifacts = clientArtifactUrls(downloadUrl);
+  const urls = clientDownloadUrls(origin);
   const steps = [
     'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
-    `curl -sSLO ${downloadUrl} -sSLO ${artifacts.sigstore} -sSLO ${artifacts.manifest}`,
+    `curl -sSLO ${urls.hub} -sSLO ${urls.sigstore} -sSLO ${urls.manifest}`,
     'chmod +x hub',
     'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
     `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
@@ -1622,10 +1727,11 @@ async function handleInvitePageGet(
   if (limited) return limited;
   const page = await loadInvitePage(db, env, token);
   const accept = req.headers.get('accept') ?? '';
+  const origin = new URL(req.url).origin;
   if (segment.endsWith('.json') || accept.includes('application/json')) {
-    return json(invitePageJson(page, token));
+    return json(invitePageJson(page, token, origin));
   }
-  return invitePageHtml(page, token);
+  return invitePageHtml(page, token, origin);
 }
 
 // POST /i/:token/verify — body {"email": "..."}. On a match, mints a FRESH
@@ -3542,10 +3648,19 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
   const method = req.method.toUpperCase();
 
   try {
-    // B1: client version gate on API requests. Exempt: /v1/health and
-    // /v1/client/latest — an outdated client must always reach liveness
-    // checks and the upgrade metadata it needs in order to update.
-    if (path.startsWith('/v1/') && path !== '/v1/health' && path !== '/v1/client/latest') {
+    // API-major prefix dispatch (spec §3.3): /v1/... handlers are registered
+    // below. When a breaking change graduates to /v2, a parallel v2 block
+    // goes here; until then an unknown API major 404s like any unknown path.
+    const apiMajor = apiMajorOf(path);
+    if (apiMajor === 'v2') {
+      throw new HttpError(404, 'not_found', 'Not found');
+    }
+
+    // B1: client version gate on API requests. Exempt: /v1/health,
+    // /v1/client/latest, and /v1/client/download/* — an outdated client must
+    // always reach liveness checks, the upgrade metadata, and the
+    // replacement artifacts it needs in order to update.
+    if (path.startsWith('/v1/') && !isGateExempt(path)) {
       gateClientVersion(req, env);
     }
 
@@ -3554,7 +3669,22 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       return new Response(UI_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
     }
     if (path === '/v1/health' && method === 'GET') return await handleHealth();
-    if (path === '/v1/client/latest' && method === 'GET') return await handleClientLatest();
+    if (path === '/v1/client/latest' && method === 'GET') return await handleClientLatest(req);
+    // §3.4: public CLI artifact downloads. Exact paths only — no path
+    // parameters, so no traversal surface by construction. Anything else
+    // under /v1/client/download/ falls through to the 404 below.
+    if (path === '/v1/client/download/hub' && method === 'GET')
+      return await handleClientDownload(db, req, 'hub');
+    if (path === '/v1/client/download/hub.sigstore' && method === 'GET')
+      return await handleClientDownload(db, req, 'sigstore');
+    if (path === '/v1/client/download/manifest.json' && method === 'GET')
+      return await handleClientDownload(db, req, 'manifest');
+    // Anything else under /v1/client/download/ is not an asset: 404, like
+    // the unmatched /i/ shapes. (Public either way — no auth needed to learn
+    // the asset map is fixed.)
+    if (path === '/v1/client/download' || path.startsWith('/v1/client/download/')) {
+      throw new HttpError(404, 'not_found', 'Not found');
+    }
 
     // Public: bootstrap + invite/provisioning redemption (code is the credential).
     // The two redemption endpoints are rate-limited per IP: they are the only

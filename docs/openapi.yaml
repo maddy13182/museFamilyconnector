@@ -21,18 +21,22 @@ info:
       403 not-a-participant or wrong role, 404 unknown id/code, 409 state
       conflict (subtasks_open, already_member, invite_used, code_used),
       410 expired code (invite_expired, code_expired), 422 PII detected,
-      429 rate limited. NOTE on 429: the worker itself enforces NO rate
-      limits — a 429 means a Cloudflare edge rate-limiting rule fired. Those
-      rules are configured by the OPERATOR (docs/INSTALL.md §5); they are not
-      part of the worker and not guaranteed to exist on any given deployment.
+      426 client too old (client_too_old — the client version gate, see below),
+      429 rate limited. NOTE on 429: the worker itself enforces in-worker
+      rate limits on unauthenticated endpoints (fixed-window counters in D1,
+      since v0.11.0) — a 429 means the in-worker bucket OR a Cloudflare edge
+      rate-limiting rule fired. Edge rules are configured by the OPERATOR
+      (docs/INSTALL.md §5); they are not part of the worker and not
+      guaranteed to exist on any given deployment.
     - Client version gate: requests carrying `User-Agent:
       family-hub-agent/<semver>` below the server's `MIN_CLI_VERSION`
-      (default "0.0.0" = gate off) are rejected with 400 `client_too_old`
+      (default "0.0.0" = gate off) are rejected with 426 `client_too_old`
       and an upgrade guidance message. The exact legacy string
       `family-hub-agent/1.0` is treated as version `0.0.0`. Requests without
       a `family-hub-agent` UA (browser dashboard, curl) are never gated, and
-      neither are `GET /v1/health` nor `GET /v1/client/latest` (an outdated
-      client must always reach the upgrade metadata).
+      neither are `GET /v1/health`, `GET /v1/client/latest`, nor anything
+      under `GET /v1/client/download/*` (an outdated client must always reach
+      the upgrade metadata and the replacement artifacts it needs to update).
     - `seq` is per-topic ordering; `gseq` is global family ordering (for /sync).
     - Entries are append-only. The writer's actor_member_id / agent_label /
       token_id are stamped server-side from the token, never from the client.
@@ -179,6 +183,7 @@ paths:
                 error: { code: circle_name_taken, message: 'A circle named "X" already exists' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
     get:
       tags: [families]
       operationId: listFamilies
@@ -345,6 +350,7 @@ paths:
             token_already_issued: true
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
 
   # ------------------------------------------------- invite onboarding pages
   /i/{token}:
@@ -358,11 +364,12 @@ paths:
         from POST /v1/families/{fid}/invites; the invitee (human or their
         agent) opens it here. Content negotiation: `Accept: application/json`
         or the `/i/{token}.json` form returns the agent JSON page (install
-        steps pinned to the server's recommended CLI release, masked email
-        hint, verify instructions); otherwise an HTML page with an email form
-        is returned. Never reveals the invite code. Unknown, used, or expired
-        pages return identical 404s. Rate-limited per IP. Not under /v1/, so
-        the client version gate does not apply.
+        steps pinned to the server's recommended CLI release — artifacts
+        download from this server's `/v1/client/download/*` endpoints,
+        masked email hint, verify instructions); otherwise an HTML page with
+        an email form is returned. Never reveals the invite code. Unknown,
+        used, or expired pages return identical 404s. Rate-limited per IP.
+        Not under /v1/, so the client version gate does not apply.
       security: []
       parameters:
         - name: token
@@ -674,6 +681,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/auth/revoke:
     post:
       tags: [auth]
@@ -708,6 +716,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/auth/tokens:
     get:
       tags: [auth]
@@ -767,6 +776,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
 
   /v1/provisioning-codes/{code}/redeem:
     post:
@@ -835,6 +845,7 @@ paths:
             token_already_issued: true
         '410': { $ref: '#/components/responses/Gone' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
 
   # ------------------------------------------------- E2EE keys (Phase 1)
   /v1/agent-keys:
@@ -1049,6 +1060,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
     get:
       tags: [topics]
       operationId: listTopics
@@ -1344,6 +1356,7 @@ paths:
         '422': { $ref: '#/components/responses/PiiError' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/topics/{tid}/entries:
     post:
       tags: [entries]
@@ -1413,6 +1426,7 @@ paths:
         '422': { $ref: '#/components/responses/PiiError' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/topics/{tid}/tasks:
     post:
       tags: [tasks]
@@ -1774,6 +1788,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/entries/{eid}/redact:
     post:
       tags: [ops]
@@ -1816,7 +1831,9 @@ paths:
       tags: [ops]
       operationId: healthCheck
       summary: Liveness check
-      description: Public. Returns ok only — no data.
+      description: |
+        Public. Returns ok, the server version, and the API majors this
+        server speaks. The client version gate never blocks this endpoint.
       security: []
       responses:
         '200':
@@ -1825,10 +1842,18 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [ok]
+                required: [ok, version, api_versions]
                 properties:
                   ok: { type: boolean, example: true }
-                  version: { type: string, example: "0.1.0" }
+                  version: { type: string, example: "0.12.0" }
+                  api_versions:
+                    type: array
+                    items: { type: string }
+                    example: ["v1"]
+                    description: |
+                      The API majors this server implements. Clients pick the
+                      highest major they implement (v1 today). Becomes
+                      ["v1","v2"] if a breaking change ever lands.
 
   /v1/client/latest:
     get:
@@ -1840,9 +1865,11 @@ paths:
         about, sourced from the repo-controlled `server/client-manifest.json`
         (bundled at build time — no database read; the release workflow is
         the only writer). Used by `hub upgrade` to compare the installed
-        version, fetch the new artifact, and verify its sha256. The client
+        version, fetch the new artifacts, and verify their sha256. The client
         version gate never blocks this endpoint, so an outdated client can
-        always reach the metadata it needs in order to update.
+        always reach the metadata it needs in order to update. All URLs are
+        absolute and self-referential: this server serves its own bundled
+        artifacts (see /v1/client/download/*).
       security: []
       responses:
         '200':
@@ -1851,13 +1878,116 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [version, min_cli_version, download_url, sha256, released_at]
+                required: [version, min_cli_version, server_version, sha256, released_at, download_url, assets]
                 properties:
-                  version: { type: string, example: "0.6.0" }
-                  min_cli_version: { type: string, example: "0.6.0" }
-                  download_url: { type: string, example: "https://github.com/maddy13182/museFamilyconnector/releases/download/cli-v0.6.0/hub" }
-                  sha256: { type: string, example: "9f2c…" }
+                  version: { type: string, example: "0.9.0" }
+                  min_cli_version: { type: string, example: "0.9.0" }
+                  server_version:
+                    type: string
+                    example: "0.12.0"
+                    description: The version of THIS server build (makes the server↔CLI pairing machine-readable).
+                  sha256: { type: string, example: "b7873c4e…" }
                   released_at: { type: string, format: date-time }
+                  download_url:
+                    type: string
+                    format: uri
+                    example: "https://<server>/v1/client/download/hub"
+                    description: Kept for field continuity; repointed at this server. The explicit contract the CLI uses is `assets`.
+                  assets:
+                    type: object
+                    required: [hub, sigstore, manifest]
+                    properties:
+                      hub: { type: string, format: uri, example: "https://<server>/v1/client/download/hub" }
+                      sigstore: { type: string, format: uri, example: "https://<server>/v1/client/download/hub.sigstore" }
+                      manifest: { type: string, format: uri, example: "https://<server>/v1/client/download/manifest.json" }
+
+  /v1/client/download/hub:
+    get:
+      tags: [ops]
+      operationId: downloadClientHub
+      summary: Download the bundled CLI artifact
+      description: |
+        Public. Serves the `hub` CLI artifact bundled into this server build
+        (hash-verified at build time against the pinned release). Exact path
+        only — no path parameters, so no traversal surface by construction;
+        anything else under /v1/client/download/ 404s. The client version
+        gate never blocks this endpoint (an outdated client must be able to
+        fetch its replacement). Rate-limited per IP with a generous bucket;
+        `Content-Length` is set and `Cache-Control: public, max-age=300`
+        (bytes change when the manifest pin updates + the server redeploys —
+        NOT immutable).
+      security: []
+      responses:
+        '200':
+          description: The CLI artifact bytes
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'attachment; filename="hub"'
+            Cache-Control:
+              schema: { type: string }
+              description: 'public, max-age=300'
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/client/download/hub.sigstore:
+    get:
+      tags: [ops]
+      operationId: downloadClientSigstore
+      summary: Download the bundled sigstore signature bundle
+      description: |
+        Public. Serves the `hub.sigstore` keyless-OIDC signature bundle for
+        the pinned CLI release (same build-bundling, rate limit, and cache
+        rules as /v1/client/download/hub). The CLI verifies this seal
+        client-side before installing — the trust anchor, unchanged by the
+        server-hosted transport.
+      security: []
+      responses:
+        '200':
+          description: The sigstore bundle (JSON)
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'attachment; filename="hub.sigstore"'
+            Cache-Control:
+              schema: { type: string }
+              description: 'public, max-age=300'
+          content:
+            application/json:
+              schema: { type: object }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/client/download/manifest.json:
+    get:
+      tags: [ops]
+      operationId: downloadClientManifest
+      summary: Download the release manifest for the bundled CLI
+      description: |
+        Public. Serves the release `manifest.json` ({version, sha256, files,
+        signature, identity, released_at}) for the pinned CLI release (same
+        build-bundling, rate limit, and cache rules as
+        /v1/client/download/hub). The CLI verifies sha256(hub) against this
+        manifest client-side before installing.
+      security: []
+      responses:
+        '200':
+          description: The release manifest (JSON)
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'attachment; filename="manifest.json"'
+            Cache-Control:
+              schema: { type: string }
+              description: 'public, max-age=300'
+          content:
+            application/json:
+              schema: { type: object }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
 components:
   securitySchemes:
@@ -1906,7 +2036,7 @@ components:
       enum: [open, in_progress, blocked, done, cancelled]
     ErrorCode:
       type: string
-      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed]
+      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, client_too_old, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed]
 
     Error:
       type: object
@@ -2143,3 +2273,15 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
           example:
             error: { code: rate_limited, message: "Slow down." }
+    ClientTooOld:
+      description: |
+        Client version below the server's MIN_CLI_VERSION (426). Fired by
+        the client version gate on /v1/* requests carrying a
+        `family-hub-agent/<semver>` User-Agent — except /v1/health,
+        /v1/client/latest, and /v1/client/download/*, which an outdated
+        client must always reach in order to update.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: client_too_old, message: "Client version 0.5.0 is below the required minimum 0.9.0. Update your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry." }

@@ -2,9 +2,9 @@
 # docs/VERSIONING.md). `agent-skill/hub` reads its version from this file
 # (or from installed package metadata) — never hardcode it elsewhere.
 #
-# The release artifact is the single `hub` file distributed via GitHub
-# Releases (see docs/CLIENT_HARDENING_SPEC.md §3 WS-C); this file is the
-# version registry + dependency declaration, not the distribution channel.
+# The release artifact is the single `hub` file, cut as a `cli-v*` tag by
+# the release workflow and served by the hub server itself (this file is
+# the version registry + dependency declaration, not the channel).
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "family-hub-cli"
-version = "0.9.0"
+version = "0.10.0"
 description = "Family Hub agent CLI (the `hub` single-file script)"
 requires-python = ">=3.9"
 dependencies = [

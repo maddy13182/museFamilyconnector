@@ -5,9 +5,14 @@
 # Steps: build the `hub` artifact (single script; deps install from the
 # lockfile at install time, not bundled) → sha256 → sign with sigstore
 # keyless OIDC → create GitHub Release `cli-v<x.y.z>` with assets
-# `hub`, `hub.sigstore`, `manifest.json` → update server/client-manifest.json
-# in the repo and commit back to main with `[skip ci]` (so no second
-# release run fires).
+# `hub`, `hub.sigstore`, `manifest.json` → open a PR updating
+# server/client-manifest.json (branch `release/manifest-cli-v<x.y.z>`).
+#
+# The manifest update goes through a PR (not a direct push to main):
+# branch protection rejects direct pushes (GH006), and the version-newer-
+# than-tag guard below means merging the manifest PR triggers one no-op
+# release run — no loop. The owner merges the PR, then deploys the server
+# (the build bundles the newly pinned CLI artifacts).
 #
 # Honest limit (docs/CLIENT_HARDENING_SPEC.md §2): this hardens the
 # *supply chain*. Nothing here stops a root-level adversary on the
@@ -22,11 +27,12 @@ on:
   push:
     branches: [main]
 
-# Minimal permissions: create releases (+ push the manifest commit) and
+# Minimal permissions: create releases and open the manifest-update PR, and
 # mint the OIDC token that sigstore-python uses for keyless signing.
 permissions:
   contents: write
   id-token: write
+  pull-requests: write
 
 # Two merges racing must not cut two releases for the same version.
 concurrency:
@@ -194,12 +200,26 @@ jobs:
             --notes "Signed CLI release. Before installing: download all three assets, verify the sigstore signature, verify the sha256 against manifest.json, then install — see agent-skill/INSTALL.md."
           echo "created=true" >> "$GITHUB_OUTPUT"
 
-      - name: Update server/client-manifest.json
+      - name: Open the manifest-update PR
         if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.cli.outputs.version }}
           SHA256: ${{ steps.sha.outputs.sha256 }}
         run: |
+          set -euo pipefail
+          # Direct pushes to main are rejected by branch protection (GH006),
+          # so the manifest update goes out as a PR. No loop risk: this
+          # workflow only acts when pyproject.toml is newer than the latest
+          # cli-v* tag, so merging the manifest PR triggers one no-op run.
+          branch="release/manifest-cli-v${VERSION}"
+          if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+            echo "branch $branch already exists; not recreating"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
           python3 - <<'EOF'
           import datetime, json, os
           path = "server/client-manifest.json"
@@ -228,21 +248,19 @@ jobs:
               fh.write("\n")
           print(json.dumps(manifest, indent=2))
           EOF
-
-      - name: Commit manifest back to main
-        if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
-        env:
-          VERSION: ${{ steps.cli.outputs.version }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add server/client-manifest.json
           if git diff --cached --quiet; then
             echo "no manifest change to commit"
             exit 0
           fi
-          # [skip ci]: the manifest commit must NOT trigger a second release
-          # run (nor any other workflow).
-          git commit -m "chore: client manifest for CLI v${VERSION} [skip ci]"
-          git push
+          git commit -m "chore: pin client manifest to CLI v${VERSION}"
+          git push -u origin "$branch"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo "PR for $branch already exists; not recreating"
+          else
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore: pin client manifest to CLI v${VERSION}" \
+              --body "Automated by the Release CLI workflow after cutting \`cli-v${VERSION}\`. Updates \`server/client-manifest.json\` (version, download_url provenance, sha256, released_at); \`min_cli_version\` is intentionally untouched — the deploy runbook raises it deliberately. Merge, then deploy the server so the build bundles the newly pinned artifacts."
+          fi

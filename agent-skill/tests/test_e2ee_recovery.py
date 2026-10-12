@@ -66,6 +66,7 @@ class RecoveryFakeHub:
 
     def __init__(self, keys_by_member, members):
         self.calls = []
+        self.health_calls = []
         self.keys_by_member = keys_by_member
         self.members = members
         self.topics = {}  # tid -> {"e2ee": 0|1, "participants": [member_id]}
@@ -108,11 +109,28 @@ class RecoveryFakeHub:
         )
 
     def __call__(self, method, url, headers, body_bytes):
-        self._record(method, url, headers, body_bytes)
         parts = urlparse.urlparse(url)
         path = parts.path
         query = urlparse.parse_qs(parts.query)
         method = method.upper()
+
+        # The fake models a current (0.12.0) server: auto-answer the
+        # per-invocation version check in main(). Recorded separately so
+        # command-traffic assertions keep their meaning.
+        if method == "GET" and path == "/v1/health":
+            self.health_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": dict(headers),
+                    "body": body_bytes.decode("utf-8") if body_bytes else None,
+                }
+            )
+            return 200, json.dumps(
+                {"ok": True, "version": "0.12.0", "api_versions": ["v1"]}
+            )
+
+        self._record(method, url, headers, body_bytes)
         body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
         mid, label = self.caller
 
@@ -236,6 +254,8 @@ class E2eeRecoveryTestBase(unittest.TestCase):
         os.environ["HOME"] = self.tmp
         os.environ["FAMILY_HUB_TOKEN"] = FAKE_TOKEN
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
+        # Fresh version-check state: the fake models a current server.
+        hub._reset_server_version_cache()
         self.privs = {}
         self.pubs = {}
         for mid, label in [("m1", "owner-agent"), ("m2", "bee-agent")]:

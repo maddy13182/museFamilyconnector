@@ -39,16 +39,22 @@ spec.loader.exec_module(hub)
 # ---------------------------------------------------------------------------
 
 
-def make_manifest(version="0.9.1", sha256="0" * 64):
+def make_manifest(version="0.10.1", sha256="0" * 64,
+                  server="https://hub.example.test"):
+    """The new /v1/client/latest shape (spec §3.5): assets served by the
+    server itself, plus min_cli_version."""
     return {
         "version": version,
-        "min_cli_version": "0.0.0",
-        "download_url": (
-            "https://github.com/maddy13182/museFamilyconnector"
-            "/releases/download/cli-v%s/hub" % version
-        ),
+        "min_cli_version": "0.10.0",
+        "server_version": "0.12.0",
+        "download_url": server + "/v1/client/download/hub",
         "sha256": sha256,
         "released_at": "2026-10-11T22:00:00Z",
+        "assets": {
+            "hub": server + "/v1/client/download/hub",
+            "sigstore": server + "/v1/client/download/hub.sigstore",
+            "manifest": server + "/v1/client/download/manifest.json",
+        },
     }
 
 
@@ -221,7 +227,8 @@ class ManifestSchemaTest(unittest.TestCase):
             hub._validate_client_manifest([1, 2])
 
     def test_missing_field(self):
-        for field in ("version", "download_url", "sha256"):
+        for field in ("version", "min_cli_version", "download_url",
+                      "sha256", "assets"):
             m = make_manifest()
             del m[field]
             with self.assertRaises(hub.HubError):
@@ -231,6 +238,12 @@ class ManifestSchemaTest(unittest.TestCase):
         with self.assertRaises(hub.HubError):
             hub._validate_client_manifest(make_manifest(version="soon"))
 
+    def test_bad_min_cli_version(self):
+        m = make_manifest()
+        m["min_cli_version"] = "soon"
+        with self.assertRaises(hub.HubError):
+            hub._validate_client_manifest(m)
+
     def test_bad_url(self):
         with self.assertRaises(hub.HubError):
             hub._validate_client_manifest(
@@ -238,17 +251,74 @@ class ManifestSchemaTest(unittest.TestCase):
                 | {"download_url": "http://evil.example/hub"}
             )
 
+    def test_bad_asset_url(self):
+        # Manifest validation checks well-formedness; the origin pin is
+        # enforced at download time by _validate_download_url.
+        m = make_manifest()
+        m["assets"] = dict(m["assets"], hub="http://evil.example/hub")
+        with self.assertRaises(hub.HubError):
+            hub._validate_client_manifest(m)
+        m2 = make_manifest()
+        m2["assets"] = "not-an-object"
+        with self.assertRaises(hub.HubError):
+            hub._validate_client_manifest(m2)
+
+    def test_missing_asset(self):
+        m = make_manifest()
+        del m["assets"]["sigstore"]
+        with self.assertRaises(hub.HubError):
+            hub._validate_client_manifest(m)
+
     def test_bad_sha256(self):
         with self.assertRaises(hub.HubError):
             hub._validate_client_manifest(make_manifest(sha256="xyz"))
 
-    def test_download_url_host_checked(self):
+    def test_download_url_origin_pinned(self):
+        server = "https://hub.example.test"
+        # Same origin passes (default and explicit https port agree).
+        hub._validate_download_url(
+            server + "/v1/client/download/hub", server)
+        hub._validate_download_url(
+            "https://hub.example.test:443/v1/client/download/hub", server)
+        # Plain http is refused for non-loopback hosts…
         with self.assertRaises(hub.HubError):
-            hub._validate_download_url("http://github.com/x/y/releases/download/v/hub")
+            hub._validate_download_url(
+                "http://github.com/x/y/releases/download/v/hub", server)
         with self.assertRaises(hub.HubError):
-            hub._validate_download_url("https://evil.example/hub")
-        # The real asset URL passes.
-        hub._validate_download_url(make_manifest()["download_url"])
+            hub._validate_download_url("http://hub.example.test/hub", server)
+        # …as is any other host, even over https.
+        with self.assertRaises(hub.HubError):
+            hub._validate_download_url("https://evil.example/hub", server)
+        with self.assertRaises(hub.HubError):
+            hub._validate_download_url(
+                "https://github.com/maddy13182/museFamilyconnector"
+                "/releases/download/cli-v0.10.1/hub", server)
+        # Non-HTTP schemes are refused outright.
+        with self.assertRaises(hub.HubError):
+            hub._validate_download_url("ftp://hub.example.test/hub", server)
+
+    def test_download_url_loopback_http_allowed(self):
+        # Dev-only exception, mirroring F03 for the server URL itself.
+        hub._validate_download_url(
+            "http://127.0.0.1:8080/v1/client/download/hub",
+            "http://127.0.0.1:8080")
+        with self.assertRaises(hub.HubError):
+            hub._validate_download_url(
+                "http://127.0.0.1:8080/v1/client/download/hub",
+                "https://hub.example.test")
+
+    def test_download_url_rejects_embedded_credentials(self):
+        with self.assertRaises(hub.HubError):
+            hub._validate_download_url(
+                "https://user:pass@hub.example.test/v1/client/download/hub",
+                "https://hub.example.test")
+
+    def test_download_url_rejects_malformed(self):
+        for bad in ("https://hub.example.test:abc/hub",
+                    "https://[::1/hub",
+                    "not a url at all"):
+            with self.assertRaises(hub.HubError):
+                hub._validate_download_url(bad, "https://hub.example.test")
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +330,11 @@ class UpgradeTest(unittest.TestCase):
     def _downloads_for(self, new_version, new_bytes):
         digest = hashlib.sha256(new_bytes).hexdigest()
         manifest = make_manifest(version=new_version, sha256=digest)
-        base = manifest["download_url"][: -len("/hub")]
+        assets = manifest["assets"]
         downloads = {
-            manifest["download_url"]: new_bytes,
-            base + "/hub.sigstore": b"fake-sigstore-bundle",
-            base + "/manifest.json": json.dumps(
+            assets["hub"]: new_bytes,
+            assets["sigstore"]: b"fake-sigstore-bundle",
+            assets["manifest"]: json.dumps(
                 {"version": new_version, "sha256": digest,
                  "files": {"hub": digest}, "signature": "hub.sigstore"}
             ).encode("utf-8"),
@@ -297,14 +367,57 @@ class UpgradeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         dl.assert_not_called()
 
+    def test_upgrade_downloads_from_server_assets(self):
+        # The signed release comes from THIS server's download endpoints —
+        # never GitHub. All three fetched URLs must be exactly the
+        # manifest's assets.* entries.
+        fx = UpgradeFixture(self)
+        new_version = "0.10.1"
+        new_bytes = stamp_version(fx.old_bytes, new_version)
+        manifest, downloads = self._downloads_for(new_version, new_bytes)
+        requested = []
+
+        def fake_download(url, what, server=None, timeout=90):
+            requested.append(url)
+            return downloads[url]
+
+        with mock.patch.object(hub, "_script_path", return_value=fx.target), \
+             mock.patch.object(hub, "_download_bytes", side_effect=fake_download), \
+             mock.patch.object(hub, "_verify_sigstore", return_value=None):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hub.cmd_upgrade(fx.args(), FakeTransport(manifest))
+        self.assertEqual(rc, 0)
+        assets = manifest["assets"]
+        self.assertEqual(
+            requested, [assets["hub"], assets["sigstore"], assets["manifest"]])
+        for url in requested:
+            self.assertNotIn("github.com", url)
+            self.assertTrue(
+                url.startswith("https://hub.example.test/v1/client/download/"))
+
+    def test_upgrade_surfaces_min_cli_version(self):
+        fx = UpgradeFixture(self)
+        manifest = make_manifest(version=hub.VERSION, sha256="0" * 64,
+                                 server="https://hub.example.test")
+        manifest["min_cli_version"] = "0.10.0"
+        with mock.patch.object(hub, "_script_path", return_value=fx.target), \
+             mock.patch.object(hub, "_download_bytes") as dl:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hub.cmd_upgrade(fx.args(), FakeTransport(manifest))
+        self.assertEqual(rc, 0)
+        self.assertIn("This server requires CLI ≥ 0.10.0", buf.getvalue())
+        dl.assert_not_called()
+
     def test_full_upgrade_flow(self):
         fx = UpgradeFixture(self)
-        new_version = "0.9.1"
+        new_version = "0.10.1"
         new_bytes = stamp_version(fx.old_bytes, new_version)
         manifest, downloads = self._downloads_for(new_version, new_bytes)
         rc, out = fx.run_upgrade(manifest, downloads)
         self.assertEqual(rc, 0)
-        self.assertIn("Upgraded hub 0.9.0 → %s" % new_version, out)
+        self.assertIn("Upgraded hub %s → %s" % (hub._cli_version(), new_version), out)
         # Atomic cut-over: the installed file is byte-identical.
         self.assertEqual(fx.read_target(), new_bytes)
         # Previous binary kept for rollback.
@@ -321,10 +434,9 @@ class UpgradeTest(unittest.TestCase):
 
     def test_sha_mismatch_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
-        manifest = make_manifest(version="0.9.1", sha256="f" * 64)
-        base = manifest["download_url"][: -len("/hub")]
-        downloads = {manifest["download_url"]: new_bytes}
+        new_bytes = stamp_version(fx.old_bytes, "0.10.1")
+        manifest = make_manifest(version="0.10.1", sha256="f" * 64)
+        downloads = {manifest["assets"]["hub"]: new_bytes}
         with self.assertRaises(hub.HubError) as ctx:
             fx.run_upgrade(manifest, downloads)
         self.assertIn("sha256 MISMATCH", str(ctx.exception))
@@ -333,15 +445,15 @@ class UpgradeTest(unittest.TestCase):
 
     def test_release_manifest_disagreement_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
+        new_bytes = stamp_version(fx.old_bytes, "0.10.1")
         digest = hashlib.sha256(new_bytes).hexdigest()
-        manifest = make_manifest(version="0.9.1", sha256=digest)
-        base = manifest["download_url"][: -len("/hub")]
+        manifest = make_manifest(version="0.10.1", sha256=digest)
+        assets = manifest["assets"]
         downloads = {
-            manifest["download_url"]: new_bytes,
-            base + "/hub.sigstore": b"fake",
+            assets["hub"]: new_bytes,
+            assets["sigstore"]: b"fake",
             # release manifest claims a *different* hash
-            base + "/manifest.json": json.dumps(
+            assets["manifest"]: json.dumps(
                 {"version": "0.7.0", "sha256": "e" * 64}
             ).encode("utf-8"),
         }
@@ -352,8 +464,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_bad_signature_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
-        manifest, downloads = self._downloads_for("0.9.1", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.10.1")
+        manifest, downloads = self._downloads_for("0.10.1", new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -366,8 +478,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_missing_sigstore_package_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
-        manifest, downloads = self._downloads_for("0.9.1", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.10.1")
+        manifest, downloads = self._downloads_for("0.10.1", new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -379,8 +491,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_failed_self_test_restores_previous(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
-        manifest, downloads = self._downloads_for("0.9.1", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, "0.10.1")
+        manifest, downloads = self._downloads_for("0.10.1", new_bytes)
         real_self_test = hub._self_test
 
         def flaky_self_test(path, expect_version=None):
@@ -414,7 +526,7 @@ class RollbackTest(unittest.TestCase):
     def test_rollback_restores_previous(self):
         fx = UpgradeFixture(self)
         # Simulate a completed upgrade: current = 0.7.0, prev = 0.6.0.
-        new_bytes = stamp_version(fx.old_bytes, "0.9.1")
+        new_bytes = stamp_version(fx.old_bytes, "0.10.1")
         with open(fx.target, "wb") as fh:
             fh.write(new_bytes)
         self._with_prev(fx, fx.old_bytes)

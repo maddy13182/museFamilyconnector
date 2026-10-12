@@ -68,30 +68,35 @@ environment variables only.
 
 After deploying the worker, confirm `GET /v1/client/latest` serves the
 manifest that is in the repo at that deploy (the server only advertises
-what `server/client-manifest.json` says):
+what `server/client-manifest.json` says — and the build bundles the pinned
+CLI artifacts into the worker via `npm run bundle:client`, so the deploy
+also serves exactly those bytes at `/v1/client/download/*`):
 
 ```sh
 curl -s https://<your-worker>/v1/client/latest | python3 -m json.tool
 ```
 
-Check that `version`, `sha256`, and `download_url` match the latest
-signed `cli-v*` GitHub Release:
+Check that `version`, `sha256`, and `server_version` look right, and that
+the served artifact matches the signed `cli-v*` GitHub Release the pin was
+taken from:
 
 ```sh
 gh release view "cli-v$(curl -s https://<your-worker>/v1/client/latest \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" \
   --json tagName,assets --jq '{tag: .tagName, assets: [.assets[].name]}'
+curl -s https://<your-worker>/v1/client/download/hub | sha256sum
+# → must equal the `sha256` in /v1/client/latest
 ```
 
 The response's `sha256` must equal the release's `manifest.json`
-`sha256`. The release workflow updates `server/client-manifest.json`
-automatically when it cuts a release (committed back to `main` with
-`[skip ci]`, which intentionally skips re-deploying) — so after a CLI
-release lands, **redeploy the worker** (or fold it into the next deploy)
-for agents' `hub upgrade` to see the new version. `min_cli_version` in
-the manifest is never raised automatically; raise it deliberately per the
-rollout order in `docs/CLIENT_HARDENING_SPEC.md` §7, only after the fleet
-reports at-or-above the new version.
+`sha256`. The release workflow opens a **PR** updating
+`server/client-manifest.json` when it cuts a release (direct pushes to
+`main` are blocked by branch protection) — so after a CLI release lands:
+**merge the manifest PR, then redeploy the worker** (or fold it into the
+next deploy) for agents' `hub upgrade` to see the new version.
+`min_cli_version` in the manifest is never raised automatically; raise it
+deliberately per the rollout order in `docs/CLIENT_HARDENING_SPEC.md` §7,
+only after the fleet reports at-or-above the new version.
 
 ## Rotating the Cloudflare token
 

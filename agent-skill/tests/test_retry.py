@@ -183,6 +183,7 @@ class CircleCreateRecoveryTest(unittest.TestCase):
     def setUp(self):
         self._sleep = mock.patch.object(hub.time, "sleep")
         self._sleep.start()
+        hub._reset_server_version_cache()
         self._saved_env = dict(os.environ)
         self.tmp = tempfile.mkdtemp(prefix="hubtest-")
         os.environ["FAMILY_HUB_CONFIG_HOME"] = self.tmp
@@ -217,6 +218,9 @@ class CircleCreateRecoveryTest(unittest.TestCase):
         def router(method, url, headers, body_bytes):
             path = urlparse.urlparse(url).path
             calls.append({"method": method, "url": url, "headers": dict(headers)})
+            if path == "/v1/health" and method == "GET":
+                return 200, json.dumps(
+                    {"ok": True, "version": "0.12.0", "api_versions": ["v1"]})
             if path == "/v1/families" and method == "POST":
                 n = len([c for c in calls if c["url"].endswith("/v1/families")])
                 if n == 1:
@@ -255,6 +259,10 @@ class CircleCreateRecoveryTest(unittest.TestCase):
 
     def test_create_duplicate_name_is_clear_error(self):
         def transport(method, url, headers, body_bytes):
+            path = urlparse.urlparse(url).path
+            if path == "/v1/health" and method == "GET":
+                return 200, json.dumps(
+                    {"ok": True, "version": "0.12.0", "api_versions": ["v1"]})
             return 409, json.dumps(
                 {"error": {"code": "circle_name_taken", "message": "exists"}}
             )

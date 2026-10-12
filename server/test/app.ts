@@ -9,11 +9,16 @@ export interface CallOpts {
   token?: string;
   body?: unknown;
   headers?: Record<string, string>;
+  /** When true, return the raw response bytes (no JSON parsing). */
+  rawBytes?: boolean;
 }
 
 export interface CallResult {
   status: number;
   body: any;
+  headers: Record<string, string>;
+  /** Set when rawBytes is true. */
+  bytes?: Uint8Array;
 }
 
 export function makeApp() {
@@ -34,6 +39,13 @@ export function makeApp() {
     }
     const req = new Request(`https://hub.test${path}`, { method, headers, body });
     const res = await handleRequest(req, db, env);
+    const resHeaders: Record<string, string> = {};
+    res.headers.forEach((v, k) => {
+      resHeaders[k] = v;
+    });
+    if (opts.rawBytes) {
+      return { status: res.status, body: undefined, headers: resHeaders, bytes: new Uint8Array(await res.arrayBuffer()) };
+    }
     const text = await res.text();
     let parsed: any;
     try {
@@ -41,7 +53,7 @@ export function makeApp() {
     } catch {
       parsed = text;
     }
-    return { status: res.status, body: parsed };
+    return { status: res.status, body: parsed, headers: resHeaders };
   }
 
   return { call, db, env, raw };

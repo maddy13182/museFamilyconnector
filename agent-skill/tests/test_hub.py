@@ -41,6 +41,10 @@ class FakeHub:
         self.routes = {}
         self.seqs = {}
         self.calls = []
+        # Per-invocation version-check traffic is recorded separately so
+        # command-traffic assertions (calls == [], calls[0], …) keep their
+        # meaning. Explicitly registered /v1/health routes still work.
+        self.health_calls = []
 
     def add(self, method, path, status, body):
         self.routes[(method.upper(), path)] = (status, body)
@@ -55,6 +59,26 @@ class FakeHub:
         self.seqs[(method.upper(), path)] = list(responses)
 
     def __call__(self, method, url, headers, body_bytes):
+        path = urlparse.urlparse(url).path
+        if (
+            method.upper() == "GET"
+            and path == "/v1/health"
+            and ("GET", "/v1/health") not in self.routes
+            and ("GET", "/v1/health") not in self.seqs
+        ):
+            # The fake models a current (0.12.0) server: auto-answer the
+            # per-invocation version check in main().
+            self.health_calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": dict(headers),
+                    "body": body_bytes.decode("utf-8") if body_bytes else None,
+                }
+            )
+            return 200, json.dumps(
+                {"ok": True, "version": "0.12.0", "api_versions": ["v1"]}
+            )
         self.calls.append(
             {
                 "method": method,
@@ -63,7 +87,6 @@ class FakeHub:
                 "body": body_bytes.decode("utf-8") if body_bytes else None,
             }
         )
-        path = urlparse.urlparse(url).path
         key = (method.upper(), path)
         if key in self.seqs and self.seqs[key]:
             status, body = self.seqs[key].pop(0)
@@ -96,6 +119,9 @@ class HubTestBase(unittest.TestCase):
         os.environ["FAMILY_HUB_TOKEN"] = FAKE_TOKEN
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
         self.fake = FakeHub()
+        # Fresh version-check state per test (the fake auto-answers
+        # /v1/health as a current server; see FakeHub.__call__).
+        hub._reset_server_version_cache()
 
     def tearDown(self):
         os.environ.clear()
