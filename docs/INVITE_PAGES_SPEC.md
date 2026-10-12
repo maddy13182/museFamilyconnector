@@ -139,13 +139,20 @@ apply (correct — an un-enrolled invitee has no client version to gate).
   "client": {
     "version": "<from client-manifest>",
     "download_url": "https://<this-server>/v1/client/download/hub",
-    "sha256": "<...>"
+    "sha256": "<...>",
+    "skill": {
+      "version": "<skill version from client-manifest>",
+      "download_url": "https://<this-server>/v1/client/download/skill.tar.gz",
+      "sha256": "<bundle sha256>"
+    }
   },
   "install": {
-    "summary": "Install the Family Hub CLI + skill, verify the release signature, then run hub setup.",
+    "summary": "Install the Family Hub skill bundle, verify its hash, verify the CLI signature, then run hub setup.",
     "steps": [
       "mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub",
-      "curl -sSLO https://<this-server>/v1/client/download/hub -sSLO https://<this-server>/v1/client/download/hub.sigstore -sSLO https://<this-server>/v1/client/download/manifest.json",
+      "curl -sSLO https://<this-server>/v1/client/download/skill.tar.gz",
+      "python3 -c \"import hashlib; assert hashlib.sha256(open('skill.tar.gz','rb').read()).hexdigest()=='<bundle sha256>', 'skill bundle hash mismatch'\"",
+      "tar -xzf skill.tar.gz",
       "chmod +x hub",
       "pip install \"sigstore>=3.0,<4.0\" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity \"https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main\" --cert-oidc-issuer \"https://token.actions.githubusercontent.com\" hub",
       "python3 -c \"import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']\"",
@@ -158,11 +165,13 @@ apply (correct — an un-enrolled invitee has no client version to gate).
 ```
 
 Derive the install-step URLs from the request origin as
-`https://<this-server>/v1/client/download/{hub,hub.sigstore,manifest.json}`
-— the server serves its own build-bundled artifacts (spec
-API_VERSIONING_SPEC §3.4); the GitHub Release URL in the pin file is
+`https://<this-server>/v1/client/download/skill.tar.gz` — the install flow
+starts with the skill bundle from THIS server (the bundle carries the CLI
+artifacts inside it); the GitHub Release URL in the pin file is
 provenance only and never surfaces in the user-facing flow.
-`email_hint`: first char of local part + `***@` + domain.
+`email_hint`: first char of local part + `***@` + domain. The bundle hash
+in the verify step is the pin's `skill_sha256`, constrained to 64-hex at
+build time by `bundle-client.mjs` (the server cannot build without it).
 
 ### 3.4 HTML page (humans)
 

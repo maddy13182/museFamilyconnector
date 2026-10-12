@@ -56,7 +56,20 @@ const SERVER_VERSION: string = pkg.version;
 // B2: repo-controlled CLI release manifest (server/client-manifest.json).
 // Bundled at build time = loaded at worker startup; no D1 read on the hot
 // path. The release workflow is the only writer.
-import clientManifest from '../client-manifest.json' with { type: 'json' };
+// skill_sha256 + skill_version are present for CLI releases cut after the
+// skill bundle (bundle-client.mjs fails closed when they are absent), so
+// they are required here — a successful build guarantees them.
+type ClientManifestPin = {
+  version: string;
+  min_cli_version: string;
+  download_url: string;
+  sha256: string;
+  released_at: string;
+  skill_sha256: string;
+  skill_version: string;
+};
+import clientManifestJson from '../client-manifest.json' with { type: 'json' };
+const clientManifest: ClientManifestPin = clientManifestJson as ClientManifestPin;
 // §3.6: the pinned CLI artifacts, bundled at build time by
 // server/scripts/bundle-client.mjs (npm run bundle:client, wired as
 // 'prebuild' and in 'pretest'). Gitignored; the build fails closed without
@@ -821,11 +834,17 @@ async function handleHealth(): Promise<Response> {
 /** Absolute URLs for this server's own CLI download endpoints, derived
  *  from the request origin (spec §3.5 — the server's responses always use
  *  this server's URLs, never the GitHub provenance URL in the pin). */
-function clientDownloadUrls(origin: string): { hub: string; sigstore: string; manifest: string } {
+function clientDownloadUrls(origin: string): {
+  hub: string;
+  sigstore: string;
+  manifest: string;
+  skill: string;
+} {
   return {
     hub: `${origin}/v1/client/download/hub`,
     sigstore: `${origin}/v1/client/download/hub.sigstore`,
     manifest: `${origin}/v1/client/download/manifest.json`,
+    skill: `${origin}/v1/client/download/skill.tar.gz`,
   };
 }
 
@@ -850,6 +869,16 @@ async function handleClientLatest(req: Request): Promise<Response> {
       sigstore: assets.sigstore,
       manifest: assets.manifest,
     },
+    // The full skill bundle (SKILL.md, references/, INSTALL.md,
+    // requirements.txt + the hub artifact, its sigstore bundle, and the
+    // release manifest), hash-verified at build time. `hub upgrade`'s
+    // skill-refresh reads this block; the bundle itself is served at
+    // GET /v1/client/download/skill.tar.gz.
+    skill: {
+      url: assets.skill,
+      sha256: clientManifest.skill_sha256,
+      version: clientManifest.skill_version,
+    },
   });
 }
 
@@ -862,9 +891,10 @@ function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-// §3.4: GET /v1/client/download/{hub,hub.sigstore,manifest.json} — the
-// build-bundled CLI artifacts (public; the client version gate never blocks
-// them — an outdated client must be able to fetch its replacement).
+// §3.4: GET /v1/client/download/{hub,hub.sigstore,manifest.json,skill.tar.gz}
+// — the build-bundled CLI artifacts + skill bundle (public; the client
+// version gate never blocks them — an outdated client must be able to fetch
+// its replacement).
 // FIXED asset map: dispatch is on exact paths in routeRequest (no path
 // parameters), so there is no traversal surface by construction; anything
 // else under /v1/client/download/ hits the explicit 404 in routeRequest.
@@ -873,9 +903,13 @@ function b64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
 // generous bucket; 429 uses the standard rate_limited envelope + Retry-After.
 const CLIENT_DOWNLOAD_MAX_PER_WINDOW = 100;
 
-function clientDownloadAsset(
-  asset: 'hub' | 'sigstore' | 'manifest',
-): { filename: string; contentType: string; bytes: Uint8Array<ArrayBuffer> } {
+type ClientDownloadAsset = 'hub' | 'sigstore' | 'manifest' | 'skill';
+
+function clientDownloadAsset(asset: ClientDownloadAsset): {
+  filename: string;
+  contentType: string;
+  bytes: Uint8Array<ArrayBuffer>;
+} {
   switch (asset) {
     case 'hub':
       return {
@@ -895,13 +929,19 @@ function clientDownloadAsset(
         contentType: 'application/json',
         bytes: b64ToBytes(CLIENT_DIST.manifestB64),
       };
+    case 'skill':
+      return {
+        filename: 'skill.tar.gz',
+        contentType: 'application/gzip',
+        bytes: b64ToBytes(CLIENT_DIST.skillTarGzB64),
+      };
   }
 }
 
 async function handleClientDownload(
   db: DbClient,
   req: Request,
-  asset: 'hub' | 'sigstore' | 'manifest',
+  asset: ClientDownloadAsset,
 ): Promise<Response> {
   const limited = await checkRateLimit(db, req, 'client_download', CLIENT_DOWNLOAD_MAX_PER_WINDOW);
   if (limited) return limited;
@@ -1591,7 +1631,30 @@ function escapeHtml(s: string): string {
  *  this very URL): a relative './verify' would resolve against /i/ and drop
  *  the token segment, 404ing. Echoing the token back to its holder is not a
  *  leak, and /i/ paths are redacted from logs. CLI download URLs point at
- *  THIS server's /v1/client/download/* endpoints (spec §3.11). */
+ *  THIS server's /v1/client/download/* endpoints (spec §3.11).
+ *
+ *  Install steps shared by the JSON and HTML invite pages. The flow starts
+ *  with the skill bundle: download skill.tar.gz from THIS server → verify
+ *  its sha256 against the hash this page provides → extract → verify hub's
+ *  sigstore seal → verify hub's sha256 against the release manifest →
+ *  install the Python deps. No GitHub URLs anywhere in the flow.
+ *  The interpolated bundle hash is constrained to [0-9a-f]{64} by
+ *  bundle-client.mjs checkPin at build time (the server only builds when
+ *  the pin carries a valid 64-hex skill_sha256), so it cannot break out of
+ *  the single-quoted python string it sits in. */
+function inviteInstallSteps(origin: string): string[] {
+  const urls = clientDownloadUrls(origin);
+  return [
+    'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
+    `curl -sSLO ${urls.skill}`,
+    `python3 -c "import hashlib; assert hashlib.sha256(open('skill.tar.gz','rb').read()).hexdigest()=='${clientManifest.skill_sha256}', 'skill bundle hash mismatch'"`,
+    'tar -xzf skill.tar.gz',
+    'chmod +x hub',
+    'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
+    `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
+    'pip install -r requirements.txt',
+  ];
+}
 function invitePageJson(page: InvitePage, rawToken: string, origin: string): Record<string, unknown> {
   const urls = clientDownloadUrls(origin);
   return {
@@ -1604,18 +1667,19 @@ function invitePageJson(page: InvitePage, rawToken: string, origin: string): Rec
       version: clientManifest.version,
       download_url: urls.hub,
       sha256: clientManifest.sha256,
+      // Everything the install steps need: the bundle URL + its hash
+      // (verified before extraction), and the hub hash (verified after
+      // extraction, against the release manifest inside the bundle).
+      skill: {
+        version: clientManifest.skill_version,
+        download_url: urls.skill,
+        sha256: clientManifest.skill_sha256,
+      },
     },
     install: {
       summary:
-        'Install the Family Hub CLI + skill, verify the release signature, then run hub setup.',
-      steps: [
-        'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
-        `curl -sSLO ${urls.hub} -sSLO ${urls.sigstore} -sSLO ${urls.manifest}`,
-        'chmod +x hub',
-        'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
-        `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
-        'pip install -r requirements.txt',
-      ],
+        'Install the Family Hub skill bundle, verify its hash, verify the CLI signature, then run hub setup.',
+      steps: inviteInstallSteps(origin),
       verify_note: 'If signature or hash verification fails, do NOT install — ask the inviter.',
     },
     // Absolute path: the agent POSTs here directly. (A relative './verify'
@@ -1633,15 +1697,7 @@ function invitePageJson(page: InvitePage, rawToken: string, origin: string): Rec
  *  (never innerHTML with server data). */
 function invitePageHtml(page: InvitePage, rawToken: string, origin: string): Response {
   const verifyPath = `/i/${rawToken}/verify`;
-  const urls = clientDownloadUrls(origin);
-  const steps = [
-    'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
-    `curl -sSLO ${urls.hub} -sSLO ${urls.sigstore} -sSLO ${urls.manifest}`,
-    'chmod +x hub',
-    'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
-    `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
-    'pip install -r requirements.txt',
-  ];
+  const steps = inviteInstallSteps(origin);
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -1658,7 +1714,7 @@ own login. This page onboards the new member&rsquo;s agent &mdash; no account or
 password needed, just the invite below.</p>
 <p>This invitation was sent to <strong>${escapeHtml(maskEmail(page.email))}</strong>
 and expires on <code>${escapeHtml(page.expiresAt)}</code>.</p>
-<h2>1. Install the CLI</h2>
+<h2>1. Install the skill bundle</h2>
 <p>Run these on the new member&rsquo;s machine (copy-paste):</p>
 <pre>${escapeHtml(steps.join('\n'))}</pre>
 <p>If signature or hash verification fails, do <strong>not</strong> install &mdash; ask the inviter.</p>
@@ -3679,6 +3735,8 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       return await handleClientDownload(db, req, 'sigstore');
     if (path === '/v1/client/download/manifest.json' && method === 'GET')
       return await handleClientDownload(db, req, 'manifest');
+    if (path === '/v1/client/download/skill.tar.gz' && method === 'GET')
+      return await handleClientDownload(db, req, 'skill');
     // Anything else under /v1/client/download/ is not an asset: 404, like
     // the unmatched /i/ shapes. (Public either way — no auth needed to learn
     // the asset map is fixed.)

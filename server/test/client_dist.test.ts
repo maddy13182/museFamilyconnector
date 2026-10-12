@@ -2,10 +2,14 @@
 // fail-closed build bundler.
 //
 // Covers: health api_versions; download endpoints (content types, exact
-// bytes vs the bundled artifacts, headers, fixed-path 404s, rate limit);
-// bundle-client.mjs fail-closed modes (placeholder hash, 404, sha mismatch)
-// plus the success path against a stub release server; openapi parity
-// (mirrors the CI api-parity job).
+// bytes vs the bundled artifacts, headers, fixed-path 404s, rate limit —
+// including the skill.tar.gz bundle and its shared rate-limit bucket);
+// /v1/client/latest skill block; bundle-client.mjs fail-closed modes
+// (placeholder hash, 404, sha mismatch — hub and skill — missing
+// skill_sha256 pin, release manifest without skill_sha256, unsafe tarball
+// members, phase-2 manifest embedded by mistake) plus the success path
+// against a stub release server; openapi parity (mirrors the CI api-parity
+// job).
 //
 // No @types/node in this repo (see shims.d.ts): base64 via atob (DOM lib),
 // sha256 via WebCrypto, bytes via Uint8Array.
@@ -13,7 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { join, dirname } from 'node:path';
@@ -21,7 +25,15 @@ import { fileURLToPath } from 'node:url';
 import { makeApp } from './app.js';
 import { CLIENT_DIST } from '../src/client-dist.generated.js';
 import pkg from '../package.json' with { type: 'json' };
-import manifest from '../client-manifest.json' with { type: 'json' };
+import manifestJson from '../client-manifest.json' with { type: 'json' };
+// The pin carries skill_sha256/skill_version for CLI releases cut after the
+// skill bundle (bundle-client.mjs fails closed without them). The committed
+// pin predates the first bundled release, so the test types the fields the
+// release workflow's manifest-PR step always writes.
+const manifest = manifestJson as typeof manifestJson & {
+  skill_sha256: string;
+  skill_version: string;
+};
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Tests run compiled from dist/test/; the script lives in server/scripts/.
@@ -106,6 +118,33 @@ test('GET /v1/client/download/manifest.json serves the release manifest', async 
   assert.equal(res.body.sha256, manifest.sha256);
 });
 
+test('GET /v1/client/download/skill.tar.gz serves the exact bundled skill bundle', async () => {
+  const app = makeApp();
+  const res = await app.call('GET', '/v1/client/download/skill.tar.gz', { rawBytes: true });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers['content-type'], 'application/gzip');
+  assert.equal(res.headers['content-disposition'], 'attachment; filename="skill.tar.gz"');
+  assert.equal(res.headers['cache-control'], 'public, max-age=300');
+  const bytes = res.bytes!;
+  assert.equal(res.headers['content-length'], String(bytes.length));
+  // Bytes equal the build-bundled tarball, whose sha256 was verified at
+  // build time against BOTH the pin's skill_sha256 and the release
+  // manifest's skill_sha256.
+  assert.ok(bytesEqual(bytes, b64ToBytes(CLIENT_DIST.skillTarGzB64)), 'served bytes == bundled bytes');
+  assert.equal(await sha256hex(bytes), manifest.skill_sha256);
+  assert.equal(await sha256hex(bytes), CLIENT_DIST.skillSha256);
+  assert.equal(res.headers['x-content-type-options'], 'nosniff');
+});
+
+test('GET /v1/client/latest carries the skill block for the bundled release', async () => {
+  const app = makeApp();
+  const res = await app.call('GET', '/v1/client/latest');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.skill.url, 'https://hub.test/v1/client/download/skill.tar.gz');
+  assert.equal(res.body.skill.sha256, manifest.skill_sha256);
+  assert.equal(res.body.skill.version, manifest.skill_version);
+});
+
 test('anything else under /v1/client/download/ 404s (fixed asset map)', async () => {
   const app = makeApp();
   for (const p of [
@@ -115,6 +154,9 @@ test('anything else under /v1/client/download/ 404s (fixed asset map)', async ()
     '/v1/client/download/HUB', // case-sensitive
     '/v1/client/download/hub.sigstore.bak',
     '/v1/client/download/hub%00',
+    '/v1/client/download/skill.tar.gz/', // trailing slash
+    '/v1/client/download/SKILL.TAR.GZ', // case-sensitive
+    '/v1/client/download/skill.tar.gz.bak',
   ]) {
     const res = await app.call('GET', p);
     assert.equal(res.status, 404, `${p} must 404`);
@@ -138,6 +180,22 @@ test('downloads are rate-limited with the standard 429 envelope + Retry-After', 
     assert.equal(r.status, 200, `request ${i + 1} should pass`);
   }
   const limited = await app.call('GET', '/v1/client/download/manifest.json');
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.error.code, 'rate_limited');
+  assert.ok(Number(limited.headers['retry-after']) > 0, 'Retry-After must be set');
+});
+
+test('downloads share one rate-limit bucket across all four assets', async () => {
+  const app = makeApp();
+  // 50 manifest.json + 50 skill.tar.gz = 100 against the shared
+  // 'client_download' bucket; the 101st request (any asset) 429s.
+  for (let i = 0; i < 50; i++) {
+    const a = await app.call('GET', '/v1/client/download/manifest.json');
+    assert.equal(a.status, 200, `manifest request ${i + 1} should pass`);
+    const b = await app.call('GET', '/v1/client/download/skill.tar.gz', { rawBytes: true });
+    assert.equal(b.status, 200, `skill request ${i + 1} should pass`);
+  }
+  const limited = await app.call('GET', '/v1/client/download/skill.tar.gz');
   assert.equal(limited.status, 429);
   assert.equal(limited.body.error.code, 'rate_limited');
   assert.ok(Number(limited.headers['retry-after']) > 0, 'Retry-After must be set');
@@ -210,15 +268,171 @@ function bundlerEnv(dir: string, pin: unknown, baseUrl: string): Record<string, 
   };
 }
 
+interface ReleaseFixture {
+  pin: Record<string, unknown>;
+  hubBytes: Uint8Array;
+  phase1Manifest: Record<string, unknown>;
+  releaseManifest: Record<string, unknown>;
+  skillTarGz: Uint8Array;
+}
+
+/** Build a well-formed skill.tar.gz the way the release workflow does:
+ *  explicit relative members, no absolute paths, no links. */
+async function buildSkillTarball(
+  dir: string,
+  files: Record<string, string | Uint8Array>,
+): Promise<Uint8Array> {
+  const stage = join(dir, 'skill-stage');
+  mkdirSync(stage, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    const p = join(stage, name);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, content);
+  }
+  const out = join(dir, 'skill.tar.gz');
+  await new Promise<void>((resolve, reject) => {
+    execFile('tar', ['-czf', out, '-C', stage, ...Object.keys(files)], {}, (err) =>
+      err ? reject(err) : resolve(),
+    );
+  });
+  return readFileSync(out);
+}
+
+/** A complete, internally consistent stub release: hub bytes, the phase-1
+ *  manifest (as embedded in the tarball), the phase-2 release manifest
+ *  (adds skill_sha256 + skill_version), and the pin. Mutate one piece per
+ *  fail-closed test. */
+async function makeRelease(dir: string, version = '9.9.9'): Promise<ReleaseFixture> {
+  const hubBytes = new TextEncoder().encode(`#!/usr/bin/env python3\nprint("hub ${version}")\n`);
+  const hubSha = createHash('sha256').update(hubBytes).digest('hex');
+  const phase1Manifest: Record<string, unknown> = {
+    version,
+    sha256: hubSha,
+    files: { hub: hubSha },
+    signature: 'hub.sigstore',
+  };
+  const skillTarGz = await buildSkillTarball(dir, {
+    'SKILL.md': '<!-- SKILL VERSION: 1.2.3 -->\n# skill\n',
+    'INSTALL.md': '# install\n',
+    'requirements.txt': 'sigstore>=3.0,<4.0\n',
+    'references/a.md': '# a\n',
+    hub: hubBytes,
+    'hub.sigstore': JSON.stringify({ mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json' }),
+    'manifest.json': JSON.stringify(phase1Manifest),
+  });
+  const skillSha = createHash('sha256').update(skillTarGz).digest('hex');
+  const releaseManifest: Record<string, unknown> = {
+    ...phase1Manifest,
+    skill_sha256: skillSha,
+    skill_version: '1.2.3',
+  };
+  const pin: Record<string, unknown> = {
+    version,
+    min_cli_version: '0.0.0',
+    download_url: `http://stub.invalid/cli-v${version}/hub`,
+    sha256: hubSha,
+    skill_sha256: skillSha,
+    skill_version: '1.2.3',
+    released_at: '2026-10-12T00:00:00Z',
+  };
+  return { pin, hubBytes, phase1Manifest, releaseManifest, skillTarGz };
+}
+
+function stubFiles(fx: ReleaseFixture): Record<string, { body: string | Uint8Array }> {
+  return {
+    hub: { body: fx.hubBytes },
+    'hub.sigstore': { body: JSON.stringify({ mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json' }) },
+    'manifest.json': { body: JSON.stringify(fx.releaseManifest) },
+    'skill.tar.gz': { body: fx.skillTarGz },
+  };
+}
+
+/** Build a tarball with a hostile member via python tarfile (the `tar`
+ *  CLI refuses to create these): kind is 'traversal' (../evil.txt),
+ *  'symlink' (evil-link -> /etc/passwd), or 'phase2' (embedded manifest
+ *  wrongly carries skill_* fields, violating the two-phase invariant). */
+async function evilSkillTarball(
+  dir: string,
+  kind: 'traversal' | 'symlink' | 'phase2',
+  hubBytes: Uint8Array,
+  phase1Manifest: Record<string, unknown>,
+): Promise<Uint8Array> {
+  const hubPath = join(dir, 'hub.bin');
+  const manPath = join(dir, 'm1.json');
+  writeFileSync(hubPath, hubBytes);
+  writeFileSync(manPath, JSON.stringify(phase1Manifest));
+  const scriptPath = join(dir, 'evil_tar.py');
+  writeFileSync(
+    scriptPath,
+    [
+      'import io, json, sys, tarfile',
+      'kind, hub_path, man_path, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]',
+      'hub = open(hub_path, "rb").read()',
+      'manifest = json.load(open(man_path))',
+      'with tarfile.open(out, "w:gz") as tf:',
+      '    def add(name, data):',
+      '        ti = tarfile.TarInfo(name)',
+      '        ti.size = len(data)',
+      '        tf.addfile(ti, io.BytesIO(data))',
+      '    add("SKILL.md", b"<!-- SKILL VERSION: 1.2.3 -->\\n")',
+      '    if kind == "traversal":',
+      '        add("../evil.txt", b"evil")',
+      '    elif kind == "symlink":',
+      '        ti = tarfile.TarInfo("evil-link")',
+      '        ti.type = tarfile.SYMTYPE',
+      '        ti.linkname = "/etc/passwd"',
+      '        tf.addfile(ti)',
+      '    elif kind == "phase2":',
+      '        manifest["skill_sha256"] = "f" * 64',
+      '        manifest["skill_version"] = "1.2.3"',
+      '    add("hub", hub)',
+      '    add("manifest.json", json.dumps(manifest).encode())',
+      '',
+    ].join('\n'),
+  );
+  const out = join(dir, 'skill-evil.tar.gz');
+  await new Promise<void>((resolve, reject) => {
+    execFile('python3', [scriptPath, kind, hubPath, manPath, out], {}, (err, _stdout, stderr) =>
+      err ? reject(new Error(stderr || err.message)) : resolve(),
+    );
+  });
+  return readFileSync(out);
+}
+
 test('bundler fails closed on a placeholder pin hash', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bundle-ph-'));
   const stub = await stubServer({});
   try {
     const r = await runBundler(
-      bundlerEnv(dir, { version: '9.9.9', sha256: 'PENDING-release-workflow-fills-this-in' }, stub.url),
+      bundlerEnv(
+        dir,
+        {
+          version: '9.9.9',
+          sha256: 'PENDING-release-workflow-fills-this-in',
+          skill_sha256: 'a'.repeat(64),
+          skill_version: '1.2.3',
+        },
+        stub.url,
+      ),
     );
     assert.notEqual(r.code, 0, 'must fail');
     assert.match(r.stderr, /PENDING|placeholder/i);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('bundler fails closed on a pin without skill_sha256', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-noskillpin-'));
+  const fx = await makeRelease(dir);
+  const stub = await stubServer(stubFiles(fx));
+  try {
+    // A CLI release cut before the skill bundle: no skill_sha256 in the pin.
+    const pin: Record<string, unknown> = { ...fx.pin };
+    delete pin.skill_sha256;
+    const r = await runBundler(bundlerEnv(dir, pin, stub.url));
+    assert.notEqual(r.code, 0, 'must fail');
+    assert.match(r.stderr, /skill_sha256/i);
   } finally {
     await stub.close();
   }
@@ -230,9 +444,16 @@ test('bundler fails closed on HTTP 404 from the release server', async () => {
     hub: { status: 404, body: '' },
     'hub.sigstore': { status: 404, body: '' },
     'manifest.json': { status: 404, body: '' },
+    'skill.tar.gz': { status: 404, body: '' },
   });
   try {
-    const r = await runBundler(bundlerEnv(dir, { version: '9.9.9', sha256: 'b'.repeat(64) }, stub.url));
+    const pin = {
+      version: '9.9.9',
+      sha256: 'b'.repeat(64),
+      skill_sha256: 'a'.repeat(64),
+      skill_version: '1.2.3',
+    };
+    const r = await runBundler(bundlerEnv(dir, pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
     assert.match(r.stderr, /404|non-2xx|HTTP/i);
   } finally {
@@ -240,21 +461,14 @@ test('bundler fails closed on HTTP 404 from the release server', async () => {
   }
 });
 
-test('bundler fails closed on sha256 mismatch (tampered bytes)', async () => {
+test('bundler fails closed on sha256 mismatch (tampered hub bytes)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bundle-mm-'));
-  const hubBytes = new TextEncoder().encode('#!/usr/bin/env python3\n# tampered\n');
-  const releaseManifest = JSON.stringify({
-    version: '9.9.9',
-    sha256: 'c'.repeat(64),
-    files: { hub: 'c'.repeat(64) },
-  });
-  const stub = await stubServer({
-    hub: { body: hubBytes },
-    'hub.sigstore': { body: JSON.stringify({ bundle: true }) },
-    'manifest.json': { body: releaseManifest },
-  });
+  const fx = await makeRelease(dir);
+  const tampered = new TextEncoder().encode('#!/usr/bin/env python3\n# tampered\n');
+  const stub = await stubServer({ ...stubFiles(fx), hub: { body: tampered } });
   try {
-    const r = await runBundler(bundlerEnv(dir, { version: '9.9.9', sha256: 'd'.repeat(64) }, stub.url));
+    const pin = { ...fx.pin, sha256: 'd'.repeat(64) };
+    const r = await runBundler(bundlerEnv(dir, pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
     assert.match(r.stderr, /mismatch/i);
   } finally {
@@ -262,20 +476,39 @@ test('bundler fails closed on sha256 mismatch (tampered bytes)', async () => {
   }
 });
 
+test('bundler fails closed on skill.tar.gz sha256 mismatch (tampered bundle)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-skillmm-'));
+  const fx = await makeRelease(dir);
+  // A different but structurally valid bundle: the hash check must catch it.
+  const other = await buildSkillTarball(join(mkdtempSync(join(tmpdir(), 'bundle-skillmm2-'))), {
+    'SKILL.md': '<!-- SKILL VERSION: 1.2.3 -->\n# different skill\n',
+    hub: fx.hubBytes,
+    'manifest.json': JSON.stringify(fx.phase1Manifest),
+  });
+  assert.notEqual(
+    createHash('sha256').update(other).digest('hex'),
+    fx.pin.skill_sha256,
+    'fixture sanity: the tampered bundle must hash differently',
+  );
+  const stub = await stubServer({ ...stubFiles(fx), 'skill.tar.gz': { body: other } });
+  try {
+    const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
+    assert.notEqual(r.code, 0, 'must fail');
+    assert.match(r.stderr, /skill\.tar\.gz.*mismatch|MISMATCH.*skill/i);
+  } finally {
+    await stub.close();
+  }
+});
+
 test('bundler fails closed when the release manifest disagrees with the pin', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bundle-rm-'));
-  const hubBytes = new TextEncoder().encode('#!/usr/bin/env python3\nprint("hub")\n');
-  const hubSha = createHash('sha256').update(hubBytes).digest('hex');
-  // Release manifest carries a DIFFERENT sha for the same bytes: the tag
-  // was republished. The bundler must refuse.
-  const releaseManifest = JSON.stringify({ version: '9.9.9', sha256: 'e'.repeat(64), files: { hub: 'e'.repeat(64) } });
-  const stub = await stubServer({
-    hub: { body: hubBytes },
-    'hub.sigstore': { body: JSON.stringify({ bundle: true }) },
-    'manifest.json': { body: releaseManifest },
-  });
+  const fx = await makeRelease(dir);
+  // Release manifest carries a DIFFERENT hub sha for the same bytes: the
+  // tag was republished. The bundler must refuse.
+  const releaseManifest = { ...fx.releaseManifest, sha256: 'e'.repeat(64) };
+  const stub = await stubServer({ ...stubFiles(fx), 'manifest.json': { body: JSON.stringify(releaseManifest) } });
   try {
-    const r = await runBundler(bundlerEnv(dir, { version: '9.9.9', sha256: hubSha }, stub.url));
+    const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
     assert.match(r.stderr, /republished|release manifest/i);
   } finally {
@@ -283,28 +516,108 @@ test('bundler fails closed when the release manifest disagrees with the pin', as
   }
 });
 
-test('bundler succeeds against a stub release and embeds verified bytes', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'bundle-ok-'));
-  const hubBytes = new TextEncoder().encode('#!/usr/bin/env python3\nprint("hub 9.9.9")\n');
-  const hubSha = createHash('sha256').update(hubBytes).digest('hex');
-  const releaseManifest = JSON.stringify({ version: '9.9.9', sha256: hubSha, files: { hub: hubSha } });
-  const sigstore = JSON.stringify({ mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json' });
+test('bundler fails closed when the release manifest has no skill_sha256', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-rmskill-'));
+  const fx = await makeRelease(dir);
+  // The release manifest is phase-1 (no skill fields): the pin demands a
+  // bundle the release never published.
+  const releaseManifest: Record<string, unknown> = { ...fx.releaseManifest };
+  delete releaseManifest.skill_sha256;
+  const stub = await stubServer({ ...stubFiles(fx), 'manifest.json': { body: JSON.stringify(releaseManifest) } });
+  try {
+    const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
+    assert.notEqual(r.code, 0, 'must fail');
+    assert.match(r.stderr, /skill_sha256/i);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('bundler fails closed on a tarball with a path-traversal member', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-evil-'));
+  const fx = await makeRelease(dir);
+  const evil = await evilSkillTarball(dir, 'traversal', fx.hubBytes, fx.phase1Manifest);
+  const evilSha = createHash('sha256').update(evil).digest('hex');
+  // Hashes agree everywhere so the failure is attributable to the member.
+  const pin = { ...fx.pin, skill_sha256: evilSha };
+  const releaseManifest = { ...fx.releaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
-    hub: { body: hubBytes },
-    'hub.sigstore': { body: sigstore },
-    'manifest.json': { body: releaseManifest },
+    ...stubFiles(fx),
+    'manifest.json': { body: JSON.stringify(releaseManifest) },
+    'skill.tar.gz': { body: evil },
   });
   try {
+    const r = await runBundler(bundlerEnv(dir, pin, stub.url));
+    assert.notEqual(r.code, 0, 'must fail');
+    assert.match(r.stderr, /refusing/i);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('bundler fails closed on a tarball with a symlink member', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-evilsym-'));
+  const fx = await makeRelease(dir);
+  const evil = await evilSkillTarball(dir, 'symlink', fx.hubBytes, fx.phase1Manifest);
+  const evilSha = createHash('sha256').update(evil).digest('hex');
+  const pin = { ...fx.pin, skill_sha256: evilSha };
+  const releaseManifest = { ...fx.releaseManifest, skill_sha256: evilSha };
+  const stub = await stubServer({
+    ...stubFiles(fx),
+    'manifest.json': { body: JSON.stringify(releaseManifest) },
+    'skill.tar.gz': { body: evil },
+  });
+  try {
+    const r = await runBundler(bundlerEnv(dir, pin, stub.url));
+    assert.notEqual(r.code, 0, 'must fail');
+    assert.match(r.stderr, /refusing/i);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('bundler fails closed when the tarball embeds a phase-2 manifest', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-evilp2-'));
+  const fx = await makeRelease(dir);
+  // The embedded manifest must be phase-1 (no skill_* fields); a bundle
+  // built against the phase-2 manifest breaks the documented circularity.
+  const evil = await evilSkillTarball(dir, 'phase2', fx.hubBytes, fx.phase1Manifest);
+  const evilSha = createHash('sha256').update(evil).digest('hex');
+  const pin = { ...fx.pin, skill_sha256: evilSha };
+  const releaseManifest = { ...fx.releaseManifest, skill_sha256: evilSha };
+  const stub = await stubServer({
+    ...stubFiles(fx),
+    'manifest.json': { body: JSON.stringify(releaseManifest) },
+    'skill.tar.gz': { body: evil },
+  });
+  try {
+    const r = await runBundler(bundlerEnv(dir, pin, stub.url));
+    assert.notEqual(r.code, 0, 'must fail');
+    assert.match(r.stderr, /phase-1/i);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('bundler succeeds against a stub release and embeds verified bytes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bundle-ok-'));
+  const fx = await makeRelease(dir);
+  const stub = await stubServer(stubFiles(fx));
+  try {
     const outPath = join(dir, 'client-dist.generated.ts');
-    const r = await runBundler(bundlerEnv(dir, { version: '9.9.9', sha256: hubSha }, stub.url));
+    const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.equal(r.code, 0, `must succeed, stderr: ${r.stderr}`);
     const src = readFileSync(outPath, 'utf-8');
     assert.ok(src.includes('"9.9.9"'), 'embeds the version');
-    assert.ok(src.includes(hubSha), 'embeds the sha256');
+    assert.ok(src.includes(fx.pin.sha256 as string), 'embeds the hub sha256');
+    assert.ok(src.includes(fx.pin.skill_sha256 as string), 'embeds the skill sha256');
     // The embedded bytes are exactly what was verified.
-    const m = /hubB64: "([^"]+)"/.exec(src);
-    if (!m || !m[1]) throw new Error('hubB64 missing from generated module');
-    assert.ok(bytesEqual(b64ToBytes(m[1]), hubBytes), 'embedded bytes == verified bytes');
+    const hubM = /hubB64: "([^"]+)"/.exec(src);
+    if (!hubM || !hubM[1]) throw new Error('hubB64 missing from generated module');
+    assert.ok(bytesEqual(b64ToBytes(hubM[1]), fx.hubBytes), 'embedded hub bytes == verified bytes');
+    const skillM = /skillTarGzB64: "([^"]+)"/.exec(src);
+    if (!skillM || !skillM[1]) throw new Error('skillTarGzB64 missing from generated module');
+    assert.ok(bytesEqual(b64ToBytes(skillM[1]), fx.skillTarGz), 'embedded bundle bytes == verified bytes');
     // Cross-check with random bytes (no fixture reuse).
     const rnd = randomBytes(1024);
     assert.equal(createHash('sha256').update(rnd).digest('hex').length, 64);

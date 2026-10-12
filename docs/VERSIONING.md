@@ -112,23 +112,49 @@ mechanism.)
 
 1. Bump `agent-skill/pyproject.toml`; add fragment(s); merge to `main`.
 2. The **Release CLI** workflow (`.github/workflows/release.yml`) builds the
-   `hub` artifact, signs it with sigstore (keyless OIDC), and cuts the
-   `cli-v<x.y.z>` GitHub Release with `hub`, `hub.sigstore`, `manifest.json`.
-   It then opens a PR (`release/manifest-cli-v<x.y.z>`) updating
-   `server/client-manifest.json` — never a direct push to `main` (branch
-   protection rejects those, GH006). The workflow only acts when
+   `hub` artifact, signs it with sigstore (keyless OIDC), writes the release
+   manifest in **two phases** (phase 1 without skill fields → build
+   `skill.tar.gz` embedding the phase-1 manifest → phase 2 rewrites the
+   manifest adding `skill_sha256` + `skill_version`), and cuts the
+   `cli-v<x.y.z>` GitHub Release with `hub`, `hub.sigstore`, `manifest.json`,
+   **and `skill.tar.gz`**. It then opens a PR (`release/manifest-cli-v<x.y.z>`)
+   updating `server/client-manifest.json` — never a direct push to `main`
+   (branch protection rejects those, GH006). The workflow only acts when
    `pyproject.toml` is newer than the latest `cli-v*` tag, so merging the
    manifest PR triggers one no-op run — no loop.
+   - **What the bundle contains:** `SKILL.md`, `references/` (recursive),
+     `INSTALL.md`, `requirements.txt` from `agent-skill/`, plus the stamped
+     `dist/hub`, `dist/hub.sigstore`, and the phase-1 `dist/manifest.json`.
+     Inclusion is an explicit relative-path allowlist — `tests/`,
+     `__pycache__/`, `pyproject.toml`, `requirements.lock`, `hub.prev*`,
+     `*.pyc` are excluded by construction.
+   - **The two-phase circularity is open:** the tarball embeds the phase-1
+     manifest (its hub sha256 is identical in both phases; only the
+     `skill_*` fields differ); the `manifest.json` uploaded to the release
+     is phase-2. `skill_version` comes from the
+     `<!-- SKILL VERSION: x.y.z -->` header of `agent-skill/SKILL.md`.
+   - **Release cadence stays CLI-driven:** the workflow only cuts a release
+     when `agent-skill/pyproject.toml` is newer than the latest `cli-v*`
+     tag. A skill-only change (SKILL.md edit, skill version bump) ships
+     with the next CLI release — bump `pyproject.toml` to force one.
 3. **Owner merges the manifest PR.** `min_cli_version` in the pin is never
    raised automatically — raise it deliberately, only after the fleet
-   reports at-or-above the new CLI version.
+   reports at-or-above the new CLI version. The pin now also carries
+   `skill_sha256` + `skill_version` for the bundle.
 4. **Deploy the server.** The build runs `npm run bundle:client` first
-   (`prebuild`): it downloads the three artifacts for the pinned version,
+   (`prebuild`): it downloads the four artifacts for the pinned version,
    verifies `sha256(hub)` against BOTH the pin and the release manifest,
-   and embeds them into the worker (`server/src/client-dist.generated.ts`,
-   gitignored). The build **fails closed** — network error, 404,
-   placeholder hash, or mismatch stops the deploy with a clear message, so
-   the worker never serves placeholders.
+   verifies `sha256(skill.tar.gz)` against BOTH the pin's `skill_sha256`
+   and the release manifest's `skill_sha256`, structurally validates the
+   tarball (relative paths only, no links, decompressed-size cap), and
+   embeds everything into the worker
+   (`server/src/client-dist.generated.ts`, gitignored). The build
+   **fails closed** — network error, 404, placeholder hash, a pin without
+   `skill_sha256`/`skill_version`, mismatch, or an unsafe tarball member
+   stops the deploy with a clear message, so the worker never serves
+   placeholders. The worker then serves the bundle at
+   `GET /v1/client/download/skill.tar.gz` and advertises it in
+   `GET /v1/client/latest` (`skill: {url, sha256, version}`).
 5. **Set the production `MIN_CLI_VERSION` binding** (`server/wrangler.toml`
    `[vars]`, or the dashboard) to the new CLI version — only after the
    fleet has upgraded. The gate rejects outdated clients with
@@ -136,17 +162,20 @@ mechanism.)
    `/v1/health`, `/v1/client/latest`, and `/v1/client/download/*` stay
    reachable so an outdated client can always fetch its replacement.
 6. Agents run `hub upgrade`, which downloads the new artifacts **from the
-   server** (`/v1/client/latest` → `assets.*`) and verifies the sigstore
-   seal + sha256 client-side before installing — the trust anchor is
-   unchanged by the server-hosted transport (see
-   `docs/API_VERSIONING_SPEC.md` §5).
+   server** (`/v1/client/latest` → `assets.*`, plus the `skill` block for
+   the bundle) and verifies the sigstore seal + sha256 client-side before
+   installing — the trust anchor is unchanged by the server-hosted
+   transport (see `docs/API_VERSIONING_SPEC.md` §5).
 
 ### How the server↔CLI pairing is declared
 
 `server/client-manifest.json` is the single pairing record:
-`{version, sha256, min_cli_version, released_at, download_url}`.
+`{version, sha256, min_cli_version, released_at, download_url, skill_sha256, skill_version}`.
 `download_url` is **provenance** (the GitHub Release URL the build fetched
 from) — the server's *responses* always use its own URLs
 (`GET /v1/client/latest` derives absolute `/v1/client/download/*` URLs
 from the request origin). To refresh the pairing without a code change:
-update the pin, rebuild, redeploy.
+update the pin, rebuild, redeploy. The `skill_*` fields are written by the
+release workflow's manifest-PR step; `bundle-client.mjs` fails closed when
+they are absent (a pin from a CLI release cut before the skill bundle
+cannot produce a bundle — cut a new CLI release).
