@@ -22,6 +22,7 @@ import {
   randomBase62,
   newAgentToken,
   newInviteCode,
+  newInvitePageToken,
   newProvisioningCode,
   resolveToken,
 } from './auth.js';
@@ -192,11 +193,13 @@ export function logEvent(
 // code IS the credential. Redacts the whole tail after the prefix —
 // over-redaction is the safe direction (trailing slashes, extra segments).
 // The bare collection routes (/v1/invites, /v1/provisioning-codes) carry no
-// code and are left alone.
+// code and are left alone. /i/ paths carry the invite page token, which is
+// the credential for the onboarding page.
 export function redactPath(path: string): string {
   return path
     .replace(/^(\/v1\/invites\/).*/, '$1[redacted]')
-    .replace(/^(\/v1\/provisioning-codes\/).*/, '$1[redacted]');
+    .replace(/^(\/v1\/provisioning-codes\/).*/, '$1[redacted]')
+    .replace(/^(\/i\/).*/, '$1[redacted]');
 }
 
 function nowIso(): string {
@@ -227,7 +230,7 @@ function clientIp(req: Request): string {
 async function checkRateLimit(
   db: DbClient,
   req: Request,
-  endpoint: 'invite_accept' | 'code_redeem',
+  endpoint: 'invite_accept' | 'code_redeem' | 'invite_page',
 ): Promise<Response | null> {
   const ip = clientIp(req);
   const now = Date.now();
@@ -1087,6 +1090,35 @@ async function handleListFamilies(db: DbClient, auth: AuthContext): Promise<Resp
   });
 }
 
+/**
+ * Mint an onboarding page token for an invite. Returns the invite_pages
+ * INSERT op (for the same execAtomically batch as the invites INSERT) and
+ * the one-time onboarding URL. The raw page token is returned to the
+ * inviter ONCE inside `onboarding_url`; only sha256(pepper || token) is
+ * stored. The origin comes from the request URL server-side — never from a
+ * client-supplied base URL.
+ */
+async function mintInvitePage(
+  env: Env,
+  req: Request,
+  codeHash: string,
+  expiresAt: string,
+): Promise<{
+  sql: string;
+  params: (string | number | null)[];
+  onboardingUrl: string;
+}> {
+  const pageToken = newInvitePageToken();
+  const pageTokenHash = await credentialHash(env.TOKEN_PEPPER, pageToken);
+  const onboardingUrl = `${new URL(req.url).origin}/i/${pageToken}`;
+  return {
+    sql: `INSERT INTO invite_pages(page_token_hash, invite_code_hash, created_at, expires_at, verify_attempts, last_attempt_at)
+          VALUES (?,?,?, ?,0,NULL)`,
+    params: [pageTokenHash, codeHash, nowIso(), expiresAt],
+    onboardingUrl,
+  };
+}
+
 // POST /v1/families/:fid/invites — owner/parent only.
 async function handleCreateInvite(
   db: DbClient,
@@ -1121,6 +1153,7 @@ async function handleCreateInvite(
       const code = newInviteCode();
       const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
       const expiresAt = daysFromNow(INVITE_TTL_DAYS);
+      const page = await mintInvitePage(env, req, codeHash, expiresAt);
       await db.execAtomically([
         {
           sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
@@ -1133,9 +1166,10 @@ async function handleCreateInvite(
                 VALUES (?,?,?,?,?,?,?)`,
           params: ['invite', auth.member_id, idemKey, codeHash, null, nowIso(), hoursFromNow(IDEM_CREATE_TTL_HOURS)],
         },
+        { sql: page.sql, params: page.params },
       ]);
       logEvent('info', 'idempotency_stored', { scope: 'invite', key: idemKey });
-      return json({ invite_code: code, expires_at: expiresAt, deduped: true });
+      return json({ invite_code: code, expires_at: expiresAt, onboarding_url: page.onboardingUrl, deduped: true });
     }
   }
   const existing = await db.queryOne(
@@ -1147,12 +1181,14 @@ async function handleCreateInvite(
   const code = newInviteCode();
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   const expiresAt = daysFromNow(INVITE_TTL_DAYS);
+  const page = await mintInvitePage(env, req, codeHash, expiresAt);
   const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
       sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
             VALUES (?,?,?,?,?,?,NULL)`,
       params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
     },
+    { sql: page.sql, params: page.params },
   ];
   if (idemKey) {
     ops.push({
@@ -1164,7 +1200,7 @@ async function handleCreateInvite(
   }
   await db.execAtomically(ops);
   if (idemKey) logEvent('info', 'idempotency_stored', { scope: 'invite', key: idemKey });
-  return json({ invite_code: code, expires_at: expiresAt }, 201);
+  return json({ invite_code: code, expires_at: expiresAt, onboarding_url: page.onboardingUrl }, 201);
 }
 
 // POST /v1/invites/:code/accept — no auth; the code is the credential.
@@ -1243,6 +1279,20 @@ async function handleAcceptInvite(
       sql: `UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL`,
       params: [ts, codeHash],
     },
+    {
+      // Self-destruct the onboarding page (v0.11.0) in the same atomic
+      // batch: match by (family_id, email) rather than the presented code
+      // hash, because a successful email verify mints a fresh code and
+      // repoints the page at it — the invitee may accept with the
+      // page-revealed code OR the raw fallback code the inviter shared
+      // directly, and the page must die in both cases. (Deleting by
+      // family+email is safe: an accepted email can never accept again —
+      // the duplicate guard 409s — so no live page for that email can be
+      // harmed.)
+      sql: `DELETE FROM invite_pages
+             WHERE invite_code_hash IN (SELECT code_hash FROM invites WHERE family_id = ? AND email = ?)`,
+      params: [inviteFamilyId, email],
+    },
   ]);
   const won = await db.queryOne(`SELECT id FROM members WHERE id = ?`, [memberId]);
   if (!won) {
@@ -1275,6 +1325,380 @@ async function handleAcceptInvite(
     },
     201,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Invite onboarding pages (v0.11.0). One single-use page per invite at
+// /i/<page-token>: the inviter sends the URL; the invitee (human or their
+// agent) proves the invited email and receives a single-use invite code plus
+// the exact `hub setup` command. Two secrets — the unguessable URL
+// (possession) and the invited email (knowledge) — mirroring the existing
+// code-is-the-credential model. Public by design (the token is the
+// credential): these routes are registered BEFORE the Bearer choke point in
+// routeRequest(), and /i/* is not under /v1/* so the client version gate
+// does not apply (an un-enrolled invitee has no client version to gate).
+// There is no listing endpoint.
+//
+// Plaintext invite codes are unrecoverable once stored (only the hash is
+// kept), so a successful email verify MINTS A FRESH code for the same
+// (family, email, role) — the same pattern the idempotency-hit path in
+// handleCreateInvite uses — inserts it as a new invite row, and repoints
+// the page at it, atomically. The original code stays live until the invite
+// is accepted or expires (it was already shared with the inviter as the
+// raw-code fallback); the (family_id, email) duplicate guard in
+// handleAcceptInvite prevents a second member from either code.
+// ---------------------------------------------------------------------------
+
+const INVITE_PAGE_TOKEN_MAX_LEN = 128;
+const VERIFY_MAX_ATTEMPTS = 10;
+const VERIFY_BACKOFF_MS = 5 * 60_000;
+const VERIFY_ATTEMPT_DECAY_MS = 60 * 60_000;
+
+/** Extract the page token from a /i/ URL segment: strip an optional
+ *  trailing `.json`, URL-decode. Empty, overlong, or undecodable input
+ *  throws the identical page 404. */
+function extractPageToken(segment: string): string {
+  let s = segment;
+  if (s.endsWith('.json')) s = s.slice(0, -'.json'.length);
+  let token: string;
+  try {
+    token = decodeURIComponent(s);
+  } catch {
+    throw new HttpError(404, 'not_found', 'Not found');
+  }
+  if (token.length === 0 || token.length > INVITE_PAGE_TOKEN_MAX_LEN) {
+    throw new HttpError(404, 'not_found', 'Not found');
+  }
+  return token;
+}
+
+interface InvitePage {
+  pageTokenHash: string;
+  email: string;
+  role: string;
+  familyId: string;
+  familyName: string;
+  createdBy: string;
+  expiresAt: string;
+  verifyAttempts: number;
+  lastAttemptAt: string | null;
+}
+
+/** Load a live invite page by presented token. Unknown tokens, used
+ *  invites, and expired invites all throw the IDENTICAL 404 (same code,
+ *  same message, same serialization). Dead rows are lazily deleted when
+ *  noticed. */
+async function loadInvitePage(db: DbClient, env: Env, rawToken: string): Promise<InvitePage> {
+  const pageTokenHash = await credentialHash(env.TOKEN_PEPPER, rawToken);
+  const row = await db.queryOne(
+    `SELECT p.page_token_hash AS page_token_hash,
+            p.verify_attempts AS verify_attempts,
+            p.last_attempt_at AS last_attempt_at,
+            i.email AS email,
+            i.role AS role,
+            i.family_id AS family_id,
+            i.created_by AS created_by,
+            i.expires_at AS expires_at,
+            i.used_at AS used_at,
+            f.name AS family_name
+       FROM invite_pages p
+       JOIN invites i ON i.code_hash = p.invite_code_hash
+       JOIN families f ON f.id = i.family_id
+      WHERE p.page_token_hash = ?`,
+    [pageTokenHash],
+  );
+  if (!row) throw new HttpError(404, 'not_found', 'Not found');
+  const usedAt = row['used_at'] as string | null;
+  const expiresAt = row['expires_at'] as string;
+  if (usedAt || expiresAt <= nowIso()) {
+    // Lazy cleanup: the invite is spent or expired, so the page is dead.
+    await db.queryAll(`DELETE FROM invite_pages WHERE page_token_hash = ?`, [pageTokenHash]);
+    throw new HttpError(404, 'not_found', 'Not found');
+  }
+  return {
+    pageTokenHash,
+    email: row['email'] as string,
+    role: row['role'] as string,
+    familyId: row['family_id'] as string,
+    familyName: row['family_name'] as string,
+    createdBy: row['created_by'] as string,
+    expiresAt,
+    verifyAttempts: (row['verify_attempts'] as number) ?? 0,
+    lastAttemptAt: row['last_attempt_at'] as string | null,
+  };
+}
+
+/** Masked email hint: first char of the local part + `***@` + domain. */
+function maskEmail(email: string): string {
+  const at = email.lastIndexOf('@');
+  if (at <= 0) return '***';
+  return `${email.charAt(0)}***@${email.slice(at + 1)}`;
+}
+
+/** Constant-time string equality for the email check: both sides are
+ *  hashed first, then the fixed-size digests are compared in a
+ *  no-early-exit loop (no length oracle). */
+async function constantTimeEqual(a: string, b: string): Promise<boolean> {
+  const da = await sha256hex(a);
+  const dbDigest = await sha256hex(b);
+  let diff = 0;
+  for (let i = 0; i < da.length; i++) {
+    diff |= da.charCodeAt(i) ^ dbDigest.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/** HTML-escape interpolated values (family name, hint, URLs, timestamps). */
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      default:
+        return '&#39;';
+    }
+  });
+}
+
+/** Sibling artifact URLs for the CLI release, derived from the manifest's
+ *  download URL by stripping the trailing `/hub` (same pattern as
+ *  agent-skill/INSTALL.md). */
+function clientArtifactUrls(downloadUrl: string): { sigstore: string; manifest: string } {
+  const base = downloadUrl.endsWith('/hub') ? downloadUrl.slice(0, -'/hub'.length) : downloadUrl;
+  return { sigstore: `${base}/hub.sigstore`, manifest: `${base}/manifest.json` };
+}
+
+/** The agent-facing JSON page. Contains no invite code and no page token —
+ *  the agent already holds the token in the URL it fetched. */
+function invitePageJson(page: InvitePage): Record<string, unknown> {
+  const downloadUrl = clientManifest.download_url as string;
+  const artifacts = clientArtifactUrls(downloadUrl);
+  return {
+    page: 'invite',
+    family_name: page.familyName,
+    role: page.role,
+    email_hint: maskEmail(page.email),
+    expires_at: page.expiresAt,
+    client: {
+      version: clientManifest.version,
+      download_url: downloadUrl,
+      sha256: clientManifest.sha256,
+    },
+    install: {
+      summary:
+        'Install the Family Hub CLI + skill, verify the release signature, then run hub setup.',
+      steps: [
+        'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
+        `curl -sSLO ${downloadUrl} -sSLO ${artifacts.sigstore} -sSLO ${artifacts.manifest}`,
+        'chmod +x hub',
+        'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
+        `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
+        'pip install -r requirements.txt',
+      ],
+      verify_note: 'If signature or hash verification fails, do NOT install — ask the inviter.',
+    },
+    // Relative on purpose: posting to ./verify resolves correctly from both
+    // /i/<token> and /i/<token>.json, and the page token is never echoed.
+    verify: {
+      method: 'POST',
+      path: './verify',
+      body: { email: 'the invited email address' },
+    },
+  };
+}
+
+/** The human-facing HTML page. All interpolated values are HTML-escaped;
+ *  the inline script renders the verify response via textContent only
+ *  (never innerHTML with server data). */
+function invitePageHtml(page: InvitePage): Response {
+  const downloadUrl = clientManifest.download_url as string;
+  const artifacts = clientArtifactUrls(downloadUrl);
+  const steps = [
+    'mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub',
+    `curl -sSLO ${downloadUrl} -sSLO ${artifacts.sigstore} -sSLO ${artifacts.manifest}`,
+    'chmod +x hub',
+    'pip install "sigstore>=3.0,<4.0" && python3 -m sigstore verify identity --bundle hub.sigstore --cert-identity "https://github.com/maddy13182/museFamilyconnector/.github/workflows/release.yml@refs/heads/main" --cert-oidc-issuer "https://token.actions.githubusercontent.com" hub',
+    `python3 -c "import hashlib,json; assert hashlib.sha256(open('hub','rb').read()).hexdigest()==json.load(open('manifest.json'))['sha256']"`,
+    'pip install -r requirements.txt',
+  ];
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join ${escapeHtml(page.familyName)} on Family Hub</title>
+<style>body{font-family:system-ui,sans-serif;max-width:44rem;margin:2rem auto;padding:0 1rem;line-height:1.5}pre{background:#f4f4f4;padding:1rem;overflow-x:auto;white-space:pre-wrap}</style>
+</head>
+<body>
+<h1>You&rsquo;re invited to join ${escapeHtml(page.familyName)} on Family Hub</h1>
+<p>Family Hub is private agent-to-agent messaging: each family runs its own
+server with messaging circles, and every family member&rsquo;s AI agent gets its
+own login. This page onboards the new member&rsquo;s agent &mdash; no account or
+password needed, just the invite below.</p>
+<p>This invitation was sent to <strong>${escapeHtml(maskEmail(page.email))}</strong>
+and expires on <code>${escapeHtml(page.expiresAt)}</code>.</p>
+<h2>1. Install the CLI</h2>
+<p>Run these on the new member&rsquo;s machine (copy-paste):</p>
+<pre>${escapeHtml(steps.join('\n'))}</pre>
+<p>If signature or hash verification fails, do <strong>not</strong> install &mdash; ask the inviter.</p>
+<h2>2. Confirm your email</h2>
+<p>Enter the invited email address (${escapeHtml(maskEmail(page.email))}) to reveal the single-use invite code:</p>
+<form id="verify-form">
+<input id="email" type="email" name="email" required maxlength="254" autocomplete="email">
+<button type="submit">Reveal invite code</button>
+</form>
+<div id="result" aria-live="polite"></div>
+<script>
+document.getElementById('verify-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const out = document.getElementById('result');
+  out.textContent = 'Checking\u2026';
+  try {
+    const res = await fetch('./verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: document.getElementById('email').value }),
+    });
+    if (res.status === 403) {
+      out.textContent = 'That email does not match this invitation. Check the address the inviter used.';
+      return;
+    }
+    if (res.status === 429) {
+      out.textContent = 'Too many attempts \u2014 wait a few minutes and try again.';
+      return;
+    }
+    if (!res.ok) {
+      out.textContent = 'Something went wrong. Ask the inviter for a fresh invite link.';
+      return;
+    }
+    const data = await res.json();
+    out.textContent = '';
+    const p = document.createElement('p');
+    p.textContent = 'Email confirmed. Run this on the new member\u2019s machine:';
+    const pre = document.createElement('pre');
+    pre.textContent = data.setup_command;
+    const note = document.createElement('p');
+    note.textContent = 'The code is single-use. This page stops working once it is redeemed.';
+    out.append(p, pre, note);
+  } catch (err) {
+    out.textContent = 'Network error. Check your connection and try again.';
+  }
+});
+</script>
+</body>
+</html>`;
+  return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+// GET /i/:token and GET /i/:token.json — public. JSON for agents
+// (Accept: application/json or the .json suffix), HTML for humans.
+async function handleInvitePageGet(
+  db: DbClient,
+  env: Env,
+  req: Request,
+  segment: string,
+): Promise<Response> {
+  const token = extractPageToken(segment);
+  const page = await loadInvitePage(db, env, token);
+  const limited = await checkRateLimit(db, req, 'invite_page');
+  if (limited) return limited;
+  const accept = req.headers.get('accept') ?? '';
+  if (segment.endsWith('.json') || accept.includes('application/json')) {
+    return json(invitePageJson(page));
+  }
+  return invitePageHtml(page);
+}
+
+// POST /i/:token/verify — body {"email": "..."}. On a match, mints a FRESH
+// single-use invite code for the same (family, email, role) — the stored
+// code's plaintext is unrecoverable, so this mirrors the idempotency-hit
+// pattern — repoints the page at it atomically, and returns the code plus
+// the exact `hub setup` command. On a mismatch: 403 and the per-page
+// attempt budget is incremented. (The 403-vs-404 distinction — wrong email
+// on a live page vs. dead/unknown token — is inherent to the design and
+// acceptable: the URL holder already knows the URL is real. Normalization
+// is trim + lowercase ONLY: no `+`-tag stripping, no Unicode confusable
+// folding — the inviter must use the canonical address.)
+async function handleInvitePageVerify(
+  db: DbClient,
+  env: Env,
+  req: Request,
+  segment: string,
+): Promise<Response> {
+  const token = extractPageToken(segment);
+  const page = await loadInvitePage(db, env, token);
+  const limited = await checkRateLimit(db, req, 'invite_page');
+  if (limited) return limited;
+
+  const body = await readJson(req);
+  // Shape validation only (string, 3-254 chars): a malformed candidate is
+  // just a wrong guess — 403, never a distinguishing 400.
+  const email = reqString(body['email'], 'email', 3, 254);
+
+  // Per-page attempt budget with backoff. Attempts older than an hour decay
+  // away; 10+ attempts with the last one < 5 minutes ago -> 429 with
+  // Retry-After. NEVER a hard lock: after the cooldown the real invitee can
+  // always try again. The check runs before the email comparison so a
+  // correct email during backoff waits too (no oracle).
+  const nowMs = Date.now();
+  const lastMs = page.lastAttemptAt ? Date.parse(page.lastAttemptAt) : NaN;
+  const attempts =
+    Number.isFinite(lastMs) && nowMs - lastMs <= VERIFY_ATTEMPT_DECAY_MS ? page.verifyAttempts : 0;
+  if (attempts >= VERIFY_MAX_ATTEMPTS && Number.isFinite(lastMs) && nowMs - lastMs < VERIFY_BACKOFF_MS) {
+    const retryAfter = Math.max(1, Math.ceil((VERIFY_BACKOFF_MS - (nowMs - lastMs)) / 1000));
+    const res = json(
+      {
+        error: {
+          code: 'rate_limited',
+          message: `Too many attempts. Try again in ${retryAfter} seconds.`,
+        },
+      },
+      429,
+    );
+    res.headers.set('Retry-After', String(retryAfter));
+    return res;
+  }
+
+  const candidate = email.trim().toLowerCase();
+  const stored = page.email.trim().toLowerCase();
+  if (!(await constantTimeEqual(candidate, stored))) {
+    await db.queryAll(
+      `UPDATE invite_pages SET verify_attempts = ?, last_attempt_at = ? WHERE page_token_hash = ?`,
+      [attempts + 1, new Date(nowMs).toISOString(), page.pageTokenHash],
+    );
+    throw new HttpError(403, 'forbidden', 'This email does not match the invitation.');
+  }
+
+  // Match: mint a fresh code (the stored code's plaintext is unrecoverable),
+  // insert it, and repoint the page at it — one atomic batch.
+  const code = newInviteCode();
+  const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
+  await db.execAtomically([
+    {
+      sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
+            VALUES (?,?,?,?,?,?,NULL)`,
+      params: [codeHash, page.familyId, page.email, page.role, page.createdBy, page.expiresAt],
+    },
+    {
+      sql: `UPDATE invite_pages SET invite_code_hash = ? WHERE page_token_hash = ?`,
+      params: [codeHash, page.pageTokenHash],
+    },
+  ]);
+  logEvent('info', 'invite_page_verified', {});
+  // Origin comes from the request URL server-side — never a client-supplied
+  // base URL. The code is base62, safe to embed unquoted in shell.
+  const origin = new URL(req.url).origin;
+  return json({
+    invite_code: code,
+    setup_command: `hub setup --server ${origin} --invite ${code}`,
+    expires_at: page.expiresAt,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3132,6 +3556,22 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
         path.slice('/v1/provisioning-codes/'.length, -'/redeem'.length),
       );
       return await handleRedeemProvisioning(db, env, req, code);
+    }
+
+    // Public: invite onboarding pages (v0.11.0). The page token is the
+    // credential, so these sit before the Bearer choke point. /i/ is not
+    // under /v1/, so the client version gate above does not apply.
+    // Unmatched /i/ shapes serve the same identical 404 as
+    // unknown/used/expired pages.
+    const inviteVerify = /^\/i\/(.+)\/verify$/.exec(path);
+    if (inviteVerify && method === 'POST') {
+      return await handleInvitePageVerify(db, env, req, inviteVerify[1]);
+    }
+    if (path.startsWith('/i/') && method === 'GET') {
+      return await handleInvitePageGet(db, env, req, path.slice('/i/'.length));
+    }
+    if (path === '/i' || path.startsWith('/i/')) {
+      throw new HttpError(404, 'not_found', 'Not found');
     }
 
     // Everything below requires a bearer token (the choke point).
