@@ -1878,7 +1878,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [version, min_cli_version, server_version, sha256, released_at, download_url, assets]
+                required: [version, min_cli_version, server_version, sha256, released_at, download_url, assets, skill]
                 properties:
                   version: { type: string, example: "0.9.0" }
                   min_cli_version: { type: string, example: "0.9.0" }
@@ -1900,6 +1900,14 @@ paths:
                       hub: { type: string, format: uri, example: "https://<server>/v1/client/download/hub" }
                       sigstore: { type: string, format: uri, example: "https://<server>/v1/client/download/hub.sigstore" }
                       manifest: { type: string, format: uri, example: "https://<server>/v1/client/download/manifest.json" }
+                  skill:
+                    type: object
+                    required: [url, sha256, version]
+                    description: The versioned skill bundle (SKILL.md, references/, INSTALL.md, requirements.txt plus the hub artifact, its sigstore bundle, and the release manifest), hash-verified at build time. `hub upgrade`'s skill-refresh reads this block.
+                    properties:
+                      url: { type: string, format: uri, example: "https://<server>/v1/client/download/skill.tar.gz" }
+                      sha256: { type: string, example: "9f2c…", description: "sha256 of skill.tar.gz (pin skill_sha256, cross-checked against the release manifest at build time)" }
+                      version: { type: string, example: "0.11.0", description: "Skill version, from the SKILL VERSION header of agent-skill/SKILL.md (versions independently from the CLI)" }
 
   /v1/client/download/hub:
     get:
@@ -1986,6 +1994,38 @@ paths:
           content:
             application/json:
               schema: { type: object }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/client/download/skill.tar.gz:
+    get:
+      tags: [ops]
+      operationId: downloadSkillBundle
+      summary: Download the versioned skill bundle
+      description: |
+        Public. Serves the `skill.tar.gz` bundle for the pinned CLI release:
+        `SKILL.md`, `references/`, `INSTALL.md`, `requirements.txt`, plus
+        the `hub` artifact, its `hub.sigstore` bundle, and the release
+        `manifest.json` (same build-bundling, rate limit, and cache rules as
+        /v1/client/download/hub). The bundler verifies sha256(skill.tar.gz)
+        against BOTH the pin's `skill_sha256` and the release manifest's
+        `skill_sha256` at build time, and structurally validates the tarball
+        (relative paths only, no links). `hub upgrade`'s skill-refresh
+        verifies the sha256 client-side before extracting.
+      security: []
+      responses:
+        '200':
+          description: The skill bundle (gzipped tar)
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'attachment; filename="skill.tar.gz"'
+            Cache-Control:
+              schema: { type: string }
+              description: 'public, max-age=300'
+          content:
+            application/gzip:
+              schema: { type: string, format: binary }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
 

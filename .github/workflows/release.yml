@@ -4,9 +4,12 @@
 #
 # Steps: build the `hub` artifact (single script; deps install from the
 # lockfile at install time, not bundled) → sha256 → sign with sigstore
-# keyless OIDC → create GitHub Release `cli-v<x.y.z>` with assets
-# `hub`, `hub.sigstore`, `manifest.json` → open a PR updating
-# server/client-manifest.json (branch `release/manifest-cli-v<x.y.z>`).
+# keyless OIDC → write the release manifest in TWO phases (phase 1 without
+# skill fields; build the `skill.tar.gz` bundle embedding the phase-1
+# manifest; phase 2 rewrites the manifest adding `skill_sha256` +
+# `skill_version`) → create GitHub Release `cli-v<x.y.z>` with assets
+# `hub`, `hub.sigstore`, `manifest.json`, `skill.tar.gz` → open a PR
+# updating server/client-manifest.json (branch `release/manifest-cli-v<x.y.z>`).
 #
 # The manifest update goes through a PR (not a direct push to main):
 # branch protection rejects direct pushes (GH006), and the version-newer-
@@ -147,7 +150,18 @@ jobs:
           pip install --quiet "sigstore>=3.0,<4.0"
           python3 -m sigstore sign --bundle dist/hub.sigstore dist/hub
 
-      - name: Write release manifest.json
+      # Phase 1 of 2. Writes the release manifest WITHOUT the skill-bundle
+      # fields (skill_sha256 / skill_version): the skill tarball built in the
+      # NEXT step embeds THIS manifest, so the tarball cannot hash itself.
+      # Phase 2 (after the tarball exists) rewrites this file ADDING the
+      # skill fields. The circularity is open and load-bearing:
+      #   - the tarball embeds the phase-1 manifest (its hub sha256 is
+      #     identical in both phases; only the skill_* fields differ);
+      #   - the manifest.json uploaded to the GitHub Release is the phase-2
+      #     one (it names the tarball's sha256).
+      # bundle-client.mjs verifies sha256(tarball) against BOTH the pin's
+      # skill_sha256 and this phase-2 release manifest's skill_sha256.
+      - name: "Write release manifest.json (phase 1: no skill fields)"
         if: steps.decide.outputs.release == 'true'
         env:
           VERSION: ${{ steps.cli.outputs.version }}
@@ -181,6 +195,109 @@ jobs:
           print(json.dumps(manifest, indent=2))
           EOF
 
+      # Build the skill bundle: the full agent-skill/ tree the installer
+      # needs (SKILL.md, references/ recursively, INSTALL.md,
+      # requirements.txt) PLUS the release artifacts (the stamped dist/hub,
+      # dist/hub.sigstore, and the PHASE-1 dist/manifest.json written above —
+      # no skill_* fields, see the circularity note on the phase-1 step).
+      #
+      # Inclusion is an explicit relative-path allowlist (references/ is
+      # copied recursively, then __pycache__/ and *.pyc are pruned), so the
+      # exclusions (tests/, __pycache__/, pyproject.toml, requirements.lock,
+      # hub.prev*, *.pyc) hold BY CONSTRUCTION — nothing else can get in.
+      # A single `tar -C <stage>` with relative member names means no
+      # absolute path and no `..` can sneak into the archive; the python
+      # assertion below fails the build if any member violates that.
+      - name: Build skill bundle
+        if: steps.decide.outputs.release == 'true'
+        id: skill
+        run: |
+          set -euo pipefail
+          rm -rf dist/skill-stage
+          mkdir -p dist/skill-stage
+          cp agent-skill/SKILL.md agent-skill/INSTALL.md agent-skill/requirements.txt dist/skill-stage/
+          # references/ is packaged RECURSIVELY; prune the excluded junk
+          # (__pycache__/, *.pyc) after the copy. The other exclusions
+          # (tests/, pyproject.toml, requirements.lock, hub.prev*) live
+          # outside references/ and never enter the stage dir at all.
+          cp -r agent-skill/references dist/skill-stage/references
+          find dist/skill-stage/references \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
+          cp dist/hub dist/hub.sigstore dist/skill-stage/
+          cp dist/manifest.json dist/skill-stage/manifest.json  # phase-1
+          tar -czf dist/skill.tar.gz -C dist/skill-stage \
+            SKILL.md references INSTALL.md requirements.txt hub hub.sigstore manifest.json
+          rm -rf dist/skill-stage
+          # Structural assertion: every member is a relative path inside the
+          # bundle (no leading `/`, no `..` segments), no symlinks/hardlinks
+          # (a link member could redirect extraction outside the target dir
+          # on install), no excluded junk (tests/, __pycache__/,
+          # pyproject.toml, requirements.lock, hub.prev*, *.pyc), and the
+          # top-level member set is exactly the allowlist — the installer
+          # extracts with plain `tar -xzf`.
+          python3 - <<'EOF'
+          import sys, tarfile
+          tf = tarfile.open("dist/skill.tar.gz")
+          members = tf.getmembers()
+          top = set()
+          for m in members:
+              n = m.name
+              if n.startswith("/") or n.startswith("./") or ".." in n.split("/"):
+                  sys.exit("refusing: bundle member has unsafe path %r" % n)
+              if m.issym() or m.islnk():
+                  sys.exit("refusing: bundle member is a link %r" % n)
+              segs = n.split("/")
+              if ("tests" in segs or "__pycache__" in segs
+                      or n.endswith("pyproject.toml") or n.endswith("requirements.lock")
+                      or n.endswith(".pyc") or "hub.prev" in segs[-1]):
+                  sys.exit("refusing: bundle member violates the exclusion list: %r" % n)
+              top.add(segs[0])
+          want = {"SKILL.md", "references", "INSTALL.md", "requirements.txt",
+                  "hub", "hub.sigstore", "manifest.json"}
+          if top != want:
+              sys.exit("refusing: bundle top-level members %r != allowlist %r" % (sorted(top), sorted(want)))
+          print("skill bundle members OK:", len(members), "members")
+          for n in sorted(m.name for m in members):
+              print("  ", n)
+          EOF
+          sum=$(sha256sum dist/skill.tar.gz | cut -d' ' -f1)
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "skill.tar.gz sha256=$sum"
+
+      # Phase 2 of 2. Rewrites dist/manifest.json ADDING the skill fields.
+      # skill_version is read from the `<!-- SKILL VERSION: x.y.z -->`
+      # header of agent-skill/SKILL.md (single source of truth for the
+      # skill version; the release cadence itself stays CLI-driven — a
+      # skill-only change ships with the next CLI release).
+      # The tarball from the previous step embeds the PHASE-1 manifest, so
+      # phase-1 and phase-2 differ ONLY by these two fields (hub sha256 is
+      # identical); bundle-client.mjs machine-checks that invariant.
+      - name: "Write release manifest.json (phase 2: add skill fields)"
+        if: steps.decide.outputs.release == 'true'
+        env:
+          SKILL_SHA256: ${{ steps.skill.outputs.sha256 }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re
+          skill_sha = os.environ["SKILL_SHA256"]
+          if not re.fullmatch(r"[0-9a-f]{64}", skill_sha):
+              raise SystemExit("refusing: skill sha256 %r is not 64-hex" % skill_sha)
+          header = open("agent-skill/SKILL.md", encoding="utf-8").read()
+          m = re.search(r"<!-- SKILL VERSION: (\d+\.\d+\.\d+) -->", header)
+          if not m:
+              raise SystemExit("refusing: agent-skill/SKILL.md has no SKILL VERSION header")
+          skill_version = m.group(1)
+          with open("dist/manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+          if "skill_sha256" in manifest or "skill_version" in manifest:
+              raise SystemExit("refusing: phase-1 manifest already has skill fields")
+          manifest["skill_sha256"] = skill_sha
+          manifest["skill_version"] = skill_version
+          with open("dist/manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          EOF
+
       - name: Create GitHub Release
         if: steps.decide.outputs.release == 'true'
         id: create
@@ -195,9 +312,9 @@ jobs:
             echo "release $tag already exists; not recreating"
             exit 0
           fi
-          gh release create "$tag" dist/hub dist/hub.sigstore dist/manifest.json \
+          gh release create "$tag" dist/hub dist/hub.sigstore dist/manifest.json dist/skill.tar.gz \
             --title "Family Hub CLI v${VERSION}" \
-            --notes "Signed CLI release. Before installing: download all three assets, verify the sigstore signature, verify the sha256 against manifest.json, then install — see agent-skill/INSTALL.md."
+            --notes "Signed CLI release. Before installing: download all four assets, verify the sigstore signature, verify the sha256 of hub AND of skill.tar.gz against manifest.json, then install — see agent-skill/INSTALL.md. skill.tar.gz is the full skill bundle (SKILL.md, references/, INSTALL.md, requirements.txt, plus the hub artifact, its sigstore bundle, and this manifest); the server hosts it at /v1/client/download/skill.tar.gz."
           echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Open the manifest-update PR
@@ -206,6 +323,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.cli.outputs.version }}
           SHA256: ${{ steps.sha.outputs.sha256 }}
+          SKILL_SHA256: ${{ steps.skill.outputs.sha256 }}
         run: |
           set -euo pipefail
           # Direct pushes to main are rejected by branch protection (GH006),
@@ -221,13 +339,22 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           python3 - <<'EOF'
-          import datetime, json, os
+          import datetime, json, os, re
           path = "server/client-manifest.json"
           prev = {}
           if os.path.exists(path):
               with open(path, encoding="utf-8") as fh:
                   prev = json.load(fh)
           version = os.environ["VERSION"]
+          skill_sha = os.environ["SKILL_SHA256"]
+          if not re.fullmatch(r"[0-9a-f]{64}", skill_sha):
+              raise SystemExit("refusing: skill sha256 %r is not 64-hex" % skill_sha)
+          # skill_version is the SKILL VERSION header, not the CLI version:
+          # the two version independently (docs/VERSIONING.md).
+          header = open("agent-skill/SKILL.md", encoding="utf-8").read()
+          m = re.search(r"<!-- SKILL VERSION: (\d+\.\d+\.\d+) -->", header)
+          if not m:
+              raise SystemExit("refusing: agent-skill/SKILL.md has no SKILL VERSION header")
           manifest = {
               "version": version,
               # Never raise the floor automatically: the deploy runbook raises
@@ -239,6 +366,8 @@ jobs:
                   "/releases/download/cli-v%s/hub" % version
               ),
               "sha256": os.environ["SHA256"],
+              "skill_sha256": skill_sha,
+              "skill_version": m.group(1),
               "released_at": datetime.datetime.now(
                   datetime.timezone.utc
               ).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -262,5 +391,5 @@ jobs:
               --base main \
               --head "$branch" \
               --title "chore: pin client manifest to CLI v${VERSION}" \
-              --body "Automated by the Release CLI workflow after cutting \`cli-v${VERSION}\`. Updates \`server/client-manifest.json\` (version, download_url provenance, sha256, released_at); \`min_cli_version\` is intentionally untouched — the deploy runbook raises it deliberately. Merge, then deploy the server so the build bundles the newly pinned artifacts."
+              --body "Automated by the Release CLI workflow after cutting \`cli-v${VERSION}\`. Updates \`server/client-manifest.json\` (version, download_url provenance, sha256, skill_sha256, skill_version, released_at); \`min_cli_version\` is intentionally untouched — the deploy runbook raises it deliberately. Merge, then deploy the server so the build bundles the newly pinned artifacts (including skill.tar.gz)."
           fi

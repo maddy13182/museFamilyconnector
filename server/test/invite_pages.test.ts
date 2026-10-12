@@ -5,7 +5,15 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp } from './app.js';
 import { redactPath } from '../src/index.js';
-import manifest from '../client-manifest.json' with { type: 'json' };
+import manifestJson from '../client-manifest.json' with { type: 'json' };
+// The pin carries skill_sha256/skill_version for CLI releases cut after the
+// skill bundle (bundle-client.mjs fails closed without them). The committed
+// pin predates the first bundled release, so the test types the fields the
+// release workflow's manifest-PR step always writes.
+const manifest = manifestJson as typeof manifestJson & {
+  skill_sha256: string;
+  skill_version: string;
+};
 
 type App = ReturnType<typeof makeApp>;
 
@@ -127,18 +135,35 @@ test('GET page as JSON returns the agent page shape without secrets', async () =
     assert.ok(typeof b.expires_at === 'string', label);
     assert.equal(b.client.version, manifest.version, label);
     assert.equal(b.client.download_url, 'https://hub.test/v1/client/download/hub', label);
-    // Install steps point at this server's download endpoints — no
+    assert.equal(b.client.skill.download_url, 'https://hub.test/v1/client/download/skill.tar.gz', label);
+    assert.equal(b.client.skill.sha256, manifest.skill_sha256, label);
+    assert.equal(b.client.skill.version, manifest.skill_version, label);
+    // Install steps start with the skill bundle from this server — no
     // GitHub release URLs remain in the user-facing flow.
     const stepsText = (b.install.steps as string[]).join('\n');
-    assert.ok(stepsText.includes('https://hub.test/v1/client/download/hub'), label);
-    assert.ok(stepsText.includes('https://hub.test/v1/client/download/hub.sigstore'), label);
-    assert.ok(stepsText.includes('https://hub.test/v1/client/download/manifest.json'), label);
+    assert.ok(stepsText.includes('https://hub.test/v1/client/download/skill.tar.gz'), label);
     assert.ok(!stepsText.includes('github.com/maddy13182/museFamilyconnector/releases'), label);
     assert.ok(typeof b.client.sha256 === 'string' && b.client.sha256.length > 0, label);
-    assert.ok(Array.isArray(b.install.steps) && b.install.steps.length === 6, label);
+    assert.ok(
+      b.install.summary.includes('skill bundle'),
+      `${label}: summary names the bundle flow`,
+    );
+    assert.ok(Array.isArray(b.install.steps) && b.install.steps.length === 8, label);
+    assert.ok(
+      (b.install.steps as string[]).some((s) => s.includes(manifest.skill_sha256)),
+      `${label}: a step verifies the bundle sha256 against the page-provided hash`,
+    );
+    assert.ok(
+      (b.install.steps as string[]).some((s) => s.includes('tar -xzf skill.tar.gz')),
+      `${label}: a step extracts the bundle`,
+    );
     assert.ok(
       (b.install.steps as string[]).some((s) => s.includes('sigstore')),
       `${label}: install steps mention signature verification`,
+    );
+    assert.ok(
+      (b.install.steps as string[]).some((s) => s.includes("json.load(open('manifest.json'))['sha256']")),
+      `${label}: install steps verify hub's sha256 against the release manifest`,
     );
     assert.equal(b.verify.method, 'POST', label);
     assert.equal(b.verify.path, `/i/${pageToken}/verify`, label);
@@ -164,9 +189,14 @@ test('GET page as HTML renders install steps and the masked hint', async () => {
   assert.ok(html.includes('<!doctype html>'), 'is an HTML document');
   assert.ok(html.includes('i***@t.dev'), 'masked hint present');
   assert.ok(html.includes('sigstore'), 'install steps present');
+  assert.ok(html.includes('skill.tar.gz'), 'install steps start with the skill bundle');
   assert.ok(
-    html.includes('https://hub.test/v1/client/download/hub'),
+    html.includes('https://hub.test/v1/client/download/skill.tar.gz'),
     'install steps use this server download endpoints',
+  );
+  assert.ok(
+    html.includes(manifest.skill_sha256),
+    'the bundle hash the page provides is embedded in the verify step',
   );
   assert.ok(
     !html.includes('github.com/maddy13182/museFamilyconnector/releases/download'),
