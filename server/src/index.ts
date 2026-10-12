@@ -3679,6 +3679,12 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       return await handleClientDownload(db, req, 'sigstore');
     if (path === '/v1/client/download/manifest.json' && method === 'GET')
       return await handleClientDownload(db, req, 'manifest');
+    // Anything else under /v1/client/download/ is not an asset: 404, like
+    // the unmatched /i/ shapes. (Public either way — no auth needed to learn
+    // the asset map is fixed.)
+    if (path === '/v1/client/download' || path.startsWith('/v1/client/download/')) {
+      throw new HttpError(404, 'not_found', 'Not found');
+    }
 
     // Public: bootstrap + invite/provisioning redemption (code is the credential).
     // The two redemption endpoints are rate-limited per IP: they are the only

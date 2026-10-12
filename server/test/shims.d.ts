@@ -42,7 +42,59 @@ declare module 'node:sqlite' {
 declare module 'node:fs' {
   export function readFileSync(path: string, encoding: string): string;
   export function readdirSync(path: string): string[];
+  export function mkdtempSync(prefix: string): string;
+  export function writeFileSync(path: string, data: string | Uint8Array): void;
 }
+
+declare module 'node:os' {
+  export function tmpdir(): string;
+}
+
+declare module 'node:crypto' {
+  export interface Hash {
+    update(data: string | Uint8Array): Hash;
+    digest(encoding: 'hex'): string;
+  }
+  export function createHash(algorithm: string): Hash;
+  export function randomBytes(size: number): Uint8Array;
+}
+
+declare module 'node:child_process' {
+  export interface ExecFileError {
+    code?: number | string | null;
+    message: string;
+  }
+  export function execFile(
+    file: string,
+    args: string[],
+    options: { env?: Record<string, string | undefined>; timeout?: number },
+    callback: (error: ExecFileError | null, stdout: string, stderr: string) => void,
+  ): void;
+}
+
+declare module 'node:http' {
+  export interface IncomingMessage {
+    url?: string;
+  }
+  export interface ServerResponse {
+    writeHead(statusCode: number): void;
+    end(body?: string | Uint8Array): void;
+  }
+  export interface Server {
+    listen(port: number, hostname: string, callback: () => void): void;
+    close(callback: (err?: unknown) => void): void;
+    address(): { port: number } | null;
+  }
+  export function createServer(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+  ): Server;
+}
+
+// Tests run under Node; the worker source never touches this.
+declare const process: {
+  execPath: string;
+  env: Record<string, string | undefined>;
+};
 
 declare module 'node:path' {
   export function dirname(p: string): string;
