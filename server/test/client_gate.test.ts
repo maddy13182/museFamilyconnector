@@ -8,8 +8,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp, TestApp } from './app.js';
-import manifest from '../client-manifest.json' with { type: 'json' };
+import manifestJson from '../client-manifest.json' with { type: 'json' };
 import pkg from '../package.json' with { type: 'json' };
+// The pin carries skill_sha256/skill_version for CLI releases cut after the
+// skill bundle (bundle-client.mjs fails closed without them). The committed
+// pin predates the first bundled release, so the test types the fields the
+// release workflow's manifest-PR step always writes.
+const manifest = manifestJson as typeof manifestJson & {
+  skill_sha256: string;
+  skill_version: string;
+};
 
 // No @types/node in this repo: random bytes via WebCrypto (DOM lib) and
 // base64 via btoa (each input byte becomes one char — safe for 32 bytes).
@@ -184,6 +192,7 @@ test('/v1/client/latest, /v1/health, and /v1/client/download/* are exempt from t
     '/v1/client/download/hub',
     '/v1/client/download/hub.sigstore',
     '/v1/client/download/manifest.json',
+    '/v1/client/download/skill.tar.gz',
   ]) {
     const r = await app.call('GET', p, oldUA);
     assert.equal(r.status, 200, `${p} must stay reachable by outdated clients`);
@@ -205,6 +214,7 @@ test('/v1/client/latest serves the manifest shape, publicly', async () => {
     'released_at',
     'server_version',
     'sha256',
+    'skill',
     'version',
   ]);
   assert.equal(res.body.version, manifest.version);
@@ -219,6 +229,13 @@ test('/v1/client/latest serves the manifest shape, publicly', async () => {
     hub: 'https://hub.test/v1/client/download/hub',
     sigstore: 'https://hub.test/v1/client/download/hub.sigstore',
     manifest: 'https://hub.test/v1/client/download/manifest.json',
+  });
+  // The skill block names the bundle URL, its build-verified sha256, and
+  // the skill version (from the SKILL VERSION header, independent of CLI).
+  assert.deepEqual(res.body.skill, {
+    url: 'https://hub.test/v1/client/download/skill.tar.gz',
+    sha256: manifest.skill_sha256,
+    version: manifest.skill_version,
   });
   assert.match(res.body.version, /^\d+\.\d+\.\d+$/);
   assert.match(res.body.min_cli_version, /^\d+\.\d+\.\d+$/);

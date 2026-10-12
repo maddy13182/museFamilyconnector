@@ -60,7 +60,7 @@ if a breaking change ever lands. Unauthenticated (unchanged).
 `gateClientVersion` rejection becomes **HTTP 426 (Upgrade Required)** with
 code `client_too_old` (was 400). Keep the plain-language message naming the
 upgrade path. Exemptions unchanged: `/v1/health` and `/v1/client/latest`
-must stay reachable by outdated clients (self-heal path) — the three new
+must stay reachable by outdated clients (self-heal path) — the four
 download endpoints (§3.4) are likewise exempt: an outdated client must be
 able to fetch its replacement.
 
@@ -80,6 +80,7 @@ The CLI binary is a public artifact (same precedent as `/v1/health` and
 | GET | `/v1/client/download/hub` | `application/octet-stream` | `Content-Disposition: attachment; filename="hub"` |
 | GET | `/v1/client/download/hub.sigstore` | `application/json` | `attachment; filename="hub.sigstore"` |
 | GET | `/v1/client/download/manifest.json` | `application/json` | `attachment; filename="manifest.json"` |
+| GET | `/v1/client/download/skill.tar.gz` | `application/gzip` | `attachment; filename="skill.tar.gz"` — the versioned skill bundle (`SKILL.md`, `references/`, `INSTALL.md`, `requirements.txt`, plus the `hub` artifact, its sigstore bundle, and the release manifest) |
 
 - **Fixed asset map only — no path parameters.** No traversal surface by
   construction. Any other path under `/v1/client/download/` → 404.
@@ -104,6 +105,11 @@ The CLI binary is a public artifact (same precedent as `/v1/health` and
     "hub": "https://<this-server>/v1/client/download/hub",
     "sigstore": "https://<this-server>/v1/client/download/hub.sigstore",
     "manifest": "https://<this-server>/v1/client/download/manifest.json"
+  },
+  "skill": {
+    "url": "https://<this-server>/v1/client/download/skill.tar.gz",
+    "sha256": "<pin skill_sha256>",
+    "version": "<pin skill_version>"
   }
 }
 ```
@@ -117,15 +123,21 @@ machine-readable.
 
 - New script `server/scripts/bundle-client.mjs`, wired as
   `npm run bundle:client`, run before `npm run build` and in `pretest`.
-- Reads `server/client-manifest.json`; derives the three GitHub release
+- Reads `server/client-manifest.json`; derives the four GitHub release
   asset URLs for the pinned version; downloads `hub`, `hub.sigstore`,
-  `manifest.json`; verifies `sha256(hub)` equals the pin's `sha256` AND the
-  release manifest's `sha256`.
+  `manifest.json`, `skill.tar.gz`; verifies `sha256(hub)` equals the pin's
+  `sha256` AND the release manifest's `sha256`; verifies
+  `sha256(skill.tar.gz)` equals the pin's `skill_sha256` AND the release
+  manifest's `skill_sha256`; structurally validates the tarball (relative
+  paths only, no links, decompressed-size cap) and machine-checks the
+  two-phase-manifest invariant (the tarball embeds the phase-1 manifest —
+  no `skill_*` fields — whose version/sha256 agree with the pin).
 - On success writes `server/src/client-dist.generated.ts` (**gitignored**)
-  exporting the three artifacts as string constants; `index.ts` serves from
+  exporting the four artifacts as string constants; `index.ts` serves from
   it (follow the existing `client-manifest.json` import pattern).
 - On **any** failure (network error, 404, placeholder hash such as
-  `PENDING-*`, hash mismatch) the script exits non-zero with a clear
+  `PENDING-*`, a pin without `skill_sha256`/`skill_version`, hash
+  mismatch, unsafe tarball member) the script exits non-zero with a clear
   message and the build stops. Never embed placeholders.
 - Refresh without code changes: update the pin in
   `server/client-manifest.json`, rebuild, redeploy.
@@ -223,12 +235,16 @@ plain-language upgrade-path message.
 - Read `min_cli_version` from `/v1/client/latest` and surface it
   (e.g. "this server requires CLI ≥ x").
 - Download all three assets from `assets.{hub,sigstore,manifest}` (this
-  server). **Remove** the `_release_asset_urls` GitHub-URL derivation —
+  server), plus the skill bundle from the `skill` block (`skill.url`,
+  verified against `skill.sha256`) when present — an older server predating
+  the bundle omits the block, in which case skill-refresh is a no-op.
+  **Remove** the `_release_asset_urls` GitHub-URL derivation —
   no conflicting parallel paths.
 - Keep ALL existing verification, unchanged: sha256 against both the
   server manifest and the release manifest; sigstore verification (refuse,
   never skip, if `sigstore` is missing); candidate self-test before AND
-  after the atomic cutover; `hub.prev` rollback.
+  after the atomic cutover; `hub.prev` rollback. The bundle's sha256 is
+  verified before extraction, the same way.
 - The sigstore cert identity is unchanged — the bytes are the identical
   signed release artifacts; only the host changed, not the seal.
 
@@ -257,6 +273,10 @@ disk — easier than tampering with the CLI). A compromised server cannot
 forge the seal for tampered bytes; the worst it can do is serve
 stale-but-validly-signed artifacts, bounded by `MIN_CLI_VERSION`
 enforcement on the server and the client's `_MIN_SERVER_VERSION` check.
+The skill bundle rides the same trust: its sha256 is pinned in the release
+manifest and verified client-side before extraction, and the tarball's
+members are structurally constrained at build time (relative paths only,
+no links) — a tampered bundle fails the hash, never the extractor.
 
 ## 6. Endpoint catalog (new/changed)
 
@@ -265,19 +285,24 @@ enforcement on the server and the client's `_MIN_SERVER_VERSION` check.
 | new | GET | `/v1/client/download/hub` | no | 200 binary | 429 |
 | new | GET | `/v1/client/download/hub.sigstore` | no | 200 JSON | 429 |
 | new | GET | `/v1/client/download/manifest.json` | no | 200 JSON | 429 |
+| new | GET | `/v1/client/download/skill.tar.gz` | no | 200 gzip tar | 429 |
 | changed | GET | `/v1/client/latest` | no | 200 new shape (§3.5) | — |
 | changed | GET | `/v1/health` | no | 200 + `api_versions` | — |
 | changed | gate | all `/v1/*` (except health, client/latest, client/download/*) | — | — | **426** `client_too_old` (was 400) |
 
 ## 7. Testing requirements
 
-- Server suite: 185/185 baseline must keep passing. New tests: health
+- Server suite: 197/197 baseline must keep passing. New tests: health
   `api_versions`; 426 gate (update `client_gate.test.ts` expectations —
   intentional behavior change, not a weakening); download endpoints
   (content types, bytes equal the pinned artifacts, fixed-path 404s, rate
-  limit); `/v1/client/latest` shape (absolute server URLs,
-  `server_version`); build script fail-closed (bad hash, 404, placeholder);
-  openapi parity (covered by the CI job; add a local test if cheap).
+  limit — including `skill.tar.gz` and its shared bucket); `/v1/client/latest`
+  shape (absolute server URLs, `server_version`, `skill` block); invite
+  pages install steps (bundle-first flow — intentional behavior change,
+  not a weakening: still assert no GitHub URLs, sigstore mention, hash
+  verification, exact step count); build script fail-closed (bad hash, 404,
+  placeholder, missing `skill_sha256` pin, skill mismatch, unsafe tarball
+  member); openapi parity (covered by the CI job; add a local test if cheap).
 - CLI suite: 318/318 baseline must keep passing. New tests:
   `_MIN_SERVER_VERSION` constant; too-old server fails before any command
   with the exact message; health missing `api_versions` → too old;
@@ -291,7 +316,10 @@ enforcement on the server and the client's `_MIN_SERVER_VERSION` check.
   impossible by construction, verify; cache semantics; rate-limit
   bypass; content-type sniffing), the build-time fetch (supply chain:
   what happens if the release is yanked mid-build; TOCTOU between verify
-  and embed), the CLI's per-invocation health check (can a captive
+  and embed; the skill tarball: zip-bomb cap, traversal/symlink members,
+  the two-phase-manifest circularity documented in the release workflow),
+  the invite page's interpolated bundle hash (charset-constrained at build
+  time), the CLI's per-invocation health check (can a captive
   portal / MITM cause a downgrade? — the seal still protects the
   artifacts; document it), and the trust-model claims in §5. Fix all
   findings before reporting.
