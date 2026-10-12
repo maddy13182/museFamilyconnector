@@ -134,6 +134,17 @@ def _skill_version():
 VERSION = _cli_version()
 SKILL_VERSION = _skill_version()
 
+# Floor of the API version contract (spec §1, §4.1): the oldest server
+# this CLI will talk to. Bumped deliberately; covered by a test. No
+# backcompat with server 0.11.0 (which reports no `api_versions` and is
+# rejected by the per-invocation check below).
+_MIN_SERVER_VERSION = "0.12.0"
+
+# API majors this CLI implements, highest first. The per-invocation check
+# selects the highest one the server advertises (v1 today) and prefixes
+# requests accordingly. No 404-probing fallback.
+_API_MAJORS_IMPLEMENTED = ("v1",)
+
 
 # ---------------------------------------------------------------------------
 # Secret handling / redaction
@@ -441,6 +452,8 @@ class HubError(Exception):
             "rate_limited": "Rate limited. Wait a minute and retry.",
             "connection": "Cannot reach the Hub server. Check --server / config "
             "and your network.",
+            "client_too_old": "This CLI is too old for the server. Run "
+            "`hub upgrade` to install the latest signed release, then retry.",
             "vault_error": "Could not load the credential from the vault helper.",
         }
         hint = hints.get(self.code, "")
@@ -478,6 +491,7 @@ def _friendly_from_http(status, payload):
         403: ("forbidden", 1),
         404: ("not_found", 1),
         409: ("conflict", 1),
+        410: ("expired", 1),
         422: ("pii", 4),
         429: ("rate_limited", 1),
     }
@@ -491,6 +505,14 @@ def _friendly_from_http(status, payload):
         "conflict",
         "pii",
         "rate_limited",
+        # API version contract (§4.4): a stale CLI is rejected with 426 +
+        # this code; the server's plain-language message names the fix.
+        "client_too_old",
+        # Expiry codes (§4.5): trusted verbatim when the server sends them.
+        "invite_expired",
+        "code_expired",
+        "transfer_expired",
+        "transfer_recipient_gone",
     }
     if code not in known:
         code = short
@@ -3265,7 +3287,9 @@ class HubClient:
 
     def call(self, method, path, query=None, json_body=None,
              idempotency_key=None, auth=True, retries=3):
-        url = self.base_url + path
+        # API-major negotiation (spec §4.3): requests are prefixed with the
+        # major selected by the per-invocation version check (v1 today).
+        url = self.base_url + _apply_api_major(path)
         if query:
             url += "?" + urlparse.urlencode(query)
         headers = {
@@ -4903,7 +4927,7 @@ def _startup_integrity_check():
     if actual != manifest["files"]["hub"]:
         emit_err(
             "error: installed CLI does not match the signed release; "
-            "reinstall from the GitHub Release."
+            "reinstall from the server (`hub upgrade`, or re-download from the server's /v1/client/download/* endpoints)."
         )
         return False
     return True
@@ -5019,7 +5043,7 @@ def cmd_verify_install(args, transport):
         emit("       but the installed file hashes to %s…" % actual[:16])
         emit(
             "RESULT: FAIL — installed CLI does not match the signed release; "
-            "reinstall from the GitHub Release."
+            "reinstall from the server (`hub upgrade`, or re-download from the server's /v1/client/download/* endpoints)."
         )
         return 1
     emit("[ OK ] sha256 matches manifest (%s…)" % actual[:16])
@@ -5036,7 +5060,7 @@ def cmd_verify_install(args, transport):
         emit("[FAIL] signature: bundle %r not found next to the CLI" % sig_ref)
         emit(
             "RESULT: FAIL — signature bundle missing; "
-            "reinstall from the GitHub Release."
+            "reinstall from the server (`hub upgrade`, or re-download from the server's /v1/client/download/* endpoints)."
         )
         return 1
     emit("[ OK ] sigstore bundle present: %s" % sig_ref)
@@ -5086,9 +5110,11 @@ def cmd_verify_install(args, transport):
 # disk); that limit is documented, not hand-waved.
 # ---------------------------------------------------------------------------
 
-# Signed artifacts live on GitHub Releases. The release workflow signs with
-# GitHub Actions' keyless OIDC signer (sigstore-python), so the expected
-# certificate identity pins this repo's release workflow on main.
+# Signed artifacts are cut by the release workflow on GitHub Releases and
+# served by the hub server itself (same bytes, same seal — only the host
+# changed). The release workflow signs with GitHub Actions' keyless OIDC
+# signer (sigstore-python), so the expected certificate identity pins this
+# repo's release workflow on main.
 _RELEASE_IDENTITY_ISSUER = "https://token.actions.githubusercontent.com"
 _RELEASE_IDENTITY = (
     "https://github.com/maddy13182/museFamilyconnector"
@@ -5100,9 +5126,10 @@ _RELEASE_ASSET_MANIFEST = "manifest.json"
 _ROLLBACK_SUFFIX = ".prev"
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)([-+][0-9A-Za-z.-]+)?$")
-_MANIFEST_URL_RE = re.compile(
-    r"^https://github\.com/[^/]+/[^/]+/releases/download/[^/]+/hub$"
-)
+# Absolute https URL (no whitespace). Server-supplied asset URLs must at
+# least be well-formed; _validate_download_url additionally pins them to
+# the configured server's origin before anything is fetched.
+_ABSOLUTE_HTTPS_URL_RE = re.compile(r"^https://[^\s/$.?#].[^\s]*$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -5145,21 +5172,39 @@ def _is_newer(candidate, current):
 def _validate_client_manifest(obj):
     """Validate a GET /v1/client/latest payload (contract C2).
 
+    New shape (spec §3.5): {version, min_cli_version, server_version,
+    sha256, released_at, download_url, assets: {hub, sigstore, manifest}}.
+    The CLI downloads from `assets.*` (this server's download endpoints);
+    `download_url` is kept for field continuity and validated too.
     Returns the manifest dict; raises HubError on any schema violation.
     """
     if not isinstance(obj, dict):
         raise HubError("bad_request", "Client manifest is not a JSON object.")
-    for field in ("version", "download_url", "sha256"):
+    for field in ("version", "min_cli_version", "download_url", "sha256", "assets"):
         if not obj.get(field):
             raise HubError(
                 "bad_request", "Client manifest is missing %r." % (field,)
             )
     _parse_version(obj["version"])  # raises on garbage
-    if not _MANIFEST_URL_RE.match(str(obj["download_url"])):
+    _parse_version(obj["min_cli_version"])  # raises on garbage
+    assets = obj["assets"]
+    if not isinstance(assets, dict):
+        raise HubError(
+            "bad_request", "Client manifest 'assets' is not an object."
+        )
+    for name in ("hub", "sigstore", "manifest"):
+        url = assets.get(name)
+        if not url or not _ABSOLUTE_HTTPS_URL_RE.match(str(url)):
+            raise HubError(
+                "bad_request",
+                "Client manifest assets.%s is not an absolute https URL: %r."
+                % (name, url),
+            )
+    if not _ABSOLUTE_HTTPS_URL_RE.match(str(obj["download_url"])):
         raise HubError(
             "bad_request",
-            "Client manifest download_url is not a GitHub Release asset "
-            "URL: %r." % (obj["download_url"],),
+            "Client manifest download_url is not an absolute https URL: %r."
+            % (obj["download_url"],),
         )
     if not _SHA256_RE.match(str(obj["sha256"])):
         raise HubError(
@@ -5168,25 +5213,47 @@ def _validate_client_manifest(obj):
     return obj
 
 
-def _validate_download_url(url):
-    """Only https GitHub Release asset URLs are acceptable download sources."""
-    parts = urlparse.urlparse(str(url))
-    if parts.scheme != "https":
+def _validate_download_url(url, server):
+    """Pin release-asset downloads to the configured server's origin.
+
+    The asset URLs are supplied by the server (from /v1/client/latest), so
+    the downloader refuses anything that is not that same origin: a
+    compromised/misbehaving server cannot bounce the fetch off to an
+    attacker host. https-only, with the same loopback-http exception as
+    the server URL itself (F03). The sha256 + sigstore verification after
+    the download remains the real trust anchor — this is defense in depth.
+    """
+    parts = urlparse.urlsplit(str(url))
+    srv = urlparse.urlsplit(str(server))
+    host = (parts.hostname or "").lower().rstrip(".")
+    srv_host = (srv.hostname or "").lower().rstrip(".")
+    if parts.scheme not in ("http", "https"):
         raise HubError(
             "bad_request",
-            "Refusing to download over a non-https URL: %r." % (url,),
+            "Refusing to download over a non-HTTP(S) URL: %r." % (url,),
         )
-    if parts.hostname != "github.com":
+    if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise HubError(
             "bad_request",
-            "Refusing to download from unexpected host %r (expected "
-            "github.com)." % (parts.hostname,),
+            "Refusing to download over plain http from non-loopback host "
+            "%r." % host,
+        )
+    # Same origin as the configured server (default ports normalized):
+    # the server's own /v1/client/download/* endpoints.
+    default_port = {"http": 80, "https": 443}
+    port = parts.port or default_port[parts.scheme]
+    srv_port = srv.port or default_port.get(srv.scheme)
+    if not host or host != srv_host or port != srv_port:
+        raise HubError(
+            "bad_request",
+            "Refusing to download from unexpected origin %r (expected the "
+            "configured hub server %r)." % (url, server),
         )
 
 
-def _download_bytes(url, what, timeout=90):
-    """Fetch a release asset. Raises HubError on any failure."""
-    _validate_download_url(url)
+def _download_bytes(url, what, server, timeout=90):
+    """Fetch a release asset from the hub server. Raises HubError on any failure."""
+    _validate_download_url(url, server)
     req = urlrequest.Request(
         url,
         headers={
@@ -5197,7 +5264,7 @@ def _download_bytes(url, what, timeout=90):
         },
     )
     try:
-        # nosemgrep: dynamic-urllib-use-detected -- URL validated by _validate_download_url (https + github.com only) immediately above
+        # nosemgrep: dynamic-urllib-use-detected -- URL validated by _validate_download_url (same-origin https pin to the configured hub server) immediately above
         with urlrequest.urlopen(req, timeout=timeout) as resp:  # nosec B310
             if resp.status != 200:
                 raise HubError(
@@ -5359,17 +5426,6 @@ def _latest_release(client):
     return _validate_client_manifest(payload)
 
 
-def _release_asset_urls(manifest):
-    """Derive the bundle + release-manifest URLs from the hub download URL."""
-    dl = str(manifest["download_url"])
-    base = re.sub(r"/hub$", "", dl)
-    return (
-        dl,
-        base + "/" + _RELEASE_ASSET_BUNDLE,
-        base + "/" + _RELEASE_ASSET_MANIFEST,
-    )
-
-
 def cmd_upgrade(args, transport):
     """Upgrade to the latest signed CLI release.
 
@@ -5377,12 +5433,19 @@ def cmd_upgrade(args, transport):
     verifies sigstore signature + sha256, self-tests the candidate, swaps
     it in atomically, and keeps the previous binary as <script>.prev for
     `hub rollback`. No-op (exit 0) when already current.
+
+    The three assets are downloaded from THIS server's download endpoints
+    (assets.{hub,sigstore,manifest} in the manifest) — never GitHub.
+    Verification is unchanged: sha256 against both the server manifest and
+    the release manifest, mandatory sigstore check, self-test before AND
+    after the atomic cutover.
     """
     current = _cli_version()
     emit("hub %s — checking for updates…" % current)
     ctx = _ctx(args, transport, need_auth=False)
     manifest = _latest_release(ctx.client)
     new_version = str(manifest["version"])
+    emit("This server requires CLI ≥ %s." % manifest["min_cli_version"])
     if not _is_newer(new_version, current):
         emit(
             "Already current: hub %s (server advertises %s). Nothing to do."
@@ -5392,10 +5455,13 @@ def cmd_upgrade(args, transport):
     emit("New release available: %s → %s." % (current, new_version))
 
     want = str(manifest["sha256"]).lower()
-    hub_url, bundle_url, rel_manifest_url = _release_asset_urls(manifest)
+    assets = manifest["assets"]
+    hub_url = str(assets["hub"])
+    bundle_url = str(assets["sigstore"])
+    rel_manifest_url = str(assets["manifest"])
     tmpdir = tempfile.mkdtemp(prefix="hub-upgrade-")
     try:
-        artifact = _download_bytes(hub_url, "hub %s" % new_version)
+        artifact = _download_bytes(hub_url, "hub %s" % new_version, ctx.server)
         got = hashlib.sha256(artifact).hexdigest()
         if got != want:
             raise HubError(
@@ -5404,9 +5470,9 @@ def cmd_upgrade(args, transport):
                 "got %s. The artifact is NOT installed."
                 % (new_version, want, got),
             )
-        bundle = _download_bytes(bundle_url, _RELEASE_ASSET_BUNDLE)
+        bundle = _download_bytes(bundle_url, _RELEASE_ASSET_BUNDLE, ctx.server)
         rel_manifest_raw = _download_bytes(
-            rel_manifest_url, _RELEASE_ASSET_MANIFEST
+            rel_manifest_url, _RELEASE_ASSET_MANIFEST, ctx.server
         )
         try:
             rel_manifest = json.loads(rel_manifest_raw.decode("utf-8"))
@@ -5517,6 +5583,106 @@ def cmd_rollback(args, transport):
     _atomic_install(current_data, prev)
     emit("Rolled back: %s is restored from %s." % (target, prev))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Server version contract (spec §1, §4.2–§4.3)
+# ---------------------------------------------------------------------------
+#
+# Once per process, before any server-touching command runs, the CLI fetches
+# GET /v1/health (unauthenticated, cheap) and requires:
+#   1. server_version >= _MIN_SERVER_VERSION, AND
+#   2. the server's advertised `api_versions` includes an API major this
+#      CLI implements (v1 today).
+# Outside this the CLI fails loudly with upgrade instructions — never
+# silently, never by guessing. There is no env var, flag, or config that
+# skips this check; the only exemptions are commands that never touch the
+# server at all (see _LOCAL_COMMANDS), plus --version/--help which exit in
+# argparse before main() runs.
+
+# Selected API major for this process, set once by _require_server_version.
+# Stays "v1" for exempt local flows (no check) and until the check runs.
+_api_major = "v1"
+# server_url -> selected API major. The check is one call per process per
+# server, not per sub-request.
+_version_check_cache = {}
+
+
+def _reset_server_version_cache():
+    """Clear the per-process version-check cache. Test hook only."""
+    global _api_major
+    _api_major = "v1"
+    _version_check_cache.clear()
+
+
+def _version_at_least(version, floor):
+    """True when semver `version` >= `floor`.
+
+    A prerelease of the floor triple itself (e.g. 0.12.0-rc1 vs floor
+    0.12.0) does NOT satisfy the floor. Unparseable input never does.
+    """
+    try:
+        have = _parse_version(version)
+        want = _parse_version(floor)
+    except HubError:
+        return False
+    if have[:3] != want[:3]:
+        return have[:3] > want[:3]
+    return not have[3]
+
+
+def _select_api_major(api_versions):
+    """Highest API major this CLI implements that the server advertises.
+
+    Returns None when there is no overlap (or the field is missing /
+    malformed) — the caller treats that as "too old".
+    """
+    if not isinstance(api_versions, list):
+        return None
+    for major in _API_MAJORS_IMPLEMENTED:
+        if major in api_versions:
+            return major
+    return None
+
+
+def _require_server_version(args, transport):
+    """Per-invocation gate: fail loudly when the server is too old.
+
+    Fetches GET /v1/health (unauthenticated) once per process per server
+    and caches the result; sets the process-wide API major used to prefix
+    requests. Raises HubError("version") with the exact contract message
+    when the server is below the floor or advertises no usable API major.
+    An unreachable server propagates the existing "connection" error —
+    never a version error. No-server-configured propagates the existing
+    config error.
+    """
+    global _api_major
+    ctx = _ctx(args, transport, need_auth=False)
+    cached = _version_check_cache.get(ctx.server)
+    if cached is not None:
+        _api_major = cached
+        return
+    health = ctx.client.call("GET", "/v1/health", auth=False, retries=1)
+    if not isinstance(health, dict):
+        health = {}
+    srv_ver = health.get("version")
+    major = _select_api_major(health.get("api_versions"))
+    if not _version_at_least(srv_ver, _MIN_SERVER_VERSION) or major is None:
+        raise HubError(
+            "version",
+            "hub %s needs server %s+ (this server runs %s). "
+            "Ask the server operator to upgrade."
+            % (VERSION, _MIN_SERVER_VERSION, srv_ver if srv_ver else "unknown"),
+        )
+    _api_major = major
+    _version_check_cache[ctx.server] = major
+
+
+def _apply_api_major(path):
+    """Rewrite the /v1/ prefix to the API major selected by the version check."""
+    if _api_major != "v1" and path.startswith("/v1/"):
+        return "/" + _api_major + path[3:]
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -5923,6 +6089,21 @@ def _wrap_setup(args, transport):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Commands that never touch the server: exempt from the per-invocation
+# server-version check. They must work with no server configured (offline
+# key management, install verification, rollback) — and because they make
+# no requests, skipping the check cannot mask a version mismatch.
+# --version/--help exit inside argparse, before main() runs.
+_LOCAL_COMMANDS = frozenset(
+    {
+        cmd_key_wrap,
+        cmd_key_backup,
+        cmd_key_restore,
+        cmd_verify_install,
+        cmd_rollback,
+    }
+)
+
 
 def main(argv=None, transport=None):
     clear_secrets()
@@ -5934,6 +6115,10 @@ def main(argv=None, transport=None):
         if not _startup_integrity_check():
             return EXIT_TAMPERED
     try:
+        # Server version contract (§4.2): fail before any command when the
+        # server is too old. Local-only commands are exempt.
+        if getattr(args, "func", None) not in _LOCAL_COMMANDS:
+            _require_server_version(args, transport)
         return args.func(args, transport)
     except HubError as exc:
         emit_err("error: " + exc.friendly())
