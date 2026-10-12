@@ -417,7 +417,7 @@ class UpgradeThroughMainTest(VersionCheckBase):
             fh.write(old_bytes)
         os.chmod(target, 0o755)
 
-        new_version = "0.10.1"
+        new_version = "0.11.1"
         new_bytes = self._stamp(old_bytes, new_version)
         digest = hashlib.sha256(new_bytes).hexdigest()
         server = "https://hub.example.test"
