@@ -226,3 +226,13 @@ export function isE2eeWireBody(v: unknown): boolean {
   const rawLen = Math.floor((blob.length * 3) / 4) - pad;
   return rawLen >= FH1_MIN_RAW_BYTES;
 }
+
+// Sync v2 (N05/R1): parse the fh1 envelope header of a well-formed wire
+// body. Returns {keyId, msgId} or null when the body is not a well-formed
+// fh1 wire string. The server performs no crypto — it only reads the two
+// header fields (write-time key checks use keyId; R1 replay uses msgId).
+export function parseFh1Header(v: unknown): { keyId: string; msgId: string } | null {
+  if (!isE2eeWireBody(v)) return null;
+  const parts = (v as string).split('.');
+  return { keyId: parts[1], msgId: parts[2] };
+}

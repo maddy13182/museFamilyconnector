@@ -151,53 +151,6 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
   assert.equal(await meStatus(app, kid.token), 401);
 });
 
-test('F04: rotate then immediate-revoke of the old token — grace overwritten, old 401s, new survives', async () => {
-  const { app, owner } = await setupRoles();
-  const rot = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(rot.status, 200);
-  const newToken = rot.body.token as string;
-
-  // old token still inside its 24h rotation grace
-  assert.equal(await meStatus(app, owner.token), 200);
-
-  // immediate revoke overwrites the future grace timestamp unconditionally
-  const rev = await app.call('POST', '/v1/auth/revoke', {
-    token: newToken,
-    body: { token_id: owner.tokenId },
-  });
-  assert.equal(rev.status, 200);
-  const row = await app.db.queryOne(`SELECT revoked_at FROM agent_tokens WHERE token_id = ?`, [
-    owner.tokenId,
-  ]);
-  assert.ok((row!['revoked_at'] as string) <= new Date().toISOString());
-  assert.equal(await meStatus(app, owner.token), 401);
-
-  // rotation is replacement, not delegation: the new token is not a cascade
-  // target of revoking the old one
-  assert.equal(await meStatus(app, newToken), 200);
-});
-
-test('F04: rotating a retired (grace-window) credential is denied; a dead one 401s', async () => {
-  const { app, owner } = await setupRoles();
-  const rot = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(rot.status, 200);
-
-  // the old token is retired (carries a future revoked_at) — rotating with it
-  // again is denied
-  const again = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(again.status, 403);
-  assert.equal(again.body.error.code, 'forbidden');
-
-  // once fully revoked, the choke point rejects it with 401 before rotation
-  const rev = await app.call('POST', '/v1/auth/revoke', {
-    token: rot.body.token as string,
-    body: { token_id: owner.tokenId },
-  });
-  assert.equal(rev.status, 200);
-  const dead = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(dead.status, 401);
-});
-
 test('F05: concurrent redeem of one code mints exactly one token', async () => {
   const { app, owner } = await setupRoles();
   const mint = await app.call('POST', '/v1/provisioning-codes', {

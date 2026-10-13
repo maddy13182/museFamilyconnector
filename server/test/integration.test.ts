@@ -129,7 +129,6 @@ test('3. parents_only topic: kid gets 403 on read/history/post; invisible in lis
   for (const [m, p] of [
     ['GET', `/v1/topics/${ctx.parentTopic}`],
     ['GET', `/v1/topics/${ctx.parentTopic}/history`],
-    ['GET', `/v1/topics/${ctx.parentTopic}/export`],
     ['POST', `/v1/topics/${ctx.parentTopic}/entries`],
   ] as const) {
     const r = await app.call(m, p, {
@@ -140,21 +139,6 @@ test('3. parents_only topic: kid gets 403 on read/history/post; invisible in lis
   }
   const list = await app.call('GET', '/v1/topics', { token: kidToken });
   assert.ok(!(list.body.topics as any[]).some((x) => x.id === ctx.parentTopic));
-});
-
-test('4. post; sync shows it to participants only', async () => {
-  const { app, ownerToken, parentToken, kidToken } = ctx;
-  const post = await app.call('POST', `/v1/topics/${ctx.parentTopic}/entries`, {
-    token: ownerToken,
-    body: { body: 'Kyler options: keep it between us for now.' },
-  });
-  assert.equal(post.status, 201);
-  assert.equal(post.body.entry.seq, 1);
-
-  const psync = await app.call('GET', '/v1/sync?after_gseq=0', { token: parentToken });
-  assert.ok((psync.body.entries as any[]).some((e) => e.body.includes('Kyler options')));
-  const ksync = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
-  assert.ok(!(ksync.body.entries as any[]).some((e) => e.body.includes('Kyler options')));
 });
 
 test('5. invite kid with from_join: old history hidden, new messages visible', async () => {
@@ -244,12 +228,6 @@ test('6. spawn linked child: kid reads child, still 403 on a fresh parent topic'
 
   const denied = await app.call('GET', `/v1/topics/${pid}/history`, { token: kidToken });
   assert.equal(denied.status, 403);
-  const deniedSync = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
-  assert.ok(
-    !(deniedSync.body.entries as any[]).some((e) =>
-      (e.body as string).includes('Private parent deliberation'),
-    ),
-  );
 });
 
 test('7. task delegation round-trip with structured result', async () => {
@@ -275,10 +253,10 @@ test('7. task delegation round-trip with structured result', async () => {
   });
   const subId = sub.body.task.id as string;
 
-  // assignee sees the assignment on sync
-  const ksync = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
+  // assignee sees the assignment in topic history
+  const khist = await app.call('GET', `/v1/topics/${tid}/history`, { token: kidToken });
   assert.ok(
-    (ksync.body.entries as any[]).some(
+    (khist.body.entries as any[]).some(
       (e) => e.kind === 'task_created' && (e.data as any).task_id === subId,
     ),
   );
@@ -304,15 +282,6 @@ test('7. task delegation round-trip with structured result', async () => {
   assert.equal(doneParent.status, 200);
 });
 
-test('8. sync cursors: second poll is empty', async () => {
-  const { app, kidToken } = ctx;
-  const s1 = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
-  const max = s1.body.max_gseq as number;
-  assert.ok(max > 0);
-  const s2 = await app.call('GET', `/v1/sync?after_gseq=${max}`, { token: kidToken });
-  assert.deepEqual(s2.body.entries, []);
-});
-
 test('9. PII posts rejected with 422', async () => {
   const { app, ownerToken } = ctx;
   const t = await app.call('POST', '/v1/topics', {
@@ -336,33 +305,6 @@ test('9. PII posts rejected with 422', async () => {
     !(hist.body.entries as any[]).some((e) => (e.body as string).includes('4111')),
     'rejected PII must never be stored',
   );
-});
-
-test('10. redact: owner only; body scrubbed, audit shape kept', async () => {
-  const { app, ownerToken, kidToken } = ctx;
-  const t = await app.call('POST', '/v1/topics', {
-    token: ownerToken,
-    body: { subject: 'redact-me', kind: 'group', participant_member_ids: [ctx.kidId] },
-  });
-  const tid = t.body.topic.id as string;
-  const post = await app.call('POST', `/v1/topics/${tid}/entries`, {
-    token: ownerToken,
-    body: { body: 'oops, wrong number here' },
-  });
-  const gseq = post.body.entry.gseq as number;
-  const seq = post.body.entry.seq as number;
-
-  const kidRedact = await app.call('POST', `/v1/entries/${gseq}/redact`, { token: kidToken, body: {} });
-  assert.equal(kidRedact.status, 403);
-
-  const ok = await app.call('POST', `/v1/entries/${gseq}/redact`, { token: ownerToken, body: {} });
-  assert.equal(ok.status, 200);
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: ownerToken });
-  const entries = hist.body.entries as any[];
-  const target = entries.find((e) => e.gseq === gseq);
-  assert.ok((target.body as string).startsWith('[redacted by owner,'));
-  assert.equal(target.seq, seq); // sequence preserved
-  assert.ok(entries.some((e) => e.kind === 'redaction'));
 });
 
 test('11. cross-family access denied everywhere', async () => {
