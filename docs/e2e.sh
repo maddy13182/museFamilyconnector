@@ -4,9 +4,11 @@
 #
 # Drives the API through: family bootstrap -> invites -> parents_only topic ->
 # kid gets 403 -> spawn linked child with briefing -> task delegation round-trip
-# -> PII rejection -> idempotent retry dedupe -> sync v1 removal -> redact removal.
+# -> PII rejection -> idempotent retry dedupe -> sync v2 (changed-topic
+# discovery, read receipts, ack) -> deleted-route confirmations (sync v1,
+# redact, export, bare task GET/PATCH, auth/tokens) -> provision/revoke lifecycle.
 #
-# HOW TO RUN (needs WS-1's server):
+# HOW TO RUN:
 #   1. cd server && npm install && npm run build   # produces dist/
 #   2. node docs/e2e-server.mjs &                  # local dev server below
 #      - listens on $HUB (default http://127.0.0.1:8787)
@@ -23,6 +25,18 @@
 #   - Tokens live in shell variables only and are never echoed. (They do appear
 #     briefly in the local process list via curl -H; acceptable for a local
 #     throwaway run, never do this over untrusted machines.)
+#
+# RELEASE GATE (spec §8) — MANUAL checklist, cannot run here:
+#   The Muse side-chat e2e must pass in a real Muse instance before the
+#   integration is called stable. Backend tests passing is NOT sufficient.
+#   In a real Muse instance, with two test agents A and B (+ a third, C):
+#     1. A creates a group topic with B and C.
+#     2. B and C discover it via `hub sync`, create the correct side chats,
+#        and display the messages.
+#     3. B replies with an approval; A and C receive it exactly once.
+#     4. Restart all three agents mid-flow: nothing is lost, nothing
+#        double-delivers (unacked entries return; acks are idempotent).
+#   Sign-off: ________________  Date: __________
 #
 set -euo pipefail
 
@@ -145,7 +159,7 @@ OWNER_MID="$(jget member.id)"; need_id "$OWNER_MID"
 PROV="$(jget provisioning_code)"
 assert_eq "$(jget member.role)" "owner" "bootstrap creates owner"
 
-# ------------------------------------------------------------- 3. owner provision redeem (PROPOSED)
+# ------------------------------------------------------------- 3. owner provision redeem
 api POST "/v1/provisioning-codes/$(urlencode "$PROV")/redeem" "" '{}'
 assert_code 201 "owner provision redeem"
 OWNER_TOKEN="$(jget token)"
@@ -293,8 +307,10 @@ api POST "/v1/tasks/$(urlencode "$TASK")/done" "$KID_TOKEN" '{"result":{"conflic
 assert_code 200 "kid completes task"
 assert_eq "$(jget task.status)" "done" "task done"
 assert_eq "$(jget task.result.conflicts)" "[]" "result payload round-trips"
-api GET "/v1/tasks/$(urlencode "$TASK")" "$OWNER_TOKEN" ""
-assert_contains "$(jget trail)" "task_done" "owner sees task_done in trail"
+# GET /v1/tasks/:id is deleted (spec §1.6); the task_done event is verified
+# via topic history instead.
+api GET "/v1/topics/$(urlencode "$CTID")/history?after_seq=0&limit=500" "$OWNER_TOKEN" ""
+assert_contains "$(kinds_of <<<"$(jget entries)")" "task_done" "owner sees task_done in history"
 
 # ------------------------------------------------------------- 15. subtask rule (server-enforced)
 api POST "/v1/topics/$(urlencode "$CTID")/tasks" "$OWNER_TOKEN" '{"title":"Plan trip"}'
@@ -350,11 +366,61 @@ assert_eq "$(jget deduped)" "true" "deduped flag set"
 api GET "/v1/topics/$(urlencode "$CTID")/history?after_seq=0&limit=500" "$OWNER_TOKEN" ""
 assert_eq "$(jlen "$(jget entries)")" "$((BEFORE_IDEM + 1))" "retry stored no duplicate"
 
-# ------------------------------------------------------------- 18. sync v1 removed (spec §1.6)
-# GET /v1/sync is deleted; sync v2 discovery (GET /v1/sync/topics) lands with
-# the Server-A scope. Here we only assert the old route is gone.
+# ------------------------------------------------------------- 18. sync v1 removed; sync v2 journey (spec §1.3/§1.4)
+# GET /v1/sync is deleted (spec §1.6).
 api GET "/v1/sync?after_gseq=0&limit=500" "$KID_TOKEN" ""
 assert_code 404 "GET /v1/sync removed"
+
+# Changed-topic discovery, one call per circle token.
+api GET "/v1/sync/topics" "$KID_TOKEN" ""
+assert_code 200 "GET /v1/sync/topics"
+SYNCTOPICS="$API_BODY"
+assert_contains "$SYNCTOPICS" "$CTID" "sync lists the child topic as changed"
+assert_contains "$SYNCTOPICS" "$T2" "sync lists the logistics topic as changed"
+case "$SYNCTOPICS" in
+  *"$PTID"*) fail "parents_only topic must not leak into the kid's sync" ;;
+  *) pass "parents_only topic absent from kid sync" ;;
+esac
+
+# Field shape + paging.
+api GET "/v1/sync/topics?limit=1" "$KID_TOKEN" ""
+assert_code 200 "sync/topics page 1"
+assert_eq "$(jget has_more)" "true" "has_more with limit=1"
+assert_eq "$(jget topics.0.key_status)" "not_e2ee" "key_status for a plaintext topic"
+assert_eq "$(jget topics.0.circle_id)" "$FID" "circle_id matches"
+PAGE2="$(jget next_page_token)"
+api GET "/v1/sync/topics?limit=1&page_token=$(urlencode "$PAGE2")" "$KID_TOKEN" ""
+assert_code 200 "sync/topics page 2"
+assert_eq "$(jget has_more)" "false" "no more pages"
+
+# Read -> receipt -> ack: the topic goes quiet afterwards.
+api GET "/v1/topics/$(urlencode "$CTID")/history" "$KID_TOKEN" ""
+assert_code 200 "history for ack journey"
+RCPT="$(jget read_receipt)"
+THRU="$(jget read_through_seq)"
+case "$RCPT" in
+  fhrr1.*) pass "history issues a read receipt" ;;
+  *) fail "history issues a read receipt — got [$RCPT]" ;;
+esac
+ACK_BODY="$(THRU="$THRU" RCPT="$RCPT" python3 -c '
+import json, os
+print(json.dumps({"seq": int(os.environ["THRU"]), "read_receipt": os.environ["RCPT"]}))')"
+api POST "/v1/topics/$(urlencode "$CTID")/ack" "$KID_TOKEN" "$ACK_BODY"
+assert_code 200 "ack with receipt"
+assert_eq "$(jget acked_seq)" "$THRU" "ack advances to read_through_seq"
+api GET "/v1/sync/topics" "$KID_TOKEN" ""
+case "$(jget topics)" in
+  *"$CTID"*) fail "acked topic must drop out of sync" ;;
+  *) pass "acked topic drops out of sync" ;;
+esac
+
+# A forged receipt is rejected (403), and the legacy bootstrap_gseq param
+# is accepted but ignored (full re-read semantics).
+api POST "/v1/topics/$(urlencode "$T2")/ack" "$KID_TOKEN" '{"seq":99,"read_receipt":"fhrr1.1.99.ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}'
+assert_code 403 "forged receipt rejected"
+assert_eq "$(jget error.code)" "invalid_read_receipt" "403 invalid_read_receipt shape"
+api GET "/v1/sync/topics?bootstrap_gseq=424242" "$KID_TOKEN" ""
+assert_code 200 "bootstrap_gseq accepted"
 
 # ------------------------------------------------------------- 19. redact removed (spec §1.6)
 # POST /v1/entries/:eid/redact is deleted (no client). The old behavior —
@@ -381,13 +447,9 @@ api POST /v1/auth/revoke "$TOK2" "$(python3 -c 'import json; print(json.dumps({"
 assert_code 200 "revoke token"
 api GET /v1/members "$TOK2" ""
 assert_code 401 "revoked token rejected"
+# GET /v1/auth/tokens was a stale PROPOSED path; spec §1.6 deletes it.
 api GET /v1/auth/tokens "$OWNER_TOKEN" ""
-if [ "$API_CODE" = "404" ]; then
-  echo "SKIP: GET /v1/auth/tokens not implemented by server (contract status: PROPOSED)"
-else
-  assert_code 200 "owner lists tokens"
-  assert_contains "$(jget tokens)" "e2e-owner-agent" "token list shows labels"
-fi
+assert_code 404 "GET /v1/auth/tokens removed"
 
 # ------------------------------------------------------------- summary
 echo

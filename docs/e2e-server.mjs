@@ -8,7 +8,13 @@ import { handleRequest } from '/home/hatch/workspace/family-hub/server/dist/src/
 import { freshDb, sqliteClient } from '/home/hatch/workspace/family-hub/server/dist/test/sqlite.js';
 
 const db = sqliteClient(freshDb());
-const env = { TOKEN_PEPPER: 'e2e-local-pepper-not-a-secret', SETUP_LOCKED: '0' };
+const env = {
+  TOKEN_PEPPER: 'e2e-local-pepper-not-a-secret',
+  // Sync v2: /history issues HMAC read receipts and fails closed (500)
+  // without this. Throwaway value for the local throwaway DB only.
+  READ_RECEIPT_SECRET: 'e2e-local-receipt-secret-not-a-secret',
+  SETUP_LOCKED: '0',
+};
 
 const server = http.createServer(async (req, res) => {
   try {
