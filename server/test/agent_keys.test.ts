@@ -60,8 +60,8 @@ function columnNames(app: TestApp, table: string): string[] {
 }
 
 test('fresh DB from the full migration chain carries the E2EE schema', async () => {
-  // Clean-slate model: 0001_init.sql holds the E2EE tables/columns; there
-  // is no 0008 migration. freshDb() applies 0001→0007 in order, mirroring
+  // Clean-slate model: 0001_init.sql holds the E2EE tables/columns.
+  // freshDb() applies 0001→0010 in order, mirroring
   // `wrangler d1 migrations apply` on a fresh database.
   const app = makeApp();
   assert.deepEqual(columnNames(app, 'agent_keys'), [
@@ -92,7 +92,30 @@ test('fresh DB from the full migration chain carries the E2EE schema', async () 
     'key_id',
     'envelope',
     'created_at',
+    'identity_key_id', // 0010: which identity key version the envelope was sealed to
   ]);
+  // 0010 (sync v2): read state + epoch log + lifecycle columns.
+  assert.deepEqual(columnNames(app, 'topic_read_state'), [
+    'member_id',
+    'agent_label',
+    'topic_id',
+    'acked_seq',
+    'updated_at',
+  ]);
+  assert.deepEqual(columnNames(app, 'topic_key_epochs'), [
+    'topic_id',
+    'epoch',
+    'key_id',
+    'commitment',
+    'recipients',
+    'forced',
+    'forced_missing',
+    'created_at',
+    'created_by',
+  ]);
+  const topicsCols2 = columnNames(app, 'topics');
+  assert.ok(topicsCols2.includes('current_epoch'), 'topics must have current_epoch (0010)');
+  assert.ok(topicsCols2.includes('rotation_required'), 'topics must have rotation_required (0010)');
   // The one-active-key-per-(member, label) partial unique index exists.
   const indexes = app.raw
     .prepare(`PRAGMA index_list(agent_keys)`)

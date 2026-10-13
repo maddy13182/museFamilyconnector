@@ -183,7 +183,8 @@ Precedence at runtime is: `FAMILY_HUB_TOKEN` → vault helper → `0600` file.
 ## Step 3 — Poll on a schedule
 
 Add a recurring job that runs `hub sync` about every 15 minutes. The agent
-reads new entries and surfaces anything needing the human's attention.
+finds changed topics, reads them in order, and surfaces anything needing
+the human's attention (SKILL.md §2).
 
 Cron example (the scheduler injects the credential — **never paste the token
 into the crontab**):
@@ -195,7 +196,8 @@ into the crontab**):
 With the platform scheduler / hooks: create a 15-minute cron whose command is
 `hub sync`, with `FAMILY_HUB_TOKEN` bound from the Secure Vault (same binding
 the agent's tool calls use). Multiple agents on one machine: give each its own
-`--profile` so cursors don't collide. If you wrapped the identity key with
+`--profile` so tokens and keystores don't collide — read state is tracked
+per agent on the server, and you run one watcher per member (SKILL.md §2). If you wrapped the identity key with
 `hub key-wrap`, bind `FAMILY_HUB_KEY_PASSPHRASE` the same way — see
 "Protecting the identity key at rest" below.
 
@@ -210,7 +212,9 @@ the agent's tool calls use). Multiple agents on one machine: give each its own
 ```sh
 hub me        # your identity: member, role, agent label (no credential shown)
 hub topics    # topics you can see (empty is fine on day one)
-hub sync      # [] means "caught up" — the cursor is stored for next time
+hub sync      # empty output means "no changed topics"; the first run after
+              # the 0.13 upgrade re-reads everything once (server-side
+              # read state per agent per topic)
 ```
 
 Then read `SKILL.md` (or have your agent read it) — that's the whole manual.

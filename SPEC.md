@@ -283,23 +283,23 @@ unless noted.
 | POST | `/families` | no | Bootstrap only. Disabled via `SETUP_LOCKED=1` after use |
 | POST | `/families/:fid/invites` | owner/parent | `{email, role}` → `{invite_code, expires_at}` |
 | POST | `/invites/:code/accept` | no (code is the credential) | `{display_name, agent_label}` → `{member, token}` — token shown once |
-| POST | `/auth/rotate` | token | New token; old valid 24h grace |
 | POST | `/auth/revoke` | token | `{token_id}` — self, or owner/parent for any family token |
 | GET | `/members` | token | Members of my family |
 | POST | `/topics` | token | `{subject, kind, participant_member_ids[], parents_only?}` |
 | GET | `/topics?q=` | token | Search/list visible topics |
 | GET | `/topics/:tid` | participant | Metadata + participants |
-| GET | `/topics/:tid/history?after_seq=&limit=` | participant | Entries, `seq >= history_from_seq` |
-| GET | `/topics/:tid/export` | participant | Full topic JSON (offline copy / migration) |
-| POST | `/topics/:tid/invite` | participant + owner/parent | `{member_ids[], history_from}` |
-| POST | `/topics/:tid/spawn` | participant | `{subject, participant_member_ids[], briefing, link_visibility?}` |
-| POST | `/topics/:tid/entries` | participant | `{kind, body, reply_to_seq?, data?}` + `Idempotency-Key` |
-| GET | `/sync?after_gseq=&limit=` | token | New entries across all visible topics |
-| POST | `/topics/:tid/tasks` | participant | Create task |
-| GET/PATCH | `/tasks/:tid` | participant of task's topic | Read / update |
-| POST | `/tasks/:tid/notes` | participant of task's topic | Progress note |
+| GET | `/sync/topics` | token | Sync v2: changed-topic discovery, one call per circle token |
+| GET | `/topics/:tid/history?after_seq=&limit=&context=` | participant | Entries, `seq >= history_from_seq`; sync v2 adds `read_through_seq` + `read_receipt` |
+| POST | `/topics/:tid/ack` | participant | Sync v2: receipt-bound contiguous ack `{seq, read_receipt}` |
+| POST | `/topics/:tid/invite` | participant + owner/parent | `{member_ids[], history_from}`; `from_join` on E2EE topics sets `rotation_required` |
+| DELETE | `/topics/:tid/participants/:mid` | participant + owner/parent | Removal; on E2EE topics sets `rotation_required` |
+| POST | `/topics/:tid/spawn` | participant | `{subject, participant_member_ids[], briefing, link_visibility?}`; briefing must be fh1 when parent is E2EE |
+| POST | `/topics/:tid/entries` | participant | `{kind, body, reply_to_seq?, data?}` + `Idempotency-Key`; E2EE content must be fh1 (N05), replay-safe via `msg_id` (R1), gated on key epoch/freshness/rotation |
+| POST | `/topics/:tid/envelopes` | participant | Staged key envelopes — stored, never flipped; only `keys/commit` activates |
+| POST | `/topics/:tid/keys/commit` | owner/parent | Sync v2: staged atomic key activation `{expected_epoch, key_id, commitment, force?}` |
+| POST | `/topics/:tid/tasks` | participant | Create task; title/description must be fh1 on E2EE topics; `task_created` carries sealed content |
+| POST | `/tasks/:tid/notes` | participant of task's topic | Progress note; must be fh1 on E2EE topics |
 | POST | `/tasks/:tid/done` | participant of task's topic | `{result?}` — enforces subtask rule |
-| POST | `/entries/:eid/redact` | owner | PII escape hatch |
 | GET | `/health` | no | Liveness only, no data |
 
 Error shape: `{error: {code, message}}` with HTTP semantics

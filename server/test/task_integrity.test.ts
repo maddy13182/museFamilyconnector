@@ -1,9 +1,9 @@
 // Tests: Phase F task integrity (audit F12-remainder, F13, F14).
 // - state + event + idempotency outcome commit in one atomic batch
-// - task_created carries full fields; PATCH emits task_updated
-// - task trail is a paginated SQL query (idx_entries_task_trail)
+// - task_created carries full fields (read back via history — the bare
+//   GET/PATCH /v1/tasks/:tid endpoints were deleted in sync v2, spec §1.6)
 // - malformed completion JSON -> 400; absent body is fine
-// - open child under a completed/cancelled parent is denied
+// - open child under a done parent is denied
 // - subtask/completion checks are atomic with their writes
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -186,9 +186,9 @@ test('F13: task_created carries the full task fields', async () => {
   });
   assert.equal(created.status, 201);
   const tid = created.body.task.id as string;
-  const got = await app.call('GET', `/v1/tasks/${tid}`, { token });
-  const ev = (got.body.trail as any[]).find((e) => e.kind === 'task_created');
-  assert.ok(ev, 'task_created must be in the trail');
+  const hist = await app.call('GET', `/v1/topics/${topicId}/history`, { token });
+  const ev = (hist.body.entries as any[]).find((e) => e.kind === 'task_created');
+  assert.ok(ev, 'task_created must be in history');
   assert.equal(ev.data.task_id, tid);
   assert.equal(ev.data.title, 'Pack bags');
   assert.equal(ev.data.description, 'For the trip');
@@ -199,58 +199,6 @@ test('F13: task_created carries the full task fields', async () => {
   assert.equal(ev.data.parent_task_id, null);
   assert.equal(ev.data.created_by, created.body.task.created_by);
   assert.equal(ev.data.created_at, created.body.task.created_at);
-});
-
-test('F13: PATCH title/description/due_at emits task_updated with the changed fields', async () => {
-  const { app, token, topicId } = await setup();
-  const tid = await createTask(app, token, topicId, { title: 'Old title' });
-  const patched = await app.call('PATCH', `/v1/tasks/${tid}`, {
-    token,
-    body: { title: 'New title', description: 'Added later', due_at: '2027-04-01' },
-  });
-  assert.equal(patched.status, 200);
-  const got = await app.call('GET', `/v1/tasks/${tid}`, { token });
-  const kinds = (got.body.trail as any[]).map((e) => e.kind);
-  assert.deepEqual(kinds, ['task_created', 'task_updated']);
-  const ev = (got.body.trail as any[]).find((e) => e.kind === 'task_updated');
-  assert.equal(ev.data.task_id, tid);
-  assert.equal(ev.data.title, 'New title');
-  assert.equal(ev.data.description, 'Added later');
-  assert.equal(ev.data.due_at, patched.body.task.due_at);
-  // A status-only PATCH emits task_status, not task_updated.
-  await app.call('PATCH', `/v1/tasks/${tid}`, { token, body: { status: 'in_progress' } });
-  const got2 = await app.call('GET', `/v1/tasks/${tid}`, { token });
-  const kinds2 = (got2.body.trail as any[]).map((e) => e.kind);
-  assert.deepEqual(kinds2, ['task_created', 'task_updated', 'task_status']);
-});
-
-test('F13: task trail is a paginated SQL query', async () => {
-  const { app, token, topicId } = await setup();
-  const tid = await createTask(app, token, topicId, { title: 'Paged' });
-  for (let i = 0; i < 3; i++) {
-    await app.call('POST', `/v1/tasks/${tid}/notes`, { token, body: { body: `note ${i}` } });
-  }
-  const p1 = await app.call('GET', `/v1/tasks/${tid}?limit=2`, { token });
-  assert.equal(p1.status, 200);
-  assert.equal((p1.body.trail as any[]).length, 2);
-  assert.equal(p1.body.has_more, true);
-  assert.deepEqual(
-    (p1.body.trail as any[]).map((e) => e.kind),
-    ['task_created', 'task_note'],
-  );
-  const p2 = await app.call('GET', `/v1/tasks/${tid}?limit=2&after_seq=${p1.body.next_after_seq}`, {
-    token,
-  });
-  assert.equal((p2.body.trail as any[]).length, 2);
-  assert.equal(p2.body.has_more, false);
-  // Every returned row matched the task in SQL (no code-side filtering).
-  for (const e of [...(p1.body.trail as any[]), ...(p2.body.trail as any[])]) {
-    assert.equal((e.data as any).task_id, tid);
-  }
-  // Unrelated chatter in the topic never leaks into the trail.
-  await app.call('POST', `/v1/topics/${topicId}/entries`, { token, body: { body: 'chatter' } });
-  const full = await app.call('GET', `/v1/tasks/${tid}`, { token });
-  assert.equal((full.body.trail as any[]).length, 4);
 });
 
 test('F14: malformed completion JSON is 400; absent body is fine', async () => {
@@ -268,7 +216,7 @@ test('F14: malformed completion JSON is 400; absent body is fine', async () => {
   assert.equal(ok.body.task.result, null);
 });
 
-test('F14: open child under a done or cancelled parent is denied', async () => {
+test('F14: open child under a done parent is denied', async () => {
   const { app, token, topicId } = await setup();
   const pid = await createTask(app, token, topicId, { title: 'Parent' });
   await app.call('POST', `/v1/tasks/${pid}/done`, { token, body: {} });
@@ -278,15 +226,6 @@ test('F14: open child under a done or cancelled parent is denied', async () => {
   });
   assert.equal(denied.status, 409);
   assert.equal(denied.body.error.code, 'parent_completed');
-
-  const pid2 = await createTask(app, token, topicId, { title: 'Parent 2' });
-  await app.call('PATCH', `/v1/tasks/${pid2}`, { token, body: { status: 'cancelled' } });
-  const denied2 = await app.call('POST', `/v1/topics/${topicId}/tasks`, {
-    token,
-    body: { title: 'Late child 2', parent_task_id: pid2 },
-  });
-  assert.equal(denied2.status, 409);
-  assert.equal(denied2.body.error.code, 'parent_completed');
 
   // Children under open parents still work.
   const pid3 = await createTask(app, token, topicId, { title: 'Parent 3' });
@@ -304,8 +243,12 @@ test('F14: denied completion writes no phantom task_done event', async () => {
   const denied = await app.call('POST', `/v1/tasks/${pid}/done`, { token, body: {} });
   assert.equal(denied.status, 409);
   assert.equal(denied.body.error.code, 'subtasks_open');
-  const got = await app.call('GET', `/v1/tasks/${pid}`, { token });
-  const kinds = (got.body.trail as any[]).map((e) => e.kind);
+  const hist = await app.call('GET', `/v1/topics/${topicId}/history`, { token });
+  const kinds = (hist.body.entries as any[])
+    .filter((e: any) => (e.data as any)?.task_id === pid)
+    .map((e: any) => e.kind);
   assert.ok(!kinds.includes('task_done'), 'no phantom task_done may be emitted');
-  assert.equal(got.body.task.status, 'open');
+  const list = await app.call('GET', `/v1/topics/${topicId}/tasks`, { token });
+  const task = (list.body.tasks as any[]).find((t: any) => t.id === pid);
+  assert.equal(task.status, 'open');
 });

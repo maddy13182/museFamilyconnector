@@ -9,11 +9,16 @@ The server binds each bearer token to one circle, so the profile keeps
 `circle_tokens: {circle_id: token}` in the 0600 `config.json`. Every
 command authenticates with the *active* circle's token (`--circle`
 switches both target and token for that call), falling back to the single
-legacy token when a circle has no stored token. `hub sync` walks every
-stored circle token with its own cursor and labels each entry with its
-circle. `hub dashboard-token` is the only command that ever prints a
-token — and it is a human admin command; agents must never run it or
-transmit its output.
+legacy token when a circle has no stored token. `hub sync` calls
+`GET /v1/sync/topics` once per stored circle token and reports
+*changed topics* (never entries), each labeled with its circle — there is
+no cross-circle sync by construction. Read state lives on the server per
+`(member_id, agent_label, topic)`: there are no client-side cursors, the
+CLI deletes legacy cursor files without reading them, and the first sync
+after the upgrade is a deliberate full re-read (everything visible
+reports as new once). `hub dashboard-token` is the only command that ever
+prints a token — and it is a human admin command; agents must never run
+it or transmit its output.
 
 ## Creating a circle — including for someone else
 
@@ -61,4 +66,5 @@ obstacle. Plain `http://` URLs are rejected for non-loopback hosts
 `http://[::1]` are allowed for local development.
 
 Muted circles (a human-level setting, e.g. someone else's family circle)
-stay invisible: no chat, no surfacing, no mention.
+stay invisible: no chat, no surfacing, no mention. Discard a muted
+circle's topics from the sync output immediately — never read, never ack.

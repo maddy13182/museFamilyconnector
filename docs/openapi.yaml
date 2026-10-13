@@ -649,39 +649,6 @@ paths:
         '410': { $ref: '#/components/responses/Gone' }
 
   # -------------------------------------------------------------------- auth
-  /v1/auth/rotate:
-    post:
-      tags: [auth]
-      operationId: rotateToken
-      summary: Rotate my agent token
-      description: |
-        Issues a new token for the calling agent. The old token stays valid for
-        a 24-hour grace period, then is revoked automatically. Both the rotation
-        and the eventual expiry are audit-logged.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema: { type: object, properties: {} }
-      responses:
-        '200':
-          description: New token issued
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [token, token_id, grace_until]
-                properties:
-                  token: { type: string, description: 'New bearer token, shown once.' }
-                  token_id: { type: string }
-                  grace_until:
-                    type: string
-                    format: date-time
-                    description: The old token stays valid until this time (24h grace), then is revoked automatically.
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/auth/revoke:
     post:
       tags: [auth]
@@ -717,29 +684,6 @@ paths:
 
         '429': { $ref: '#/components/responses/RateLimited' }
         '426': { $ref: '#/components/responses/ClientTooOld' }
-  /v1/auth/tokens:
-    get:
-      tags: [auth]
-      operationId: listTokens
-      summary: List agent tokens (proposed)
-      x-spec-note: PROPOSED — not in SPEC §13. Required so owners can find token_ids for the revoke runbook (SPEC §12 incident response).
-      description: |
-        Returns token metadata (never token values). A member sees their own
-        agents' tokens; `owner`/`parent` see all tokens in the family.
-      responses:
-        '200':
-          description: Token list
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [tokens]
-                properties:
-                  tokens:
-                    type: array
-                    items: { $ref: '#/components/schemas/TokenInfo' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
   /v1/provisioning-codes:
     post:
       tags: [auth]
@@ -1151,6 +1095,66 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/sync/topics:
+    get:
+      tags: [sync]
+      operationId: syncTopics
+      summary: Changed-topic discovery (sync v2)
+      description: |
+        Changed-topic discovery, per circle token — one call per circle, never
+        crossing family boundaries (cross-family topic ids 404 by
+        construction). Returns per changed topic: topic_id, circle_id,
+        circle_name, subject, kind, e2ee, acked_seq, latest_seq, new_count,
+        last_activity_ts, last_actor, key_status (ok|pending|not_e2ee),
+        assigned_to_me. Changed = visible entry with
+        seq > max(acked_seq, history_from_seq - 1). Bootstrap: the first call
+        sends no cursor — a deliberate full re-read; every visible entry is
+        reported as unread once, duplicates handled by the skill's dedupe
+        rule. The CLI deletes legacy cursor files without reading them.
+      parameters:
+        - name: bootstrap_gseq
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+          description: First call only; legacy cursor, ignored after bootstrap.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: page_token
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Changed topics
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topics]
+                properties:
+                  topics:
+                    type: array
+                    items:
+                      type: object
+                      required: [topic_id, circle_id, circle_name, subject, kind, e2ee, acked_seq, latest_seq, new_count, last_activity_ts, last_actor, key_status, assigned_to_me]
+                      properties:
+                        topic_id: { type: string }
+                        circle_id: { type: string }
+                        circle_name: { type: string }
+                        subject: { type: string }
+                        kind: { type: string }
+                        e2ee: { type: boolean }
+                        acked_seq: { type: integer }
+                        latest_seq: { type: integer }
+                        new_count: { type: integer }
+                        last_activity_ts: { type: string, format: date-time }
+                        last_actor: { type: string }
+                        key_status: { type: string, enum: [ok, pending, not_e2ee] }
+                        assigned_to_me: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /v1/topics/{tid}/history:
     get:
       tags: [topics]
@@ -1161,6 +1165,15 @@ paths:
         `seq >=` the caller's `history_from_seq` are returned (invite-time
         visibility). 403 unless the caller is a participant. Page with
         `after_seq`; more entries exist while the last returned seq < max_seq.
+        `context` (default 10, max 50) prepends up to that many entries
+        immediately before `after_seq` (bounded below by history_from_seq),
+        flagged `is_context: true` — re-reads for orientation; page entries
+        carry `is_context: false`. Every response includes `read_through_seq`
+        (highest newly-read seq in this page; context rows excluded) and a
+        `read_receipt` HMAC binding
+        (member_id, agent_label, topic_id, from_seq, through_seq) with
+        from_seq = max(after_seq, history_from_seq - 1) + 1 — POST it to
+        /v1/topics/{tid}/ack to advance read state.
       parameters:
         - $ref: '#/components/parameters/TopicId'
         - name: after_seq
@@ -1172,6 +1185,12 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: context
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, maximum: 50, default: 10 }
+          description: Sync v2 — also return up to N entries before after_seq (flagged is_context).
+
       responses:
         '200':
           description: History page
@@ -1179,50 +1198,81 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entries, max_seq]
+                required: [entries, max_seq, read_through_seq, read_receipt]
                 properties:
                   entries:
                     type: array
-                    items: { $ref: '#/components/schemas/Entry' }
+                    items:
+                      allOf:
+                        - { $ref: '#/components/schemas/Entry' }
+                        - type: object
+                          properties:
+                            is_context: { type: boolean }
                   max_seq:
                     type: integer
                     description: Highest seq in the topic (visible range).
+                  read_through_seq:
+                    type: integer
+                    description: Highest newly-read seq in this page (context rows excluded).
+                  read_receipt:
+                    type: string
+                    description: >
+                      HMAC-bound receipt for this (member, agent, topic,
+                      from_seq, through_seq); present to POST .../ack.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /v1/topics/{tid}/export:
-    get:
+  /v1/topics/{tid}/ack:
+    post:
       tags: [topics]
-      operationId: exportTopic
-      summary: Export full topic as JSON
-      description: Topic + participants + all visible entries + tasks. For offline copies and migration. 403 unless participant.
+      operationId: ackTopic
+      summary: Advance per-agent read state (sync v2)
+      description: |
+        Receipt-bound, contiguous ack. Body { seq, read_receipt }, both
+        required. The server HMAC-verifies the receipt — it must bind THIS
+        (member_id, agent_label, topic_id); cross-agent replay fails with
+        403 invalid_read_receipt. effective = max(acked_seq,
+        history_from_seq - 1). seq <= effective is a no-op success
+        (idempotent). Otherwise the ack must be contiguous: from_seq <=
+        effective + 1 and seq <= through_seq, else 409 noncontiguous_ack
+        (read and ack pages in order). Read state advances atomically via
+        max(). 403 unless the caller is a participant; 404 when the topic
+        is not in the caller's family.
       parameters:
         - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seq, read_receipt]
+              properties:
+                seq:
+                  type: integer
+                  minimum: 0
+                  description: Read position to acknowledge through.
+                read_receipt:
+                  type: string
+                  description: Receipt issued by GET .../history for the range being acked.
       responses:
         '200':
-          description: Full topic export
+          description: Read state advanced (or no-op)
           content:
             application/json:
               schema:
                 type: object
-                required: [topic, participants, entries, tasks, exported_at]
+                required: [topic_id, acked_seq]
                 properties:
-                  topic: { $ref: '#/components/schemas/Topic' }
-                  participants:
-                    type: array
-                    items: { $ref: '#/components/schemas/TopicParticipantView' }
-                  entries:
-                    type: array
-                    items: { $ref: '#/components/schemas/Entry' }
-                  tasks:
-                    type: array
-                    items: { $ref: '#/components/schemas/Task' }
-                  exported_at: { type: string, format: date-time }
+                  topic_id: { type: string }
+                  acked_seq: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/topics/{tid}/invite:
     post:
@@ -1234,6 +1284,11 @@ paths:
         logged as a `member_joined` entry (visible to existing readers).
         `history_from: from_join` sets the new participant's history_from_seq to
         current_max_seq + 1 (they see only what comes after joining).
+        Sync v2 (spec §1.4): on E2EE topics a `from_join` accept sets
+        `topics.rotation_required = 1` in the same transaction — the new
+        member is never given the current epoch key; encrypted writes pause
+        with 409 `rotation_required` until the owner rekeys and commits, at
+        which point the joiner receives only the new epoch key.
       parameters:
         - $ref: '#/components/parameters/TopicId'
       requestBody:
@@ -1336,7 +1391,7 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 20000
-                  description: Curated context for the new participants; becomes entry seq 1 (kind=briefing).
+                  description: Curated context for the new participants; becomes entry seq 1 (kind=briefing). Sync v2: must be well-formed fh1 when the parent topic is E2EE (400 plaintext_in_e2ee_topic otherwise).
                 link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
       responses:
         '201':
@@ -1371,7 +1426,20 @@ paths:
         server-generated. Supports
         `Idempotency-Key` header: retries with the same key return the
         original entry (`deduped: true`) instead of creating a duplicate.
-        Body is PII-scanned before insert.
+        Body is PII-scanned before insert (well-formed fh1 ciphertext skips
+        the scan — the CLI scans plaintext before encrypting).
+        Sync v2 (spec §1.5): on E2EE topics, `message` content must be
+        sealed — `body` and `data` (when present, a JSON string holding the
+        fh1 wire body) must be well-formed fh1, else 400
+        `plaintext_in_e2ee_topic`. Protocol kinds skip this check
+        (plaintext by design). Encrypted writes are gated server-side on the
+        fh1 header's key_id: 409 `key_not_active` at epoch 0 (writes blocked
+        until the first key commits), 409 `stale_key` when the key_id
+        differs from the topic's current key, 409 `rotation_required` while
+        a removal/from-join rekey is pending. R1 replay: the fh1 `msg_id` is
+        stored under a partial unique index — a retried POST with the same
+        body returns the existing entry (`deduped: true`); the same msg_id
+        with different content is 409 `msg_id_conflict`.
       parameters:
         - $ref: '#/components/parameters/TopicId'
         - name: Idempotency-Key
@@ -1424,7 +1492,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/PiiError' }
-
+        '409':
+          description: key_not_active | stale_key | rotation_required | msg_id_conflict
         '429': { $ref: '#/components/responses/RateLimited' }
         '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/topics/{tid}/tasks:
@@ -1435,6 +1504,11 @@ paths:
       description: |
         Caller must be a participant. The assignee (if set) must already be a
         participant of the topic (400 otherwise). Appends a `task_created` entry.
+        Sync v2 (spec §1.5): on E2EE topics `title` and `description` must be
+        well-formed fh1 (400 `plaintext_in_e2ee_topic` otherwise); the
+        `task_created` entry body is the sealed title and its data collapses
+        to `{"task_id": "…", "sealed": "fh1…"}` with `task_id` plaintext so
+        the task-visibility predicate keeps working.
       parameters:
         - $ref: '#/components/parameters/TopicId'
       requestBody:
@@ -1497,17 +1571,20 @@ paths:
       operationId: postTopicEnvelope
       summary: Store a sealed topic-key envelope for a recipient agent
       description: |
-        E2EE (Phase 2). Stores one sealed topic-key envelope for the target
-        (member_id, agent_label). The envelope blob is opaque to the server:
-        format-validated (standard base64) and stored, never inspected.
-        The caller must be a current participant of the topic (403
-        otherwise); the target must be a current participant AND hold an
+        E2EE (sync v2). STAGED distribution: stores one sealed topic-key
+        envelope for the target (member_id, agent_label). The envelope blob
+        is opaque to the server: format-validated (standard base64) and
+        stored, never inspected. N04: a new key_id is STORED, never flipped —
+        only POST .../keys/commit activates a key and advances
+        topics.current_key_id. The caller must be a current participant of
+        the topic (403 otherwise); introducing a key_id different from the
+        topic's current_key_id is allowed only for owner/parent callers (403
+        otherwise). The target must be a current participant AND hold an
         ACTIVE (non-superseded) registered public key (400 otherwise —
         sealing to an agent with no key on file is meaningless; they must
-        run `hub key-init` first). Key election (secfix F1): a key_id
-        different from the topic's current_key_id INTRODUCES a new key
-        (rotation) — allowed only for owner/parent callers (403 otherwise);
-        on success current_key_id advances atomically. Re-POSTing the same
+        run `hub key-init` first). The server records the target's active
+        identity-key id on the row (identity_key_id) for the commit's
+        superseded-key check. Re-POSTing the same
         (topic_id, member_id, agent_label, key_id) replaces the stored
         envelope — idempotent distribution — and preserves the original
         created_at (secfix F3).
@@ -1559,11 +1636,16 @@ paths:
       operationId: listTopicEnvelopes
       summary: Fetch my own key envelopes for a topic
       description: |
-        E2EE (Phase 2). Returns ONLY the caller's own envelopes — rows are
-        matched on the caller's (member_id, agent_label) from the Bearer
-        token, never on caller-supplied input. One agent can never fetch
-        another agent's envelopes. 403 when the caller is not a participant
-        of the topic.
+        E2EE (sync v2). Returns ONLY the caller's own envelopes for COMMITTED
+        epochs — rows are matched on the caller's (member_id, agent_label)
+        from the Bearer <redacted> never on caller-supplied input, and joined
+        against the topic's epoch log. Staged (uncommitted) keys stay
+        invisible until POST .../keys/commit activates them: an uncommitted
+        key must never be treated as usable. Each envelope carries its
+        epoch's `commitment` (hex SHA256 of the topic key; null for
+        grandfathered pre-migration epochs) for the CLI's verify-on-open
+        (N07). One agent can never fetch another agent's envelopes. 403 when
+        the caller is not a participant of the topic.
       parameters:
         - name: tid
           in: path
@@ -1582,7 +1664,7 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at]
+                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at, epoch]
                       properties:
                         topic_id: { type: string }
                         member_id: { type: string }
@@ -1590,70 +1672,79 @@ paths:
                         key_id: { type: string }
                         envelope: { type: string }
                         created_at: { type: string, format: date-time }
+                        epoch: { type: integer, description: Committed epoch this envelope belongs to. }
+                        commitment:
+                          type: string
+                          nullable: true
+                          description: >
+                            Hex SHA256 of the topic key for verify-on-open;
+                            null for grandfathered pre-migration epochs.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /v1/tasks/{tid}:
-    get:
-      tags: [tasks]
-      operationId: getTask
-      summary: Get a task + its entry trail
-      description: Caller must be a participant of the task's topic.
-      parameters:
-        - $ref: '#/components/parameters/TaskId'
-      responses:
-        '200':
-          description: Task detail
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [task, trail]
-                properties:
-                  task: { $ref: '#/components/schemas/Task' }
-                  trail:
-                    type: array
-                    items: { $ref: '#/components/schemas/Entry' }
-                    description: All entries in the topic referencing this task, in seq order (capped at 5000).
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-    patch:
-      tags: [tasks]
-      operationId: updateTask
-      summary: Update a task
+  /v1/topics/{tid}/keys/commit:
+    post:
+      tags: [e2ee]
+      operationId: commitTopicKey
+      summary: Staged atomic key activation (sync v2)
       description: |
-        Caller must be a participant of the task's topic. Changing status
-        appends `task_status`; changing assignee appends `task_assigned` (new
-        assignee must be a topic participant). Transition to `done` is rejected
-        with 409 while any subtask is not in done/cancelled (use
-        POST /v1/tasks/{tid}/done for completion with a result payload).
+        Handles GENESIS (expected_epoch 1, topic at epoch 0) and ROTATION
+        (expected_epoch = current_epoch + 1). Body
+        { expected_epoch, key_id, commitment, force }. Owner/parent only;
+        force is owner-only. Single transaction: expected_epoch must equal
+        current_epoch + 1 (409 stale_epoch); key_id must never have been used
+        for this topic (409 key_reuse); commitment must be 64 hex chars and
+        never used (409 key_material_reuse). Then the set-equality of STAGED
+        vs CURRENT agents (staged = envelope rows for key_id sealed to each
+        agent's currently-active identity key; current = live agents of
+        current participants): staged envelopes for non-participants BURN the
+        key — 409 recipients_removed_key_burned, staged rows deleted, client
+        must generate fresh key material (force cannot override); agents with
+        an active identity key but no staged envelope for it → 409
+        superseded_identity_key (not force-overridable — re-seal to the
+        active key); agents with no active identity key at all → 409
+        incomplete_distribution, or commit with force:true recording
+        forced=1 + forced_missing (the ONLY case force covers). On success
+        the epoch row is inserted and topics.current_key_id/current_epoch
+        advance atomically (rotation_required cleared). Response
+        { topic_id, epoch, key_id }.
       parameters:
-        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/TopicId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              minProperties: 1
+              required: [expected_epoch, key_id, commitment]
               properties:
-                status: { $ref: '#/components/schemas/TaskStatus' }
-                assignee_member_id: { type: string }
-                title: { type: string, minLength: 1, maxLength: 200 }
-                description: { type: string, maxLength: 20000 }
-                due_at: { type: string, format: date-time }
+                expected_epoch:
+                  type: integer
+                  minimum: 1
+                  description: Must equal current_epoch + 1 (1 for genesis).
+                key_id:
+                  type: string
+                  description: Random 128-bit topic-key id, 32 hex chars; never reused.
+                commitment:
+                  type: string
+                  description: Hex SHA256 of the topic key, 64 hex chars; never reused.
+                force:
+                  type: boolean
+                  default: false
+                  description: Owner-only; covers ONLY agents with no active identity key.
       responses:
         '200':
-          description: Task updated
+          description: Epoch committed
           content:
             application/json:
               schema:
                 type: object
-                required: [task]
+                required: [topic_id, epoch, key_id]
                 properties:
-                  task: { $ref: '#/components/schemas/Task' }
+                  topic_id: { type: string }
+                  epoch: { type: integer }
+                  key_id: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1665,7 +1756,10 @@ paths:
       tags: [tasks]
       operationId: addTaskNote
       summary: Add a progress note to a task
-      description: Appends a `task_note` entry to the task's topic. Body is PII-scanned.
+      description: |
+        Appends a `task_note` entry to the task's topic. Body is PII-scanned.
+        Sync v2 (spec §1.5): when the task's topic is E2EE the note body must
+        be well-formed fh1 (400 `plaintext_in_e2ee_topic` otherwise).
       parameters:
         - $ref: '#/components/parameters/TaskId'
       requestBody:
@@ -1701,6 +1795,10 @@ paths:
       description: |
         Sets status to done, stores the `result` JSON, appends `task_done`.
         Rejected with 409 while any subtask is not in done/cancelled.
+        N05 (E2EE topics): `result` must be an fh1 sealed body (400
+        `plaintext_in_e2ee_topic` otherwise); the `task_done` entry data
+        carries it as `{"task_id": "…", "sealed": "fh1…"}` with `task_id`
+        plaintext for the F06 visibility predicate.
       parameters:
         - $ref: '#/components/parameters/TaskId'
       requestBody:
@@ -1729,102 +1827,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
-  /v1/sync:
-    get:
-      tags: [sync]
-      operationId: syncEntries
-      summary: Poll for new entries across all visible topics
-      description: |
-        The agent's main poll loop. Returns entries with gseq > after_gseq, in
-        global order, across every topic the caller participates in (and with
-        seq >= their history_from_seq per topic). One call per poll keeps a
-        local cursor (`next_after_gseq`). Pagination is page-based: when
-        `has_more` is true, more entries remain — keep polling with
-        `next_after_gseq` until it comes back false. The cursor never jumps
-        past undelivered entries, so a deep backlog drains without gaps.
-      parameters:
-        - name: after_gseq
-          in: query
-          required: false
-          schema: { type: integer, minimum: 0, default: 0 }
-        - name: limit
-          in: query
-          required: false
-          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
-      responses:
-        '200':
-          description: New entries page
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [entries, has_more]
-                properties:
-                  entries:
-                    type: array
-                    items: { $ref: '#/components/schemas/Entry' }
-                  max_gseq:
-                    type: integer
-                    description: >
-                      Highest gseq in this response window (max of the returned
-                      entries; equals after_gseq when the page is empty).
-                      Kept for contract compatibility — clients MUST prefer
-                      next_after_gseq as their poll cursor.
-                  next_after_gseq:
-                    type: integer
-                    description: >
-                      Pass as after_gseq on the next poll. Always the last
-                      returned entry's gseq, or the after_gseq sent when the
-                      page is empty (cursor unchanged). Never advances past
-                      undelivered entries: when has_more is true the client
-                      must keep polling to drain the backlog.
-                  has_more:
-                    type: boolean
-                    description: >
-                      True when more entries remain beyond this page. Poll
-                      again with next_after_gseq until false; then the client
-                      is caught up.
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-  /v1/entries/{eid}/redact:
-    post:
-      tags: [ops]
-      operationId: redactEntry
-      summary: Redact an entry body (owner only)
-      description: |
-        PII escape hatch. Replaces `body` with `[redacted by owner, <ts>]`;
-        seq, actor, and timestamp are preserved, and a `redaction` entry
-        (body `Entry #<seq> redacted by owner`, data.redacted_gseq) is appended
-        to the same topic. Note: clients that already synced the entry keep
-        their copy — see the incident runbook in docs/SECURITY.md.
-      parameters:
-        - name: eid
-          in: path
-          required: true
-          schema: { type: integer, minimum: 1 }
-          description: The entry's gseq.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema: { type: object, properties: {} }
-      responses:
-        '200':
-          description: Entry redacted
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok]
-                properties:
-                  ok: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/health:
     get:
@@ -2076,7 +2078,7 @@ components:
       enum: [open, in_progress, blocked, done, cancelled]
     ErrorCode:
       type: string
-      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, client_too_old, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed]
+      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, client_too_old, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed, noncontiguous_ack, invalid_read_receipt, stale_epoch, key_reuse, key_material_reuse, recipients_removed_key_burned, superseded_identity_key, incomplete_distribution, misconfigured, plaintext_in_e2ee_topic, msg_id_conflict, key_not_active, stale_key, rotation_required]
 
     Error:
       type: object

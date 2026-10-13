@@ -151,53 +151,6 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
   assert.equal(await meStatus(app, kid.token), 401);
 });
 
-test('F04: rotate then immediate-revoke of the old token — grace overwritten, old 401s, new survives', async () => {
-  const { app, owner } = await setupRoles();
-  const rot = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(rot.status, 200);
-  const newToken = rot.body.token as string;
-
-  // old token still inside its 24h rotation grace
-  assert.equal(await meStatus(app, owner.token), 200);
-
-  // immediate revoke overwrites the future grace timestamp unconditionally
-  const rev = await app.call('POST', '/v1/auth/revoke', {
-    token: newToken,
-    body: { token_id: owner.tokenId },
-  });
-  assert.equal(rev.status, 200);
-  const row = await app.db.queryOne(`SELECT revoked_at FROM agent_tokens WHERE token_id = ?`, [
-    owner.tokenId,
-  ]);
-  assert.ok((row!['revoked_at'] as string) <= new Date().toISOString());
-  assert.equal(await meStatus(app, owner.token), 401);
-
-  // rotation is replacement, not delegation: the new token is not a cascade
-  // target of revoking the old one
-  assert.equal(await meStatus(app, newToken), 200);
-});
-
-test('F04: rotating a retired (grace-window) credential is denied; a dead one 401s', async () => {
-  const { app, owner } = await setupRoles();
-  const rot = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(rot.status, 200);
-
-  // the old token is retired (carries a future revoked_at) — rotating with it
-  // again is denied
-  const again = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(again.status, 403);
-  assert.equal(again.body.error.code, 'forbidden');
-
-  // once fully revoked, the choke point rejects it with 401 before rotation
-  const rev = await app.call('POST', '/v1/auth/revoke', {
-    token: rot.body.token as string,
-    body: { token_id: owner.tokenId },
-  });
-  assert.equal(rev.status, 200);
-  const dead = await app.call('POST', '/v1/auth/rotate', { token: owner.token, body: {} });
-  assert.equal(dead.status, 401);
-});
-
 test('F05: concurrent redeem of one code mints exactly one token', async () => {
   const { app, owner } = await setupRoles();
   const mint = await app.call('POST', '/v1/provisioning-codes', {
@@ -361,4 +314,63 @@ test('F17: revoking a token revokes the full transitive descendant closure', asy
   assert.equal(await meStatus(app, owner.token), 401);
   assert.equal(await meStatus(app, bToken), 401);
   assert.equal(await meStatus(app, cToken), 401);
+});
+
+test('N01: transfer commit revokes every credential of the removed owner atomically', async () => {
+  const { app, famId, owner, parent } = await setupRoles();
+
+  // The owner holds TWO agent tokens (two agents, e.g. phone + server).
+  const mint2 = await app.call('POST', '/v1/provisioning-codes', {
+    token: owner.token,
+    body: { member_id: owner.memberId, agent_label: 'owner-second-agent' },
+  });
+  assert.equal(mint2.status, 201);
+  const red2 = await app.call(
+    'POST',
+    `/v1/provisioning-codes/${encodeURIComponent(mint2.body.provisioning_code)}/redeem`,
+    { body: {} },
+  );
+  assert.equal(red2.status, 201);
+  const ownerToken2 = red2.body.token as string;
+  assert.equal(await meStatus(app, ownerToken2), 200, 'second owner agent works pre-transfer');
+
+  // Offer ownership to the parent; the recipient accepts (on_complete=remove).
+  const offer = await app.call('POST', `/v1/families/${famId}/transfer`, {
+    token: owner.token,
+    body: { to_member_id: parent.memberId },
+  });
+  assert.equal(offer.status, 201);
+  const acc = await app.call('POST', `/v1/families/${famId}/transfer/accept`, {
+    token: parent.token,
+  });
+  assert.equal(acc.status, 200);
+
+  // Atomicity: exactly one owner (the recipient), never zero, never two.
+  const owners = await app.db.queryAll(
+    `SELECT id FROM members WHERE family_id = ? AND role = 'owner'`,
+    [famId],
+  );
+  assert.equal(owners.length, 1);
+  assert.equal(owners[0]['id'], parent.memberId);
+
+  // EVERY credential of the removed owner is dead — both agents, same commit.
+  assert.equal(await meStatus(app, owner.token), 401, 'first owner token revoked at transfer commit');
+  assert.equal(await meStatus(app, ownerToken2), 401, 'second owner token revoked at transfer commit');
+  const rows = await app.db.queryAll(
+    `SELECT revoked_at FROM agent_tokens WHERE member_id = ?`,
+    [owner.memberId],
+  );
+  assert.ok(rows.length >= 2);
+  assert.ok(rows.every((r) => r['revoked_at']), 'all owner tokens carry revoked_at');
+
+  // The recipient's pre-existing credential keeps working and now carries
+  // owner powers (can mint for others).
+  assert.equal(await meStatus(app, parent.token), 200, 'recipient token survives the commit');
+  const me = await app.call('GET', '/v1/me', { token: parent.token });
+  assert.equal(me.body.role, 'owner');
+  const mint = await app.call('POST', '/v1/provisioning-codes', {
+    token: parent.token,
+    body: { member_id: parent.memberId, agent_label: 'post-transfer-agent' },
+  });
+  assert.equal(mint.status, 201, 'new owner can mint');
 });

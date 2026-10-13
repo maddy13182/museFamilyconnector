@@ -11,7 +11,6 @@ import {
   Row,
   HttpError,
   AuthContext,
-  TASK_STATUSES,
   MEMBER_ROLES,
   TRANSFER_COMPLETION_MODES,
   FAMILY_KINDS,
@@ -45,6 +44,7 @@ import {
   reqKeyId,
   reqEnvelopeB64,
   isE2eeWireBody,
+  parseFh1Header,
 } from './validate.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
@@ -418,28 +418,96 @@ function piiGuardJson(value: unknown): void {
   }
 }
 
-const PII_REDACTED_LEAF = '[redacted]';
+// ---------------------------------------------------------------------------
+// Sync v2 — N05 field-level E2EE enforcement + write-time key checks.
+// ---------------------------------------------------------------------------
 
-/**
- * Structure-preserving PII scrub of a JSON value (F08): string leaves that
- * scanPii flags are replaced with a marker; everything else (including
- * linkage fields like task_id) is untouched.
- */
-function redactPiiLeaves<T>(value: T): T {
-  if (typeof value === 'string') {
-    return (scanPii(value) ? PII_REDACTED_LEAF : value) as T;
+/** True when the topic is E2EE. Small lookup for paths that reach the topic
+ *  through a task id (getTaskInScope returns the task, not the topic). */
+async function topicE2ee(db: DbClient, topicId: string): Promise<boolean> {
+  const t = await db.queryOne(`SELECT e2ee FROM topics WHERE id = ?`, [topicId]);
+  return (t?.['e2ee'] as number) === 1;
+}
+
+// POST /entries content kinds. Everything except 'message' is a protocol /
+// system kind: plaintext by design, readable by agents that do not (yet)
+// hold the topic key (key rotation notices, key requests, pending-key
+// notices, archive announcements). Spec §1.5 exempts the protocol kind
+// `key-request` from the fh1 requirement; the server's wire enum spells it
+// `key_request`, and the same plaintext-by-design rationale covers the other
+// three system kinds — the CLI posts all four via its plaintext
+// system-entry path, and encrypting them would break rotation/add flows.
+// N05 content checks and the epoch/rotation write gates below therefore
+// apply only to kind 'message'.
+function isProtocolKind(kind: string): boolean {
+  return kind !== 'message';
+}
+
+// N05: a content field on an E2EE topic must be a well-formed fh1 wire
+// body. Violation -> 400 plaintext_in_e2ee_topic. Never logs the value.
+function requireE2eeContent(value: unknown, field: string): void {  if (!isE2eeWireBody(value)) {
+    logEvent('warn', 'plaintext_in_e2ee_topic', { field });
+    throw new HttpError(
+      400,
+      'plaintext_in_e2ee_topic',
+      `${field} must be E2EE ciphertext (fh1) in an E2EE topic`,
+    );
   }
-  if (Array.isArray(value)) {
-    return value.map(redactPiiLeaves) as T;
+}
+
+// N05: entry `data` (a JSON string) on an E2EE topic. The sealed payload is
+// carried as a JSON string holding the fh1 wire body — structured plaintext
+// linkage data is not permitted on E2EE content writes. Absent/null data is
+// fine.
+function requireE2eeData(data: string | null, field: string): void {
+  if (data === null) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    parsed = undefined;
   }
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(value)) {
-      out[k] = redactPiiLeaves((value as Record<string, unknown>)[k]);
-    }
-    return out as T;
+  if (typeof parsed !== 'string' || !isE2eeWireBody(parsed)) {
+    logEvent('warn', 'plaintext_in_e2ee_topic', { field });
+    throw new HttpError(
+      400,
+      'plaintext_in_e2ee_topic',
+      `${field} must be E2EE ciphertext (fh1) in an E2EE topic`,
+    );
   }
-  return value;
+}
+
+// Write-time key checks (spec §1.5): server-side gates on encrypted content
+// writes to E2EE topics, independent of client version. keyId is parsed
+// from the fh1 body header. Order is deliberate: epoch liveness first
+// (genesis not yet committed), then key freshness (stale client keystore),
+// then the rotation pause (removal / from-join rekey pending).
+function checkE2eeWriteKey(topic: Row, keyId: string): void {
+  const epoch = topic['current_epoch'] as number;
+  if (epoch < 1) {
+    logEvent('warn', 'key_not_active', { reason: 'epoch_0' });
+    throw new HttpError(
+      409,
+      'key_not_active',
+      'E2EE topic has no active key yet — writes blocked until the first key is committed',
+    );
+  }
+  if (keyId !== (topic['current_key_id'] as string | null)) {
+    logEvent('warn', 'stale_key', { reason: 'key_id_mismatch' });
+    throw new HttpError(
+      409,
+      'stale_key',
+      'Entry was encrypted to a superseded topic key — fetch the current key and retry',
+    );
+  }
+  if ((topic['rotation_required'] as number) === 1) {
+    logEvent('warn', 'rotation_required', { reason: 'rekey_pending' });
+    throw new HttpError(
+      409,
+      'rotation_required',
+      'A membership change requires a fresh key — encrypted writes pause until the owner commits a rotation',
+    );
+  }
 }
 
 function parseDataField(row: Row): unknown {
@@ -658,11 +726,13 @@ function entryInsertOp(args: {
   replyToSeq?: number | null;
   pin?: string;
   pinParams?: (string | number | null)[];
+  // R1: msg_id extracted from the fh1 body at POST time (NULL otherwise).
+  msgId?: string | null;
 }): BatchOp {
   const pin = args.pin ? ` HAVING ${args.pin}` : '';
   return {
-    sql: `INSERT INTO entries(topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body, data, reply_to_seq)
-          SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+    sql: `INSERT INTO entries(topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body, data, reply_to_seq, msg_id)
+          SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?
             FROM entries WHERE topic_id = ?${pin}`,
     params: [
       args.topicId,
@@ -674,6 +744,7 @@ function entryInsertOp(args: {
       args.body,
       args.data,
       args.replyToSeq ?? null,
+      args.msgId ?? null,
       args.topicId,
       ...(args.pinParams ?? []),
     ],
@@ -821,6 +892,119 @@ function gateClientVersion(req: Request, env: Env): void {
  */
 async function keyFingerprint(publicKey: string): Promise<string> {
   return 'fp:' + (await sha256hex(publicKey)).slice(0, 16);
+}
+
+// ---------------------------------------------------------------------------
+// Sync v2 read receipts (spec §1.4).
+//
+// GET /v1/topics/:tid/history issues a receipt binding
+// (member_id, agent_label, topic_id, from_seq, through_seq); POST
+// /v1/topics/:tid/ack must present a receipt whose HMAC verifies before the
+// ack advances. Receipts are stateless (server restart loses nothing): the
+// HMAC is the whole credential.
+//
+// Wire format: `fhrr1.<from_seq>.<through_seq>.<hmac_hex64>` where the HMAC
+// is HMAC-SHA256(READ_RECEIPT_SECRET, canonical) and canonical is a
+// pipe-joined, version-tagged payload. The member/agent/topic binding lives
+// INSIDE the HMAC, so a receipt minted for one agent cannot be replayed by
+// another (cross-agent replay fails verification).
+//
+// The secret is read from env (READ_RECEIPT_SECRET) and never logged. When
+// unset the server fails closed with 500 misconfigured — receipts are
+// never silently disabled.
+// ---------------------------------------------------------------------------
+
+const RECEIPT_PREFIX = 'fhrr1';
+
+function receiptCanonical(
+  memberId: string,
+  agentLabel: string,
+  topicId: string,
+  fromSeq: number,
+  throughSeq: number,
+): string {
+  return ['fh-read-receipt', 'v1', memberId, agentLabel, topicId, String(fromSeq), String(throughSeq)].join(
+    '|',
+  );
+}
+
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** Constant-time hex comparison (no early exit on first mismatch). */
+function constantTimeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function readReceiptSecret(env: Env): string {
+  const s = env.READ_RECEIPT_SECRET;
+  if (!s) {
+    throw new HttpError(
+      500,
+      'misconfigured',
+      'READ_RECEIPT_SECRET is not set — read receipts cannot be issued or verified',
+    );
+  }
+  return s;
+}
+
+async function issueReadReceipt(
+  env: Env,
+  memberId: string,
+  agentLabel: string,
+  topicId: string,
+  fromSeq: number,
+  throughSeq: number,
+): Promise<string> {
+  const mac = await hmacSha256Hex(
+    readReceiptSecret(env),
+    receiptCanonical(memberId, agentLabel, topicId, fromSeq, throughSeq),
+  );
+  return `${RECEIPT_PREFIX}.${fromSeq}.${throughSeq}.${mac}`;
+}
+
+const RECEIPT_MAC_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Verify a receipt binds THIS (member_id, agent_label, topic_id).
+ * Returns the bound (from_seq, through_seq). 403 invalid_read_receipt on
+ * any malformation or HMAC mismatch (forgery / cross-agent replay).
+ */
+async function verifyReadReceipt(
+  env: Env,
+  receipt: string,
+  memberId: string,
+  agentLabel: string,
+  topicId: string,
+): Promise<{ from_seq: number; through_seq: number }> {
+  const bad = (): HttpError =>
+    new HttpError(403, 'invalid_read_receipt', 'read_receipt failed verification');
+  const parts = receipt.split('.');
+  if (parts.length !== 4 || parts[0] !== RECEIPT_PREFIX) throw bad();
+  const fromSeq = /^\d+$/.test(parts[1]) ? Number(parts[1]) : NaN;
+  const throughSeq = /^\d+$/.test(parts[2]) ? Number(parts[2]) : NaN;
+  if (!Number.isSafeInteger(fromSeq) || !Number.isSafeInteger(throughSeq)) throw bad();
+  if (!RECEIPT_MAC_RE.test(parts[3])) throw bad();
+  const expected = await hmacSha256Hex(
+    readReceiptSecret(env),
+    receiptCanonical(memberId, agentLabel, topicId, fromSeq, throughSeq),
+  );
+  if (!constantTimeEqualHex(parts[3], expected)) throw bad();
+  return { from_seq: fromSeq, through_seq: throughSeq };
 }
 
 // ---------------------------------------------------------------------------
@@ -2412,25 +2596,32 @@ async function handleAgentKeyRotate(
   });
 }
 
-// E2EE (Phase 2) — POST /v1/topics/:tid/envelopes {member_id, agent_label,
-// key_id, envelope} — store one sealed topic-key envelope for a recipient
-// agent. The envelope blob is opaque to the server: format-validated
-// (base64) and stored, never inspected.
+// E2EE (sync v2, spec §1.5) — POST /v1/topics/:tid/envelopes
+// {member_id, agent_label, key_id, envelope} — STAGED distribution. The
+// envelope blob is opaque to the server: format-validated (base64) and
+// stored, never inspected.
+//
+// N04 fix: non-current key_id envelopes are STORED, never flipped. The old
+// behavior ("first POST with a new key_id flips topics.current_key_id")
+// let a bare envelope POST elect the encryption key with no completeness
+// check; now only POST /v1/topics/:tid/keys/commit advances the epoch and
+// flips current_key_id.
 //
 // Access control (defense in depth; crypto is per-agent but the blob store
 // still gates on membership):
 //   - caller must be a current participant of the topic (403 otherwise;
 //     404 when the topic doesn't exist in the caller's family);
+//   - a key_id different from the topic's current_key_id INTRODUCES a key
+//     (rotation/genesis staging) and is allowed only for owner/parent
+//     callers (403 otherwise); the key_id is stored as staged — the commit
+//     decides whether it activates;
 //   - the target (member_id, agent_label) must be a current participant
 //     AND hold an ACTIVE (non-superseded) registered public key (400
-//     otherwise — sealing to an agent with no key on file is meaningless);
-//   - KEY ELECTION (secfix F1): topics.current_key_id is the single source
-//     of truth for "the current key". POSTing an envelope whose key_id
-//     differs from current_key_id INTRODUCES a new key (rotation) and is
-//     allowed only for owner/parent callers (403 otherwise); on success
-//     current_key_id advances to the new key_id in the same atomic batch.
-//     This stops a participant from downgrading victims to a removed
-//     member's key or hijacking encryption to an attacker key.
+//     otherwise — sealing to an agent with no key on file is meaningless).
+// The server records the target's ACTIVE identity-key id at POST time
+// (topic_key_envelopes.identity_key_id) so keys/commit can reject envelopes
+// sealed to superseded keys. On re-POST the recorded id refreshes to the
+// key active at the latest POST (the blob was presumably re-sealed).
 // Re-POSTing the same (topic_id, member_id, agent_label, key_id) replaces
 // the stored envelope — idempotent distribution — and PRESERVES the
 // original created_at (secfix F3): re-POSTing must not forge recency.
@@ -2446,21 +2637,17 @@ async function handlePostEnvelope(
   const targetAgentLabel = reqString(body['agent_label'], 'agent_label', 1, 80);
   const keyId = reqKeyId(body['key_id'], 'key_id');
   const envelope = reqEnvelopeB64(body['envelope'], 'envelope');
-  // F1: a key_id different from the topic's current_key_id is a rotation —
-  // owner/parent privilege. (current_key_id is NULL only for topics created
-  // before this column existed; the same gate bootstraps those.)
+  // Introducing a key_id (one the topic has not committed) is an
+  // owner/parent privilege — a participant must not stage keys for victims.
+  // Staging stores the envelope; it NEVER flips topics.current_key_id (N04).
   const currentKeyId = topic['current_key_id'] as string | null;
-  let rotates = false;
-  if (keyId !== currentKeyId) {
-    if (auth.role !== 'owner' && auth.role !== 'parent') {
-      throw new HttpError(
-        403,
-        'forbidden',
-        'Only an owner or parent may introduce a new topic key (rotation). ' +
-          'Ask an owner/parent to run `hub topic-rekey`.',
-      );
-    }
-    rotates = true;
+  if (keyId !== currentKeyId && auth.role !== 'owner' && auth.role !== 'parent') {
+    throw new HttpError(
+      403,
+      'forbidden',
+      'Only an owner or parent may introduce a new topic key. ' +
+        'Ask an owner/parent to run `hub topic-rekey`.',
+    );
   }
   const targetPart = await db.queryOne(
     `SELECT member_id FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
@@ -2470,7 +2657,7 @@ async function handlePostEnvelope(
     throw new HttpError(400, 'bad_request', 'envelope target must be a current participant of this topic');
   }
   const targetKey = await db.queryOne(
-    `SELECT 1 FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+    `SELECT id FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
     [targetMemberId, targetAgentLabel],
   );
   if (!targetKey) {
@@ -2481,29 +2668,29 @@ async function handlePostEnvelope(
     );
   }
   const ts = nowIso();
-  const ops: { sql: string; params: (string | number | null)[] }[] = [
+  await db.execAtomically([
     {
-      // F3: ON CONFLICT updates only the envelope blob — created_at keeps
-      // its original value, so a re-POST cannot forge recency.
-      sql: `INSERT INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at)
-            VALUES (?,?,?,?,?,?)
+      // F3: ON CONFLICT updates only the envelope blob (and the
+      // server-observed identity_key_id) — created_at keeps its original
+      // value, so a re-POST cannot forge recency.
+      sql: `INSERT INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at, identity_key_id)
+            VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(topic_id, member_id, agent_label, key_id)
-            DO UPDATE SET envelope = excluded.envelope`,
-      params: [tid, targetMemberId, targetAgentLabel, keyId, envelope, ts],
+            DO UPDATE SET envelope = excluded.envelope, identity_key_id = excluded.identity_key_id`,
+      params: [tid, targetMemberId, targetAgentLabel, keyId, envelope, ts, targetKey['id'] as string],
     },
-  ];
-  if (rotates) {
-    ops.push({
-      sql: `UPDATE topics SET current_key_id = ? WHERE id = ?`,
-      params: [keyId, tid],
-    });
-  }
-  await db.execAtomically(ops);
+  ]);
   const row = await db.queryOne(
     `SELECT created_at FROM topic_key_envelopes
       WHERE topic_id = ? AND member_id = ? AND agent_label = ? AND key_id = ?`,
     [tid, targetMemberId, targetAgentLabel, keyId],
   );
+  logEvent('info', 'envelope_staged', {
+    endpoint: 'envelopes',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+  });
   return json(
     {
       topic_id: tid,
@@ -2516,11 +2703,16 @@ async function handlePostEnvelope(
   );
 }
 
-// E2EE (Phase 2) — GET /v1/topics/:tid/envelopes — return ONLY the caller's
-// own envelopes: rows are matched on the caller's (member_id, agent_label)
-// taken from the Bearer <redacted> never from caller-supplied input. One agent
-// can never fetch another agent's envelopes. 403 when the caller is not a
-// participant (404 when the topic doesn't exist in the caller's family).
+// E2EE (sync v2, spec §1.5) — GET /v1/topics/:tid/envelopes — return ONLY
+// the caller's own envelopes for COMMITTED epochs: rows are matched on the
+// caller's (member_id, agent_label) taken from the Bearer <redacted> never
+// from caller-supplied input, and joined against the topic's epoch log, so
+// staged (uncommitted) keys stay invisible until keys/commit activates
+// them — an uncommitted key must never be treated as usable. Each envelope
+// carries its epoch's `commitment` (hex SHA256 of the topic key, NULL for
+// grandfathered pre-migration epochs) so the CLI can verify-on-open (N07).
+// 403 when the caller is not a participant (404 when the topic doesn't
+// exist in the caller's family).
 async function handleGetEnvelopes(
   db: DbClient,
   auth: AuthContext,
@@ -2528,50 +2720,23 @@ async function handleGetEnvelopes(
 ): Promise<Response> {
   await requireParticipant(db, auth, tid);
   const rows = await db.queryAll(
-    `SELECT topic_id, member_id, agent_label, key_id, envelope, created_at
-       FROM topic_key_envelopes
-      WHERE topic_id = ? AND member_id = ? AND agent_label = ?
-      ORDER BY created_at ASC`,
+    `SELECT e.topic_id, e.member_id, e.agent_label, e.key_id, e.envelope,
+            e.created_at, k.epoch, k.commitment
+       FROM topic_key_envelopes e
+       JOIN topic_key_epochs k
+         ON k.topic_id = e.topic_id AND k.key_id = e.key_id
+      WHERE e.topic_id = ? AND e.member_id = ? AND e.agent_label = ?
+      ORDER BY k.epoch ASC, e.created_at ASC`,
     [tid, auth.member_id, auth.agent_label],
   );
+  logEvent('info', 'envelopes_listed', {
+    endpoint: 'envelopes',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    count: rows.length,
+  });
   return json({ envelopes: rows });
-}
-
-// POST /v1/auth/rotate — new token; old valid 24h grace.
-async function handleRotate(
-  db: DbClient,
-  env: Env,
-  req: Request,
-  auth: AuthContext,
-): Promise<Response> {
-  const raw = req.headers.get('authorization')!.slice('Bearer '.length).trim();
-  const oldHash = await credentialHash(env.TOKEN_PEPPER, raw);
-  // F04: a retired credential cannot be rotated again. A fully-revoked token
-  // never reaches here (the auth choke point rejects it with 401); this
-  // covers a token already carrying revoked_at, e.g. inside its
-  // rotation-grace window. Rotate the current token instead.
-  const old = await db.queryOne(`SELECT revoked_at FROM agent_tokens WHERE token_hash = ?`, [oldHash]);
-  if (!old) throw new HttpError(401, 'unauthorized', 'Unknown token');
-  if (old['revoked_at']) {
-    throw new HttpError(403, 'forbidden', 'Token is retired; rotate using the current token instead');
-  }
-  const token = newAgentToken();
-  const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
-  const tokenId = newId();
-  const ts = nowIso();
-  const graceUntil = hoursFromNow(24);
-  await db.execAtomically([
-    { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_hash = ?`, params: [graceUntil, oldHash] },
-    {
-      // issued_by_token_id stays NULL: rotation replaces a credential rather
-      // than delegating authority, so the new token is deliberately NOT a
-      // cascade target when the old token is revoked (F17).
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
-            VALUES (?,?,?, ?,?,NULL,NULL,NULL)`,
-      params: [tokenHash, tokenId, auth.member_id, auth.agent_label, ts],
-    },
-  ]);
-  return json({ token, token_id: tokenId, grace_until: graceUntil });
 }
 
 // POST /v1/auth/revoke {token_id} — self-revoke always; owner/parent for
@@ -2871,9 +3036,25 @@ async function handlePatchTopicSubject(
   return json({ topic: updated });
 }
 
-// GET /v1/topics/:tid/history?after_seq=&limit=
+// GET /v1/topics/:tid/history?after_seq=&limit=&context=
+//
+// Sync v2 (spec §1.4): `context` (default 10, max 50) prepends up to that
+// many entries immediately BEFORE `after_seq` (bounded below by the
+// caller's history_from_seq), each flagged `is_context: true` — they are
+// re-reads for orientation, not new reads. The page entries carry
+// `is_context: false`.
+//
+// Every response includes `read_through_seq` (the highest newly-read seq
+// in this page — context rows excluded; max(after, floor-1) when the page
+// is empty) and a `read_receipt` HMAC binding
+// (member_id, agent_label, topic_id, from_seq, through_seq), where
+// from_seq = max(after, history_from_seq - 1) + 1 is the REQUESTED
+// boundary (so gaps can't deadlock acks) and through_seq =
+// read_through_seq (only what this page actually showed). POST
+// /v1/topics/:tid/ack verifies the receipt before advancing read state.
 async function handleHistory(
   db: DbClient,
+  env: Env,
   req: Request,
   auth: AuthContext,
   tid: string,
@@ -2882,41 +3063,50 @@ async function handleHistory(
   const url = new URL(req.url);
   const after = parseSeqCursor(url.searchParams.get('after_seq'));
   const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
+  const context = parseLimit(url.searchParams.get('context'), 10, 50);
   const rows = await db.queryAll(
     `SELECT * FROM entries
       WHERE topic_id = ? AND seq > ? AND seq >= ?
       ORDER BY seq ASC LIMIT ?`,
     [tid, after, history_from_seq, limit],
   );
+  const ctxRows = await db.queryAll(
+    `SELECT * FROM entries
+      WHERE topic_id = ? AND seq <= ? AND seq >= ?
+      ORDER BY seq DESC LIMIT ?`,
+    [tid, after, history_from_seq, context],
+  );
+  ctxRows.reverse();
+  const entries = [
+    ...ctxRows.map((r) => ({ ...publicEntry(r), is_context: true })),
+    ...rows.map((r) => ({ ...publicEntry(r), is_context: false })),
+  ];
   const maxRow = await db.queryOne(`SELECT MAX(seq) AS m FROM entries WHERE topic_id = ?`, [tid]);
-  return json({ entries: rows.map(publicEntry), max_seq: (maxRow?.['m'] as number | null) ?? 0 });
-}
-
-// GET /v1/topics/:tid/export — full topic JSON for offline copy / migration.
-async function handleExport(db: DbClient, auth: AuthContext, tid: string): Promise<Response> {
-  const { topic, history_from_seq } = await requireParticipant(db, auth, tid);
-  const parts = await db.queryAll(
-    `SELECT p.member_id, p.joined_at, p.history_from_seq, m.name, m.role
-       FROM topic_participants p JOIN members m ON m.id = p.member_id
-      WHERE p.topic_id = ?`,
-    [tid],
+  const fromSeq = Math.max(after, history_from_seq - 1) + 1;
+  const readThroughSeq =
+    rows.length > 0 ? (rows[rows.length - 1]['seq'] as number) : fromSeq - 1;
+  const readReceipt = await issueReadReceipt(
+    env,
+    auth.member_id,
+    auth.agent_label,
+    tid,
+    fromSeq,
+    readThroughSeq,
   );
-  const entries = await db.queryAll(
-    `SELECT * FROM entries WHERE topic_id = ? AND seq >= ? ORDER BY seq ASC`,
-    [tid, history_from_seq],
-  );
-  // F06: tasks are filtered by the caller's history floor — same rule as entry
-  // reads. A from_join member must not see tasks created before they joined.
-  const tasks = await db.queryAll(
-    `SELECT * FROM tasks WHERE topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER} ORDER BY created_at ASC`,
-    [tid, auth.member_id],
-  );
+  logEvent('info', 'topic_history', {
+    endpoint: 'history',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    returned: rows.length,
+    context: ctxRows.length,
+    read_through_seq: readThroughSeq,
+  });
   return json({
-    topic,
-    participants: parts,
-    entries: entries.map(publicEntry),
-    tasks: tasks.map(publicTask),
-    exported_at: nowIso(),
+    entries,
+    max_seq: (maxRow?.['m'] as number | null) ?? 0,
+    read_through_seq: readThroughSeq,
+    read_receipt: readReceipt,
   });
 }
 
@@ -2961,6 +3151,19 @@ async function handleTopicInvite(
                                ELSE COALESCE((SELECT MAX(seq) FROM entries WHERE topic_id = ?), 0) + 1 END`,
     params: [tid, mid, ts, fullFloor, tid] as (string | number | null)[],
   }));
+  // Sync v2: a from_join member must never receive the current epoch key
+  // (it would decrypt pre-join content), so on E2EE topics the accept sets
+  // rotation_required = 1 in the SAME transaction. They stay key-pending
+  // until the owner rekeys, then receive only the new epoch key. The CLI
+  // seals envelopes (the server never does) — the flag + write gate is the
+  // server's whole interface here.
+  if (historyFrom === 'from_join' && added.length > 0 && (topic['e2ee'] as number) === 1) {
+    ops.push({
+      sql: `UPDATE topics SET rotation_required = 1 WHERE id = ?`,
+      params: [tid] as (string | number | null)[],
+    });
+    logEvent('info', 'rotation_required_set', { reason: 'from_join_accept' });
+  }
   await db.execAtomically(ops);
   for (const mid of added) {
     const m = members.find((x) => x['id'] === mid)!;
@@ -2993,7 +3196,7 @@ async function handleRemoveParticipant(
   tid: string,
   mid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   if (auth.role !== 'owner' && auth.role !== 'parent') {
     throw new HttpError(403, 'forbidden', 'Only owner/parent can remove members from a topic');
   }
@@ -3013,12 +3216,25 @@ async function handleRemoveParticipant(
   if (((count?.['c'] as number) ?? 0) <= 1) {
     throw new HttpError(400, 'bad_request', 'Cannot remove the last participant of a topic');
   }
+  // Sync v2: on E2EE topics, member removal gates future encrypted writes —
+  // the removed member must not read anything written after their removal.
+  // The flag is set in the SAME transaction as the removal and is cleared
+  // by a successful keys/commit (Server-A). The CLI seals the new epoch's
+  // envelopes (the server never seals); the write gate in handlePostEntry
+  // reads this flag.
+  const removalE2ee = (topic['e2ee'] as number) === 1;
   await db.execAtomically([
     {
       sql: `DELETE FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
       params: [tid, mid],
     },
+    ...(removalE2ee
+      ? [{ sql: `UPDATE topics SET rotation_required = 1 WHERE id = ?`, params: [tid] as (string | number | null)[] }]
+      : []),
   ]);
+  if (removalE2ee) {
+    logEvent('info', 'rotation_required_set', { reason: 'member_removed' });
+  }
   const selfLeave = auth.member_id === mid;
   await appendEntry(db, {
     topic_id: tid,
@@ -3048,7 +3264,14 @@ async function handleSpawn(
     ? 'placeholder'
     : reqEnum(body['link_visibility'], 'link_visibility', ['placeholder', 'hidden'] as const);
   let ids = reqIdArray(body['participant_member_ids'], 'participant_member_ids', 20);
-  piiGuard(briefing);
+  // N05: the briefing is copied into the child topic as content — when the
+  // parent is E2EE it must arrive sealed. Well-formed fh1 is opaque, so it
+  // skips the PII scan (the CLI scans plaintext before encrypting).
+  if ((parent['e2ee'] as number) === 1) {
+    requireE2eeContent(briefing, 'briefing');
+  } else {
+    piiGuard(briefing);
+  }
   await requireFamilyMembers(db, auth, ids);
   if (!ids.includes(auth.member_id)) ids = [...ids, auth.member_id];
 
@@ -3092,7 +3315,7 @@ async function handlePostEntry(
   auth: AuthContext,
   tid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   const body = await readJson(req);
   // E2EE Phase 4 system kinds: plaintext by design, posted only by current
   // participants (requireParticipant above). key_rotated announces a topic
@@ -3113,6 +3336,14 @@ async function handlePostEntry(
       ] as const);
   const text = reqString(body['body'], 'body', 1, MAX_BODY);
   const data = reqJsonData(body['data'], 'data', MAX_DATA);
+  const e2ee = (topic['e2ee'] as number) === 1;
+  const protocol = isProtocolKind(kind);
+  // N05: on E2EE topics, content writes must be sealed. Protocol kinds skip
+  // the fh1 requirement (plaintext by design).
+  if (e2ee && !protocol) {
+    requireE2eeContent(text, 'body');
+    requireE2eeData(data, 'data');
+  }
   const replyTo = body['reply_to_seq'] === undefined || body['reply_to_seq'] === null
     ? null
     : (() => {
@@ -3129,7 +3360,34 @@ async function handlePostEntry(
   // encrypting. Malformed fh1-looking bodies are still scanned.
   if (!isE2eeWireBody(text)) piiGuard(text);
   // F08: entry data (JSON) is scanned too — string leaves, recursively.
-  if (data) piiGuardJson(JSON.parse(data));
+  // Sealed data (a JSON string holding an fh1 wire body) is opaque like a
+  // ciphertext body and skips the scan under the same rule.
+  if (data) {
+    const parsedData = JSON.parse(data);
+    if (!(typeof parsedData === 'string' && isE2eeWireBody(parsedData))) {
+      piiGuardJson(parsedData);
+    }
+  }
+
+  // R1: extract msg_id from fh1 bodies at POST time. Plaintext bodies have
+  // no msg_id. The unique index turns a replayed ciphertext into either an
+  // idempotent success (same body) or 409 msg_id_conflict (same id, new
+  // body).
+  const fh1 = parseFh1Header(text);
+  const msgId = fh1 ? fh1.msgId : null;
+  if (msgId !== null) {
+    const dup = await db.queryOne(
+      `SELECT * FROM entries WHERE topic_id = ? AND msg_id = ?`,
+      [tid, msgId],
+    );
+    if (dup) return resolveMsgIdConflict(dup, text);
+  }
+  // Write-time key checks (spec §1.5): server-side, independent of client
+  // version. Apply to encrypted content writes on E2EE topics — protocol
+  // kinds are plaintext by design and skip these gates too.
+  if (e2ee && !protocol && fh1) {
+    checkE2eeWriteKey(topic, fh1.keyId);
+  }
 
   const idemKey = req.headers.get('idempotency-key');
   if (idemKey !== null) {
@@ -3153,7 +3411,7 @@ async function handlePostEntry(
   // retry key (or a key pointing at nothing).
   const ts = nowIso();
   const ops: BatchOp[] = [
-    entryInsertOp({ topicId: tid, kind, body: text, auth, data, ts, replyToSeq: replyTo }),
+    entryInsertOp({ topicId: tid, kind, body: text, auth, data, ts, replyToSeq: replyTo, msgId }),
   ];
   if (idemKey !== null) {
     ops.push({
@@ -3168,7 +3426,21 @@ async function handlePostEntry(
       params: [auth.token_id, idemKey, ts, hoursFromNow(IDEM_TTL_HOURS), tid, ts],
     });
   }
-  await execBatchWithRetry(db, () => ops);
+  try {
+    await execBatchWithRetry(db, () => ops);
+  } catch (e) {
+    // R1 race window: a concurrent POST committed the same msg_id between
+    // our pre-check and this insert. Resolve against the conflicting row
+    // rather than surfacing a 500.
+    if (msgId !== null && isUniqueViolation(e)) {
+      const dup = await db.queryOne(
+        `SELECT * FROM entries WHERE topic_id = ? AND msg_id = ?`,
+        [tid, msgId],
+      );
+      if (dup) return resolveMsgIdConflict(dup, text);
+    }
+    throw e;
+  }
   // ts is generated per request, so (topic_id, ts) identifies the new row.
   const entry = await db.queryOne(
     `SELECT * FROM entries WHERE topic_id = ? AND ts = ? ORDER BY seq DESC LIMIT 1`,
@@ -3178,34 +3450,659 @@ async function handlePostEntry(
   return json({ entry: publicEntry(entry) }, 201);
 }
 
-// GET /v1/sync?after_gseq=&limit= — one call per poll, all visible topics.
-//
-// Pagination is page-based, never head-based: fetch limit+1 rows; when the
-// extra row is present there is more backlog to drain (has_more=true) and
-// only the first `limit` rows are returned. next_after_gseq is always the
-// last RETURNED entry's gseq — or the input cursor when the page is empty —
-// so a client paging through an arbitrarily deep backlog can never skip
-// entries (the old MAX-based cursor jumped past undelivered rows). No second
-// query: one SELECT per sync poll.
-async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promise<Response> {
-  const url = new URL(req.url);
-  const after = parseSeqCursor(url.searchParams.get('after_gseq'));
-  const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
-  const rows = await db.queryAll(
-    `SELECT e.* FROM entries e
-       JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
-      WHERE e.gseq > ? AND e.seq >= p.history_from_seq
-      ORDER BY e.gseq ASC LIMIT ?`,
-    [auth.member_id, after, limit + 1],
+// R1 conflict resolution: a second POST carrying the same (topic_id, msg_id)
+// is a retried write when the stored body is byte-identical — return the
+// existing entry as a successful idempotent retry. A different body under
+// the same msg_id is a genuine conflict -> 409 msg_id_conflict.
+function resolveMsgIdConflict(existing: Row, incomingBody: string): Response {
+  if ((existing['body'] as string) === incomingBody) {
+    logEvent('info', 'msg_id_replay', { outcome: 'idempotent_retry' });
+    return json({ entry: publicEntry(existing), deduped: true });
+  }
+  logEvent('warn', 'msg_id_conflict', { outcome: 'conflict' });
+  throw new HttpError(
+    409,
+    'msg_id_conflict',
+    'An entry with this message id already exists with different content',
   );
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
-  const entries = page.map(publicEntry);
-  const nextAfter = page.length > 0 ? (page[page.length - 1]['gseq'] as number) : after;
-  // max_gseq stays for contract compatibility: the highest gseq in THIS
-  // page (clients MUST prefer next_after_gseq as their poll cursor).
-  const maxGseq = nextAfter;
-  return json({ entries, max_gseq: maxGseq, next_after_gseq: nextAfter, has_more: hasMore });
+}
+
+// ---------------------------------------------------------------------------
+// Sync v2 (spec §1.3, §1.4).
+// ---------------------------------------------------------------------------
+
+/** Opaque page token: base64url(JSON {o: offset}). btoa/atob (not Buffer)
+ *  so this runs in the Worker runtime too; the payload is ASCII-only. */
+function encodePageToken(offset: number): string {
+  return btoa(JSON.stringify({ o: offset }))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function decodePageToken(v: string | null): number {
+  if (v === null || v === undefined || v === '') return 0;
+  try {
+    const b64 = v.replace(/-/g, '+').replace(/_/g, '/');
+    const parsed: unknown = JSON.parse(atob(b64));
+    const o = (parsed as { o?: unknown } | null)?.o;
+    if (typeof o === 'number' && Number.isInteger(o) && o >= 0) return o;
+  } catch {
+    /* fall through to 400 */
+  }
+  throw new HttpError(400, 'bad_request', 'page_token is invalid');
+}
+
+/**
+ * GET /v1/sync/topics — changed-topic discovery, ONE call per circle token
+ * (spec §1.3: the Bearer <redacted> exactly one (member_id, family_id); the
+ * server never crosses family boundaries, so there is no cross-circle sync).
+ *
+ * Changed = the topic has a VISIBLE entry (seq >= the caller's
+ * history_from_seq) with seq > max(acked_seq, history_from_seq - 1), where
+ * a missing read-state row counts as acked_seq 0 (all visible unread).
+ *
+ * Params: `bootstrap_gseq` (first call only), `limit`, `page_token`.
+ * Bootstrap decision (spec-ambiguous, documented): the first call carries
+ * no cursor and is a deliberate full re-read — every visible topic seeds a
+ * read-state row with acked_seq 0 and reports as changed once. `bootstrap_gseq`
+ * is accepted and validated but NOT used for seeding: the CLI deletes legacy
+ * cursor files without reading them, so any value sent would be unreliable;
+ * seeding-from-cursor was rejected in favor of the spec's headline behavior.
+ *
+ * Field decisions (spec-ambiguous, documented):
+ * - `acked_seq` is the EFFECTIVE read position
+ *   max(stored acked_seq, history_from_seq - 1).
+ * - `latest_seq` / `new_count` / `last_activity_ts` / `last_actor` are
+ *   computed over VISIBLE entries only (seq >= history_from_seq).
+ * - `e2ee` is 0/1 (integer), matching the existing topic JSON shape.
+ * - `key_status`: 'not_e2ee' for plaintext topics; for E2EE topics 'ok'
+ *   when the caller's agent holds an envelope for the committed current
+ *   key (current_epoch >= 1), else 'pending' (epoch 0 or no envelope —
+ *   use the key-request flow). rotation_required does not change it: the
+ *   agent still holds its current key; only writes pause.
+ * - `assigned_to_me`: an open/in_progress/blocked task in the topic is
+ *   assigned to the caller AND visible to them (F06 history floor).
+ * Paging is offset-based over (last_activity_ts DESC, topic_id ASC);
+ * changed sets can shift between pages — the CLI dedupes.
+ */
+async function handleSyncTopics(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+): Promise<Response> {
+  const url = new URL(req.url);
+  // Accepted, validated, intentionally not used for seeding (see above).
+  parseSeqCursor(url.searchParams.get('bootstrap_gseq'));
+  const limit = parseLimit(url.searchParams.get('limit'), 50, 200);
+  const offset = decodePageToken(url.searchParams.get('page_token'));
+
+  const rows = await db.queryAll(
+    `SELECT t.id AS topic_id, t.family_id AS circle_id, f.name AS circle_name,
+            t.subject, t.kind, t.e2ee,
+            t.current_epoch, t.current_key_id, t.rotation_required,
+            p.history_from_seq,
+            COALESCE(rs.acked_seq, 0) AS acked_seq,
+            (SELECT MAX(e.seq) FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq) AS latest_seq,
+            (SELECT COUNT(*) FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
+                AND e.seq > MAX(COALESCE(rs.acked_seq, 0), p.history_from_seq - 1)) AS new_count,
+            (SELECT e.ts FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
+              ORDER BY e.seq DESC LIMIT 1) AS last_activity_ts,
+            (SELECT e.actor_member_id FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
+              ORDER BY e.seq DESC LIMIT 1) AS last_actor
+       FROM topics t
+       JOIN topic_participants p ON p.topic_id = t.id AND p.member_id = ?
+       JOIN families f ON f.id = t.family_id
+       LEFT JOIN topic_read_state rs
+         ON rs.topic_id = t.id AND rs.member_id = ? AND rs.agent_label = ?
+      WHERE t.family_id = ?`,
+    [auth.member_id, auth.member_id, auth.agent_label, auth.family_id],
+  );
+
+  const changed = rows.filter((r) => (r['new_count'] as number) > 0);
+  const topicIds = rows.map((r) => r['topic_id'] as string);
+
+  // Seed read-state rows (acked 0) for every visible topic lacking one —
+  // this is the bootstrap full re-read; later joins only add rows.
+  const ts = nowIso();
+  if (topicIds.length > 0) {
+    await db.execAtomically(
+      topicIds.map((topicId) => ({
+        sql: `INSERT INTO topic_read_state(member_id, agent_label, topic_id, acked_seq, updated_at)
+              SELECT ?,?,?,0,?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM topic_read_state
+                  WHERE member_id = ? AND agent_label = ? AND topic_id = ?)`,
+        params: [auth.member_id, auth.agent_label, topicId, ts, auth.member_id, auth.agent_label, topicId],
+      })),
+    );
+  }
+
+  // key_status: caller's agents holding an envelope for the committed
+  // current key.
+  let okTopics = new Set<string>();
+  if (topicIds.length > 0) {
+    const placeholders = topicIds.map(() => '?').join(',');
+    const okRows = await db.queryAll(
+      `SELECT e.topic_id FROM topic_key_envelopes e
+         JOIN topics t ON t.id = e.topic_id
+        WHERE e.member_id = ? AND e.agent_label = ?
+          AND t.current_epoch >= 1 AND e.key_id = t.current_key_id
+          AND e.topic_id IN (${placeholders})`,
+      [auth.member_id, auth.agent_label, ...topicIds],
+    );
+    okTopics = new Set(okRows.map((r) => r['topic_id'] as string));
+  }
+
+  // assigned_to_me: open task assigned to the caller and visible to them.
+  let assignedTopics = new Set<string>();
+  if (topicIds.length > 0) {
+    const placeholders = topicIds.map(() => '?').join(',');
+    const aRows = await db.queryAll(
+      `SELECT DISTINCT topic_id FROM tasks
+        WHERE assignee_member_id = ?
+          AND status NOT IN ('done','cancelled')
+          AND ${TASK_VISIBLE_TO_MEMBER}
+          AND topic_id IN (${placeholders})`,
+      [auth.member_id, auth.member_id, ...topicIds],
+    );
+    assignedTopics = new Set(aRows.map((r) => r['topic_id'] as string));
+  }
+
+  const topics = changed.map((r) => {
+    const e2ee = r['e2ee'] as number;
+    const topicId = r['topic_id'] as string;
+    const keyStatus = e2ee !== 1 ? 'not_e2ee' : okTopics.has(topicId) ? 'ok' : 'pending';
+    const effectiveAcked = Math.max(r['acked_seq'] as number, (r['history_from_seq'] as number) - 1);
+    return {
+      topic_id: topicId,
+      circle_id: r['circle_id'],
+      circle_name: r['circle_name'],
+      subject: r['subject'],
+      kind: r['kind'],
+      e2ee,
+      acked_seq: effectiveAcked,
+      latest_seq: r['latest_seq'],
+      new_count: r['new_count'],
+      last_activity_ts: r['last_activity_ts'],
+      last_actor: r['last_actor'],
+      key_status: keyStatus,
+      assigned_to_me: assignedTopics.has(topicId),
+    };
+  });
+  topics.sort((a, b) => {
+    const ta = (a['last_activity_ts'] as string | null) ?? '';
+    const tb = (b['last_activity_ts'] as string | null) ?? '';
+    if (ta !== tb) return tb < ta ? -1 : 1;
+    return (a['topic_id'] as string) < (b['topic_id'] as string) ? -1 : 1;
+  });
+
+  const page = topics.slice(offset, offset + limit);
+  const hasMore = offset + limit < topics.length;
+  logEvent('info', 'sync_topics', {
+    endpoint: 'sync/topics',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    family_id: auth.family_id,
+    changed: topics.length,
+    returned: page.length,
+    has_more: hasMore,
+  });
+  return json({
+    topics: page,
+    has_more: hasMore,
+    next_page_token: hasMore ? encodePageToken(offset + limit) : null,
+  });
+}
+
+/**
+ * POST /v1/topics/:tid/ack — receipt-bound, contiguous ack (spec §1.4).
+ * Body { seq, read_receipt }, both required.
+ *
+ * 1. HMAC-verify the receipt; it must bind THIS
+ *    (member_id, agent_label, topic_id) — cross-agent replay fails here.
+ * 2. effective = max(acked_seq, history_from_seq - 1).
+ * 3. seq <= effective → no-op success (idempotent).
+ * 4. Else require from_seq <= effective + 1 AND seq <= through_seq,
+ *    else 409 noncontiguous_ack (the client must read+ack pages in order).
+ * 5. Atomic max() upsert of read state.
+ */
+async function handleAck(
+  db: DbClient,
+  env: Env,
+  req: Request,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  const { history_from_seq } = await requireParticipant(db, auth, tid);
+  const body = await readJson(req);
+  const seqRaw = body['seq'];
+  if (typeof seqRaw !== 'number' || !Number.isInteger(seqRaw) || seqRaw < 0) {
+    throw new HttpError(400, 'bad_request', 'seq must be a non-negative integer');
+  }
+  const seq = seqRaw;
+  const receiptRaw = body['read_receipt'];
+  if (typeof receiptRaw !== 'string' || receiptRaw.length === 0 || receiptRaw.length > 512) {
+    throw new HttpError(400, 'bad_request', 'read_receipt is required');
+  }
+  const { from_seq, through_seq } = await verifyReadReceipt(
+    env,
+    receiptRaw,
+    auth.member_id,
+    auth.agent_label,
+    tid,
+  );
+  const state = await db.queryOne(
+    `SELECT acked_seq FROM topic_read_state
+      WHERE member_id = ? AND agent_label = ? AND topic_id = ?`,
+    [auth.member_id, auth.agent_label, tid],
+  );
+  const acked = state ? (state['acked_seq'] as number) : 0;
+  const effective = Math.max(acked, history_from_seq - 1);
+  if (seq <= effective) {
+    logEvent('info', 'topic_ack', {
+      endpoint: 'ack',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      outcome: 'noop',
+      acked_seq: effective,
+    });
+    return json({ topic_id: tid, acked_seq: effective });
+  }
+  if (from_seq > effective + 1 || seq > through_seq) {
+    logEvent('warn', 'topic_ack', {
+      endpoint: 'ack',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      outcome: 'rejected',
+      code: 'noncontiguous_ack',
+    });
+    throw new HttpError(
+      409,
+      'noncontiguous_ack',
+      'Ack is not contiguous with read state: read the topic in order (from_seq must be <= acked+1) and ack only seqs covered by the receipt (seq <= through_seq)',
+    );
+  }
+  // Atomic max(): concurrent acks can never move the cursor backwards.
+  const ts = nowIso();
+  await db.execAtomically([
+    {
+      sql: `INSERT INTO topic_read_state(member_id, agent_label, topic_id, acked_seq, updated_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(member_id, agent_label, topic_id)
+            DO UPDATE SET acked_seq = max(topic_read_state.acked_seq, excluded.acked_seq),
+                          updated_at = excluded.updated_at`,
+      params: [auth.member_id, auth.agent_label, tid, seq, ts],
+    },
+  ]);
+  logEvent('info', 'topic_ack', {
+    endpoint: 'ack',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    outcome: 'advanced',
+    acked_seq: seq,
+  });
+  return json({ topic_id: tid, acked_seq: seq });
+}
+
+/**
+ * Map a keys/commit write-conflict (UNIQUE/PK backstop fired by a
+ * concurrent commit that won the race between our pre-checks and the
+ * atomic batch) to the spec's 409 codes. SQLite/D1 constraint messages
+ * name the offending columns; the mapping is deliberately narrow so an
+ * unexpected constraint still surfaces as stale_epoch (retry-safe).
+ */
+function commitConflictError(e: unknown): HttpError {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/commitment/i.test(msg)) {
+    return new HttpError(
+      409,
+      'key_material_reuse',
+      'Identical key material was committed under a different key_id (concurrent commit won)',
+    );
+  }
+  if (/key_id/i.test(msg)) {
+    return new HttpError(
+      409,
+      'key_reuse',
+      'key_id was already used for this topic (concurrent commit won)',
+    );
+  }
+  return new HttpError(
+    409,
+    'stale_epoch',
+    'A concurrent key commit won the race; re-read the topic and retry',
+  );
+}
+
+function agentPairKey(memberId: string, agentLabel: string): string {
+  return memberId + '\n' + agentLabel;
+}
+
+function splitAgentPairKey(k: string): [string, string] {
+  const i = k.indexOf('\n');
+  return [k.slice(0, i), k.slice(i + 1)];
+}
+
+/**
+ * POST /v1/topics/:tid/keys/commit — staged atomic key activation
+ * (spec §1.4). Handles GENESIS (expected_epoch 1, topic at epoch 0) and
+ * ROTATION (expected_epoch = current_epoch + 1).
+ * Body { expected_epoch, key_id, commitment, force }. Owner/parent only.
+ *
+ * Single transaction: epoch+1 check (409 stale_epoch), key_id unused
+ * (409 key_reuse), commitment 64-hex and unused (409 key_material_reuse),
+ * then the set-equality of STAGED vs CURRENT agents:
+ *   staged = agents with an envelope row for key_id sealed to their
+ *            CURRENTLY-ACTIVE identity key (envelope.identity_key_id must
+ *            match the agent's active agent_keys row);
+ *   current = LIVE agents of current participant members — distinct
+ *            (member_id, agent_label) from non-revoked agent_tokens.
+ *            (Decision: revoked agents cannot fetch envelopes, so they do
+ *            not gate completeness; keyless-but-live agents DO, via force.)
+ *   - staged − current ≠ ∅ → 409 recipients_removed_key_burned {removed}:
+ *     the removed party saw this key material, so the server deletes its
+ *     staged rows and the client MUST generate fresh key material and
+ *     restart — resealing is insufficient. force cannot override.
+ *   - an agent WITH an active identity key but no staged envelope for it
+ *     (missing row, or sealed to a superseded key) → 409
+ *     superseded_identity_key {agents}: not force-overridable, the owner
+ *     must (re-)seal to the active key.
+ *   - an agent with NO active identity key at all → 409
+ *     incomplete_distribution {missing}; force (OWNER-only) may commit —
+ *     the only case force covers. The epoch row records forced=1 +
+ *     forced_missing; those agents get key_status pending and use the
+ *     key-request flow.
+ *   - equal → commit: INSERT the epoch row (recipients = staged set) and
+ *     CAS-update topics (current_key_id, current_epoch, clear
+ *     rotation_required) in ONE atomic batch. The epoch PK plus the
+ *     key_id/commitment UNIQUEs are the race backstops: a concurrent
+ *     commit that wins surfaces as a constraint error, mapped to 409.
+ */
+async function handleKeysCommit(
+  db: DbClient,
+  _env: Env,
+  req: Request,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  const { topic } = await requireParticipant(db, auth, tid);
+  if ((topic['e2ee'] as number) !== 1) {
+    throw new HttpError(400, 'bad_request', 'keys/commit is only valid for E2EE topics');
+  }
+  if (auth.role !== 'owner' && auth.role !== 'parent') {
+    throw new HttpError(403, 'forbidden', 'Only an owner or parent may commit a topic key');
+  }
+  const body = await readJson(req);
+  const expectedRaw = body['expected_epoch'];
+  if (typeof expectedRaw !== 'number' || !Number.isInteger(expectedRaw) || expectedRaw < 1) {
+    throw new HttpError(400, 'bad_request', 'expected_epoch must be a positive integer');
+  }
+  const expectedEpoch = expectedRaw;
+  const keyId = reqKeyId(body['key_id'], 'key_id');
+  const commitmentRaw = body['commitment'];
+  if (typeof commitmentRaw !== 'string' || !/^[0-9a-fA-F]{64}$/.test(commitmentRaw)) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      'commitment must be 64 hex chars (SHA256 of the topic key)',
+    );
+  }
+  const commitment = commitmentRaw.toLowerCase();
+  const forceRaw = body['force'];
+  if (forceRaw !== undefined && forceRaw !== true && forceRaw !== false) {
+    throw new HttpError(400, 'bad_request', 'force must be a boolean');
+  }
+  const force = forceRaw === true;
+  // force is owner-only even though plain commits allow parents.
+  if (force && auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only an owner may force-commit a topic key');
+  }
+
+  const currentEpoch = (topic['current_epoch'] as number | null) ?? 0;
+  if (expectedEpoch !== currentEpoch + 1) {
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'stale_epoch',
+    });
+    throw new HttpError(
+      409,
+      'stale_epoch',
+      `expected_epoch ${expectedEpoch} does not follow the topic's current epoch ${currentEpoch}`,
+    );
+  }
+  // Pre-checks; the UNIQUE backstops below catch races (mapped to 409).
+  const usedKey = await db.queryOne(
+    `SELECT 1 FROM topic_key_epochs WHERE topic_id = ? AND key_id = ?`,
+    [tid, keyId],
+  );
+  if (usedKey) {
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'key_reuse',
+    });
+    throw new HttpError(
+      409,
+      'key_reuse',
+      'key_id was already used for this topic — generate fresh key material',
+    );
+  }
+  const usedCommitment = await db.queryOne(
+    `SELECT 1 FROM topic_key_epochs WHERE topic_id = ? AND commitment = ?`,
+    [tid, commitment],
+  );
+  if (usedCommitment) {
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'key_material_reuse',
+    });
+    throw new HttpError(
+      409,
+      'key_material_reuse',
+      'Identical key material was already committed under a different key_id',
+    );
+  }
+
+  // staged: envelope rows for key_id sealed to the agent's currently-active
+  // identity key. Envelopes sealed to superseded keys (or to agents whose
+  // member has since left the topic — their key rows are never deleted)
+  // simply do not appear here.
+  const stagedRows = await db.queryAll(
+    `SELECT e.member_id, e.agent_label FROM topic_key_envelopes e
+       JOIN agent_keys k ON k.id = e.identity_key_id
+      WHERE e.topic_id = ? AND e.key_id = ?
+        AND k.member_id = e.member_id AND k.agent_label = e.agent_label
+        AND k.superseded_at IS NULL`,
+    [tid, keyId],
+  );
+  const staged = new Set(
+    stagedRows.map((r) => agentPairKey(r['member_id'] as string, r['agent_label'] as string)),
+  );
+  // current: live agents of current participant members.
+  const currentRows = await db.queryAll(
+    `SELECT DISTINCT t.member_id, t.agent_label
+       FROM agent_tokens t
+       JOIN topic_participants p ON p.member_id = t.member_id
+      WHERE p.topic_id = ? AND t.revoked_at IS NULL`,
+    [tid],
+  );
+  const current = new Set(
+    currentRows.map((r) => agentPairKey(r['member_id'] as string, r['agent_label'] as string)),
+  );
+  const activeRows = await db.queryAll(
+    `SELECT member_id, agent_label FROM agent_keys WHERE superseded_at IS NULL`,
+  );
+  const activeSet = new Set(
+    activeRows.map((r) => agentPairKey(r['member_id'] as string, r['agent_label'] as string)),
+  );
+
+  const removed = [...staged].filter((a) => !current.has(a));
+  if (removed.length > 0) {
+    // BURN: a removed party is assumed to have seen this key material (their
+    // envelope was staged), so the whole key is unusable — delete ALL of
+    // its staged rows. The client MUST generate fresh key material and
+    // restart: resealing the same key is insufficient. (The server does not
+    // keep a separate burn registry — the spec places the fresh-material
+    // obligation on the client; a same-key_id recommit would require
+    // deliberately re-sealing to the full current set, and the removed
+    // member can no longer be sealed to at all: envelope POST targets must
+    // be current participants.) force cannot override: committing would
+    // hand future messages to the removed party.
+    await db.execAtomically([
+      {
+        sql: `DELETE FROM topic_key_envelopes WHERE topic_id = ? AND key_id = ?`,
+        params: [tid, keyId],
+      },
+    ]);
+    const removedPairs = removed.map((a) => {
+      const [member_id, agent_label] = splitAgentPairKey(a);
+      return { member_id, agent_label };
+    });
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'recipients_removed_key_burned',
+      removed_count: removedPairs.length,
+    });
+    throw new HttpError(
+      409,
+      'recipients_removed_key_burned',
+      'Key burned: envelopes were staged for agents who are no longer participants — they saw this key material. The staged rows were deleted; generate fresh key material and restart (resealing is insufficient).',
+    );
+  }
+
+  const missing = [...current].filter((a) => !staged.has(a));
+  const superseded = missing.filter((a) => activeSet.has(a));
+  const keyless = missing.filter((a) => !activeSet.has(a));
+  if (superseded.length > 0) {
+    const agents = superseded.map((a) => {
+      const [member_id, agent_label] = splitAgentPairKey(a);
+      return { member_id, agent_label };
+    });
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'superseded_identity_key',
+      agent_count: agents.length,
+    });
+    throw new HttpError(
+      409,
+      'superseded_identity_key',
+      'Some agents have no envelope sealed to their ACTIVE identity key (missing or sealed to a superseded key). Re-seal to the active key and recommit; force cannot override this.',
+    );
+  }
+  let forced = 0;
+  let forcedMissing: string | null = null;
+  if (keyless.length > 0) {
+    if (!force) {
+      const agents = keyless.map((a) => {
+        const [member_id, agent_label] = splitAgentPairKey(a);
+        return { member_id, agent_label };
+      });
+      logEvent('warn', 'key_commit_rejected', {
+        endpoint: 'keys/commit',
+        member_id: auth.member_id,
+        agent_label: auth.agent_label,
+        topic_id: tid,
+        code: 'incomplete_distribution',
+        agent_count: agents.length,
+      });
+      throw new HttpError(
+        409,
+        'incomplete_distribution',
+        'Some current agents have no active identity key and no envelope. Seal the delta and recommit, or retry with force:true (owner only) to commit without them.',
+      );
+    }
+    forced = 1;
+    forcedMissing = JSON.stringify(
+      keyless.map((a) => {
+        const [member_id, agent_label] = splitAgentPairKey(a);
+        return [member_id, agent_label];
+      }),
+    );
+  }
+
+  // Single atomic batch: INSERT the epoch row, then CAS-advance the topic
+  // (clearing rotation_required). The (topic_id, epoch) PK plus the
+  // (topic_id, key_id) / (topic_id, commitment) UNIQUEs are the race
+  // backstops — a concurrent commit that wins raises a constraint error,
+  // mapped to 409 below.
+  const ts = nowIso();
+  const recipients = JSON.stringify(
+    [...staged].map((a) => {
+      const [member_id, agent_label] = splitAgentPairKey(a);
+      return [member_id, agent_label];
+    }),
+  );
+  try {
+    await db.execAtomically([
+      {
+        sql: `INSERT INTO topic_key_epochs(
+                topic_id, epoch, key_id, commitment, recipients,
+                forced, forced_missing, created_at, created_by)
+              VALUES (?,?,?,?,?,?,?,?,?)`,
+        params: [tid, expectedEpoch, keyId, commitment, recipients, forced, forcedMissing, ts, auth.member_id],
+      },
+      {
+        sql: `UPDATE topics
+                 SET current_key_id = ?, current_epoch = ?, rotation_required = 0
+               WHERE id = ? AND current_epoch = ?`,
+        params: [keyId, expectedEpoch, tid, expectedEpoch - 1],
+      },
+    ]);
+  } catch (e) {
+    const mapped = commitConflictError(e);
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: mapped.code,
+    });
+    throw mapped;
+  }
+  // CAS sanity check: execAtomically reports no row counts, so re-read.
+  // (The epoch PK makes a silent half-apply impossible — a lost race would
+  // have raised above — this is belt-and-braces.)
+  const after = await db.queryOne(`SELECT current_epoch, current_key_id FROM topics WHERE id = ?`, [
+    tid,
+  ]);
+  if (after!['current_epoch'] !== expectedEpoch || after!['current_key_id'] !== keyId) {
+    throw new HttpError(
+      409,
+      'stale_epoch',
+      'A concurrent key commit won the race; re-read the topic and retry',
+    );
+  }
+  logEvent('info', 'key_epoch_committed', {
+    endpoint: 'keys/commit',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    epoch: expectedEpoch,
+    forced,
+  });
+  return json({ topic_id: tid, epoch: expectedEpoch, key_id: keyId });
 }
 
 // POST /v1/topics/:tid/tasks
@@ -3216,7 +4113,7 @@ async function handleCreateTask(
   auth: AuthContext,
   tid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   const body = await readJson(req);
   const title = reqString(body['title'], 'title', 1, 200);
   const description = optString(body['description'], 'description', MAX_BODY);
@@ -3240,26 +4137,46 @@ async function handleCreateTask(
       throw new HttpError(400, 'bad_request', 'parent_task_id must be a task in this topic');
     }
   }
-  if (description) piiGuard(description);
-  piiGuard(title); // F08: task titles are scanned too.
+  const taskE2ee = (topic['e2ee'] as number) === 1;
+  if (taskE2ee) {
+    // N05: task content fields must arrive sealed; only indexing metadata
+    // stays plaintext. Well-formed fh1 is opaque — skip the PII scan (the
+    // CLI scans plaintext before encrypting).
+    requireE2eeContent(title, 'title');
+    if (description !== null) requireE2eeContent(description, 'description');
+  } else {
+    if (description) piiGuard(description);
+    piiGuard(title); // F08: task titles are scanned too.
+  }
 
   const taskId = newId();
   const ts = nowIso();
   // F13: task_created carries the full task fields, so the log can
   // reconstruct task state. The F06 visibility predicate reads task_id out
   // of this same payload — it must stay.
-  const createdData = JSON.stringify({
-    task_id: taskId,
-    title,
-    description,
-    due_at: dueAt,
-    status: 'open',
-    owner_member_id: auth.member_id,
-    assignee_member_id: assignee,
-    parent_task_id: parentTask,
-    created_by: auth.member_id,
-    created_at: ts,
-  });
+  //
+  // N05 (E2EE topics): the old `Task created: ${title}` body leaked the
+  // title into the entry log. The entry body is now the sealed title as
+  // posted (already fh1), and data collapses to
+  // {"task_id": "…", "sealed": "fh1…"} with task_id plaintext so the F06
+  // json_extract predicate keeps working. `sealed` carries the sealed
+  // description (the primary content); when the task has no description it
+  // carries the sealed title. Indexing metadata (status, owner/assignee
+  // ids, parent_task_id, due_at) stays plaintext on the tasks row itself.
+  const createdData = taskE2ee
+    ? JSON.stringify({ task_id: taskId, sealed: description ?? title })
+    : JSON.stringify({
+        task_id: taskId,
+        title,
+        description,
+        due_at: dueAt,
+        status: 'open',
+        owner_member_id: auth.member_id,
+        assignee_member_id: assignee,
+        parent_task_id: parentTask,
+        created_by: auth.member_id,
+        created_at: ts,
+      });
   // F12: task row + task_created event commit in the SAME batch — the audit's
   // fault injection (event write fails) must leave no orphan task.
   // F14: the child insert is conditional on the parent still being open, so
@@ -3280,7 +4197,9 @@ async function handleCreateTask(
     entryInsertOp({
       topicId: tid,
       kind: 'task_created',
-      body: `Task created: ${title}`,
+      // N05: plaintext `Task created: ${title}` leaked the title; in E2EE
+      // topics the body is the sealed title as posted.
+      body: taskE2ee ? title : `Task created: ${title}`,
       auth,
       data: createdData,
       ts,
@@ -3322,50 +4241,6 @@ async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): 
   return task;
 }
 
-// GET /v1/tasks/:tid?after_seq=&limit= — task + its entry trail.
-// F13: the trail is one indexed SQL query (idx_entries_task_trail),
-// paginated like /history — the old code fetched 5,000 topic entries and
-// filtered by task_id in JS.
-async function handleGetTask(
-  db: DbClient,
-  req: Request,
-  auth: AuthContext,
-  taskId: string,
-): Promise<Response> {
-  const task = await getTaskInScope(db, auth, taskId);
-  const topicId = task['topic_id'] as string;
-  // F06: a from_join member must not read task snapshots created before they
-  // joined. 404 (same as a missing task) so existence doesn't leak.
-  const visible = await db.queryOne(
-    `SELECT 1 AS ok FROM tasks WHERE id = ? AND topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER}`,
-    [taskId, topicId, auth.member_id],
-  );
-  if (!visible) throw new HttpError(404, 'not_found', 'Task not found');
-  const part = await db.queryOne(
-    `SELECT history_from_seq FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
-    [topicId, auth.member_id],
-  );
-  const url = new URL(req.url);
-  const after = parseSeqCursor(url.searchParams.get('after_seq'));
-  const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
-  const rows = await db.queryAll(
-    `SELECT * FROM entries
-      WHERE topic_id = ? AND seq > ? AND seq >= ?
-        AND json_extract(data, '$.task_id') = ?
-      ORDER BY seq ASC LIMIT ?`,
-    [topicId, after, part!['history_from_seq'] as number, taskId, limit + 1],
-  );
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
-  const nextAfter = page.length > 0 ? (page[page.length - 1]['seq'] as number) : after;
-  return json({
-    task: publicTask(task),
-    trail: page.map(publicEntry),
-    has_more: hasMore,
-    next_after_seq: nextAfter,
-  });
-}
-
 // GET /v1/topics/:tid/tasks — list tasks in a topic.
 async function handleListTopicTasks(db: DbClient, auth: AuthContext, tid: string): Promise<Response> {
   await requireParticipant(db, auth, tid);
@@ -3376,158 +4251,6 @@ async function handleListTopicTasks(db: DbClient, auth: AuthContext, tid: string
     [tid, auth.member_id],
   );
   return json({ tasks: rows.map(publicTask) });
-}
-
-// PATCH /v1/tasks/:tid
-async function handlePatchTask(
-  db: DbClient,
-  _env: Env,
-  req: Request,
-  auth: AuthContext,
-  taskId: string,
-): Promise<Response> {
-  const task = await getTaskInScope(db, auth, taskId);
-  const topicId = task['topic_id'] as string;
-  const body = await readJson(req);
-  const sets: string[] = [];
-  const params: (string | number | null)[] = [];
-  let statusChanged: string | null = null;
-  let assigneeChanged: string | null | undefined;
-  // F13: fields that previously changed silently; emitted as task_updated.
-  const updatedFields: Record<string, string | null> = {};
-
-  if (body['title'] !== undefined) {
-    const title = reqString(body['title'], 'title', 1, 200);
-    piiGuard(title); // F08: task titles are scanned too.
-    sets.push('title = ?');
-    params.push(title);
-    updatedFields['title'] = title;
-  }
-  if (body['description'] !== undefined) {
-    const description = optString(body['description'], 'description', MAX_BODY);
-    if (description) piiGuard(description);
-    sets.push('description = ?');
-    params.push(description);
-    updatedFields['description'] = description;
-  }
-  if (body['due_at'] !== undefined) {
-    const dueAt = body['due_at'] === null ? null : reqIsoDate(body['due_at'], 'due_at');
-    sets.push('due_at = ?');
-    params.push(dueAt);
-    updatedFields['due_at'] = dueAt;
-  }
-  if (body['assignee_member_id'] !== undefined) {
-    const raw = body['assignee_member_id'];
-    const assignee = raw === null ? null : reqString(raw, 'assignee_member_id', 1, 128);
-    if (assignee !== null) {
-      const part = await db.queryOne(
-        `SELECT member_id FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
-        [topicId, assignee],
-      );
-      if (!part) throw new HttpError(400, 'bad_request', 'assignee must be a participant of this topic');
-    }
-    if (assignee !== task['assignee_member_id']) {
-      assigneeChanged = assignee;
-      sets.push('assignee_member_id = ?');
-      params.push(assignee);
-    }
-  }
-  if (body['status'] !== undefined) {
-    const status = reqEnum(body['status'], 'status', TASK_STATUSES);
-    if (status !== task['status']) {
-      if (status === 'done') await assertNoOpenSubtasks(db, taskId);
-      statusChanged = status;
-      sets.push('status = ?');
-      params.push(status);
-    }
-  }
-  if (sets.length === 0) {
-    const fresh = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
-    return json({ task: publicTask(fresh!) });
-  }
-  const ts = nowIso();
-  sets.push('updated_at = ?');
-  params.push(ts);
-  // F14: completing via PATCH is guarded INSIDE the update — the write only
-  // applies while no open subtask exists, in the same batch as the events.
-  // The pre-check above preserves the old fast-path 409; this guard closes
-  // the race between that check and the write.
-  let where = `WHERE id = ?`;
-  const whereParams: (string | number | null)[] = [taskId];
-  const completing = statusChanged === 'done';
-  if (completing) {
-    where += ` AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled'))`;
-    whereParams.push(taskId);
-  }
-  // F12: the state change and its events commit in the SAME batch. Each event
-  // is pinned to the update actually applying (updated_at flip), so a
-  // guard-blocked completion emits no phantom events.
-  const pin = `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`;
-  const pinParams: (string | number | null)[] = [taskId, ts];
-  const ops: BatchOp[] = [
-    { sql: `UPDATE tasks SET ${sets.join(', ')} ${where}`, params: [...params, ...whereParams] },
-  ];
-  if (Object.keys(updatedFields).length > 0) {
-    ops.push(
-      entryInsertOp({
-        topicId,
-        kind: 'task_updated',
-        body: `Task updated`,
-        auth,
-        data: JSON.stringify({ task_id: taskId, ...updatedFields }),
-        ts,
-        pin,
-        pinParams,
-      }),
-    );
-  }
-  if (assigneeChanged !== undefined) {
-    ops.push(
-      entryInsertOp({
-        topicId,
-        kind: 'task_assigned',
-        body: assigneeChanged ? `Task assigned` : `Task unassigned`,
-        auth,
-        data: JSON.stringify({ task_id: taskId, assignee_member_id: assigneeChanged }),
-        ts,
-        pin,
-        pinParams,
-      }),
-    );
-  }
-  if (statusChanged) {
-    ops.push(
-      entryInsertOp({
-        topicId,
-        kind: 'task_status',
-        body: `Task status → ${statusChanged}`,
-        auth,
-        data: JSON.stringify({ task_id: taskId, status: statusChanged }),
-        ts,
-        pin,
-        pinParams,
-      }),
-    );
-  }
-  await execBatchWithRetry(db, () => ops);
-  const updated = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
-  if (completing && updated!['status'] !== 'done') {
-    // The atomic guard refused the completion after the pre-check passed
-    // (a subtask was created in between): confirm for an accurate 409.
-    const open = await db.queryAll(
-      `SELECT id FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled')`,
-      [taskId],
-    );
-    if (open.length > 0) {
-      throw new HttpError(
-        409,
-        'subtasks_open',
-        `Cannot complete task: ${open.length} subtask(s) still open`,
-      );
-    }
-    throw new HttpError(500, 'internal', 'Task completion did not apply');
-  }
-  return json({ task: publicTask(updated!) });
 }
 
 // POST /v1/tasks/:tid/notes
@@ -3541,7 +4264,13 @@ async function handleTaskNote(
   const task = await getTaskInScope(db, auth, taskId);
   const body = await readJson(req);
   const text = reqString(body['body'], 'body', 1, MAX_BODY);
-  piiGuard(text);
+  // N05: note bodies on E2EE topics must arrive sealed. Well-formed fh1 is
+  // opaque — skip the PII scan (the CLI scans plaintext before encrypting).
+  if ((await topicE2ee(db, task['topic_id'] as string))) {
+    requireE2eeContent(text, 'body');
+  } else {
+    piiGuard(text);
+  }
   const entry = await appendEntry(db, {
     topic_id: task['topic_id'] as string,
     kind: 'task_note',
@@ -3564,9 +4293,26 @@ async function handleTaskDone(
   const topicId = task['topic_id'] as string;
   // F14: an absent body is fine; malformed JSON is 400 (no longer swallowed).
   const body = await readOptionalJson(req);
-  const result = reqJsonData(body['result'], 'result', MAX_DATA);
-  // F08: completion results (JSON) are scanned too — string leaves, recursively.
-  if (result) piiGuardJson(JSON.parse(result));
+  // N05 (E2EE topics): the completion result is user content — it must arrive
+  // sealed (fh1), mirroring the task title/description contract. Plaintext
+  // topics keep the legacy JSON result shape.
+  const topicRow = await db.queryOne(`SELECT e2ee FROM topics WHERE id = ?`, [topicId]);
+  const doneE2ee = (topicRow?.['e2ee'] as number) === 1;
+  const rawResult = body['result'];
+  let result: string | null;
+  if (doneE2ee) {
+    if (rawResult === undefined || rawResult === null) {
+      result = null;
+    } else {
+      requireE2eeContent(rawResult, 'result');
+      result = rawResult as string;
+    }
+  } else {
+    result = reqJsonData(rawResult, 'result', MAX_DATA);
+    // F08: completion results (JSON) are scanned too — string leaves, recursively.
+    // Sealed (fh1) results are opaque — the CLI scans plaintext before encrypting.
+    if (result) piiGuardJson(JSON.parse(result));
+  }
   await assertNoOpenSubtasks(db, taskId);
   const ts = nowIso();
   // F12+F14: the completion and its task_done event commit in the SAME
@@ -3585,7 +4331,12 @@ async function handleTaskDone(
       kind: 'task_done',
       body: `Task completed`,
       auth,
-      data: JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
+      // N05: on E2EE topics the sealed result rides in `sealed` (mirroring
+      // task_created); task_id stays plaintext for the F06 visibility
+      // predicate. Plaintext topics keep the legacy embedded result shape.
+      data: doneE2ee
+        ? JSON.stringify({ task_id: taskId, sealed: result })
+        : JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
       ts,
       pin: `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`,
       pinParams: [taskId, ts],
@@ -3608,53 +4359,6 @@ async function handleTaskDone(
     throw new HttpError(500, 'internal', 'Task completion did not apply');
   }
   return json({ task: publicTask(updated!) });
-}
-
-// POST /v1/entries/:eid/redact — owner only. Preserves seq/actor/ts; scrubs body.
-async function handleRedact(
-  db: DbClient,
-  _env: Env,
-  _req: Request,
-  auth: AuthContext,
-  eid: string,
-): Promise<Response> {
-  if (auth.role !== 'owner') {
-    throw new HttpError(403, 'forbidden', 'Only the family owner can redact entries');
-  }
-  const gseq = Number(eid);
-  if (!Number.isInteger(gseq) || gseq < 1) {
-    throw new HttpError(400, 'bad_request', 'Invalid entry id');
-  }
-  const entry = await db.queryOne(
-    `SELECT e.* FROM entries e JOIN topics t ON t.id = e.topic_id
-      WHERE e.gseq = ? AND t.family_id = ?`,
-    [gseq, auth.family_id],
-  );
-  if (!entry) throw new HttpError(404, 'not_found', 'Entry not found');
-  const ts = nowIso();
-  const scrubbed = `[redacted by owner, ${ts}]`;
-  // F08: also scrub PII-shaped string leaves in data, structure-preserving
-  // (linkage fields like task_id survive). NULL data stays NULL.
-  let newData = entry['data'] as string | null;
-  if (newData !== null) {
-    try {
-      newData = JSON.stringify(redactPiiLeaves(JSON.parse(newData)));
-    } catch {
-      // data is always JSON (validated at write); keep the original rather
-      // than lose it if parsing ever fails.
-    }
-  }
-  await db.execAtomically([
-    { sql: `UPDATE entries SET body = ?, data = ? WHERE gseq = ?`, params: [scrubbed, newData, gseq] },
-  ]);
-  await appendEntry(db, {
-    topic_id: entry['topic_id'] as string,
-    kind: 'redaction',
-    body: `Entry #${entry['seq']} redacted by owner`,
-    auth,
-    data: JSON.stringify({ redacted_gseq: gseq }),
-  });
-  return json({ ok: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -3784,7 +4488,6 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     const authHeader = req.headers.get('authorization');
     const auth: AuthContext = await resolveToken(db, env, authHeader);
 
-    if (path === '/v1/auth/rotate' && method === 'POST') return await handleRotate(db, env, req, auth);
     if (path === '/v1/auth/revoke' && method === 'POST') return await handleRevoke(db, env, req, auth);
     if (path === '/v1/families' && method === 'GET') return await handleListFamilies(db, auth);
     if (path === '/v1/members' && method === 'GET') return await handleListMembers(db, auth);
@@ -3801,7 +4504,9 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     }
     if (path === '/v1/topics' && method === 'POST') return await handleCreateTopic(db, env, req, auth);
     if (path === '/v1/topics' && method === 'GET') return await handleListTopics(db, req, auth);
-    if (path === '/v1/sync' && method === 'GET') return await handleSync(db, req, auth);
+    // Sync v2 (spec §1.4): per-circle-token changed-topic discovery.
+    // (Legacy entry-level GET /v1/sync deleted per spec §1.6.)
+    if (path === '/v1/sync/topics' && method === 'GET') return await handleSyncTopics(db, req, auth);
 
     const famInvite = /^\/v1\/families\/([^/]+)\/invites$/.exec(path);
     if (famInvite && method === 'POST') {
@@ -3828,12 +4533,9 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       }
     }
 
-    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes|subject)$/.exec(path);
+    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|invite|spawn|entries|tasks|envelopes|subject|ack)$/.exec(path);
     if (topicSub && method === 'GET' && topicSub[2] === 'history') {
-      return await handleHistory(db, req, auth, decodeURIComponent(topicSub[1]));
-    }
-    if (topicSub && method === 'GET' && topicSub[2] === 'export') {
-      return await handleExport(db, auth, decodeURIComponent(topicSub[1]));
+      return await handleHistory(db, env, req, auth, decodeURIComponent(topicSub[1]));
     }
     if (topicSub && method === 'POST' && topicSub[2] === 'invite') {
       return await handleTopicInvite(db, env, req, auth, decodeURIComponent(topicSub[1]));
@@ -3868,6 +4570,17 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       return await handleGetTopic(db, auth, decodeURIComponent(topicOnly[1]));
     }
 
+    // Sync v2 (spec §1.4) — receipt-bound contiguous ack.
+    if (topicSub && method === 'POST' && topicSub[2] === 'ack') {
+      return await handleAck(db, env, req, auth, decodeURIComponent(topicSub[1]));
+    }
+    // E2EE (sync v2, spec §1.4) — POST /v1/topics/:tid/keys/commit:
+    // staged atomic key activation (genesis + rotation).
+    const topicKeysCommit = /^\/v1\/topics\/([^/]+)\/keys\/commit$/.exec(path);
+    if (topicKeysCommit && method === 'POST') {
+      return await handleKeysCommit(db, env, req, auth, decodeURIComponent(topicKeysCommit[1]));
+    }
+
     // E2EE Phase 4 — DELETE /v1/topics/:tid/participants/:mid (owner/parent).
     const topicParticipant = /^\/v1\/topics\/([^/]+)\/participants\/([^/]+)$/.exec(path);
     if (topicParticipant && method === 'DELETE') {
@@ -3881,25 +4594,17 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       );
     }
 
-    const taskSub = /^\/v1\/tasks\/([^/]+)(\/(notes|done))?$/.exec(path);
+    // Sync v2 §1.6: GET/PATCH /v1/tasks/:tid are deleted (no client; the CLI
+    // uses notes/done). Only the notes and done sub-paths remain.
+    const taskSub = /^\/v1\/tasks\/([^/]+)\/(notes|done)$/.exec(path);
     if (taskSub) {
       const taskId = decodeURIComponent(taskSub[1]);
-      if (!taskSub[2] && (method === 'GET' || method === 'PATCH')) {
-        return method === 'GET'
-          ? await handleGetTask(db, req, auth, taskId)
-          : await handlePatchTask(db, env, req, auth, taskId);
-      }
-      if (taskSub[3] === 'notes' && method === 'POST') {
+      if (taskSub[2] === 'notes' && method === 'POST') {
         return await handleTaskNote(db, env, req, auth, taskId);
       }
-      if (taskSub[3] === 'done' && method === 'POST') {
+      if (taskSub[2] === 'done' && method === 'POST') {
         return await handleTaskDone(db, env, req, auth, taskId);
       }
-    }
-
-    const redact = /^\/v1\/entries\/([^/]+)\/redact$/.exec(path);
-    if (redact && method === 'POST') {
-      return await handleRedact(db, env, req, auth, decodeURIComponent(redact[1]));
     }
 
     throw new HttpError(404, 'not_found', 'Unknown endpoint');

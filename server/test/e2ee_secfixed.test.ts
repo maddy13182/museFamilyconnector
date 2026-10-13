@@ -186,7 +186,7 @@ test('F1: kid participant introducing a new key_id is 403; current_key_id unchan
   assert.equal(n!['c'], 0);
 });
 
-test('F1: owner introducing a new key_id succeeds and advances current_key_id', async () => {
+test('F1: owner introducing a new key_id stages it — current_key_id does NOT advance (N04)', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SecfixF1d');
   const keyId = hex(16);
@@ -194,6 +194,9 @@ test('F1: owner introducing a new key_id succeeds and advances current_key_id', 
   assert.equal(res.status, 201);
   const tid = res.body.topic.id as string;
 
+  // Sync v2 (N04 fix): POSTing an envelope with a new key_id STORES it
+  // (staged) but no longer flips topics.current_key_id — only
+  // POST /v1/topics/:tid/keys/commit activates a key.
   const rotatedKeyId = hex(16);
   const rot = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
     token: owner.token,
@@ -204,12 +207,22 @@ test('F1: owner introducing a new key_id succeeds and advances current_key_id', 
     }),
   });
   assert.equal(rot.status, 201);
-  assert.equal(await currentKeyId(app, tid), rotatedKeyId);
+  assert.equal(await currentKeyId(app, tid), keyId, 'current_key_id must not flip on envelope POST');
+  const n = await app.db.queryOne(
+    `SELECT COUNT(*) AS c FROM topic_key_envelopes WHERE topic_id = ? AND key_id = ?`,
+    [tid, rotatedKeyId],
+  );
+  assert.equal(n!['c'], 1, 'staged envelope must be stored');
 
-  // GET /v1/topics/:id advertises the new current key (the CLI elects from it).
+  // GET /v1/topics/:id still advertises the old current key.
   const detail = await app.call('GET', `/v1/topics/${tid}`, { token: owner.token });
   assert.equal(detail.status, 200);
-  assert.equal(detail.body.topic.current_key_id, rotatedKeyId);
+  assert.equal(detail.body.topic.current_key_id, keyId);
+
+  // The staged envelope is invisible via GET until keys/commit.
+  const staged = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: owner.token });
+  assert.equal(staged.status, 200);
+  assert.equal(staged.body.envelopes.length, 0, 'staged envelopes must stay invisible pre-commit');
 });
 
 test('F1: re-POST of the CURRENT key_id by a kid is distribution, not rotation (201)', async () => {
@@ -378,7 +391,7 @@ test('F4: PATCH subject — empty / oversize subjects are 400', async () => {
  *  scan was skipped for E2EE ciphertext. Fully deterministic: the 12 head
  *  bytes encode exactly "4111111111111111" and the 28 zero tail bytes keep
  *  the run bounded by non-digits ('A's). */
-function piiTrippingWireBody(): string {
+function piiTrippingWireBody(keyId: string): string {
   const digits = '4111111111111111'; // Luhn-valid test card number
   const vals = [...digits].map((c) => 52 + (c.charCodeAt(0) - 48)); // '0'->52 … '9'->61
   const head: number[] = [];
@@ -391,17 +404,24 @@ function piiTrippingWireBody(): string {
   const blob = btoa(String.fromCharCode(...raw));
   assert.ok(blob.startsWith(digits), 'crafted payload must start with the digit run');
   assert.ok(scanPii(blob) !== null, 'crafted payload must trip the PII scanner');
-  return `fh1.${hex(16)}.${hex(16)}.${blob}`;
+  return `fh1.${keyId}.${hex(16)}.${blob}`;
 }
 
 test('info: well-formed fh1 ciphertext body skips the server PII scan', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SecfixPii');
-  const res = await createE2eeTopic(app, owner.token, hex(16));
+  const keyId = hex(16);
+  const res = await createE2eeTopic(app, owner.token, keyId);
   assert.equal(res.status, 201);
   const tid = res.body.topic.id as string;
+  // Sync v2: new E2EE topics sit at epoch 0 (genesis) with writes blocked.
+  // These PII tests are not about genesis, so simulate the committed state
+  // directly — Server-A's keys/commit would set this in production.
+  await app.db.execAtomically([
+    { sql: `UPDATE topics SET current_epoch = 1 WHERE id = ?`, params: [tid] },
+  ]);
 
-  const wire = piiTrippingWireBody();
+  const wire = piiTrippingWireBody(keyId);
   assert.ok(scanPii(wire) !== null, 'test body must trip the PII scanner');
   const posted = await app.call('POST', `/v1/topics/${tid}/entries`, {
     token: owner.token,
@@ -411,20 +431,21 @@ test('info: well-formed fh1 ciphertext body skips the server PII scan', async ()
   assert.equal(posted.body.entry.body, wire);
 });
 
-test('info: malformed fh1-looking body is still PII-scanned', async () => {
+test('info: malformed fh1-looking body is rejected as plaintext on E2EE topics (N05)', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SecfixPii2');
   const res = await createE2eeTopic(app, owner.token, hex(16));
   assert.equal(res.status, 201);
   const tid = res.body.topic.id as string;
 
-  // Starts with the tag but is not a well-formed wire string -> scanned.
+  // Starts with the tag but is not a well-formed wire string -> not
+  // ciphertext, so N05 rejects it before the PII scan ever runs.
   const bad = 'fh1.nothex.4111111111111111';
-  assert.ok(scanPii(bad) !== null, 'test body must trip the PII scanner');
+  assert.ok(scanPii(bad) !== null, 'test body would trip the PII scanner if scanned');
   const posted = await app.call('POST', `/v1/topics/${tid}/entries`, {
     token: owner.token,
     body: { kind: 'message', body: bad },
   });
-  assert.equal(posted.status, 422);
-  assert.equal(posted.body.error.code, 'pii_detected');
+  assert.equal(posted.status, 400);
+  assert.equal(posted.body.error.code, 'plaintext_in_e2ee_topic');
 });

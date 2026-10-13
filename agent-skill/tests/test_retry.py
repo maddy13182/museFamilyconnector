@@ -220,7 +220,7 @@ class CircleCreateRecoveryTest(unittest.TestCase):
             calls.append({"method": method, "url": url, "headers": dict(headers)})
             if path == "/v1/health" and method == "GET":
                 return 200, json.dumps(
-                    {"ok": True, "version": "0.13.0", "api_versions": ["v1"]})
+                    {"ok": True, "version": "1.0.0", "api_versions": ["v1"]})
             if path == "/v1/families" and method == "POST":
                 n = len([c for c in calls if c["url"].endswith("/v1/families")])
                 if n == 1:
@@ -262,7 +262,7 @@ class CircleCreateRecoveryTest(unittest.TestCase):
             path = urlparse.urlparse(url).path
             if path == "/v1/health" and method == "GET":
                 return 200, json.dumps(
-                    {"ok": True, "version": "0.13.0", "api_versions": ["v1"]})
+                    {"ok": True, "version": "1.0.0", "api_versions": ["v1"]})
             return 409, json.dumps(
                 {"error": {"code": "circle_name_taken", "message": "exists"}}
             )

@@ -114,7 +114,7 @@ class RecoveryFakeHub:
         query = urlparse.parse_qs(parts.query)
         method = method.upper()
 
-        # The fake models a current (0.13.0) server: auto-answer the
+        # The fake models a current (1.0.0) server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
         if method == "GET" and path == "/v1/health":
@@ -127,7 +127,7 @@ class RecoveryFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "0.13.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
             )
 
         self._record(method, url, headers, body_bytes)
@@ -608,7 +608,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
         self.assertEqual(rc, 0, "stderr: %s" % err)
         rc, out, err = self.run_cli(["read", "--topic", TOPIC_ID])
         self.assertEqual(rc, 0, "stderr: %s" % err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         bodies = [e["body"] for e in entries]
         self.assertIn("old secret", bodies)
         kinds = [e["kind"] for e in entries]

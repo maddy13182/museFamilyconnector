@@ -129,7 +129,6 @@ test('3. parents_only topic: kid gets 403 on read/history/post; invisible in lis
   for (const [m, p] of [
     ['GET', `/v1/topics/${ctx.parentTopic}`],
     ['GET', `/v1/topics/${ctx.parentTopic}/history`],
-    ['GET', `/v1/topics/${ctx.parentTopic}/export`],
     ['POST', `/v1/topics/${ctx.parentTopic}/entries`],
   ] as const) {
     const r = await app.call(m, p, {
@@ -140,21 +139,6 @@ test('3. parents_only topic: kid gets 403 on read/history/post; invisible in lis
   }
   const list = await app.call('GET', '/v1/topics', { token: kidToken });
   assert.ok(!(list.body.topics as any[]).some((x) => x.id === ctx.parentTopic));
-});
-
-test('4. post; sync shows it to participants only', async () => {
-  const { app, ownerToken, parentToken, kidToken } = ctx;
-  const post = await app.call('POST', `/v1/topics/${ctx.parentTopic}/entries`, {
-    token: ownerToken,
-    body: { body: 'Kyler options: keep it between us for now.' },
-  });
-  assert.equal(post.status, 201);
-  assert.equal(post.body.entry.seq, 1);
-
-  const psync = await app.call('GET', '/v1/sync?after_gseq=0', { token: parentToken });
-  assert.ok((psync.body.entries as any[]).some((e) => e.body.includes('Kyler options')));
-  const ksync = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
-  assert.ok(!(ksync.body.entries as any[]).some((e) => e.body.includes('Kyler options')));
 });
 
 test('5. invite kid with from_join: old history hidden, new messages visible', async () => {
@@ -244,12 +228,6 @@ test('6. spawn linked child: kid reads child, still 403 on a fresh parent topic'
 
   const denied = await app.call('GET', `/v1/topics/${pid}/history`, { token: kidToken });
   assert.equal(denied.status, 403);
-  const deniedSync = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
-  assert.ok(
-    !(deniedSync.body.entries as any[]).some((e) =>
-      (e.body as string).includes('Private parent deliberation'),
-    ),
-  );
 });
 
 test('7. task delegation round-trip with structured result', async () => {
@@ -275,10 +253,10 @@ test('7. task delegation round-trip with structured result', async () => {
   });
   const subId = sub.body.task.id as string;
 
-  // assignee sees the assignment on sync
-  const ksync = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
+  // assignee sees the assignment in topic history
+  const khist = await app.call('GET', `/v1/topics/${tid}/history`, { token: kidToken });
   assert.ok(
-    (ksync.body.entries as any[]).some(
+    (khist.body.entries as any[]).some(
       (e) => e.kind === 'task_created' && (e.data as any).task_id === subId,
     ),
   );
@@ -302,15 +280,6 @@ test('7. task delegation round-trip with structured result', async () => {
     body: {},
   });
   assert.equal(doneParent.status, 200);
-});
-
-test('8. sync cursors: second poll is empty', async () => {
-  const { app, kidToken } = ctx;
-  const s1 = await app.call('GET', '/v1/sync?after_gseq=0', { token: kidToken });
-  const max = s1.body.max_gseq as number;
-  assert.ok(max > 0);
-  const s2 = await app.call('GET', `/v1/sync?after_gseq=${max}`, { token: kidToken });
-  assert.deepEqual(s2.body.entries, []);
 });
 
 test('9. PII posts rejected with 422', async () => {
@@ -338,33 +307,6 @@ test('9. PII posts rejected with 422', async () => {
   );
 });
 
-test('10. redact: owner only; body scrubbed, audit shape kept', async () => {
-  const { app, ownerToken, kidToken } = ctx;
-  const t = await app.call('POST', '/v1/topics', {
-    token: ownerToken,
-    body: { subject: 'redact-me', kind: 'group', participant_member_ids: [ctx.kidId] },
-  });
-  const tid = t.body.topic.id as string;
-  const post = await app.call('POST', `/v1/topics/${tid}/entries`, {
-    token: ownerToken,
-    body: { body: 'oops, wrong number here' },
-  });
-  const gseq = post.body.entry.gseq as number;
-  const seq = post.body.entry.seq as number;
-
-  const kidRedact = await app.call('POST', `/v1/entries/${gseq}/redact`, { token: kidToken, body: {} });
-  assert.equal(kidRedact.status, 403);
-
-  const ok = await app.call('POST', `/v1/entries/${gseq}/redact`, { token: ownerToken, body: {} });
-  assert.equal(ok.status, 200);
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: ownerToken });
-  const entries = hist.body.entries as any[];
-  const target = entries.find((e) => e.gseq === gseq);
-  assert.ok((target.body as string).startsWith('[redacted by owner,'));
-  assert.equal(target.seq, seq); // sequence preserved
-  assert.ok(entries.some((e) => e.kind === 'redaction'));
-});
-
 test('11. cross-family access denied everywhere', async () => {
   const { app, famB } = ctx;
   // Mint a raw token for family B's member directly (provisioning code already used).
@@ -389,4 +331,161 @@ test('11. cross-family access denied everywhere', async () => {
   assert.ok(r2.status === 403 || r2.status === 404);
   const r3 = await app.call('GET', '/v1/members', { token: rawB });
   assert.ok(!(r3.body.members as any[]).some((m: any) => m.email === 'mahesh@a.dev'));
+});
+
+// ---------------------------------------------------------------------------
+// Sync v2 + E2EE rotation end-to-end (spec §5: "add v2 + rotation e2e").
+// ---------------------------------------------------------------------------
+
+function iB64(n: number): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(n));
+  return btoa(String.fromCharCode(...bytes));
+}
+function iHex(n: number): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(n));
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+function iWire(keyId: string): string {
+  return `fh1.${keyId}.${iHex(16)}.${iB64(40)}`;
+}
+
+test('20. sync v2 journey: changed-topic discovery -> read -> receipt -> ack -> quiet', async () => {
+  const { app, ownerToken } = ctx;
+  const t = await app.call('POST', '/v1/topics', {
+    token: ownerToken,
+    body: { subject: 'v2 journey', kind: 'group', participant_member_ids: [] },
+  });
+  assert.equal(t.status, 201);
+  const tid = t.body.topic.id as string;
+  await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { body: 'first' },
+  });
+  await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { body: 'second' },
+  });
+
+  // Changed-topic discovery (per-circle token).
+  const s1 = await app.call('GET', '/v1/sync/topics', { token: ownerToken });
+  assert.equal(s1.status, 200);
+  const found = (s1.body.topics as any[]).find((x) => x.topic_id === tid);
+  assert.ok(found, 'new topic is reported as changed');
+  assert.equal(found.new_count, 2);
+  assert.equal(found.acked_seq, 0);
+  assert.equal(found.key_status, 'not_e2ee');
+  assert.equal(found.circle_id, ctx.famA);
+
+  // Read in order, ack with the receipt: the topic goes quiet.
+  const h = await app.call('GET', `/v1/topics/${tid}/history`, { token: ownerToken });
+  assert.equal(h.status, 200);
+  assert.ok((h.body.read_receipt as string).startsWith('fhrr1.'), 'history issues a receipt');
+  const ack = await app.call('POST', `/v1/topics/${tid}/ack`, {
+    token: ownerToken,
+    body: { seq: h.body.read_through_seq, read_receipt: h.body.read_receipt },
+  });
+  assert.equal(ack.status, 200);
+  assert.equal(ack.body.acked_seq, 2);
+  const s2 = await app.call('GET', '/v1/sync/topics', { token: ownerToken });
+  assert.ok(!(s2.body.topics as any[]).some((x: any) => x.topic_id === tid), 'acked topic drops out');
+
+  // New activity re-lists it with a fresh count.
+  await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { body: 'third' },
+  });
+  const s3 = await app.call('GET', '/v1/sync/topics', { token: ownerToken });
+  const again = (s3.body.topics as any[]).find((x: any) => x.topic_id === tid);
+  assert.ok(again);
+  assert.equal(again.new_count, 1);
+});
+
+test('21. E2EE rotation e2e: genesis -> encrypted write -> removal gates -> rekey resumes', async () => {
+  const { app, ownerToken, parentToken, parentId } = ctx;
+  // Register identity keys for the two agents (owner + parent).
+  for (const tok of [ownerToken, parentToken]) {
+    const rk = await app.call('POST', '/v1/agent-keys/rotate', {
+      token: tok,
+      body: { agent_public_key: iB64(32) },
+    });
+    assert.equal(rk.status, 200);
+  }
+  const t = await app.call('POST', '/v1/topics', {
+    token: ownerToken,
+    body: {
+      subject: iB64(64),
+      kind: 'group',
+      participant_member_ids: [parentId],
+      e2ee: 1,
+      initial_key_id: iHex(16),
+    },
+  });
+  assert.equal(t.status, 201);
+  const tid = t.body.topic.id as string;
+
+  // Genesis: stage envelopes for owner + parent, commit epoch 1.
+  const me = await app.call('GET', '/v1/me', { token: ownerToken });
+  const meP = await app.call('GET', '/v1/me', { token: parentToken });
+  const ownerLabel = me.body.agent_label as string;
+  const parentLabel = meP.body.agent_label as string;
+  const ownerMid = me.body.id as string;
+  const k1 = iHex(16);
+  for (const [mid, label] of [
+    [ownerMid, ownerLabel],
+    [parentId, parentLabel],
+  ] as const) {
+    const e = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+      token: ownerToken,
+      body: { member_id: mid, agent_label: label, key_id: k1, envelope: iB64(96) },
+    });
+    assert.equal(e.status, 201);
+  }
+  const c1 = await app.call('POST', `/v1/topics/${tid}/keys/commit`, {
+    token: ownerToken,
+    body: { expected_epoch: 1, key_id: k1, commitment: iHex(32) },
+  });
+  assert.equal(c1.status, 200);
+
+  // Encrypted writes flow.
+  const w1 = await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { kind: 'message', body: iWire(k1) },
+  });
+  assert.equal(w1.status, 201);
+
+  // Removal gates encrypted writes until a fresh key commits.
+  const rem = await app.call('DELETE', `/v1/topics/${tid}/participants/${parentId}`, {
+    token: ownerToken,
+  });
+  assert.equal(rem.status, 200);
+  const gated = await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { kind: 'message', body: iWire(k1) },
+  });
+  assert.equal(gated.status, 409);
+  assert.equal(gated.body.error.code, 'rotation_required');
+
+  // Rekey with fresh material (the removed parent is not staged): writes resume.
+  const k2 = iHex(16);
+  const e2 = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+    token: ownerToken,
+    body: { member_id: ownerMid, agent_label: ownerLabel, key_id: k2, envelope: iB64(96) },
+  });
+  assert.equal(e2.status, 201);
+  const c2 = await app.call('POST', `/v1/topics/${tid}/keys/commit`, {
+    token: ownerToken,
+    body: { expected_epoch: 2, key_id: k2, commitment: iHex(32) },
+  });
+  assert.equal(c2.status, 200);
+  const w2 = await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { kind: 'message', body: iWire(k2) },
+  });
+  assert.equal(w2.status, 201);
+
+  // The removed parent is locked out and holds no new-key envelope.
+  const gone = await app.call('GET', `/v1/topics/${tid}/history`, { token: parentToken });
+  assert.equal(gone.status, 403);
 });
