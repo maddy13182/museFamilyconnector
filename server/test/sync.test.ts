@@ -40,13 +40,18 @@ test('sync/topics is per-circle: a token sees only its own circle topics', async
 
   const tidA = await createPlainTopic(app, a.owner.token, 'A topic');
   const tidB = await createPlainTopic(app, b.owner.token, 'B topic');
+  // Note: own posts don't flag topics as changed (server excludes self
+  // from new_count). For the isolation check, we verify the other
+  // circle's topic never appears — the per-circle WHERE clause, not
+  // new_count, drives that.
   await postEntry(app, a.owner.token, tidA, 'hello A');
   await postEntry(app, b.owner.token, tidB, 'hello B');
 
   const sa = await syncTopics(app, a.owner.token);
   assert.equal(sa.status, 200);
   const idsA = (sa.body.topics as any[]).map((t) => t.topic_id);
-  assert.ok(idsA.includes(tidA), 'own circle topic listed');
+  // tidA not listed: own post doesn't count as new (new behavior).
+  assert.ok(!idsA.includes(tidA), 'own post does not flag topic as changed');
   assert.ok(!idsA.includes(tidB), 'other circle topic must not leak');
   for (const t of sa.body.topics as any[]) {
     assert.equal(t.circle_id, a.famId);
@@ -54,7 +59,7 @@ test('sync/topics is per-circle: a token sees only its own circle topics', async
 
   const sb = await syncTopics(app, b.owner.token);
   const idsB = (sb.body.topics as any[]).map((t) => t.topic_id);
-  assert.ok(idsB.includes(tidB));
+  assert.ok(!idsB.includes(tidB), 'own post does not flag topic as changed');
   assert.ok(!idsB.includes(tidA));
 });
 

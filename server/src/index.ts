@@ -3522,6 +3522,10 @@ function decodePageToken(v: string | null): number {
  *   max(stored acked_seq, history_from_seq - 1).
  * - `latest_seq` / `new_count` / `last_activity_ts` / `last_actor` are
  *   computed over VISIBLE entries only (seq >= history_from_seq).
+ * - `new_count` excludes the requesting agent's own entries
+ *   (actor_member_id + agent_label match) — your own posts never flag a
+ *   topic as "changed." Use `hub read` for full history including your own
+ *   messages.
  * - `e2ee` is 0/1 (integer), matching the existing topic JSON shape.
  * - `key_status`: 'not_e2ee' for plaintext topics; for E2EE topics 'ok'
  *   when the caller's agent holds an envelope for the committed current
@@ -3554,7 +3558,8 @@ async function handleSyncTopics(
               WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq) AS latest_seq,
             (SELECT COUNT(*) FROM entries e
               WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
-                AND e.seq > MAX(COALESCE(rs.acked_seq, 0), p.history_from_seq - 1)) AS new_count,
+                AND e.seq > MAX(COALESCE(rs.acked_seq, 0), p.history_from_seq - 1)
+                AND NOT (e.actor_member_id = ? AND e.agent_label = ?)) AS new_count,
             (SELECT e.ts FROM entries e
               WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
               ORDER BY e.seq DESC LIMIT 1) AS last_activity_ts,
@@ -3567,7 +3572,9 @@ async function handleSyncTopics(
        LEFT JOIN topic_read_state rs
          ON rs.topic_id = t.id AND rs.member_id = ? AND rs.agent_label = ?
       WHERE t.family_id = ?`,
-    [auth.member_id, auth.member_id, auth.agent_label, auth.family_id],
+    // Params in TEXTUAL ? order: new_count subquery (actor_member_id,
+    // agent_label) comes before the JOIN conditions in the SQL string.
+    [auth.member_id, auth.agent_label, auth.member_id, auth.member_id, auth.agent_label, auth.family_id],
   );
 
   const changed = rows.filter((r) => (r['new_count'] as number) > 0);

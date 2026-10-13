@@ -171,7 +171,7 @@ async function main() {
         body: tarballBytes,
         type: 'application/gzip',
       },
-      [`/${skillTag}/manifest.json`]: {
+      [`/${skillTag}/skill-manifest.json`]: {
         body: skillReleaseManifestBytes,
         type: 'application/json',
       },

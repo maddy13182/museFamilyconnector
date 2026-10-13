@@ -305,7 +305,7 @@ async function main() {
     sigstore: `${base}/hub.sigstore`,
     manifest: `${base}/manifest.json`,
     skill: `${skillBase}/skill.tar.gz`,
-    skillManifest: `${skillBase}/manifest.json`,
+    skillManifest: `${skillBase}/skill-manifest.json`,
   };
 
   console.error(`bundle-client: fetching CLI ${tag} (pin sha256 ${pin.sha256.slice(0, 16)}…, skill sha256 ${pin.skillSha256.slice(0, 16)}…)`);

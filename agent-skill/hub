@@ -5081,7 +5081,25 @@ def cmd_tasks(args, transport):
 def cmd_members(args, transport):
     ctx = _ctx(args, transport)
     resp = ctx.client.call("GET", "/v1/members")
-    emit_json(_as_list(resp, "members"))
+    members = _as_list(resp, "members")
+    # Echo which circle this is for (Prem's feedback: was unclear).
+    circle_id = _active_circle_id(ctx.cfg)
+    circle_name = None
+    try:
+        circles = _list_circles(ctx.client)
+        for c in circles:
+            if isinstance(c, dict) and c.get("id") == circle_id:
+                circle_name = c.get("name")
+                break
+    except Exception:
+        pass
+    emit_json(
+        {
+            "circle_id": circle_id,
+            "circle_name": circle_name,
+            "members": members,
+        }
+    )
     return 0
 
 

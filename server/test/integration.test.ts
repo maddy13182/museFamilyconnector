@@ -352,19 +352,21 @@ function iWire(keyId: string): string {
 }
 
 test('20. sync v2 journey: changed-topic discovery -> read -> receipt -> ack -> quiet', async () => {
-  const { app, ownerToken } = ctx;
+  const { app, ownerToken, parentToken, parentId } = ctx;
   const t = await app.call('POST', '/v1/topics', {
     token: ownerToken,
-    body: { subject: 'v2 journey', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'v2 journey', kind: 'group', participant_member_ids: [parentId] },
   });
   assert.equal(t.status, 201);
   const tid = t.body.topic.id as string;
+  // Parent posts (not owner): owner should see these as new. Own posts
+  // never flag a topic as changed (server excludes self from new_count).
   await app.call('POST', `/v1/topics/${tid}/entries`, {
-    token: ownerToken,
+    token: parentToken,
     body: { body: 'first' },
   });
   await app.call('POST', `/v1/topics/${tid}/entries`, {
-    token: ownerToken,
+    token: parentToken,
     body: { body: 'second' },
   });
 
@@ -391,9 +393,9 @@ test('20. sync v2 journey: changed-topic discovery -> read -> receipt -> ack -> 
   const s2 = await app.call('GET', '/v1/sync/topics', { token: ownerToken });
   assert.ok(!(s2.body.topics as any[]).some((x: any) => x.topic_id === tid), 'acked topic drops out');
 
-  // New activity re-lists it with a fresh count.
+  // New activity re-lists it with a fresh count (parent posts again).
   await app.call('POST', `/v1/topics/${tid}/entries`, {
-    token: ownerToken,
+    token: parentToken,
     body: { body: 'third' },
   });
   const s3 = await app.call('GET', '/v1/sync/topics', { token: ownerToken });

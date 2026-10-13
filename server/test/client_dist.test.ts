@@ -361,7 +361,7 @@ function stubFiles(fx: ReleaseFixture): Record<string, { body: string | Uint8Arr
     [`${cliTag}/hub.sigstore`]: { body: JSON.stringify({ mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json' }) },
     [`${cliTag}/manifest.json`]: { body: JSON.stringify(fx.releaseManifest) },
     [`${skillTag}/skill.tar.gz`]: { body: fx.skillTarGz },
-    [`${skillTag}/manifest.json`]: { body: JSON.stringify(fx.skillReleaseManifest) },
+    [`${skillTag}/skill-manifest.json`]: { body: JSON.stringify(fx.skillReleaseManifest) },
   };
 }
 
@@ -463,7 +463,7 @@ test('bundler fails closed on HTTP 404 from the release server', async () => {
     '/cli-v9.9.9/hub.sigstore': { status: 404, body: '' },
     '/cli-v9.9.9/manifest.json': { status: 404, body: '' },
     '/skill-v1.2.3/skill.tar.gz': { status: 404, body: '' },
-    '/skill-v1.2.3/manifest.json': { status: 404, body: '' },
+    '/skill-v1.2.3/skill-manifest.json': { status: 404, body: '' },
   });
   try {
     const pin = {
@@ -542,7 +542,7 @@ test('bundler fails closed when the skill release manifest has no skill_sha256',
   // bundle the skill release never published.
   const skillReleaseManifest: Record<string, unknown> = { ...fx.skillReleaseManifest };
   delete skillReleaseManifest.skill_sha256;
-  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
+  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
   try {
     const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
@@ -557,7 +557,7 @@ test('bundler fails closed when the skill release manifest version disagrees wit
   const fx = await makeRelease(dir);
   // The skill-v tag was republished under a different skill version.
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_version: '9.9.9' };
-  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
+  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
   try {
     const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
@@ -577,7 +577,7 @@ test('bundler fails closed on a tarball with a path-traversal member', async () 
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
     ...stubFiles(fx),
-    '/skill-v1.2.3/manifest.json': { body: JSON.stringify(skillReleaseManifest) },
+    '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
     '/skill-v1.2.3/skill.tar.gz': { body: evil },
   });
   try {
@@ -598,7 +598,7 @@ test('bundler fails closed on a tarball with a symlink member', async () => {
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
     ...stubFiles(fx),
-    '/skill-v1.2.3/manifest.json': { body: JSON.stringify(skillReleaseManifest) },
+    '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
     '/skill-v1.2.3/skill.tar.gz': { body: evil },
   });
   try {
@@ -621,7 +621,7 @@ test('bundler fails closed when the tarball embeds a phase-2 manifest', async ()
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
     ...stubFiles(fx),
-    '/skill-v1.2.3/manifest.json': { body: JSON.stringify(skillReleaseManifest) },
+    '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
     '/skill-v1.2.3/skill.tar.gz': { body: evil },
   });
   try {
