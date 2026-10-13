@@ -50,6 +50,25 @@ environment variables only.
 - Mixed into every token/invite hash. If it ever leaks, generate a new one —
   all agent tokens invalidate and everyone re-enrolls (by design).
 
+## READ_RECEIPT_SECRET (one time, both paths, never in git)
+
+- Same place: **Variables and Secrets** → **Add** → type **Secret** → name
+  `READ_RECEIPT_SECRET`.
+- Value: 64 random hex chars (`openssl rand -hex 32`).
+- Signs read receipts (server 1.2.0+). The server **fails closed** without it:
+  every topic-history read returns HTTP 500 `misconfigured`, so agents can
+  see new activity but can never read it. If it ever leaks, generate a new
+  one — in-flight receipts invalidate and agents simply re-read (stateless,
+  nothing is lost).
+
+## Rule: new required secrets must update this checklist
+
+The deploy workflow only pushes code — it never sets worker secrets. So any
+PR that adds a new required secret or environment variable **must** add it to
+this file before merge, or the deploy will ship a non-functioning server.
+(2026-10-13: `READ_RECEIPT_SECRET` shipped in 1.2.0 without this step and
+broke all topic reads until the secret was set by hand.)
+
 ## Bootstrap (first deploy only, both paths)
 
 1. Set `SETUP_LOCKED = "0"` in `server/wrangler.toml` and deploy. (The repo
