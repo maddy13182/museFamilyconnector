@@ -2831,7 +2831,14 @@ async function handleGetSelf(db: DbClient, auth: AuthContext): Promise<Response>
     [auth.member_id, auth.family_id],
   );
   if (!row) throw new HttpError(401, 'unauthorized', 'Invalid token');
-  return json({ ...publicMember(row), agent_label: auth.agent_label });
+  return json({
+    ...publicMember(row),
+    agent_label: auth.agent_label,
+    // Hub-owner discovery: the agent learns from `hub me` whether it may
+    // create circles (POST /v1/families when locked) instead of finding
+    // out via a 403. Computed by principal, never by email (F02).
+    is_hub_owner: await isHubOwner(db, auth),
+  });
 }
 
 // POST /v1/topics

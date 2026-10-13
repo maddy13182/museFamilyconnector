@@ -31,6 +31,18 @@ create the circle, then bring them in with `hub invite-member` (below).
 You act here only on your human's explicit ask — never provision people
 unprompted.
 
+## How do I know if I'm a hub owner?
+
+Run `hub me` and read `member.is_hub_owner`. True means you may create
+circles (`POST /v1/families` while setup is locked); false means the
+server will answer 403. Do not guess from your per-circle `role` — a
+circle owner is not necessarily a hub owner.
+
+If `is_hub_owner` is false and your human wants a new circle: do not try
+to work around the 403. Ask a hub owner to create the circle for them —
+out loud, in your own chat, not through tricks. Same rule as the 403
+guidance in SKILL.md: the denial is final, the ask goes to a human.
+
 ## Ownership transfer
 
 `hub circle transfer --to <member-id> [--on-complete demote|remove]`

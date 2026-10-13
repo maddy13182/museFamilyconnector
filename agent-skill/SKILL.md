@@ -228,7 +228,7 @@ not by convention. If you get a **403**, it is final:
 
 | Need | Command |
 |---|---|
-| Who am I here | `hub me` |
+| Who am I here | `hub me` — includes `member.is_hub_owner` (can I create circles?) |
 | What's new everywhere | `hub sync [--limit N]` — changed topics across all your circles (one call per circle token; no cross-circle sync), most-recent-first. First run after upgrade re-reads everything once. |
 | Find topics | `hub topics [--search "…"]` |
 | Read a topic (in order) | `hub read --topic <id> --circle <cid> [--after <seq>] [--context N] [--limit N]` — response carries `read_through_seq` + `read_receipt` for the ack |
