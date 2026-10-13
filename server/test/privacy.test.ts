@@ -1,9 +1,11 @@
 // Tests: Phase C privacy boundaries.
-// F06 — the from-join history floor must apply to task list, task get, and
-// topic export (not just entry reads), and the cutoff must be computed inside
-// the membership insert transaction.
+// F06 — the from-join history floor must apply to the task list (not just
+// entry reads), and the cutoff must be computed inside the membership
+// insert transaction. (The bare task GET, topic export, and entry redact
+// endpoints that F06 once covered were deleted per spec §1.6 — the last
+// section below asserts the deletions hold.)
 // F08 — the PII guard must cover entry.data string leaves, task titles, and
-// task completion results; owner redaction must scrub PII leaves in data.
+// task completion results.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp, TestApp } from './app.js';
@@ -236,4 +238,47 @@ test('F08: PII-shaped completion results are rejected; clean results pass', asyn
   });
   assert.equal(good.status, 200);
   assert.deepEqual(good.body.task.result, { summary: 'all done', items: 2 });
+});
+
+// ---------------------------------------------------------------------------
+// Spec §1.6 deletions hold: redact / export / bare task GET+PATCH are gone.
+// ---------------------------------------------------------------------------
+
+test('deleted endpoints stay deleted: redact, export, bare task GET/PATCH', async () => {
+  const { app, ownerToken, ownerId } = await bootstrap();
+  const tid = await makeTopic(app, ownerToken, ownerId, []);
+  const entry = await app.call('POST', `/v1/topics/${tid}/entries`, {
+    token: ownerToken,
+    body: { body: 'some entry' },
+  });
+  assert.equal(entry.status, 201);
+  const gseq = entry.body.entry.gseq as number;
+  const task = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+    token: ownerToken,
+    body: { title: 'some task' },
+  });
+  const taskId = task.body.task.id as string;
+
+  // POST /v1/entries/:eid/redact — deleted (no client).
+  for (const tok of [ownerToken]) {
+    const r = await app.call('POST', `/v1/entries/${gseq}/redact`, { token: tok, body: {} });
+    assert.equal(r.status, 404, 'redact must stay deleted');
+  }
+  // GET /v1/topics/:tid/export — deleted (no client).
+  const exp = await app.call('GET', `/v1/topics/${tid}/export`, { token: ownerToken });
+  assert.equal(exp.status, 404, 'export must stay deleted');
+  // GET / PATCH /v1/tasks/:tid — deleted (the CLI uses notes/done).
+  for (const method of ['GET', 'PATCH'] as const) {
+    const r = await app.call(method, `/v1/tasks/${taskId}`, {
+      token: ownerToken,
+      body: method === 'PATCH' ? { title: 'x' } : undefined,
+    });
+    assert.equal(r.status, 404, `${method} /v1/tasks/:id must stay deleted`);
+  }
+  // The task sub-paths that remain still work (notes/done are not bare-task).
+  const note = await app.call('POST', `/v1/tasks/${taskId}/notes`, {
+    token: ownerToken,
+    body: { body: 'still here' },
+  });
+  assert.equal(note.status, 201);
 });
