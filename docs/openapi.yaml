@@ -1274,42 +1274,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
-  /v1/topics/{tid}/export:
-    get:
-      tags: [topics]
-      operationId: exportTopic
-      summary: Export full topic as JSON
-      description: Topic + participants + all visible entries + tasks. For offline copies and migration. 403 unless participant.
-      parameters:
-        - $ref: '#/components/parameters/TopicId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [seq, read_receipt]
-              properties:
-                seq: { type: integer, minimum: 1 }
-                read_receipt: { type: string }
-      responses:
-        '200':
-          description: Ack recorded
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [topic_id, acked_seq]
-                properties:
-                  topic_id: { type: string }
-                  acked_seq: { type: integer }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409':
-          description: noncontiguous_ack — the ack skips unacked entries
-
   /v1/topics/{tid}/invite:
     post:
       tags: [topics]
@@ -1786,86 +1750,6 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
-
-  /v1/tasks/{tid}:
-    get:
-      tags: [tasks]
-      operationId: getTask
-      summary: Get a task + its entry trail
-      description: Caller must be a participant of the task's topic.
-      parameters:
-        - $ref: '#/components/parameters/TaskId'
-      responses:
-        '200':
-          description: Task detail
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [task, trail]
-                properties:
-                  task: { $ref: '#/components/schemas/Task' }
-                  trail:
-                    type: array
-                    items: { $ref: '#/components/schemas/Entry' }
-                    description: All entries in the topic referencing this task, in seq order (capped at 5000).
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-    patch:
-      tags: [tasks]
-      operationId: updateTask
-      summary: Update a task
-      description: |
-        Staged atomic key activation. Handles genesis (expected_epoch: 1,
-        topic at epoch 0) and rotation (expected_epoch: current_epoch + 1).
-        Owner/parent only. Single transaction: E2EE topic required (400
-        otherwise; topics at epoch 0 reject all content writes with 409
-        key_not_active); expected_epoch == current_epoch + 1 else 409
-        stale_epoch; key_id never reused (409 key_reuse); commitment 64 hex
-        chars and never reused (409 key_material_reuse). Staged envelopes
-        must cover exactly the current participant set: envelopes for removed
-        agents burn the key (409 recipients_removed_key_burned, staged rows
-        deleted — generate fresh key material and restart, never reseal);
-        envelopes sealed to superseded identity keys count as missing (409
-        superseded_identity_key, not force-overridable); agents with no
-        active identity key at all may be force-committed by the owner (409
-        incomplete_distribution otherwise; forced=1 recorded, those agents
-        stay key_status pending). INSERTs the epoch row and CAS-flips
-        current_key_id/current_epoch. Clears topics.rotation_required.
-        Response { topic_id, epoch, key_id }.
-      parameters:
-        - $ref: '#/components/parameters/TopicId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [expected_epoch, key_id, commitment]
-              properties:
-                expected_epoch: { type: integer, minimum: 1 }
-                key_id: { type: string, description: Random 128-bit topic-key id, 32 hex chars. }
-                commitment: { type: string, description: Hex SHA256 of the topic key, 64 chars. }
-                force: { type: boolean, default: false, description: Owner-only; covers only agents with no active identity key. }
-      responses:
-        '200':
-          description: Key activated
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [topic_id, epoch, key_id]
-                properties:
-                  topic_id: { type: string }
-                  epoch: { type: integer }
-                  key_id: { type: string }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409':
-          description: stale_epoch | key_reuse | key_material_reuse | recipients_removed_key_burned | superseded_identity_key | incomplete_distribution
 
   /v1/tasks/{tid}/notes:
     post:
