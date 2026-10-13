@@ -65,7 +65,7 @@ class FakeHub:
             and path == "/v1/health"
             and ("GET", "/v1/health") not in self.routes
         ):
-            # The fake models a current (0.14.0) server: auto-answer the
+            # The fake models a current (1.0.0) server: auto-answer the
             # per-invocation version check in main().
             self.health_calls.append(
                 {
@@ -76,7 +76,7 @@ class FakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "0.14.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
             )
         self.calls.append(
             {

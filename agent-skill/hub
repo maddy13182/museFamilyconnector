@@ -138,12 +138,12 @@ SKILL_VERSION = _skill_version()
 
 # Floor of the API version contract (spec §1, §4.1): the oldest server
 # this CLI will talk to. Bumped deliberately; covered by a test. Clean
-# break — no backcompat: 0.14.0 is the first server that serves the
+# break — no backcompat: 1.0.0 is the first server that serves the
 # sync-v2 flows (`/v1/sync/topics`, receipt-bound `ack`, `/v1/keys/commit`)
 # and enforces the E2EE lifecycle (staged key envelopes, N05 plaintext
 # rejection, write-time key gates, `rotation_required` transitions),
 # which this CLI requires.
-_MIN_SERVER_VERSION = "0.14.0"
+_MIN_SERVER_VERSION = "1.0.0"
 
 # API majors this CLI implements, highest first. The per-invocation check
 # selects the highest one the server advertises (v1 today) and prefixes
@@ -5805,7 +5805,7 @@ def _is_newer(candidate, current):
 
 
 def _validate_skill_block(manifest):
-    """Validate the manifest's `skill` block (contract §3.6, server 0.13.0+).
+    """Validate the manifest's `skill` block (contract §3.6, server 1.0.0+).
 
     Shape: {url, sha256, version} — the server-hosted skill bundle
     (skill.tar.gz) advertised by GET /v1/client/latest. `url` must be an

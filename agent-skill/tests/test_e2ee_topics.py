@@ -167,7 +167,7 @@ class E2eeFakeHub:
         query = urlparse.parse_qs(parts.query)
         method = method.upper()
 
-        # The fake models a current (0.14.0) server: auto-answer the
+        # The fake models a current (1.0.0) server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
         if method == "GET" and path == "/v1/health":
@@ -180,7 +180,7 @@ class E2eeFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "0.14.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
             )
 
         self._record(method, url, headers, body_bytes)

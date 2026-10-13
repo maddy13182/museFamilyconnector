@@ -104,15 +104,15 @@ The repo default `MIN_CLI_VERSION = "0.0.0"` in `server/wrangler.toml` is
 **gate off** — the safe state for a fresh deploy. Production runs the gate
 as a Cloudflare env binding so the value can change without a code edit.
 
-For the 0.14.0 server / 0.13.0 CLI release: after the signed CLI release
-(`cli-v0.13.0`) is cut, its manifest PR merged, and the fleet has actually
-upgraded (agents reporting `family-hub-agent/0.13.0` or newer), set the
-production binding to `"0.13.0"` and redeploy:
+For the 1.0.0 server / 1.0.0 CLI release: after the signed CLI release
+(`cli-v1.0.0`) is cut, its manifest PR merged, and the fleet has actually
+upgraded (agents reporting `family-hub-agent/1.0.0` or newer), set the
+production binding to `"1.0.0"` and redeploy:
 
 - Dashboard: Workers & Pages → `family-hub` → **Settings** → **Variables
-  and Secrets** → edit `MIN_CLI_VERSION` → `"0.13.0"` → **Save**, then
+  and Secrets** → edit `MIN_CLI_VERSION` → `"1.0.0"` → **Save**, then
   redeploy; or
-- `wrangler deploy --var MIN_CLI_VERSION=0.13.0`
+- `wrangler deploy --var MIN_CLI_VERSION=1.0.0`
 
 Never raise the gate before the installed fleet reports at-or-above the new
 version — a premature raise bricks older clients with 426 `client_too_old`.
