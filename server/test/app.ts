@@ -26,6 +26,8 @@ export function makeApp() {
   const db: DbClient = sqliteClient(raw);
   const env: Env = {
     TOKEN_PEPPER: 'test-pepper-do-not-use-in-production',
+    // Sync v2 read receipts need a secret; tests use a fixed throwaway.
+    READ_RECEIPT_SECRET: 'test-read-receipt-secret-do-not-use-in-production',
     SETUP_LOCKED: '0',
   };
 

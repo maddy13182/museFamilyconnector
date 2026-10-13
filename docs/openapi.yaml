@@ -1161,6 +1161,15 @@ paths:
         `seq >=` the caller's `history_from_seq` are returned (invite-time
         visibility). 403 unless the caller is a participant. Page with
         `after_seq`; more entries exist while the last returned seq < max_seq.
+        `context` (default 10, max 50) prepends up to that many entries
+        immediately before `after_seq` (bounded below by history_from_seq),
+        flagged `is_context: true` — re-reads for orientation; page entries
+        carry `is_context: false`. Every response includes `read_through_seq`
+        (highest newly-read seq in this page; context rows excluded) and a
+        `read_receipt` HMAC binding
+        (member_id, agent_label, topic_id, from_seq, through_seq) with
+        from_seq = max(after_seq, history_from_seq - 1) + 1 — POST it to
+        /v1/topics/{tid}/ack to advance read state.
       parameters:
         - $ref: '#/components/parameters/TopicId'
         - name: after_seq
@@ -1172,6 +1181,11 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: context
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+          description: Number of pre-after_seq entries to include as context (is_context: true).
       responses:
         '200':
           description: History page
@@ -1179,18 +1193,81 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entries, max_seq]
+                required: [entries, max_seq, read_through_seq, read_receipt]
                 properties:
                   entries:
                     type: array
-                    items: { $ref: '#/components/schemas/Entry' }
+                    items:
+                      allOf:
+                        - { $ref: '#/components/schemas/Entry' }
+                        - type: object
+                          properties:
+                            is_context: { type: boolean }
                   max_seq:
                     type: integer
                     description: Highest seq in the topic (visible range).
+                  read_through_seq:
+                    type: integer
+                    description: Highest newly-read seq in this page (context rows excluded).
+                  read_receipt:
+                    type: string
+                    description: >
+                      HMAC-bound receipt for this (member, agent, topic,
+                      from_seq, through_seq); present to POST .../ack.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/ack:
+    post:
+      tags: [topics]
+      operationId: ackTopic
+      summary: Advance per-agent read state (sync v2)
+      description: |
+        Receipt-bound, contiguous ack. Body { seq, read_receipt }, both
+        required. The server HMAC-verifies the receipt — it must bind THIS
+        (member_id, agent_label, topic_id); cross-agent replay fails with
+        403 invalid_read_receipt. effective = max(acked_seq,
+        history_from_seq - 1). seq <= effective is a no-op success
+        (idempotent). Otherwise the ack must be contiguous: from_seq <=
+        effective + 1 and seq <= through_seq, else 409 noncontiguous_ack
+        (read and ack pages in order). Read state advances atomically via
+        max(). 403 unless the caller is a participant; 404 when the topic
+        is not in the caller's family.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seq, read_receipt]
+              properties:
+                seq:
+                  type: integer
+                  minimum: 0
+                  description: Read position to acknowledge through.
+                read_receipt:
+                  type: string
+                  description: Receipt issued by GET .../history for the range being acked.
+      responses:
+        '200':
+          description: Read state advanced (or no-op)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic_id, acked_seq]
+                properties:
+                  topic_id: { type: string }
+                  acked_seq: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/topics/{tid}/export:
     get:
@@ -1497,17 +1574,20 @@ paths:
       operationId: postTopicEnvelope
       summary: Store a sealed topic-key envelope for a recipient agent
       description: |
-        E2EE (Phase 2). Stores one sealed topic-key envelope for the target
-        (member_id, agent_label). The envelope blob is opaque to the server:
-        format-validated (standard base64) and stored, never inspected.
-        The caller must be a current participant of the topic (403
-        otherwise); the target must be a current participant AND hold an
+        E2EE (sync v2). STAGED distribution: stores one sealed topic-key
+        envelope for the target (member_id, agent_label). The envelope blob
+        is opaque to the server: format-validated (standard base64) and
+        stored, never inspected. N04: a new key_id is STORED, never flipped —
+        only POST .../keys/commit activates a key and advances
+        topics.current_key_id. The caller must be a current participant of
+        the topic (403 otherwise); introducing a key_id different from the
+        topic's current_key_id is allowed only for owner/parent callers (403
+        otherwise). The target must be a current participant AND hold an
         ACTIVE (non-superseded) registered public key (400 otherwise —
         sealing to an agent with no key on file is meaningless; they must
-        run `hub key-init` first). Key election (secfix F1): a key_id
-        different from the topic's current_key_id INTRODUCES a new key
-        (rotation) — allowed only for owner/parent callers (403 otherwise);
-        on success current_key_id advances atomically. Re-POSTing the same
+        run `hub key-init` first). The server records the target's active
+        identity-key id on the row (identity_key_id) for the commit's
+        superseded-key check. Re-POSTing the same
         (topic_id, member_id, agent_label, key_id) replaces the stored
         envelope — idempotent distribution — and preserves the original
         created_at (secfix F3).
@@ -1559,11 +1639,16 @@ paths:
       operationId: listTopicEnvelopes
       summary: Fetch my own key envelopes for a topic
       description: |
-        E2EE (Phase 2). Returns ONLY the caller's own envelopes — rows are
-        matched on the caller's (member_id, agent_label) from the Bearer
-        token, never on caller-supplied input. One agent can never fetch
-        another agent's envelopes. 403 when the caller is not a participant
-        of the topic.
+        E2EE (sync v2). Returns ONLY the caller's own envelopes for COMMITTED
+        epochs — rows are matched on the caller's (member_id, agent_label)
+        from the Bearer <redacted> never on caller-supplied input, and joined
+        against the topic's epoch log. Staged (uncommitted) keys stay
+        invisible until POST .../keys/commit activates them: an uncommitted
+        key must never be treated as usable. Each envelope carries its
+        epoch's `commitment` (hex SHA256 of the topic key; null for
+        grandfathered pre-migration epochs) for the CLI's verify-on-open
+        (N07). One agent can never fetch another agent's envelopes. 403 when
+        the caller is not a participant of the topic.
       parameters:
         - name: tid
           in: path
@@ -1582,7 +1667,7 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at]
+                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at, epoch]
                       properties:
                         topic_id: { type: string }
                         member_id: { type: string }
@@ -1590,9 +1675,84 @@ paths:
                         key_id: { type: string }
                         envelope: { type: string }
                         created_at: { type: string, format: date-time }
+                        epoch: { type: integer, description: Committed epoch this envelope belongs to. }
+                        commitment:
+                          type: string
+                          nullable: true
+                          description: >
+                            Hex SHA256 of the topic key for verify-on-open;
+                            null for grandfathered pre-migration epochs.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/topics/{tid}/keys/commit:
+    post:
+      tags: [e2ee]
+      operationId: commitTopicKey
+      summary: Staged atomic key activation (sync v2)
+      description: |
+        Handles GENESIS (expected_epoch 1, topic at epoch 0) and ROTATION
+        (expected_epoch = current_epoch + 1). Body
+        { expected_epoch, key_id, commitment, force }. Owner/parent only;
+        force is owner-only. Single transaction: expected_epoch must equal
+        current_epoch + 1 (409 stale_epoch); key_id must never have been used
+        for this topic (409 key_reuse); commitment must be 64 hex chars and
+        never used (409 key_material_reuse). Then the set-equality of STAGED
+        vs CURRENT agents (staged = envelope rows for key_id sealed to each
+        agent's currently-active identity key; current = live agents of
+        current participants): staged envelopes for non-participants BURN the
+        key — 409 recipients_removed_key_burned, staged rows deleted, client
+        must generate fresh key material (force cannot override); agents with
+        an active identity key but no staged envelope for it → 409
+        superseded_identity_key (not force-overridable — re-seal to the
+        active key); agents with no active identity key at all → 409
+        incomplete_distribution, or commit with force:true recording
+        forced=1 + forced_missing (the ONLY case force covers). On success
+        the epoch row is inserted and topics.current_key_id/current_epoch
+        advance atomically (rotation_required cleared). Response
+        { topic_id, epoch, key_id }.
+      parameters:
+        - $ref: '#/components/parameters/TopicId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_epoch, key_id, commitment]
+              properties:
+                expected_epoch:
+                  type: integer
+                  minimum: 1
+                  description: Must equal current_epoch + 1 (1 for genesis).
+                key_id:
+                  type: string
+                  description: Random 128-bit topic-key id, 32 hex chars; never reused.
+                commitment:
+                  type: string
+                  description: Hex SHA256 of the topic key, 64 hex chars; never reused.
+                force:
+                  type: boolean
+                  default: false
+                  description: Owner-only; covers ONLY agents with no active identity key.
+      responses:
+        '200':
+          description: Epoch committed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topic_id, epoch, key_id]
+                properties:
+                  topic_id: { type: string }
+                  epoch: { type: integer }
+                  key_id: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/tasks/{tid}:
     get:
@@ -1788,6 +1948,96 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
 
         '429': { $ref: '#/components/responses/RateLimited' }
+        '426': { $ref: '#/components/responses/ClientTooOld' }
+  /v1/sync/topics:
+    get:
+      tags: [sync]
+      operationId: syncTopics
+      summary: Changed-topic discovery (sync v2)
+      description: |
+        Sync v2 changed-topic discovery. Called ONCE PER CIRCLE TOKEN — the
+        Bearer <redacted> exactly one (member_id, family_id); the server never
+        crosses family boundaries, so there is no cross-circle sync. A topic
+        is "changed" when it has a visible entry (seq >= the caller's
+        history_from_seq) with seq > max(acked_seq, history_from_seq - 1);
+        a missing read-state row counts as acked_seq 0 (all visible unread).
+        The first call carries no cursor: a deliberate full re-read seeds a
+        read-state row (acked_seq 0) per visible topic and reports every
+        visible topic as changed once. `bootstrap_gseq` is accepted and
+        validated but not used for seeding. Pagination is offset-based over
+        (last_activity_ts DESC, topic_id); changed sets can shift between
+        pages — clients dedupe.
+      parameters:
+        - name: bootstrap_gseq
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+          description: >
+            First call only. Accepted and validated; the server always seeds
+            read state from 0 (deliberate full re-read) rather than from a
+            legacy gseq cursor.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: page_token
+          in: query
+          required: false
+          schema: { type: string }
+          description: Opaque token from the previous page (next_page_token).
+      responses:
+        '200':
+          description: Changed topics page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topics, has_more]
+                properties:
+                  topics:
+                    type: array
+                    items:
+                      type: object
+                      required: [topic_id, circle_id, circle_name, subject, kind, e2ee, acked_seq, latest_seq, new_count, key_status, assigned_to_me]
+                      properties:
+                        topic_id: { type: string }
+                        circle_id: { type: string }
+                        circle_name: { type: string }
+                        subject: { type: string }
+                        kind: { type: string, enum: [direct, group] }
+                        e2ee: { type: integer, enum: [0, 1] }
+                        acked_seq:
+                          type: integer
+                          description: Effective read position = max(stored acked_seq, history_from_seq - 1).
+                        latest_seq:
+                          type: integer
+                          nullable: true
+                          description: Highest visible seq (null when no visible entries).
+                        new_count:
+                          type: integer
+                          description: Visible entries with seq > effective acked_seq.
+                        last_activity_ts: { type: string, format: date-time, nullable: true }
+                        last_actor:
+                          type: string
+                          nullable: true
+                          description: member_id of the latest visible entry's actor.
+                        key_status:
+                          type: string
+                          enum: [ok, pending, not_e2ee]
+                          description: >
+                            not_e2ee for plaintext topics; ok when the caller's
+                            agent holds an envelope for the committed current
+                            key, else pending (use the key-request flow).
+                        assigned_to_me:
+                          type: boolean
+                          description: An open task in the topic is assigned to the caller.
+                  has_more: { type: boolean }
+                  next_page_token:
+                    type: string
+                    nullable: true
+                    description: Pass as page_token for the next page; null when done.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '426': { $ref: '#/components/responses/ClientTooOld' }
   /v1/entries/{eid}/redact:
     post:
@@ -2076,7 +2326,7 @@ components:
       enum: [open, in_progress, blocked, done, cancelled]
     ErrorCode:
       type: string
-      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, client_too_old, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed]
+      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, client_too_old, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed, noncontiguous_ack, invalid_read_receipt, stale_epoch, key_reuse, key_material_reuse, recipients_removed_key_burned, superseded_identity_key, incomplete_distribution, misconfigured]
 
     Error:
       type: object
