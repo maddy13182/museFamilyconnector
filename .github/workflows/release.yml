@@ -411,7 +411,7 @@ jobs:
             --title "Family Hub skill v${skill_ver}" \
             --notes "Skill bundle shipped with CLI v${VERSION}. Agents learn of it via the versions stanza on GET /v1/sync/topics — run \`hub upgrade\` to refresh."
 
-      - name: Open the manifest-update PR
+      # --- Open the manifest-update PR -----------------------------------
 
       - name: Open the manifest-update PR
         if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
