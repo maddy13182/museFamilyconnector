@@ -138,10 +138,12 @@ SKILL_VERSION = _skill_version()
 
 # Floor of the API version contract (spec §1, §4.1): the oldest server
 # this CLI will talk to. Bumped deliberately; covered by a test. Clean
-# break — no backcompat: 0.13.0 is the first server that serves the
-# skill bundle (`/v1/client/download/skill.tar.gz`, manifest `skill`
-# block, contract §3.6), which `hub upgrade` now requires.
-_MIN_SERVER_VERSION = "0.13.0"
+# break — no backcompat: 0.14.0 is the first server that serves the
+# sync-v2 flows (`/v1/sync/topics`, receipt-bound `ack`, `/v1/keys/commit`)
+# and enforces the E2EE lifecycle (staged key envelopes, N05 plaintext
+# rejection, write-time key gates, `rotation_required` transitions),
+# which this CLI requires.
+_MIN_SERVER_VERSION = "0.14.0"
 
 # API majors this CLI implements, highest first. The per-invocation check
 # selects the highest one the server advertises (v1 today) and prefixes

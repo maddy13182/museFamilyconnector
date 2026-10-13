@@ -111,7 +111,7 @@ def make_manifest(skill_version, tarball_bytes, server=SERVER):
     return {
         "version": "0.12.0",
         "min_cli_version": "0.10.0",
-        "server_version": "0.13.0",
+        "server_version": "0.14.0",
         "download_url": server + "/v1/client/download/hub",
         "sha256": "0" * 64,
         "released_at": "2026-10-12T00:00:00Z",
