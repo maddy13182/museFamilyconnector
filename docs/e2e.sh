@@ -4,7 +4,7 @@
 #
 # Drives the API through: family bootstrap -> invites -> parents_only topic ->
 # kid gets 403 -> spawn linked child with briefing -> task delegation round-trip
-# -> PII rejection -> idempotent retry dedupe -> sync cursors -> redact.
+# -> PII rejection -> idempotent retry dedupe -> sync v1 removal -> redact removal.
 #
 # HOW TO RUN (needs WS-1's server):
 #   1. cd server && npm install && npm run build   # produces dist/
@@ -350,47 +350,24 @@ assert_eq "$(jget deduped)" "true" "deduped flag set"
 api GET "/v1/topics/$(urlencode "$CTID")/history?after_seq=0&limit=500" "$OWNER_TOKEN" ""
 assert_eq "$(jlen "$(jget entries)")" "$((BEFORE_IDEM + 1))" "retry stored no duplicate"
 
-# ------------------------------------------------------------- 18. sync cursors advance
+# ------------------------------------------------------------- 18. sync v1 removed (spec §1.6)
+# GET /v1/sync is deleted; sync v2 discovery (GET /v1/sync/topics) lands with
+# the Server-A scope. Here we only assert the old route is gone.
 api GET "/v1/sync?after_gseq=0&limit=500" "$KID_TOKEN" ""
-CURSOR="$(jget next_after_gseq)"
-if [ -z "$CURSOR" ]; then CURSOR="$(jget max_gseq)"; fi
-if [ -z "$CURSOR" ]; then
-  # server omits the cursor at head — fall back to max gseq seen
-  CURSOR="$(python3 -c 'import json,sys; es=json.load(sys.stdin); print(max([e["gseq"] for e in es] or [0]))' <<<"$(jget entries)")"
-fi
-api POST "/v1/topics/$(urlencode "$CTID")/entries" "$OWNER_TOKEN" '{"body":"sync probe message"}'
-assert_code 201 "probe post for sync"
-api GET "/v1/sync?after_gseq=$CURSOR&limit=500" "$KID_TOKEN" ""
-assert_eq "$(jlen "$(jget entries)")" "1" "sync returns only new entries"
-assert_contains "$(jget entries)" "sync probe message" "sync payload correct"
-NEWCURSOR="$(jget next_after_gseq)"
-if [ -n "$NEWCURSOR" ]; then
-  if [ "$NEWCURSOR" -gt "$CURSOR" ]; then pass "sync cursor advances";
-  else fail "sync cursor advances — $NEWCURSOR not > $CURSOR"; fi
-else
-  pass "sync cursor at head (server omits cursor; payload verified)"
-fi
+assert_code 404 "GET /v1/sync removed"
 
-# ------------------------------------------------------------- 19. redact (owner only)
+# ------------------------------------------------------------- 19. redact removed (spec §1.6)
+# POST /v1/entries/:eid/redact is deleted (no client). The old behavior —
+# owner-only scrub — is gone; assert the route 404s for everyone.
 api POST "/v1/topics/$(urlencode "$CTID")/entries" "$OWNER_TOKEN" '{"body":"oops wrong number 555-0100"}'
-assert_code 201 "post entry to redact"
+assert_code 201 "post entry (would-be redact target)"
 EGSEQ="$(jget entry.gseq)"
 api POST "/v1/entries/$EGSEQ/redact" "$KID_TOKEN" '{}'
-assert_code 403 "kid cannot redact"
+assert_code 404 "redact removed (kid)"
 api POST "/v1/entries/$EGSEQ/redact" "$OWNER_TOKEN" '{}'
-assert_code 200 "owner redacts"
-assert_eq "$(jget ok)" "true" "redact ok"
-api GET "/v1/topics/$(urlencode "$CTID")/history" "$OWNER_TOKEN" ""
-RBODY="$(GSEQ="$EGSEQ" python3 -c '
-import json, sys, os
-es = json.load(sys.stdin)["entries"]
-g = int(os.environ["GSEQ"])
-m = [e for e in es if e["gseq"] == g]
-print(m[0]["body"] if m else "NOT-FOUND")' <<<"$API_BODY")"
-assert_contains "$RBODY" "[redacted by owner" "redaction replaces body"
-assert_contains "$(kinds_of <<<"$(jget entries)")" "redaction" "redaction entry appended"
+assert_code 404 "redact removed (owner)"
 
-# ------------------------------------------------------------- 20. provision -> rotate -> revoke lifecycle
+# ------------------------------------------------------------- 20. provision -> revoke lifecycle
 api POST /v1/provisioning-codes "$KID_TOKEN" "$(python3 -c 'import json; print(json.dumps({"member_id":"'"$KID_MID"'","agent_label":"e2e-kid-agent-2"}))')"
 assert_code 201 "kid mints provisioning code"
 PC2="$(jget provisioning_code)"

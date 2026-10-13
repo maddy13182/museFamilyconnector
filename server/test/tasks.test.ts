@@ -67,24 +67,6 @@ test('done with open subtasks is rejected (409); works after subtasks close', as
   assert.equal(doneParent.body.task.status, 'done');
 });
 
-test('PATCH status=done also enforces the subtask gate', async () => {
-  const { app, token, topicId } = await setup();
-  const parent = await app.call('POST', `/v1/topics/${topicId}/tasks`, {
-    token,
-    body: { title: 'P' },
-  });
-  const pid = parent.body.task.id as string;
-  await app.call('POST', `/v1/topics/${topicId}/tasks`, {
-    token,
-    body: { title: 'S', parent_task_id: pid },
-  });
-  const denied = await app.call('PATCH', `/v1/tasks/${pid}`, {
-    token,
-    body: { status: 'done' },
-  });
-  assert.equal(denied.status, 409);
-});
-
 test('assignee must participate in the topic; parent task must be in-topic', async () => {
   const { app, token, topicId } = await setup();
   const bad = await app.call('POST', `/v1/topics/${topicId}/tasks`, {
@@ -117,8 +99,11 @@ test('task trail reconstructs lifecycle entries', async () => {
   const tid = t.body.task.id as string;
   await app.call('POST', `/v1/tasks/${tid}/notes`, { token: kidToken, body: { body: 'working on it' } });
   await app.call('POST', `/v1/tasks/${tid}/done`, { token, body: { result: { ok: true } } });
-  const got = await app.call('GET', `/v1/tasks/${tid}`, { token });
-  assert.equal(got.status, 200);
-  const kinds = (got.body.trail as any[]).map((e) => e.kind);
+  // Bare GET /v1/tasks/:tid is deleted (spec §1.6); the trail is the
+  // topic's task_created/task_* entries, readable via history.
+  const hist = await app.call('GET', `/v1/topics/${topicId}/history`, { token });
+  const kinds = (hist.body.entries as any[])
+    .filter((e: any) => (e.data as any)?.task_id === tid)
+    .map((e: any) => e.kind);
   assert.deepEqual(kinds, ['task_created', 'task_note', 'task_done']);
 });

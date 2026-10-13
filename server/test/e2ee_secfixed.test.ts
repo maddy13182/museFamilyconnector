@@ -391,7 +391,7 @@ test('F4: PATCH subject — empty / oversize subjects are 400', async () => {
  *  scan was skipped for E2EE ciphertext. Fully deterministic: the 12 head
  *  bytes encode exactly "4111111111111111" and the 28 zero tail bytes keep
  *  the run bounded by non-digits ('A's). */
-function piiTrippingWireBody(): string {
+function piiTrippingWireBody(keyId: string): string {
   const digits = '4111111111111111'; // Luhn-valid test card number
   const vals = [...digits].map((c) => 52 + (c.charCodeAt(0) - 48)); // '0'->52 … '9'->61
   const head: number[] = [];
@@ -404,17 +404,24 @@ function piiTrippingWireBody(): string {
   const blob = btoa(String.fromCharCode(...raw));
   assert.ok(blob.startsWith(digits), 'crafted payload must start with the digit run');
   assert.ok(scanPii(blob) !== null, 'crafted payload must trip the PII scanner');
-  return `fh1.${hex(16)}.${hex(16)}.${blob}`;
+  return `fh1.${keyId}.${hex(16)}.${blob}`;
 }
 
 test('info: well-formed fh1 ciphertext body skips the server PII scan', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SecfixPii');
-  const res = await createE2eeTopic(app, owner.token, hex(16));
+  const keyId = hex(16);
+  const res = await createE2eeTopic(app, owner.token, keyId);
   assert.equal(res.status, 201);
   const tid = res.body.topic.id as string;
+  // Sync v2: new E2EE topics sit at epoch 0 (genesis) with writes blocked.
+  // These PII tests are not about genesis, so simulate the committed state
+  // directly — Server-A's keys/commit would set this in production.
+  await app.db.execAtomically([
+    { sql: `UPDATE topics SET current_epoch = 1 WHERE id = ?`, params: [tid] },
+  ]);
 
-  const wire = piiTrippingWireBody();
+  const wire = piiTrippingWireBody(keyId);
   assert.ok(scanPii(wire) !== null, 'test body must trip the PII scanner');
   const posted = await app.call('POST', `/v1/topics/${tid}/entries`, {
     token: owner.token,
@@ -424,20 +431,21 @@ test('info: well-formed fh1 ciphertext body skips the server PII scan', async ()
   assert.equal(posted.body.entry.body, wire);
 });
 
-test('info: malformed fh1-looking body is still PII-scanned', async () => {
+test('info: malformed fh1-looking body is rejected as plaintext on E2EE topics (N05)', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SecfixPii2');
   const res = await createE2eeTopic(app, owner.token, hex(16));
   assert.equal(res.status, 201);
   const tid = res.body.topic.id as string;
 
-  // Starts with the tag but is not a well-formed wire string -> scanned.
+  // Starts with the tag but is not a well-formed wire string -> not
+  // ciphertext, so N05 rejects it before the PII scan ever runs.
   const bad = 'fh1.nothex.4111111111111111';
-  assert.ok(scanPii(bad) !== null, 'test body must trip the PII scanner');
+  assert.ok(scanPii(bad) !== null, 'test body would trip the PII scanner if scanned');
   const posted = await app.call('POST', `/v1/topics/${tid}/entries`, {
     token: owner.token,
     body: { kind: 'message', body: bad },
   });
-  assert.equal(posted.status, 422);
-  assert.equal(posted.body.error.code, 'pii_detected');
+  assert.equal(posted.status, 400);
+  assert.equal(posted.body.error.code, 'plaintext_in_e2ee_topic');
 });

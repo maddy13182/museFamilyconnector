@@ -11,7 +11,6 @@ import {
   Row,
   HttpError,
   AuthContext,
-  TASK_STATUSES,
   MEMBER_ROLES,
   TRANSFER_COMPLETION_MODES,
   FAMILY_KINDS,
@@ -45,6 +44,7 @@ import {
   reqKeyId,
   reqEnvelopeB64,
   isE2eeWireBody,
+  parseFh1Header,
 } from './validate.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
@@ -418,28 +418,96 @@ function piiGuardJson(value: unknown): void {
   }
 }
 
-const PII_REDACTED_LEAF = '[redacted]';
+// ---------------------------------------------------------------------------
+// Sync v2 — N05 field-level E2EE enforcement + write-time key checks.
+// ---------------------------------------------------------------------------
 
-/**
- * Structure-preserving PII scrub of a JSON value (F08): string leaves that
- * scanPii flags are replaced with a marker; everything else (including
- * linkage fields like task_id) is untouched.
- */
-function redactPiiLeaves<T>(value: T): T {
-  if (typeof value === 'string') {
-    return (scanPii(value) ? PII_REDACTED_LEAF : value) as T;
+/** True when the topic is E2EE. Small lookup for paths that reach the topic
+ *  through a task id (getTaskInScope returns the task, not the topic). */
+async function topicE2ee(db: DbClient, topicId: string): Promise<boolean> {
+  const t = await db.queryOne(`SELECT e2ee FROM topics WHERE id = ?`, [topicId]);
+  return (t?.['e2ee'] as number) === 1;
+}
+
+// POST /entries content kinds. Everything except 'message' is a protocol /
+// system kind: plaintext by design, readable by agents that do not (yet)
+// hold the topic key (key rotation notices, key requests, pending-key
+// notices, archive announcements). Spec §1.5 exempts the protocol kind
+// `key-request` from the fh1 requirement; the server's wire enum spells it
+// `key_request`, and the same plaintext-by-design rationale covers the other
+// three system kinds — the CLI posts all four via its plaintext
+// system-entry path, and encrypting them would break rotation/add flows.
+// N05 content checks and the epoch/rotation write gates below therefore
+// apply only to kind 'message'.
+function isProtocolKind(kind: string): boolean {
+  return kind !== 'message';
+}
+
+// N05: a content field on an E2EE topic must be a well-formed fh1 wire
+// body. Violation -> 400 plaintext_in_e2ee_topic. Never logs the value.
+function requireE2eeContent(value: unknown, field: string): void {  if (!isE2eeWireBody(value)) {
+    logEvent('warn', 'plaintext_in_e2ee_topic', { field });
+    throw new HttpError(
+      400,
+      'plaintext_in_e2ee_topic',
+      `${field} must be E2EE ciphertext (fh1) in an E2EE topic`,
+    );
   }
-  if (Array.isArray(value)) {
-    return value.map(redactPiiLeaves) as T;
+}
+
+// N05: entry `data` (a JSON string) on an E2EE topic. The sealed payload is
+// carried as a JSON string holding the fh1 wire body — structured plaintext
+// linkage data is not permitted on E2EE content writes. Absent/null data is
+// fine.
+function requireE2eeData(data: string | null, field: string): void {
+  if (data === null) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    parsed = undefined;
   }
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(value)) {
-      out[k] = redactPiiLeaves((value as Record<string, unknown>)[k]);
-    }
-    return out as T;
+  if (typeof parsed !== 'string' || !isE2eeWireBody(parsed)) {
+    logEvent('warn', 'plaintext_in_e2ee_topic', { field });
+    throw new HttpError(
+      400,
+      'plaintext_in_e2ee_topic',
+      `${field} must be E2EE ciphertext (fh1) in an E2EE topic`,
+    );
   }
-  return value;
+}
+
+// Write-time key checks (spec §1.5): server-side gates on encrypted content
+// writes to E2EE topics, independent of client version. keyId is parsed
+// from the fh1 body header. Order is deliberate: epoch liveness first
+// (genesis not yet committed), then key freshness (stale client keystore),
+// then the rotation pause (removal / from-join rekey pending).
+function checkE2eeWriteKey(topic: Row, keyId: string): void {
+  const epoch = topic['current_epoch'] as number;
+  if (epoch < 1) {
+    logEvent('warn', 'key_not_active', { reason: 'epoch_0' });
+    throw new HttpError(
+      409,
+      'key_not_active',
+      'E2EE topic has no active key yet — writes blocked until the first key is committed',
+    );
+  }
+  if (keyId !== (topic['current_key_id'] as string | null)) {
+    logEvent('warn', 'stale_key', { reason: 'key_id_mismatch' });
+    throw new HttpError(
+      409,
+      'stale_key',
+      'Entry was encrypted to a superseded topic key — fetch the current key and retry',
+    );
+  }
+  if ((topic['rotation_required'] as number) === 1) {
+    logEvent('warn', 'rotation_required', { reason: 'rekey_pending' });
+    throw new HttpError(
+      409,
+      'rotation_required',
+      'A membership change requires a fresh key — encrypted writes pause until the owner commits a rotation',
+    );
+  }
 }
 
 function parseDataField(row: Row): unknown {
@@ -658,11 +726,13 @@ function entryInsertOp(args: {
   replyToSeq?: number | null;
   pin?: string;
   pinParams?: (string | number | null)[];
+  // R1: msg_id extracted from the fh1 body at POST time (NULL otherwise).
+  msgId?: string | null;
 }): BatchOp {
   const pin = args.pin ? ` HAVING ${args.pin}` : '';
   return {
-    sql: `INSERT INTO entries(topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body, data, reply_to_seq)
-          SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?
+    sql: `INSERT INTO entries(topic_id, seq, ts, actor_member_id, agent_label, token_id, kind, body, data, reply_to_seq, msg_id)
+          SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?
             FROM entries WHERE topic_id = ?${pin}`,
     params: [
       args.topicId,
@@ -674,6 +744,7 @@ function entryInsertOp(args: {
       args.body,
       args.data,
       args.replyToSeq ?? null,
+      args.msgId ?? null,
       args.topicId,
       ...(args.pinParams ?? []),
     ],
@@ -2668,43 +2739,6 @@ async function handleGetEnvelopes(
   return json({ envelopes: rows });
 }
 
-// POST /v1/auth/rotate — new token; old valid 24h grace.
-async function handleRotate(
-  db: DbClient,
-  env: Env,
-  req: Request,
-  auth: AuthContext,
-): Promise<Response> {
-  const raw = req.headers.get('authorization')!.slice('Bearer '.length).trim();
-  const oldHash = await credentialHash(env.TOKEN_PEPPER, raw);
-  // F04: a retired credential cannot be rotated again. A fully-revoked token
-  // never reaches here (the auth choke point rejects it with 401); this
-  // covers a token already carrying revoked_at, e.g. inside its
-  // rotation-grace window. Rotate the current token instead.
-  const old = await db.queryOne(`SELECT revoked_at FROM agent_tokens WHERE token_hash = ?`, [oldHash]);
-  if (!old) throw new HttpError(401, 'unauthorized', 'Unknown token');
-  if (old['revoked_at']) {
-    throw new HttpError(403, 'forbidden', 'Token is retired; rotate using the current token instead');
-  }
-  const token = newAgentToken();
-  const tokenHash = await credentialHash(env.TOKEN_PEPPER, token);
-  const tokenId = newId();
-  const ts = nowIso();
-  const graceUntil = hoursFromNow(24);
-  await db.execAtomically([
-    { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE token_hash = ?`, params: [graceUntil, oldHash] },
-    {
-      // issued_by_token_id stays NULL: rotation replaces a credential rather
-      // than delegating authority, so the new token is deliberately NOT a
-      // cascade target when the old token is revoked (F17).
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
-            VALUES (?,?,?, ?,?,NULL,NULL,NULL)`,
-      params: [tokenHash, tokenId, auth.member_id, auth.agent_label, ts],
-    },
-  ]);
-  return json({ token, token_id: tokenId, grace_until: graceUntil });
-}
-
 // POST /v1/auth/revoke {token_id} — self-revoke always; owner/parent for
 // other members' tokens, except a parent can NEVER revoke an owner's token
 // (F01). Revocation is immediate and unconditional: it overwrites any future
@@ -3076,34 +3110,6 @@ async function handleHistory(
   });
 }
 
-// GET /v1/topics/:tid/export — full topic JSON for offline copy / migration.
-async function handleExport(db: DbClient, auth: AuthContext, tid: string): Promise<Response> {
-  const { topic, history_from_seq } = await requireParticipant(db, auth, tid);
-  const parts = await db.queryAll(
-    `SELECT p.member_id, p.joined_at, p.history_from_seq, m.name, m.role
-       FROM topic_participants p JOIN members m ON m.id = p.member_id
-      WHERE p.topic_id = ?`,
-    [tid],
-  );
-  const entries = await db.queryAll(
-    `SELECT * FROM entries WHERE topic_id = ? AND seq >= ? ORDER BY seq ASC`,
-    [tid, history_from_seq],
-  );
-  // F06: tasks are filtered by the caller's history floor — same rule as entry
-  // reads. A from_join member must not see tasks created before they joined.
-  const tasks = await db.queryAll(
-    `SELECT * FROM tasks WHERE topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER} ORDER BY created_at ASC`,
-    [tid, auth.member_id],
-  );
-  return json({
-    topic,
-    participants: parts,
-    entries: entries.map(publicEntry),
-    tasks: tasks.map(publicTask),
-    exported_at: nowIso(),
-  });
-}
-
 // POST /v1/topics/:tid/invite — participant + owner/parent.
 async function handleTopicInvite(
   db: DbClient,
@@ -3145,6 +3151,19 @@ async function handleTopicInvite(
                                ELSE COALESCE((SELECT MAX(seq) FROM entries WHERE topic_id = ?), 0) + 1 END`,
     params: [tid, mid, ts, fullFloor, tid] as (string | number | null)[],
   }));
+  // Sync v2: a from_join member must never receive the current epoch key
+  // (it would decrypt pre-join content), so on E2EE topics the accept sets
+  // rotation_required = 1 in the SAME transaction. They stay key-pending
+  // until the owner rekeys, then receive only the new epoch key. The CLI
+  // seals envelopes (the server never does) — the flag + write gate is the
+  // server's whole interface here.
+  if (historyFrom === 'from_join' && added.length > 0 && (topic['e2ee'] as number) === 1) {
+    ops.push({
+      sql: `UPDATE topics SET rotation_required = 1 WHERE id = ?`,
+      params: [tid] as (string | number | null)[],
+    });
+    logEvent('info', 'rotation_required_set', { reason: 'from_join_accept' });
+  }
   await db.execAtomically(ops);
   for (const mid of added) {
     const m = members.find((x) => x['id'] === mid)!;
@@ -3177,7 +3196,7 @@ async function handleRemoveParticipant(
   tid: string,
   mid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   if (auth.role !== 'owner' && auth.role !== 'parent') {
     throw new HttpError(403, 'forbidden', 'Only owner/parent can remove members from a topic');
   }
@@ -3197,12 +3216,25 @@ async function handleRemoveParticipant(
   if (((count?.['c'] as number) ?? 0) <= 1) {
     throw new HttpError(400, 'bad_request', 'Cannot remove the last participant of a topic');
   }
+  // Sync v2: on E2EE topics, member removal gates future encrypted writes —
+  // the removed member must not read anything written after their removal.
+  // The flag is set in the SAME transaction as the removal and is cleared
+  // by a successful keys/commit (Server-A). The CLI seals the new epoch's
+  // envelopes (the server never seals); the write gate in handlePostEntry
+  // reads this flag.
+  const removalE2ee = (topic['e2ee'] as number) === 1;
   await db.execAtomically([
     {
       sql: `DELETE FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
       params: [tid, mid],
     },
+    ...(removalE2ee
+      ? [{ sql: `UPDATE topics SET rotation_required = 1 WHERE id = ?`, params: [tid] as (string | number | null)[] }]
+      : []),
   ]);
+  if (removalE2ee) {
+    logEvent('info', 'rotation_required_set', { reason: 'member_removed' });
+  }
   const selfLeave = auth.member_id === mid;
   await appendEntry(db, {
     topic_id: tid,
@@ -3232,7 +3264,14 @@ async function handleSpawn(
     ? 'placeholder'
     : reqEnum(body['link_visibility'], 'link_visibility', ['placeholder', 'hidden'] as const);
   let ids = reqIdArray(body['participant_member_ids'], 'participant_member_ids', 20);
-  piiGuard(briefing);
+  // N05: the briefing is copied into the child topic as content — when the
+  // parent is E2EE it must arrive sealed. Well-formed fh1 is opaque, so it
+  // skips the PII scan (the CLI scans plaintext before encrypting).
+  if ((parent['e2ee'] as number) === 1) {
+    requireE2eeContent(briefing, 'briefing');
+  } else {
+    piiGuard(briefing);
+  }
   await requireFamilyMembers(db, auth, ids);
   if (!ids.includes(auth.member_id)) ids = [...ids, auth.member_id];
 
@@ -3276,7 +3315,7 @@ async function handlePostEntry(
   auth: AuthContext,
   tid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   const body = await readJson(req);
   // E2EE Phase 4 system kinds: plaintext by design, posted only by current
   // participants (requireParticipant above). key_rotated announces a topic
@@ -3297,6 +3336,14 @@ async function handlePostEntry(
       ] as const);
   const text = reqString(body['body'], 'body', 1, MAX_BODY);
   const data = reqJsonData(body['data'], 'data', MAX_DATA);
+  const e2ee = (topic['e2ee'] as number) === 1;
+  const protocol = isProtocolKind(kind);
+  // N05: on E2EE topics, content writes must be sealed. Protocol kinds skip
+  // the fh1 requirement (plaintext by design).
+  if (e2ee && !protocol) {
+    requireE2eeContent(text, 'body');
+    requireE2eeData(data, 'data');
+  }
   const replyTo = body['reply_to_seq'] === undefined || body['reply_to_seq'] === null
     ? null
     : (() => {
@@ -3313,7 +3360,34 @@ async function handlePostEntry(
   // encrypting. Malformed fh1-looking bodies are still scanned.
   if (!isE2eeWireBody(text)) piiGuard(text);
   // F08: entry data (JSON) is scanned too — string leaves, recursively.
-  if (data) piiGuardJson(JSON.parse(data));
+  // Sealed data (a JSON string holding an fh1 wire body) is opaque like a
+  // ciphertext body and skips the scan under the same rule.
+  if (data) {
+    const parsedData = JSON.parse(data);
+    if (!(typeof parsedData === 'string' && isE2eeWireBody(parsedData))) {
+      piiGuardJson(parsedData);
+    }
+  }
+
+  // R1: extract msg_id from fh1 bodies at POST time. Plaintext bodies have
+  // no msg_id. The unique index turns a replayed ciphertext into either an
+  // idempotent success (same body) or 409 msg_id_conflict (same id, new
+  // body).
+  const fh1 = parseFh1Header(text);
+  const msgId = fh1 ? fh1.msgId : null;
+  if (msgId !== null) {
+    const dup = await db.queryOne(
+      `SELECT * FROM entries WHERE topic_id = ? AND msg_id = ?`,
+      [tid, msgId],
+    );
+    if (dup) return resolveMsgIdConflict(dup, text);
+  }
+  // Write-time key checks (spec §1.5): server-side, independent of client
+  // version. Apply to encrypted content writes on E2EE topics — protocol
+  // kinds are plaintext by design and skip these gates too.
+  if (e2ee && !protocol && fh1) {
+    checkE2eeWriteKey(topic, fh1.keyId);
+  }
 
   const idemKey = req.headers.get('idempotency-key');
   if (idemKey !== null) {
@@ -3337,7 +3411,7 @@ async function handlePostEntry(
   // retry key (or a key pointing at nothing).
   const ts = nowIso();
   const ops: BatchOp[] = [
-    entryInsertOp({ topicId: tid, kind, body: text, auth, data, ts, replyToSeq: replyTo }),
+    entryInsertOp({ topicId: tid, kind, body: text, auth, data, ts, replyToSeq: replyTo, msgId }),
   ];
   if (idemKey !== null) {
     ops.push({
@@ -3352,7 +3426,21 @@ async function handlePostEntry(
       params: [auth.token_id, idemKey, ts, hoursFromNow(IDEM_TTL_HOURS), tid, ts],
     });
   }
-  await execBatchWithRetry(db, () => ops);
+  try {
+    await execBatchWithRetry(db, () => ops);
+  } catch (e) {
+    // R1 race window: a concurrent POST committed the same msg_id between
+    // our pre-check and this insert. Resolve against the conflicting row
+    // rather than surfacing a 500.
+    if (msgId !== null && isUniqueViolation(e)) {
+      const dup = await db.queryOne(
+        `SELECT * FROM entries WHERE topic_id = ? AND msg_id = ?`,
+        [tid, msgId],
+      );
+      if (dup) return resolveMsgIdConflict(dup, text);
+    }
+    throw e;
+  }
   // ts is generated per request, so (topic_id, ts) identifies the new row.
   const entry = await db.queryOne(
     `SELECT * FROM entries WHERE topic_id = ? AND ts = ? ORDER BY seq DESC LIMIT 1`,
@@ -3362,34 +3450,21 @@ async function handlePostEntry(
   return json({ entry: publicEntry(entry) }, 201);
 }
 
-// GET /v1/sync?after_gseq=&limit= — one call per poll, all visible topics.
-//
-// Pagination is page-based, never head-based: fetch limit+1 rows; when the
-// extra row is present there is more backlog to drain (has_more=true) and
-// only the first `limit` rows are returned. next_after_gseq is always the
-// last RETURNED entry's gseq — or the input cursor when the page is empty —
-// so a client paging through an arbitrarily deep backlog can never skip
-// entries (the old MAX-based cursor jumped past undelivered rows). No second
-// query: one SELECT per sync poll.
-async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promise<Response> {
-  const url = new URL(req.url);
-  const after = parseSeqCursor(url.searchParams.get('after_gseq'));
-  const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
-  const rows = await db.queryAll(
-    `SELECT e.* FROM entries e
-       JOIN topic_participants p ON p.topic_id = e.topic_id AND p.member_id = ?
-      WHERE e.gseq > ? AND e.seq >= p.history_from_seq
-      ORDER BY e.gseq ASC LIMIT ?`,
-    [auth.member_id, after, limit + 1],
+// R1 conflict resolution: a second POST carrying the same (topic_id, msg_id)
+// is a retried write when the stored body is byte-identical — return the
+// existing entry as a successful idempotent retry. A different body under
+// the same msg_id is a genuine conflict -> 409 msg_id_conflict.
+function resolveMsgIdConflict(existing: Row, incomingBody: string): Response {
+  if ((existing['body'] as string) === incomingBody) {
+    logEvent('info', 'msg_id_replay', { outcome: 'idempotent_retry' });
+    return json({ entry: publicEntry(existing), deduped: true });
+  }
+  logEvent('warn', 'msg_id_conflict', { outcome: 'conflict' });
+  throw new HttpError(
+    409,
+    'msg_id_conflict',
+    'An entry with this message id already exists with different content',
   );
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
-  const entries = page.map(publicEntry);
-  const nextAfter = page.length > 0 ? (page[page.length - 1]['gseq'] as number) : after;
-  // max_gseq stays for contract compatibility: the highest gseq in THIS
-  // page (clients MUST prefer next_after_gseq as their poll cursor).
-  const maxGseq = nextAfter;
-  return json({ entries, max_gseq: maxGseq, next_after_gseq: nextAfter, has_more: hasMore });
 }
 
 // ---------------------------------------------------------------------------
@@ -4038,7 +4113,7 @@ async function handleCreateTask(
   auth: AuthContext,
   tid: string,
 ): Promise<Response> {
-  await requireParticipant(db, auth, tid);
+  const { topic } = await requireParticipant(db, auth, tid);
   const body = await readJson(req);
   const title = reqString(body['title'], 'title', 1, 200);
   const description = optString(body['description'], 'description', MAX_BODY);
@@ -4062,26 +4137,46 @@ async function handleCreateTask(
       throw new HttpError(400, 'bad_request', 'parent_task_id must be a task in this topic');
     }
   }
-  if (description) piiGuard(description);
-  piiGuard(title); // F08: task titles are scanned too.
+  const taskE2ee = (topic['e2ee'] as number) === 1;
+  if (taskE2ee) {
+    // N05: task content fields must arrive sealed; only indexing metadata
+    // stays plaintext. Well-formed fh1 is opaque — skip the PII scan (the
+    // CLI scans plaintext before encrypting).
+    requireE2eeContent(title, 'title');
+    if (description !== null) requireE2eeContent(description, 'description');
+  } else {
+    if (description) piiGuard(description);
+    piiGuard(title); // F08: task titles are scanned too.
+  }
 
   const taskId = newId();
   const ts = nowIso();
   // F13: task_created carries the full task fields, so the log can
   // reconstruct task state. The F06 visibility predicate reads task_id out
   // of this same payload — it must stay.
-  const createdData = JSON.stringify({
-    task_id: taskId,
-    title,
-    description,
-    due_at: dueAt,
-    status: 'open',
-    owner_member_id: auth.member_id,
-    assignee_member_id: assignee,
-    parent_task_id: parentTask,
-    created_by: auth.member_id,
-    created_at: ts,
-  });
+  //
+  // N05 (E2EE topics): the old `Task created: ${title}` body leaked the
+  // title into the entry log. The entry body is now the sealed title as
+  // posted (already fh1), and data collapses to
+  // {"task_id": "…", "sealed": "fh1…"} with task_id plaintext so the F06
+  // json_extract predicate keeps working. `sealed` carries the sealed
+  // description (the primary content); when the task has no description it
+  // carries the sealed title. Indexing metadata (status, owner/assignee
+  // ids, parent_task_id, due_at) stays plaintext on the tasks row itself.
+  const createdData = taskE2ee
+    ? JSON.stringify({ task_id: taskId, sealed: description ?? title })
+    : JSON.stringify({
+        task_id: taskId,
+        title,
+        description,
+        due_at: dueAt,
+        status: 'open',
+        owner_member_id: auth.member_id,
+        assignee_member_id: assignee,
+        parent_task_id: parentTask,
+        created_by: auth.member_id,
+        created_at: ts,
+      });
   // F12: task row + task_created event commit in the SAME batch — the audit's
   // fault injection (event write fails) must leave no orphan task.
   // F14: the child insert is conditional on the parent still being open, so
@@ -4102,7 +4197,9 @@ async function handleCreateTask(
     entryInsertOp({
       topicId: tid,
       kind: 'task_created',
-      body: `Task created: ${title}`,
+      // N05: plaintext `Task created: ${title}` leaked the title; in E2EE
+      // topics the body is the sealed title as posted.
+      body: taskE2ee ? title : `Task created: ${title}`,
       auth,
       data: createdData,
       ts,
@@ -4144,50 +4241,6 @@ async function getTaskInScope(db: DbClient, auth: AuthContext, taskId: string): 
   return task;
 }
 
-// GET /v1/tasks/:tid?after_seq=&limit= — task + its entry trail.
-// F13: the trail is one indexed SQL query (idx_entries_task_trail),
-// paginated like /history — the old code fetched 5,000 topic entries and
-// filtered by task_id in JS.
-async function handleGetTask(
-  db: DbClient,
-  req: Request,
-  auth: AuthContext,
-  taskId: string,
-): Promise<Response> {
-  const task = await getTaskInScope(db, auth, taskId);
-  const topicId = task['topic_id'] as string;
-  // F06: a from_join member must not read task snapshots created before they
-  // joined. 404 (same as a missing task) so existence doesn't leak.
-  const visible = await db.queryOne(
-    `SELECT 1 AS ok FROM tasks WHERE id = ? AND topic_id = ? AND ${TASK_VISIBLE_TO_MEMBER}`,
-    [taskId, topicId, auth.member_id],
-  );
-  if (!visible) throw new HttpError(404, 'not_found', 'Task not found');
-  const part = await db.queryOne(
-    `SELECT history_from_seq FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
-    [topicId, auth.member_id],
-  );
-  const url = new URL(req.url);
-  const after = parseSeqCursor(url.searchParams.get('after_seq'));
-  const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
-  const rows = await db.queryAll(
-    `SELECT * FROM entries
-      WHERE topic_id = ? AND seq > ? AND seq >= ?
-        AND json_extract(data, '$.task_id') = ?
-      ORDER BY seq ASC LIMIT ?`,
-    [topicId, after, part!['history_from_seq'] as number, taskId, limit + 1],
-  );
-  const hasMore = rows.length > limit;
-  const page = hasMore ? rows.slice(0, limit) : rows;
-  const nextAfter = page.length > 0 ? (page[page.length - 1]['seq'] as number) : after;
-  return json({
-    task: publicTask(task),
-    trail: page.map(publicEntry),
-    has_more: hasMore,
-    next_after_seq: nextAfter,
-  });
-}
-
 // GET /v1/topics/:tid/tasks — list tasks in a topic.
 async function handleListTopicTasks(db: DbClient, auth: AuthContext, tid: string): Promise<Response> {
   await requireParticipant(db, auth, tid);
@@ -4198,158 +4251,6 @@ async function handleListTopicTasks(db: DbClient, auth: AuthContext, tid: string
     [tid, auth.member_id],
   );
   return json({ tasks: rows.map(publicTask) });
-}
-
-// PATCH /v1/tasks/:tid
-async function handlePatchTask(
-  db: DbClient,
-  _env: Env,
-  req: Request,
-  auth: AuthContext,
-  taskId: string,
-): Promise<Response> {
-  const task = await getTaskInScope(db, auth, taskId);
-  const topicId = task['topic_id'] as string;
-  const body = await readJson(req);
-  const sets: string[] = [];
-  const params: (string | number | null)[] = [];
-  let statusChanged: string | null = null;
-  let assigneeChanged: string | null | undefined;
-  // F13: fields that previously changed silently; emitted as task_updated.
-  const updatedFields: Record<string, string | null> = {};
-
-  if (body['title'] !== undefined) {
-    const title = reqString(body['title'], 'title', 1, 200);
-    piiGuard(title); // F08: task titles are scanned too.
-    sets.push('title = ?');
-    params.push(title);
-    updatedFields['title'] = title;
-  }
-  if (body['description'] !== undefined) {
-    const description = optString(body['description'], 'description', MAX_BODY);
-    if (description) piiGuard(description);
-    sets.push('description = ?');
-    params.push(description);
-    updatedFields['description'] = description;
-  }
-  if (body['due_at'] !== undefined) {
-    const dueAt = body['due_at'] === null ? null : reqIsoDate(body['due_at'], 'due_at');
-    sets.push('due_at = ?');
-    params.push(dueAt);
-    updatedFields['due_at'] = dueAt;
-  }
-  if (body['assignee_member_id'] !== undefined) {
-    const raw = body['assignee_member_id'];
-    const assignee = raw === null ? null : reqString(raw, 'assignee_member_id', 1, 128);
-    if (assignee !== null) {
-      const part = await db.queryOne(
-        `SELECT member_id FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
-        [topicId, assignee],
-      );
-      if (!part) throw new HttpError(400, 'bad_request', 'assignee must be a participant of this topic');
-    }
-    if (assignee !== task['assignee_member_id']) {
-      assigneeChanged = assignee;
-      sets.push('assignee_member_id = ?');
-      params.push(assignee);
-    }
-  }
-  if (body['status'] !== undefined) {
-    const status = reqEnum(body['status'], 'status', TASK_STATUSES);
-    if (status !== task['status']) {
-      if (status === 'done') await assertNoOpenSubtasks(db, taskId);
-      statusChanged = status;
-      sets.push('status = ?');
-      params.push(status);
-    }
-  }
-  if (sets.length === 0) {
-    const fresh = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
-    return json({ task: publicTask(fresh!) });
-  }
-  const ts = nowIso();
-  sets.push('updated_at = ?');
-  params.push(ts);
-  // F14: completing via PATCH is guarded INSIDE the update — the write only
-  // applies while no open subtask exists, in the same batch as the events.
-  // The pre-check above preserves the old fast-path 409; this guard closes
-  // the race between that check and the write.
-  let where = `WHERE id = ?`;
-  const whereParams: (string | number | null)[] = [taskId];
-  const completing = statusChanged === 'done';
-  if (completing) {
-    where += ` AND NOT EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled'))`;
-    whereParams.push(taskId);
-  }
-  // F12: the state change and its events commit in the SAME batch. Each event
-  // is pinned to the update actually applying (updated_at flip), so a
-  // guard-blocked completion emits no phantom events.
-  const pin = `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`;
-  const pinParams: (string | number | null)[] = [taskId, ts];
-  const ops: BatchOp[] = [
-    { sql: `UPDATE tasks SET ${sets.join(', ')} ${where}`, params: [...params, ...whereParams] },
-  ];
-  if (Object.keys(updatedFields).length > 0) {
-    ops.push(
-      entryInsertOp({
-        topicId,
-        kind: 'task_updated',
-        body: `Task updated`,
-        auth,
-        data: JSON.stringify({ task_id: taskId, ...updatedFields }),
-        ts,
-        pin,
-        pinParams,
-      }),
-    );
-  }
-  if (assigneeChanged !== undefined) {
-    ops.push(
-      entryInsertOp({
-        topicId,
-        kind: 'task_assigned',
-        body: assigneeChanged ? `Task assigned` : `Task unassigned`,
-        auth,
-        data: JSON.stringify({ task_id: taskId, assignee_member_id: assigneeChanged }),
-        ts,
-        pin,
-        pinParams,
-      }),
-    );
-  }
-  if (statusChanged) {
-    ops.push(
-      entryInsertOp({
-        topicId,
-        kind: 'task_status',
-        body: `Task status → ${statusChanged}`,
-        auth,
-        data: JSON.stringify({ task_id: taskId, status: statusChanged }),
-        ts,
-        pin,
-        pinParams,
-      }),
-    );
-  }
-  await execBatchWithRetry(db, () => ops);
-  const updated = await db.queryOne(`SELECT * FROM tasks WHERE id = ?`, [taskId]);
-  if (completing && updated!['status'] !== 'done') {
-    // The atomic guard refused the completion after the pre-check passed
-    // (a subtask was created in between): confirm for an accurate 409.
-    const open = await db.queryAll(
-      `SELECT id FROM tasks WHERE parent_task_id = ? AND status NOT IN ('done','cancelled')`,
-      [taskId],
-    );
-    if (open.length > 0) {
-      throw new HttpError(
-        409,
-        'subtasks_open',
-        `Cannot complete task: ${open.length} subtask(s) still open`,
-      );
-    }
-    throw new HttpError(500, 'internal', 'Task completion did not apply');
-  }
-  return json({ task: publicTask(updated!) });
 }
 
 // POST /v1/tasks/:tid/notes
@@ -4363,7 +4264,13 @@ async function handleTaskNote(
   const task = await getTaskInScope(db, auth, taskId);
   const body = await readJson(req);
   const text = reqString(body['body'], 'body', 1, MAX_BODY);
-  piiGuard(text);
+  // N05: note bodies on E2EE topics must arrive sealed. Well-formed fh1 is
+  // opaque — skip the PII scan (the CLI scans plaintext before encrypting).
+  if ((await topicE2ee(db, task['topic_id'] as string))) {
+    requireE2eeContent(text, 'body');
+  } else {
+    piiGuard(text);
+  }
   const entry = await appendEntry(db, {
     topic_id: task['topic_id'] as string,
     kind: 'task_note',
@@ -4430,53 +4337,6 @@ async function handleTaskDone(
     throw new HttpError(500, 'internal', 'Task completion did not apply');
   }
   return json({ task: publicTask(updated!) });
-}
-
-// POST /v1/entries/:eid/redact — owner only. Preserves seq/actor/ts; scrubs body.
-async function handleRedact(
-  db: DbClient,
-  _env: Env,
-  _req: Request,
-  auth: AuthContext,
-  eid: string,
-): Promise<Response> {
-  if (auth.role !== 'owner') {
-    throw new HttpError(403, 'forbidden', 'Only the family owner can redact entries');
-  }
-  const gseq = Number(eid);
-  if (!Number.isInteger(gseq) || gseq < 1) {
-    throw new HttpError(400, 'bad_request', 'Invalid entry id');
-  }
-  const entry = await db.queryOne(
-    `SELECT e.* FROM entries e JOIN topics t ON t.id = e.topic_id
-      WHERE e.gseq = ? AND t.family_id = ?`,
-    [gseq, auth.family_id],
-  );
-  if (!entry) throw new HttpError(404, 'not_found', 'Entry not found');
-  const ts = nowIso();
-  const scrubbed = `[redacted by owner, ${ts}]`;
-  // F08: also scrub PII-shaped string leaves in data, structure-preserving
-  // (linkage fields like task_id survive). NULL data stays NULL.
-  let newData = entry['data'] as string | null;
-  if (newData !== null) {
-    try {
-      newData = JSON.stringify(redactPiiLeaves(JSON.parse(newData)));
-    } catch {
-      // data is always JSON (validated at write); keep the original rather
-      // than lose it if parsing ever fails.
-    }
-  }
-  await db.execAtomically([
-    { sql: `UPDATE entries SET body = ?, data = ? WHERE gseq = ?`, params: [scrubbed, newData, gseq] },
-  ]);
-  await appendEntry(db, {
-    topic_id: entry['topic_id'] as string,
-    kind: 'redaction',
-    body: `Entry #${entry['seq']} redacted by owner`,
-    auth,
-    data: JSON.stringify({ redacted_gseq: gseq }),
-  });
-  return json({ ok: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -4606,7 +4466,6 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     const authHeader = req.headers.get('authorization');
     const auth: AuthContext = await resolveToken(db, env, authHeader);
 
-    if (path === '/v1/auth/rotate' && method === 'POST') return await handleRotate(db, env, req, auth);
     if (path === '/v1/auth/revoke' && method === 'POST') return await handleRevoke(db, env, req, auth);
     if (path === '/v1/families' && method === 'GET') return await handleListFamilies(db, auth);
     if (path === '/v1/members' && method === 'GET') return await handleListMembers(db, auth);
@@ -4623,8 +4482,8 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     }
     if (path === '/v1/topics' && method === 'POST') return await handleCreateTopic(db, env, req, auth);
     if (path === '/v1/topics' && method === 'GET') return await handleListTopics(db, req, auth);
-    if (path === '/v1/sync' && method === 'GET') return await handleSync(db, req, auth);
     // Sync v2 (spec §1.4): per-circle-token changed-topic discovery.
+    // (Legacy entry-level GET /v1/sync deleted per spec §1.6.)
     if (path === '/v1/sync/topics' && method === 'GET') return await handleSyncTopics(db, req, auth);
 
     const famInvite = /^\/v1\/families\/([^/]+)\/invites$/.exec(path);
@@ -4652,12 +4511,9 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       }
     }
 
-    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes|subject|ack)$/.exec(path);
+    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|invite|spawn|entries|tasks|envelopes|subject|ack)$/.exec(path);
     if (topicSub && method === 'GET' && topicSub[2] === 'history') {
       return await handleHistory(db, env, req, auth, decodeURIComponent(topicSub[1]));
-    }
-    if (topicSub && method === 'GET' && topicSub[2] === 'export') {
-      return await handleExport(db, auth, decodeURIComponent(topicSub[1]));
     }
     if (topicSub && method === 'POST' && topicSub[2] === 'invite') {
       return await handleTopicInvite(db, env, req, auth, decodeURIComponent(topicSub[1]));
@@ -4716,25 +4572,17 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       );
     }
 
-    const taskSub = /^\/v1\/tasks\/([^/]+)(\/(notes|done))?$/.exec(path);
+    // Sync v2 §1.6: GET/PATCH /v1/tasks/:tid are deleted (no client; the CLI
+    // uses notes/done). Only the notes and done sub-paths remain.
+    const taskSub = /^\/v1\/tasks\/([^/]+)\/(notes|done)$/.exec(path);
     if (taskSub) {
       const taskId = decodeURIComponent(taskSub[1]);
-      if (!taskSub[2] && (method === 'GET' || method === 'PATCH')) {
-        return method === 'GET'
-          ? await handleGetTask(db, req, auth, taskId)
-          : await handlePatchTask(db, env, req, auth, taskId);
-      }
-      if (taskSub[3] === 'notes' && method === 'POST') {
+      if (taskSub[2] === 'notes' && method === 'POST') {
         return await handleTaskNote(db, env, req, auth, taskId);
       }
-      if (taskSub[3] === 'done' && method === 'POST') {
+      if (taskSub[2] === 'done' && method === 'POST') {
         return await handleTaskDone(db, env, req, auth, taskId);
       }
-    }
-
-    const redact = /^\/v1\/entries\/([^/]+)\/redact$/.exec(path);
-    if (redact && method === 'POST') {
-      return await handleRedact(db, env, req, auth, decodeURIComponent(redact[1]));
     }
 
     throw new HttpError(404, 'not_found', 'Unknown endpoint');

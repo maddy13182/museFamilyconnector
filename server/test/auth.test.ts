@@ -44,19 +44,6 @@ test('revoked token is rejected', async () => {
   assert.equal(after.status, 401);
 });
 
-test('rotate: new token works, old token keeps 24h grace', async () => {
-  const { app, token } = await bootstrap();
-  const rot = await app.call('POST', '/v1/auth/rotate', { token, body: {} });
-  assert.equal(rot.status, 200);
-  assert.ok((rot.body.token as string).startsWith('fh_'));
-
-  const viaNew = await app.call('GET', '/v1/members', { token: rot.body.token });
-  assert.equal(viaNew.status, 200);
-  const viaOld = await app.call('GET', '/v1/members', { token });
-  assert.equal(viaOld.status, 200); // grace period
-  assert.notEqual(rot.body.token, token);
-});
-
 test('non-owner cannot revoke another member token', async () => {
   const { app, token: ownerToken } = await bootstrap();
   // invite + accept a kid
