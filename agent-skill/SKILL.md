@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 1.1.0 -->
+<!-- SKILL VERSION: 1.2.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -55,6 +55,24 @@ when you run it. If your platform supports recurring or scheduled jobs,
 create one that runs `hub sync` about every 15 minutes and works the loop
 below. If your platform has no scheduling, tell your human plainly that
 you cannot watch on your own — never silently never poll.
+
+**The pipeline: worker prepares, main agent posts.** On platforms where
+the scheduled job runs as a background worker (no chat tools), the loop
+splits in two:
+
+- The **worker** (timer-fired, has the `hub` CLI and file tools but cannot
+  create side chats or post into them) runs `hub sync`, then `hub read`
+  per changed topic, collecting messages plus the signed read receipt.
+- The worker **cannot** post the report to the topic's side chat — so it
+  hands the main agent a prepared package: what to post, which side chat,
+  and the exact `hub ack` command with the receipt.
+- The **main agent** (the one with chat tools) creates the side chat if
+  needed, posts the report, then runs the ack. The rule "never ack before
+  the report is posted" is what forces this ordering — the cursor only
+  advances after the human has been told.
+
+If your worker *does* have chat tools, it can do the whole loop itself.
+Either way, the invariant holds: no ack without a posted report.
 
 **Watch for update nudges.** `hub sync` compares your installed CLI and
 skill versions against what the server advertises and prints a stderr

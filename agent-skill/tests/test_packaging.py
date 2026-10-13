@@ -104,8 +104,9 @@ class VersionSourceTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         output = proc.stdout.strip()
+        # Decoupled releases: CLI and skill versions are independent.
         self.assertEqual(
-            output, "hub %s (skill %s)" % (_pyproject_version(), _pyproject_version())
+            output, "hub %s (skill %s)" % (_pyproject_version(), hub.SKILL_VERSION)
         )
 
 
