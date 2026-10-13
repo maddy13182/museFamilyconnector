@@ -310,8 +310,8 @@ class TestTokenLoading(HubTestBase):
 class TestRedaction(HubTestBase):
     def test_sync_redacted(self):
         self.seed_config()
-        self.fake.add("GET", "/v1/sync", 200,
-                      {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}]})
+        self.fake.add("GET", "/v1/sync/topics", 200,
+                      {"topics": [{"topic_id": "t1", "subject": "hello"}]})
         rc, out, err = self.run_cli(["sync"])
         self.assertEqual(rc, 0)
         self.assertTokenAbsent(out, err)
@@ -323,7 +323,7 @@ class TestRedaction(HubTestBase):
 
     def test_debug_redacts_authorization(self):
         self.seed_config()
-        self.fake.add("GET", "/v1/sync", 200, {"entries": []})
+        self.fake.add("GET", "/v1/sync/topics", 200, {"topics": []})
         rc, out, err = self.run_cli(["--debug", "sync"])
         self.assertEqual(rc, 0)
         self.assertTokenAbsent(out, err)
@@ -391,7 +391,7 @@ class TestRedaction(HubTestBase):
 
     def test_401_error_redacted(self):
         self.seed_config()
-        self.fake.add("GET", "/v1/sync", 401,
+        self.fake.add("GET", "/v1/sync/topics", 401,
                       {"error": {"code": "auth", "message": "bad token"}})
         rc, out, err = self.run_cli(["sync"])
         self.assertEqual(rc, 3)
@@ -481,46 +481,14 @@ class TestRedaction(HubTestBase):
 
     def test_spawn_redacted(self):
         self.seed_config()
+        self.fake.add("GET", "/v1/topics/tp", 200,
+                      {"topic": {"id": "tp", "e2ee": 0}})
         self.fake.add("POST", "/v1/topics/tp/spawn", 200, {"id": "tc"})
         rc, out, err = self.run_cli([
             "spawn", "--topic", "tp", "--subject", "kid-safe",
             "--with", "m2", "--briefing", "approved summary"])
         self.assertEqual(rc, 0)
         self.assertTokenAbsent(out, err)
-
-
-# ---------------------------------------------------------------------------
-# Sync cursor behavior
-# ---------------------------------------------------------------------------
-
-
-class TestSyncCursor(HubTestBase):
-    def test_cursor_advances(self):
-        self.seed_config()
-        self.fake.add("GET", "/v1/sync", 200, {"entries": [
-            {"gseq": 5, "seq": 1, "body": "a"},
-            {"gseq": 7, "seq": 2, "body": "b"},
-        ]})
-        rc, out, _ = self.run_cli(["sync"])
-        self.assertEqual(rc, 0)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 2)
-        with open(hub.cursor_path("default")) as fh:
-            self.assertEqual(fh.read().strip(), "7")
-        # second sync resumes after gseq=7
-        rc, _out2, _ = self.run_cli(["sync"])
-        self.assertIn("after_gseq=7", self.fake.last_url())
-
-    def test_cursor_untouched_when_empty(self):
-        self.seed_config()
-        with open(hub.cursor_path("default"), "w") as fh:
-            fh.write("42")
-        self.fake.add("GET", "/v1/sync", 200, {"entries": []})
-        rc, out, _ = self.run_cli(["sync"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out), [])
-        with open(hub.cursor_path("default")) as fh:
-            self.assertEqual(fh.read().strip(), "42")
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +958,157 @@ class TestCircleTransfer(HubTestBase):
 
 
 # ---------------------------------------------------------------------------
+# Sync v2: per-circle changed-topic discovery (no client cursors)
+# ---------------------------------------------------------------------------
+
+
+class TestSyncV2(HubTestBase):
+    TOK_A = "fh_CIRCLE_A_token123456"
+    TOK_B = "fh_CIRCLE_B_token789012"
+    CIRCLES = [
+        {"id": "c111", "name": "Family"},
+        {"id": "c222", "name": "Friends"},
+    ]
+
+    def seed_multi(self):
+        self.seed_config(
+            active_circle_id="c111",
+            circle_tokens={"c111": self.TOK_A, "c222": self.TOK_B},
+        )
+
+    def test_sync_topics_labeled_per_circle(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": self.CIRCLES})
+        self.fake.add_seq("GET", "/v1/sync/topics", [
+            (200, {"topics": [{"topic_id": "t1", "subject": "a",
+                               "acked_seq": 1, "latest_seq": 3}]}),
+            (200, {"topics": [{"topic_id": "t2", "subject": "b",
+                               "acked_seq": 0, "latest_seq": 1}]}),
+        ])
+        rc, out, err = self.run_cli(["sync"])
+        self.assertEqual(rc, 0, err)
+        topics = json.loads(out)
+        self.assertEqual(len(topics), 2)
+        by_circle = {t["circle_id"]: t for t in topics}
+        self.assertEqual(by_circle["c111"]["circle_name"], "Family")
+        self.assertEqual(by_circle["c222"]["circle_name"], "Friends")
+        # each circle synced with its own token
+        auths = {c["headers"].get("Authorization")
+                 for c in self.fake.calls
+                 if "/v1/sync/topics" in c["url"]}
+        self.assertEqual(auths, {"Bearer " + self.TOK_A, "Bearer " + self.TOK_B})
+        self.assertTokenAbsent(out, err)
+
+    def test_sync_deletes_legacy_cursors_without_reading(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": self.CIRCLES})
+        self.fake.add("GET", "/v1/sync/topics", 200, {"topics": []})
+        os.makedirs(hub.profile_dir("default"), exist_ok=True)
+        for name in ("cursor", "cursor-c111", "cursor-c222"):
+            with open(os.path.join(hub.profile_dir("default"), name), "w") as fh:
+                fh.write("424242")
+        rc, out, err = self.run_cli(["sync"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), [])
+        for name in ("cursor", "cursor-c111", "cursor-c222"):
+            self.assertFalse(
+                os.path.exists(os.path.join(hub.profile_dir("default"), name)),
+                "legacy cursor %s must be deleted unread" % name)
+
+    def test_sync_partial_failure_reports_per_circle(self):
+        self.seed_multi()
+        self.fake.add("GET", "/v1/families", 200, {"families": self.CIRCLES})
+        self.fake.add_seq("GET", "/v1/sync/topics", [
+            (200, {"topics": [{"topic_id": "t1", "subject": "a"}]}),
+            (500, {"error": {"code": "internal", "message": "boom"}}),
+        ])
+        rc, out, err = self.run_cli(["sync"])
+        self.assertNotEqual(rc, 0)
+        topics = json.loads(out)
+        self.assertEqual(len(topics), 1)  # healthy circle's topics survive
+        self.assertEqual(topics[0]["circle_id"], "c111")
+        self.assertIn("sync failed for circle", err)
+        self.assertIn("Friends", err)
+
+
+class TestReadReceipt(HubTestBase):
+    def test_read_surfaces_receipt_and_defaults_after_to_acked(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics/t1/history", 200,
+                      {"entries": [{"seq": 6, "body": "x"}],
+                       "read_through_seq": 9, "read_receipt": "rcpt-1"})
+        rc, out, err = self.run_cli(["read", "--topic", "t1"])
+        self.assertEqual(rc, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["read_through_seq"], 9)
+        self.assertEqual(result["read_receipt"], "rcpt-1")
+        self.assertEqual(len(result["entries"]), 1)
+        # --after omitted: no after_seq param — the server defaults to the
+        # agent's acked position.
+        self.assertNotIn("after_seq", self.fake.last_url())
+
+    def test_read_after_and_context_are_passed_through(self):
+        self.seed_config()
+        self.fake.add("GET", "/v1/topics/t1/history", 200, {"entries": []})
+        rc, out, err = self.run_cli(
+            ["read", "--topic", "t1", "--after", "42", "--context", "5"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("after_seq=42", self.fake.last_url())
+        self.assertIn("context=5", self.fake.last_url())
+
+
+class TestAck(HubTestBase):
+    def test_ack_posts_seq_and_receipt(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/topics/t1/ack", 200,
+                      {"topic_id": "t1", "acked_seq": 9})
+        rc, out, err = self.run_cli(
+            ["ack", "--topic", "t1", "--seq", "9", "--receipt", "rcpt-1"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["acked_seq"], 9)
+        call = self.fake.calls[-1]
+        self.assertEqual(
+            json.loads(call["body"]), {"seq": 9, "read_receipt": "rcpt-1"})
+
+    def test_ack_requires_both_seq_and_receipt(self):
+        self.seed_config()
+        for argv in (["ack", "--topic", "t1", "--seq", "9"],
+                     ["ack", "--topic", "t1", "--receipt", "r"]):
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    hub.main(argv, transport=self.fake)
+            self.assertEqual(cm.exception.code, 2)  # argparse: missing required
+        # ...and nothing was sent.
+        self.assertEqual(self.fake.calls, [])
+
+
+class TestTokenRevoke(HubTestBase):
+    def test_revoke_posts_with_confirmation(self):
+        self.seed_config()
+        self.fake.add("POST", "/v1/auth/revoke", 200,
+                      {"ok": True, "token_id": "tok_1"})
+        with mock.patch("builtins.input", return_value="yes"):
+            rc, out, err = self.run_cli(
+                ["token-revoke", "--token-id", "tok_1"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["token_id"], "tok_1")
+        call = self.fake.calls[-1]
+        self.assertTrue(call["url"].endswith("/v1/auth/revoke"))
+        self.assertEqual(json.loads(call["body"]), {"token_id": "tok_1"})
+        self.assertIn("revoked", err)
+
+    def test_revoke_cancelled_by_default(self):
+        self.seed_config()
+        with mock.patch("builtins.input", return_value="no"):
+            rc, out, err = self.run_cli(["token-revoke", "--token-id", "tok_1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("cancelled", err)
+        posts = [c for c in self.fake.calls if c["method"] == "POST"]
+        self.assertEqual(posts, [])
+
+
+# ---------------------------------------------------------------------------
 # Per-circle tokens (v0.2.0): one token per circle, active-circle auth,
 # legacy fallback, multi-circle sync, dashboard-token
 # ---------------------------------------------------------------------------
@@ -1010,13 +1129,6 @@ class TestCircleTokens(HubTestBase):
         }
         cfg.update(over)
         self.seed_config(**cfg)
-
-    def sync_paths(self):
-        return [
-            (urlparse.urlparse(c["url"]).path, c["headers"].get("Authorization"))
-            for c in self.fake.calls
-            if urlparse.urlparse(c["url"]).path == "/v1/sync"
-        ]
 
     # -- circle create auto-redeem --------------------------------------
 
@@ -1190,111 +1302,6 @@ class TestCircleTokens(HubTestBase):
              "--email", "a@example.com", "--role", "kid"])
         self.assertEqual(rc, 1)
         self.assertIn("hub circle join --code", err)
-
-    # -- sync --------------------------------------------------------------
-
-    def test_sync_labels_entries_per_circle(self):
-        self.seed_multi()
-        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
-        self.fake.add("GET", "/v1/sync", 200, {"entries": [
-            {"gseq": 3, "seq": 1, "body": "hello"}]})
-        rc, out, _ = self.run_cli(["sync"])
-        self.assertEqual(rc, 0)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 2)  # one per circle
-        by_circle = {e["circle_id"]: e for e in entries}
-        self.assertEqual(by_circle["c111"]["circle_name"], "Family")
-        self.assertEqual(by_circle["c222"]["circle_name"], "Friends")
-        # each circle synced with its own token...
-        auths = {p for _, p in self.sync_paths()}
-        self.assertEqual(auths, {"Bearer " + self.TOK_A,
-                                 "Bearer " + self.TOK_B})
-        # ...and its own cursor
-        for cid in ("c111", "c222"):
-            with open(hub.cursor_path("default", cid)) as fh:
-                self.assertEqual(fh.read().strip(), "3")
-        self.assertFalse(os.path.exists(hub.cursor_path("default")))
-
-    def test_sync_multi_circle_no_entries(self):
-        self.seed_multi()
-        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
-        self.fake.add("GET", "/v1/sync", 200, {"entries": []})
-        rc, out, err = self.run_cli(["sync"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out), [])
-        self.assertIn("no new entries", err)
-
-    def test_sync_partial_failure_emits_without_advancing_cursors(self):
-        # Circle A (c111) returns events; circle B (c222) 500s. A's events
-        # must still be emitted, no cursor may advance (so a retry
-        # re-delivers them), and the exit code must be non-zero with a
-        # per-circle error naming the failed circle.
-        self.seed_multi()
-        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
-        self.fake.add_seq("GET", "/v1/sync", [
-            (200, {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}],
-                    "next_after_gseq": 3, "has_more": False}),
-            (500, {"error": {"code": "internal", "message": "boom"}}),
-        ])
-        rc, out, err = self.run_cli(["sync"])
-        self.assertNotEqual(rc, 0)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["body"], "hello")
-        self.assertEqual(entries[0]["circle_id"], "c111")
-        self.assertEqual(entries[0]["circle_name"], "Family")
-        self.assertIn("sync failed for circle", err)
-        self.assertIn("Friends", err)
-        # Neither circle's cursor advanced: the retry re-delivers A's events.
-        for cid in ("c111", "c222"):
-            self.assertFalse(
-                os.path.exists(hub.cursor_path("default", cid)),
-                "cursor file for %s must not exist after a failed sync" % cid,
-            )
-        self.assertTokenAbsent(out, err)
-
-    def test_sync_retry_after_partial_failure_redelivers(self):
-        # After the failure above, the same events come back on retry.
-        self.seed_multi()
-        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
-        self.fake.add_seq("GET", "/v1/sync", [
-            (200, {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}],
-                    "next_after_gseq": 3, "has_more": False}),
-            (500, {"error": {"code": "internal", "message": "boom"}}),
-        ])
-        rc, out, _ = self.run_cli(["sync"])
-        self.assertNotEqual(rc, 0)
-        # Retry: both circles healthy now; A's event is re-delivered and
-        # this time both cursors advance.
-        self.fake.add("GET", "/v1/sync", 200,
-                      {"entries": [{"gseq": 3, "seq": 1, "body": "hello"}],
-                       "next_after_gseq": 3, "has_more": False})
-        rc, out, _ = self.run_cli(["sync"])
-        self.assertEqual(rc, 0)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 2)  # one per circle
-        for cid in ("c111", "c222"):
-            with open(hub.cursor_path("default", cid)) as fh:
-                self.assertEqual(fh.read().strip(), "3")
-
-    def test_sync_one_circle_empty_others_advance(self):
-        # A healthy circle with no new entries does not block cursor
-        # acknowledgement for a healthy circle that did return entries.
-        self.seed_multi()
-        self.fake.add("GET", "/v1/families", 200, {"families": CIRCLES})
-        self.fake.add_seq("GET", "/v1/sync", [
-            (200, {"entries": [], "next_after_gseq": 0, "has_more": False}),
-            (200, {"entries": [{"gseq": 7, "seq": 1, "body": "yo"}],
-                    "next_after_gseq": 7, "has_more": False}),
-        ])
-        rc, out, _ = self.run_cli(["sync"])
-        self.assertEqual(rc, 0)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["circle_id"], "c222")
-        with open(hub.cursor_path("default", "c222")) as fh:
-            self.assertEqual(fh.read().strip(), "7")
-        self.assertFalse(os.path.exists(hub.cursor_path("default", "c111")))
 
     # -- circle use warnings ---------------------------------------------------
 

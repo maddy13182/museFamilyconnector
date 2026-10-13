@@ -281,7 +281,7 @@ class TestWireFormat(E2eeMsgTestBase):
 class TestRoundTrip(E2eeMsgTestBase):
     def test_post_read_sync_round_trip(self):
         key, kid = self.new_key()
-        self.fake.add_topic("et1", e2ee=1)
+        self.fake.add_topic("et1", e2ee=1, current_key_id=kid)
         self.seed_keystore("et1", {kid: key})
 
         rc, out, err = self.run_cli(
@@ -302,22 +302,15 @@ class TestRoundTrip(E2eeMsgTestBase):
         # read decrypts body + data
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["body"], "hello secret")
         self.assertEqual(entries[0]["data"], {"a": 1, "b": [2, 3]})
 
-        # sync decrypts too
-        rc, out, err = self.run_cli(["sync"])
-        self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["body"], "hello secret")
-        self.assertEqual(entries[0]["data"], {"a": 1, "b": [2, 3]})
 
     def test_post_without_data_leaves_data_null(self):
         key, kid = self.new_key()
-        self.fake.add_topic("et1", e2ee=1)
+        self.fake.add_topic("et1", e2ee=1, current_key_id=kid)
         self.seed_keystore("et1", {kid: key})
         rc, out, err = self.run_cli(
             ["post", "--topic", "et1", "--message", "no data here"])
@@ -325,7 +318,7 @@ class TestRoundTrip(E2eeMsgTestBase):
         payload = json.loads(self.post_entry_calls()[0]["body"])
         self.assertNotIn("data", payload)
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         self.assertEqual(entries[0]["body"], "no data here")
         self.assertIsNone(entries[0]["data"])
 
@@ -339,7 +332,7 @@ class TestAadTamper(E2eeMsgTestBase):
     def setUp(self):
         super().setUp()
         self.key, self.kid = self.new_key()
-        self.fake.add_topic("et1", e2ee=1)
+        self.fake.add_topic("et1", e2ee=1, current_key_id=self.kid)
         self.seed_keystore("et1", {self.kid: self.key})
         rc, _, err = self.run_cli(
             ["post", "--topic", "et1", "--message", "tamper target"])
@@ -394,7 +387,7 @@ class TestAadTamper(E2eeMsgTestBase):
             data={"redacted_gseq": 41})
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         by_kind = {e["kind"]: e for e in entries}
         self.assertEqual(by_kind["redaction"]["body"],
                          "Entry #1 redacted by owner")
@@ -419,7 +412,7 @@ class TestKeyRotation(E2eeMsgTestBase):
             "et1", hub._e2ee_encrypt_field(b"new era", "et1", new_kid, new_key))
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 0, err)
-        bodies = [e["body"] for e in json.loads(out)]
+        bodies = [e["body"] for e in json.loads(out)["entries"]]
         self.assertEqual(bodies, ["old era", "new era"])
 
     def test_post_selects_server_advertised_current_key(self):
@@ -490,7 +483,7 @@ class TestMissingKey(E2eeMsgTestBase):
         self.seed_keystore("et1", {other_kid: other_key})
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         self.assertEqual(len(entries), 1)
         self.assertIn("key-request", entries[0]["body"])
         self.assertIn("cannot decrypt", entries[0]["body"])
@@ -507,7 +500,7 @@ class TestMissingKey(E2eeMsgTestBase):
         # No keystore file at all.
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         self.assertIn("key-request", entries[0]["body"])
 
 
@@ -563,43 +556,13 @@ class TestPiiPreScan(E2eeMsgTestBase):
 
 
 class TestMixedSync(E2eeMsgTestBase):
-    def test_mixed_sync_and_o1_topic_detect(self):
-        key, kid = self.new_key()
-        self.fake.add_topic("pt1", e2ee=0, subject="plain")
-        self.fake.add_topic("pt2", e2ee=0, subject="plain2")
-        self.fake.add_topic("et1", e2ee=1)
-        self.seed_keystore("et1", {kid: key})
-        plain_entries = []
-        for i in range(60):
-            plain_entries.append(
-                self.fake.add_entry("pt1", "plain-%d" % i)["body"])
-            self.fake.add_entry("pt2", "plain2-%d" % i)
-        secret_wire = hub._e2ee_encrypt_field(b"mixed secret", "et1", kid, key)
-        self.fake.add_entry("et1", secret_wire)
-
-        rc, out, err = self.run_cli(["sync"])
-        self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 121)
-        by_topic = {}
-        for e in entries:
-            by_topic.setdefault(e["topic_id"], []).append(e)
-        # Plaintext topics: byte-identical to what the server returned.
-        self.assertEqual(
-            [e["body"] for e in by_topic["pt1"]], plain_entries)
-        # E2EE topic: decrypted.
-        self.assertEqual(by_topic["et1"][0]["body"], "mixed secret")
-        # O(1) per topic: exactly one topic-record GET per distinct topic,
-        # not one per entry.
-        self.assertEqual(len(self.fake.topic_record_gets()), 3)
-
     def test_read_plaintext_topic_untouched_single_fetch(self):
         self.fake.add_topic("pt1", e2ee=0, subject="plain")
         for i in range(10):
             self.fake.add_entry("pt1", "msg-%d" % i)
         rc, out, err = self.run_cli(["read", "--topic", "pt1"])
         self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         self.assertEqual([e["body"] for e in entries],
                          ["msg-%d" % i for i in range(10)])
         self.assertEqual(len(self.fake.topic_record_gets()), 1)
@@ -659,31 +622,6 @@ class TestTopicSubjects(E2eeMsgTestBase):
         self.assertEqual(hub._e2ee_decrypt_subject(enc_b, key, "topic-B"), "same subject")
         with self.assertRaises(hub.HubError):
             hub._e2ee_decrypt_subject(enc_a, key, "topic-B")
-
-
-# ---------------------------------------------------------------------------
-# Perf smoke: 200 plaintext entries must not measurably slow down
-# ---------------------------------------------------------------------------
-
-
-class TestPerfSmoke(E2eeMsgTestBase):
-    def test_200_entry_plaintext_sync_is_fast_and_o1(self):
-        for n in range(4):
-            self.fake.add_topic("pt%d" % n, e2ee=0, subject="t%d" % n)
-            for i in range(50):
-                self.fake.add_entry("pt%d" % n, "entry %d/%d" % (n, i))
-        start = time.monotonic()
-        rc, out, err = self.run_cli(["sync", "--limit", "500"])
-        elapsed = time.monotonic() - start
-        self.assertEqual(rc, 0, err)
-        entries = json.loads(out)
-        self.assertEqual(len(entries), 200)
-        # Structural guarantee: one topic-record fetch per topic, not per
-        # entry — this is what keeps sync O(topics), not O(entries).
-        self.assertEqual(len(self.fake.topic_record_gets()), 4)
-        # Smoke bound (mocked transport; guards against accidental
-        # per-entry crypto or repeated keystore walks).
-        self.assertLess(elapsed, 10, "200-entry sync took %.2fs" % elapsed)
 
 
 if __name__ == "__main__":

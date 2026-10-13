@@ -269,14 +269,6 @@ def config_path(profile):
     return os.path.join(profile_dir(profile), "config.json")
 
 
-def cursor_path(profile, circle_id=None):
-    base = os.path.join(profile_dir(profile), "cursor")
-    if circle_id:
-        safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(circle_id))[:64] or "x"
-        return base + "-" + safe
-    return base
-
-
 def default_token_path(profile):
     return os.path.join(profile_dir(profile), "token")
 
@@ -455,6 +447,49 @@ class HubError(Exception):
             "rate_limited": "Rate limited. Wait a minute and retry.",
             "connection": "Cannot reach the Hub server. Check --server / config "
             "and your network.",
+            # Sync-v2 / E2EE-lifecycle guidance: every code names the exact
+            # recovery. The server is authoritative; these hints only route
+            # the operator to the right CLI command.
+            "plaintext_in_e2ee_topic": "The server rejected plaintext content "
+            "in an E2EE topic. For `hub post` encryption is automatic; for "
+            "`hub task-new` / `hub spawn` pass the topic so the CLI encrypts; "
+            "for `hub task-note` re-run with --topic <id> so the CLI can "
+            "encrypt the note under the topic key. Nothing was stored.",
+            "key_not_active": "The topic's key was never activated (epoch 0): "
+            "writes stay blocked until an owner runs `hub topic-rekey --topic "
+            "<id>` to complete the key ceremony.",
+            "stale_key": "The write used a superseded key id. Run `hub "
+            "key-fetch --topic <id>` (or `hub sync`) to pick up the current "
+            "key, then retry — the CLI refuses to post under a stale key.",
+            "rotation_required": "Membership changed: encrypted writes pause "
+            "until an owner commits a fresh key with `hub topic-rekey "
+            "--topic <id>`.",
+            "stale_epoch": "Someone else advanced the topic's key epoch. "
+            "Re-read the topic and retry the commit against the new epoch.",
+            "key_reuse": "That key id was already used for this topic "
+            "(key ids are never reused). Generate fresh key material and "
+            "retry.",
+            "key_material_reuse": "Identical key material was already "
+            "committed under a different key id. Generate fresh key material "
+            "and retry — never re-seal a burned key.",
+            "recipients_removed_key_burned": "A member was removed after the "
+            "key was sealed: the key is BURNED (the removed party may have "
+            "seen it). Generate fresh key material and restart the rotation — "
+            "never re-seal the burned key.",
+            "incomplete_distribution": "Some participant agents have no "
+            "registered identity key. Wait for them to run `hub key-init`, "
+            "then re-run to seal the delta and recommit — or re-run with "
+            "--force (owner only, confirmed) to commit without them; they "
+            "stay key-pending and use the key-request flow.",
+            "superseded_identity_key": "An agent rotated their identity key "
+            "after the envelope was sealed. Re-fetch the active identity keys "
+            "and re-seal the envelopes, then recommit.",
+            "noncontiguous_ack": "Acks must be contiguous: the receipt's "
+            "from_seq must follow your last acked seq. Read the missing "
+            "pages first (in order), then ack in order.",
+            "msg_id_conflict": "A message with this id but different content "
+            "already exists (replay conflict). Use a fresh idempotency key / "
+            "message id and retry.",
             "client_too_old": "This CLI is too old for the server. Run "
             "`hub upgrade` to install the latest signed release, then retry.",
             "vault_error": "Could not load the credential from the vault helper.",
@@ -516,6 +551,22 @@ def _friendly_from_http(status, payload):
         "code_expired",
         "transfer_expired",
         "transfer_recipient_gone",
+        # Sync-v2 / E2EE-lifecycle contract codes (spec §1.4–1.5): trusted
+        # verbatim so the CLI can branch on them (see the key-commit retry
+        # loop) and so errors name the exact server condition. friendly()
+        # carries per-code retry/abort guidance below.
+        "plaintext_in_e2ee_topic",
+        "key_not_active",
+        "stale_key",
+        "rotation_required",
+        "stale_epoch",
+        "key_reuse",
+        "key_material_reuse",
+        "recipients_removed_key_burned",
+        "incomplete_distribution",
+        "superseded_identity_key",
+        "noncontiguous_ack",
+        "msg_id_conflict",
     }
     if code not in known:
         code = short
@@ -1278,16 +1329,20 @@ def _load_topic_keys(profile, topic_id):
     return keys
 
 
-def _e2ee_current_key(profile, topic_id, ctx):
+def _e2ee_current_key(profile, topic_id, ctx, topic=None):
     """Select the key to encrypt new messages under: (key_id_hex, key_bytes).
 
-    Single-key keystore (the Phase 3 norm): returned directly, no extra
-    round trip. Multi-key keystore (post-rotation): the server-advertised
-    topics.current_key_id is the source of truth for "current", read from
-    the topic record — NEVER envelope recency (secfix F1: created_at is
-    forgeable via re-POST, so electing by it lets an attacker downgrade a
-    victim to a removed member's key or hijack encryption to an attacker
-    key).
+    The server-advertised topics.current_key_id is ALWAYS the source of
+    truth for "current" — even for a single-key keystore. (Sync-v2 fix: the
+    old code returned a lone local key unchecked, so a client holding only
+    a stale key posted under a superseded key_id and ate a server 409
+    stale_key. The client now refuses first.) Key election is NEVER by
+    envelope recency (secfix F1: created_at is forgeable via re-POST, so
+    electing by it lets an attacker downgrade a victim to a removed
+    member's key or hijack encryption to an attacker key).
+
+    `topic` may be a pre-fetched topic record (avoids a second
+    GET /v1/topics/:id on the post path); fetched when omitted.
     """
     topic_id = str(topic_id)
     keys = _load_topic_keys(profile, topic_id)
@@ -1300,20 +1355,30 @@ def _e2ee_current_key(profile, topic_id, ctx):
             "your key envelope first (see `hub key-request`) or ask a topic "
             "participant to share one, then retry." % (topic_id, keystore_path),
         )
-    if len(keys) == 1:
-        key_id_hex = next(iter(keys))
-        return key_id_hex, keys[key_id_hex]
-    topic = _fetch_topic_record(ctx.client, topic_id)
+    if topic is None:
+        topic = _fetch_topic_record(ctx.client, topic_id)
     current = topic.get("current_key_id")
-    if isinstance(current, str) and current in keys:
+    if not isinstance(current, str) or not current:
+        # Epoch 0: the key ceremony never completed (genesis crash), or the
+        # topic record predates epochs. Never fall back to a local key here:
+        # at epoch 0 writes are blocked server-side (409 key_not_active) and
+        # any local key is uncommitted.
+        raise HubError(
+            "error",
+            "Cannot post to E2EE topic %s: the topic's key was never "
+            "activated (epoch 0). An owner must complete the key ceremony "
+            "(`hub topic-rekey --topic %s`) before writes are accepted; "
+            "nothing was posted." % (topic_id, topic_id),
+        )
+    if current in keys:
         return current, keys[current]
     raise HubError(
         "error",
         "Cannot post to E2EE topic %s: the server-advertised current key "
-        "(…%s) is not in the local keystore (%s). Fetch your key envelope "
-        "first (`hub key-fetch --topic %s`, or `hub sync`), then retry; "
-        "nothing was posted."
-        % (topic_id, str(current)[-8:], keystore_path, topic_id),
+        "(…%s) is not in the local keystore (%s) — the local key(s) are "
+        "stale. Fetch your key envelope first (`hub key-fetch --topic %s`, "
+        "or `hub sync`), then retry; nothing was posted."
+        % (topic_id, current[-8:], keystore_path, topic_id),
     )
 
 
@@ -1438,7 +1503,7 @@ def _cmd_post_e2ee(args, ctx, topic, message, data):
     if data is not None:
         data_json = json.dumps(data, sort_keys=True, separators=(",", ":"))
         check_pii(data_json)
-    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, topic_id, ctx)
+    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, topic_id, ctx, topic)
     enc_body = _e2ee_encrypt_field(
         message.encode("utf-8"), topic_id, key_id_hex, topic_key)
     payload = {"kind": args.kind, "body": enc_body}
@@ -1614,6 +1679,26 @@ def _e2ee_distribute_key(ctx, topic_id, key_id_hex, key_id_bytes, topic_key, mem
     return posted, keyless, failures
 
 
+def _commitment_check(key_bytes, commitment):
+    """N07 envelope verification against the epoch commitment.
+
+    Returns True when SHA256(key) matches the server-advertised epoch
+    commitment, False on MISMATCH (refuse the key — substitution or DoS),
+    or None when there is no commitment to check (grandfathered
+    pre-commitment-era epoch: trust-on-first-use, surfaced visibly by the
+    caller). A malformed commitment counts as a mismatch, never as
+    unverifiable.
+    """
+    if commitment is None:
+        return None
+    if not isinstance(commitment, str):
+        return False
+    commitment = commitment.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", commitment):
+        return False
+    return hashlib.sha256(key_bytes).hexdigest() == commitment
+
+
 def _e2ee_refresh_own_keys(client, profile, topic_id, quiet=True):
     """Fetch our own envelopes; open + merge any key_ids missing locally.
 
@@ -1658,35 +1743,35 @@ def _e2ee_refresh_own_keys(client, profile, topic_id, quiet=True):
             continue
         if kid_bytes.hex() != kid or len(key) != _E2EE_TOPIC_KEY_BYTES:
             continue  # key_id binding mismatch: never store a mislabeled key
+        # N07: verify the opened key against the epoch commitment carried
+        # on the envelope row (spec §1.5: GET envelopes returns each
+        # committed epoch's commitment). A mismatch means substitution or
+        # DoS: refuse the key, loudly — never silently.
+        check = _commitment_check(key, env.get("commitment"))
+        if check is False:
+            msg = (
+                "REFUSING key envelope for topic %s (key …%s): "
+                "SHA256(opened key) != the server-advertised epoch "
+                "commitment (possible key substitution or denial of "
+                "service). The key was NOT stored; nothing was posted."
+                % (topic_id, kid[-8:])
+            )
+            if quiet:
+                emit_err("WARNING: " + msg)
+                continue
+            raise HubError("error", msg)
+        if check is None:
+            # Grandfathered NULL commitment (pre-commitment era): nothing
+            # to verify against. Trust-on-first-use, but visible — never
+            # silent.
+            emit_err(
+                "note: key …%s for topic %s is unverifiable "
+                "(pre-commitment era); trust-on-first-use." % (kid[-8:], topic_id)
+            )
         _merge_topic_key(profile, topic_id, kid, key)
         known.add(kid)
         fresh.append(kid)
     return fresh
-
-
-def _e2ee_refresh_after_sync(client, profile, e2ee_flags):
-    """Opportunistic envelope refresh for E2EE topics seen in a sync batch.
-
-    e2ee_flags is {topic_id: is_e2ee} as returned by
-    _decrypt_entries_for_display. Failures are warnings, never fatal: sync
-    must not die because a refresh hiccupped.
-    """
-    for topic_id, is_e2ee in (e2ee_flags or {}).items():
-        if not is_e2ee:
-            continue
-        try:
-            fresh = _e2ee_refresh_own_keys(client, profile, topic_id)
-        except HubError as exc:
-            emit_err(
-                "warning: key-envelope refresh for topic %s failed: %s"
-                % (topic_id, exc.friendly())
-            )
-            continue
-        for kid in fresh:
-            emit_err(
-                "topic %s: fetched a new key envelope (key …%s); `hub post` "
-                "will now use the new key." % (topic_id, kid[-8:])
-            )
 
 
 def _pending_distribution_notice(ctx, topic, key_id_hex, member_id, name, rotated):
@@ -1718,19 +1803,340 @@ def _pending_distribution_notice(ctx, topic, key_id_hex, member_id, name, rotate
     )
 
 
-def cmd_topic_add_member(args, transport):
-    """Envelope step of adding a member to an E2EE topic.
+# ---------------------------------------------------------------------------
+# Staged key commit (sync-v2, spec §1.4) — shared by genesis and rotation.
+#
+# Envelope POSTs are STAGED: the server stores them but never flips
+# current_key_id (the N04 defect was the flip-on-POST). Only
+# POST /v1/topics/:tid/keys/commit activates a key, atomically, after
+# checking the staged set against the current participant set.
+# ---------------------------------------------------------------------------
 
-    The server step (`hub invite`) must already have made them a
-    participant — the two steps are deliberately separate, and this command
-    refuses to auto-invite. Seals the CURRENT topic key (never old keys) for
-    each of the new member's registered agents.
+_KEY_COMMIT_MAX_ATTEMPTS = 4  # bounds the 409-retry loop below
+
+
+def _conflict_names(exc):
+    """Pull the server's named-agent lists out of a 409 payload.
+
+    The commit endpoint reports {removed:[...]} / {missing:[...]} /
+    {agents:[...]} alongside the error code (spec §1.4); the exact key
+    depends on the code. Returns {} when the payload carries none.
+    """
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return {}
+    err = details.get("error")
+    if not isinstance(err, dict):
+        return {}
+    return {k: v for k, v in err.items() if isinstance(v, list)}
+
+
+def _seal_for_participants(ctx, topic_id, key_id_hex, topic_key):
+    """Seal one key for every CURRENT participant agent (staged).
+
+    Returns (participants, posted, keyless). Re-fetches /v1/agent-keys on
+    every call, so a retry after `superseded_identity_key` seals to the
+    fresh active identity keys. Envelope POST is idempotent-by-content:
+    re-sealing the same key_id for the same agent does not change the
+    commit's set-equality (staged vs current participants).
+    """
+    participants = _topic_participants(ctx, topic_id)
+    member_ids = sorted(participants)
+    if not member_ids:
+        raise HubError(
+            "error",
+            "Server returned no participants for topic %s." % topic_id,
+        )
+    posted, keyless, failures = _e2ee_distribute_key(
+        ctx, topic_id, key_id_hex, bytes.fromhex(key_id_hex), topic_key,
+        member_ids,
+    )
+    if failures:
+        raise HubError(
+            "error",
+            "Key distribution ABORTED: %d envelope(s) failed to post (%s). "
+            "No commit was attempted; fix the cause and re-run."
+            % (len(failures), "; ".join(failures)),
+        )
+    return participants, posted, keyless
+
+
+def _confirm_force_commit(topic_id, key_id_hex, missing, yes):
+    """Interactive confirmation for a --force commit; raises on decline."""
+    who = ", ".join(missing) if missing else "the agents listed by the server"
+    emit_err(
+        "FORCE COMMIT for E2EE topic %s (key …%s): the following participant "
+        "agents have no registered identity key and would NOT receive the "
+        "new key: %s.\n"
+        "They stay key_status pending and must use the key-request flow; "
+        "they cannot read messages encrypted under the new key until then. "
+        "--force covers ONLY agents with no active identity key — never "
+        "removed members, never superseded keys (the server enforces this).\n"
+        "Confirm with your human FIRST. Type 'yes' to commit, anything else "
+        "aborts (nothing is committed)."
+        % (topic_id, key_id_hex[-8:], who)
+    )
+    if yes:
+        return
+    try:
+        answer = input()
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("yes", "y"):
+        raise HubError("error", "Force commit declined: nothing was committed.")
+
+
+def _run_staged_key_commit(ctx, topic_id, expected_epoch, key_id_hex, topic_key,
+                           force_requested, yes, what):
+    """Seal + commit one key epoch with the spec §1.4 409 handling.
+
+    `what` is "genesis" (expected_epoch=1, activating a topic stuck at
+    epoch 0) or "rotation". Returns (commit_resp, final_key_id_hex,
+    final_key, participants, posted, keyless, force_used).
+
+    Retry policy (bounded by _KEY_COMMIT_MAX_ATTEMPTS):
+    - recipients_removed_key_burned → the key is BURNED (a removed party
+      may have seen it): generate FRESH material and RESTART — never
+      re-seal the burned key. force cannot override this.
+    - incomplete_distribution → agents with no identity key at all. Without
+      --force: abort naming them (re-run after `hub key-init` — the SAME
+      key is kept, the retry seals the delta and recommits). With --force:
+      confirm, recommit with force=true (owner only; server enforces).
+    - superseded_identity_key → re-fetch active identity keys and re-seal
+      the SAME key material, recommit.
+    - stale_epoch → re-read the topic, recommit for current_epoch+1.
+    - key_reuse / key_material_reuse → fresh material, restart.
+    Anything else (or attempts exhausted) aborts loudly: a genesis leaves
+    the topic at epoch 0 (writes blocked) for `hub topic-rekey` to
+    complete later; a rotation leaves the old key current.
+    """
+    commitment = hashlib.sha256(topic_key).hexdigest()
+    force_param = False
+    attempt = 0
+    while True:
+        attempt += 1
+        last = attempt >= _KEY_COMMIT_MAX_ATTEMPTS
+        participants, posted, keyless = _seal_for_participants(
+            ctx, topic_id, key_id_hex, topic_key
+        )
+        try:
+            resp = ctx.client.call(
+                "POST",
+                "/v1/topics/%s/keys/commit" % urlparse.quote(str(topic_id), safe=""),
+                json_body={
+                    "expected_epoch": expected_epoch,
+                    "key_id": key_id_hex,
+                    "commitment": commitment,
+                    "force": force_param,
+                },
+            )
+            return (resp, key_id_hex, topic_key, participants, posted,
+                    keyless, force_param)
+        except HubError as exc:
+            code = getattr(exc, "server_code", None)
+            if last:
+                if what == "genesis":
+                    tail = (
+                        "The topic is unchanged at epoch 0 (writes blocked); "
+                        "the key is stored locally — complete the ceremony "
+                        "later with `hub topic-rekey --topic %s`." % topic_id
+                    )
+                else:
+                    tail = (
+                        "The old key is still current; fix the cause and "
+                        "re-run."
+                    )
+                raise HubError(
+                    "error",
+                    "Key %s failed after %d attempts (last: %s). %s"
+                    % (what, attempt, exc, tail),
+                )
+            if code == "recipients_removed_key_burned":
+                removed = _conflict_names(exc).get("removed") or []
+                emit_err(
+                    "commit rejected (recipients_removed_key_burned%s): the "
+                    "key is BURNED and its staged envelopes were deleted "
+                    "server-side. Generating fresh key material and "
+                    "restarting (attempt %d/%d) — the burned key is never "
+                    "re-sealed."
+                    % (
+                        " [%s]" % ", ".join(removed) if removed else "",
+                        attempt + 1,
+                        _KEY_COMMIT_MAX_ATTEMPTS,
+                    )
+                )
+                topic_key = os.urandom(_E2EE_TOPIC_KEY_BYTES)
+                _note_topic_key_secrets(topic_key)
+                key_id_hex = os.urandom(_E2EE_KEY_ID_BYTES).hex()
+                commitment = hashlib.sha256(topic_key).hexdigest()
+                continue
+            if code == "incomplete_distribution":
+                if force_param:
+                    # Already force-committed and still rejected: the server
+                    # disagrees — surface it instead of looping forever.
+                    raise
+                missing = _conflict_names(exc).get("missing") or []
+                if not force_requested:
+                    raise HubError(
+                        "conflict",
+                        "Key %s blocked: %s. Either wait for them to run "
+                        "`hub key-init` and re-run (the SAME key is kept — "
+                        "the retry seals the delta and recommits), or re-run "
+                        "with --force (owner only, confirmed) to commit "
+                        "without them."
+                        % (
+                            what,
+                            ", ".join(missing) if missing else
+                            "some participant agents have no registered identity key",
+                        ),
+                    )
+                _confirm_force_commit(topic_id, key_id_hex, missing, yes)
+                force_param = True
+                emit_err("confirmed: recommitting with force=true.")
+                continue
+            if code == "superseded_identity_key":
+                agents = _conflict_names(exc).get("agents") or []
+                emit_err(
+                    "commit rejected (superseded_identity_key%s): re-fetching "
+                    "the active identity keys and re-sealing the SAME key "
+                    "material (attempt %d/%d)."
+                    % (
+                        " [%s]" % ", ".join(agents) if agents else "",
+                        attempt + 1,
+                        _KEY_COMMIT_MAX_ATTEMPTS,
+                    )
+                )
+                continue  # _seal_for_participants re-reads /v1/agent-keys
+            if code == "stale_epoch":
+                topic = _fetch_topic_record(ctx.client, topic_id)
+                expected_epoch = (topic.get("current_epoch") or 0) + 1
+                emit_err(
+                    "commit rejected (stale_epoch): the topic advanced under "
+                    "us; retrying the commit for epoch %d (attempt %d/%d)."
+                    % (expected_epoch, attempt + 1, _KEY_COMMIT_MAX_ATTEMPTS)
+                )
+                continue
+            if code in ("key_reuse", "key_material_reuse"):
+                emit_err(
+                    "commit rejected (%s): regenerating fresh key material "
+                    "and restarting (attempt %d/%d)."
+                    % (code, attempt + 1, _KEY_COMMIT_MAX_ATTEMPTS)
+                )
+                topic_key = os.urandom(_E2EE_TOPIC_KEY_BYTES)
+                _note_topic_key_secrets(topic_key)
+                key_id_hex = os.urandom(_E2EE_KEY_ID_BYTES).hex()
+                commitment = hashlib.sha256(topic_key).hexdigest()
+                continue
+            raise
+
+
+def _history_grant(participant):
+    """The member's history grant: 'full' | 'from-join' | None (unknown).
+
+    Prefers the server's `history_from` label (set by `hub invite
+    --history`); falls back to a numeric `history_from_seq` floor (a floor
+    above 1 means from-join). None when the server reports neither — the
+    caller must FAIL CLOSED (never guess): sealing the current epoch key
+    for a from-join member would hand them pre-join plaintext, and a sealed
+    envelope cannot be un-rung.
+    """
+    hf = participant.get("history_from")
+    if hf in ("full", "from-join"):
+        return hf
+    seq = participant.get("history_from_seq")
+    if isinstance(seq, bool):
+        return None
+    if isinstance(seq, int):
+        return "from-join" if seq > 1 else "full"
+    return None
+
+
+def _seal_history_keys(ctx, topic_id, member_id):
+    """Seal the current + all committed epoch keys we hold, for one member.
+
+    Epoch source (decision, spec §2.6): GET /v1/topics/:tid/envelopes
+    returns ONLY committed-epoch envelopes, each row carrying its epoch's
+    `commitment` (spec §1.5) — so the distinct key_ids in that response ARE
+    the committed epoch log, and staged (uncommitted) keys are correctly
+    excluded. The server-advertised current_key_id from the topic record is
+    unioned in as belt-and-braces. For each committed key_id held locally,
+    the local key is cross-checked against the committed commitment (N07):
+    a mismatch is refused loudly, never sealed.
+
+    Returns (posted, unavailable_key_ids, keyless, n_committed_epochs).
+    """
+    topic = _fetch_topic_record(ctx.client, topic_id)
+    resp = ctx.client.call(
+        "GET",
+        "/v1/topics/%s/envelopes" % urlparse.quote(str(topic_id), safe=""),
+    )
+    committed = {}  # key_id -> commitment (None when grandfathered)
+    for env in _as_list(resp, "envelopes"):
+        if not isinstance(env, dict):
+            continue
+        kid = env.get("key_id")
+        if isinstance(kid, str) and kid and kid not in committed:
+            committed[kid] = env.get("commitment")
+    current = topic.get("current_key_id")
+    if isinstance(current, str) and current and current not in committed:
+        committed[current] = None
+    local = _load_topic_keys(ctx.profile, topic_id)
+    posted, keyless, failures, unavailable = 0, False, [], []
+    for kid, commitment in committed.items():
+        key = local.get(kid)
+        if key is None:
+            unavailable.append(kid)
+            continue
+        if _commitment_check(key, commitment) is False:
+            emit_err(
+                "WARNING: refusing to seal key …%s for %s: the local key "
+                "does not match the server's committed epoch commitment "
+                "(possible substitution). It was NOT sealed."
+                % (kid[-8:], member_id)
+            )
+            unavailable.append(kid)
+            continue
+        p, kl, f = _e2ee_distribute_key(
+            ctx, topic_id, kid, bytes.fromhex(kid), key, [member_id]
+        )
+        posted += p
+        keyless = keyless or bool(kl)
+        failures.extend(f)
+    if failures:
+        raise HubError(
+            "error",
+            "Key distribution failed for %d agent(s): %s. No key was "
+            "stored and the distribution is incomplete; fix the cause and "
+            "re-run." % (len(failures), "; ".join(failures)),
+        )
+    return posted, unavailable, keyless, len(committed)
+
+
+def cmd_topic_add_member(args, transport):
+    """Envelope step of adding a member to an E2EE topic (spec §1.4).
+
+    The server step (`hub invite [--history full|from-join]`) must already
+    have made them a participant — the two steps are deliberately separate,
+    and this command refuses to auto-invite.
+
+    - `from-join` members: NO key is sealed. They stay key_status pending
+      until an owner runs `hub topic-rekey`; pre-join content is
+      cryptographically (not just policy-) unreadable to them. The server
+      enforces this too (rotation_required on accept).
+    - `full` (full-history) members: the CURRENT plus ALL committed epoch
+      keys the local keystore holds are sealed, so granted history is
+      actually readable (key usability). Committed epochs not held locally
+      are reported as unavailable, never silently skipped.
+
+    The history grant comes from the participant record (`history_from`);
+    when the server reports none, the command FAILS CLOSED rather than
+    guessing. A member with no registered keys gets a visible
+    `pending_key_distribution` notice — never silence.
     """
     ctx = _ctx(args, transport)
     _require_nacl()
     topic = _e2ee_require_topic(ctx, args.topic)
-    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, args.topic, ctx)
-    key_id_bytes = bytes.fromhex(key_id_hex)
+    topic_id = str(args.topic)
     participants = _topic_participants(ctx, args.topic)
     member_ids = _id_list(args.member)
     if not member_ids:
@@ -1743,30 +2149,74 @@ def cmd_topic_add_member(args, transport):
             "Adding (server step) and key distribution (this step) are deliberately "
             "separate; this command never auto-invites." % (args.topic, ",".join(missing)),
         )
-    posted, keyless, failures = _e2ee_distribute_key(
-        ctx, args.topic, key_id_hex, key_id_bytes, topic_key, member_ids
-    )
-    if failures:
-        raise HubError(
-            "error",
-            "Key distribution failed for %d agent(s): %s. No key was stored and "
-            "the distribution is incomplete; fix the cause and re-run."
-            % (len(failures), "; ".join(failures)),
+    results = []
+    for mid in member_ids:
+        grant = _history_grant(participants[mid])
+        if grant is None:
+            raise HubError(
+                "error",
+                "Cannot determine the history grant for %s: the server did "
+                "not report 'history_from' on the participant record. "
+                "Refusing to seal keys blindly — a from-join member must "
+                "NEVER receive the current epoch key. Ask the inviter which "
+                "grant was used, or re-invite with an explicit --history."
+                % mid,
+            )
+        if grant == "from-join":
+            results.append(
+                {
+                    "member_id": mid,
+                    "history": "from-join",
+                    "envelopes_posted": 0,
+                    "note": "no key sealed: from-join members stay "
+                    "key_status pending until an owner runs `hub topic-rekey "
+                    "--topic %s` (the server enforces this)." % topic_id,
+                }
+            )
+            continue
+        posted, unavailable, keyless, n_committed = _seal_history_keys(
+            ctx, topic_id, mid
         )
-    pending = []
-    for mid in keyless:
-        name = participants[mid].get("name") or mid
-        _pending_distribution_notice(ctx, topic, key_id_hex, mid, name, rotated=False)
-        pending.append(mid)
-    emit_json(
-        {
-            "topic_id": str(args.topic),
-            "key_id": key_id_hex,
-            "members": member_ids,
+        if keyless:
+            name = participants[mid].get("name") or mid
+            # rotated=False branch of the notice ignores key_id_hex.
+            _pending_distribution_notice(ctx, topic, "", mid, name, rotated=False)
+        elif posted == 0:
+            # We hold none of the topic's committed epoch keys (or there are
+            # none yet): fail loudly rather than report a phantom success.
+            if n_committed == 0:
+                reason = (
+                    "the topic has no committed key epochs yet (epoch 0?) — "
+                    "complete the key ceremony first "
+                    "(`hub topic-rekey --topic %s`)" % topic_id
+                )
+            else:
+                reason = (
+                    "the local keystore holds none of the topic's %d "
+                    "committed epoch key(s) — fetch them first "
+                    "(`hub key-request` / `hub key-fetch`), then re-run"
+                    % n_committed
+                )
+            raise HubError(
+                "error",
+                "Cannot distribute keys to %s: %s. Nothing was sealed."
+                % (mid, reason),
+            )
+        entry = {
+            "member_id": mid,
+            "history": "full",
             "envelopes_posted": posted,
-            "pending_key_distribution": pending,
+            "pending_key_distribution": bool(keyless),
         }
-    )
+        if unavailable:
+            entry["unavailable_epoch_keys"] = unavailable
+            entry["note"] = (
+                "these committed epoch keys are not in the local keystore "
+                "and were NOT sealed; the member can `hub key-request` them "
+                "from a holder."
+            )
+        results.append(entry)
+    emit_json({"topic_id": topic_id, "members": results})
     return 0
 
 
@@ -1795,118 +2245,153 @@ def cmd_topic_remove_member(args, transport):
 
 
 def cmd_topic_rekey(args, transport):
-    """Rotate an E2EE topic's key after a membership change.
+    """Rotate an E2EE topic's key — or complete a stuck genesis (spec §2).
 
-    1. Requires the CURRENT key locally (you cannot rotate what you can't read).
-    2. Generates a new 32-byte key + 128-bit key_id locally.
-    3. Seals fresh envelopes for every REMAINING participant agent (the
-       server rejects envelopes for non-participants, so a removed member
-       cannot receive the new key through this path).
-    4. Round-trip verifies our own envelope, then MERGES the new key into the
-       local keystore — old keys are retained for history decryption.
-    5. Posts a PLAINTEXT `key_rotated` announcement readable by everyone,
-       including agents that haven't fetched the new key yet.
-    Members with no registered keys get a visible pending notice instead of
-    an envelope — never silent.
+    Staged flow (spec §1.4): fresh key material + commitment (SHA256(key))
+    → seal per-agent envelopes (POST envelopes, staged — stored, never
+    flipped) → POST keys/commit. The commit is atomic; its 409s are handled
+    per the retry policy in _run_staged_key_commit: burn → fresh material
+    and RESTART (never re-seal); delta → seal and recommit the same key;
+    superseded identity keys → re-seal to the active key and recommit;
+    stale epoch → re-read and retry.
 
-    Rotation is an owner/parent privilege (secfix F1): the server rejects a
-    new key_id from anyone else with 403, and this command fails loudly
-    BEFORE generating anything when the caller's role is not owner/parent.
+    The OLD key is NOT needed: rotation does not require holding the
+    current key (an owner who lost it can still rotate). The new key is
+    merged into the local keystore only AFTER the commit succeeds — old
+    keys are retained for history decryption. A plaintext `key_rotated`
+    announcement follows (readable by everyone, including agents that have
+    not fetched the new key yet). Members with no registered keys get a
+    visible pending notice instead of an envelope — never silent.
+
+    Genesis: a topic stuck at epoch 0 (created, never committed) is
+    completed by reusing the single locally stored key (never committed, so
+    never burned); the commit runs with expected_epoch=1.
+
+    Rotation is an owner/parent privilege; --force is owner-only, confirmed
+    by prompt, and covers ONLY agents with no active identity key — never
+    removed members, never superseded keys (the server enforces this).
     """
     ctx = _ctx(args, transport)
     _require_nacl()
     topic = _e2ee_require_topic(ctx, args.topic)
     me = ctx.client.call("GET", "/v1/me")
     me = me if isinstance(me, dict) else {}
-    if me.get("role") not in ("owner", "parent"):
+    role = me.get("role")
+    if role not in ("owner", "parent"):
         raise HubError(
             "forbidden",
             "Only an owner or parent may rotate an E2EE topic's key "
             "(your role: %s). Ask an owner/parent to run `hub topic-rekey`. "
             "Nothing was generated and nothing was posted."
-            % (me.get("role") or "unknown"),
+            % (role or "unknown"),
         )
-    old_key_id_hex, _old_key = _e2ee_current_key(ctx.profile, args.topic, ctx)
-    priv = _load_identity_key(agent_key_path(ctx.profile))
-
-    new_key = os.urandom(_E2EE_TOPIC_KEY_BYTES)
-    _note_topic_key_secrets(new_key)
-    new_key_id_bytes = os.urandom(_E2EE_KEY_ID_BYTES)
-    new_key_id_hex = new_key_id_bytes.hex()
-
-    participants = _topic_participants(ctx, args.topic)
-    member_ids = sorted(participants)
-    if not member_ids:
-        raise HubError("error", "Server returned no participants for topic %s." % args.topic)
-    posted, keyless, failures = _e2ee_distribute_key(
-        ctx, args.topic, new_key_id_hex, new_key_id_bytes, new_key, member_ids
-    )
-    if failures:
+    if args.force and role != "owner":
         raise HubError(
-            "error",
-            "Rotation ABORTED: %d envelope(s) failed to post (%s). The new key was "
-            "NOT stored locally and no rotation was announced; the old key is still "
-            "current. Fix the cause and re-run." % (len(failures), "; ".join(failures)),
+            "forbidden",
+            "--force is owner-only (your role: %s). A parent cannot force a "
+            "commit past keyless agents." % (role or "unknown"),
         )
-
-    # Round-trip check BEFORE storing locally (same posture as topic creation):
-    # our own envelope must open to exactly the new key.
-    own = ctx.client.call(
-        "GET", "/v1/topics/%s/envelopes" % urlparse.quote(str(args.topic), safe="")
-    )
-    mine = [
-        e
-        for e in _as_list(own, "envelopes")
-        if isinstance(e, dict) and e.get("key_id") == new_key_id_hex
-    ]
-    if not mine:
-        raise HubError(
-            "error",
-            "Round-trip check failed: our own envelope for the new key is missing "
-            "server-side. The new key was NOT stored.",
+    topic_id = str(args.topic)
+    current_epoch = topic.get("current_epoch") or 0
+    previous_key_id = topic.get("current_key_id")
+    if current_epoch == 0:
+        # Stuck genesis: reuse the locally stored key. It was never
+        # committed, so it cannot be burned; if the server ever burns it
+        # (membership changed under us), the commit loop regenerates fresh
+        # material and restarts.
+        keys = _load_topic_keys(ctx.profile, topic_id)
+        if len(keys) != 1:
+            raise HubError(
+                "error",
+                "Topic %s is at epoch 0 (key never activated) but the local "
+                "keystore holds %d keys — the genesis key is ambiguous or "
+                "missing, so the ceremony cannot be completed from here. "
+                "Ask the agent that created the topic to re-run "
+                "`hub topic-rekey --topic %s`, or delete the topic and "
+                "create a fresh one." % (topic_id, len(keys), topic_id),
+            )
+        key_id_hex, new_key = next(iter(keys.items()))
+        _note_topic_key_secrets(new_key)
+        genesis = True
+    else:
+        new_key = os.urandom(_E2EE_TOPIC_KEY_BYTES)
+        _note_topic_key_secrets(new_key)
+        key_id_hex = os.urandom(_E2EE_KEY_ID_BYTES).hex()
+        genesis = False
+    expected_epoch = current_epoch + 1
+    try:
+        (resp, final_kid, final_key, participants, posted, keyless,
+         force_used) = _run_staged_key_commit(
+            ctx, topic_id, expected_epoch, key_id_hex, new_key,
+            force_requested=bool(args.force), yes=bool(args.yes),
+            what="genesis" if genesis else "rotation",
         )
-    opened_kid, opened_key = _e2ee_open_envelope(
-        mine[0].get("envelope") or "", priv, str(args.topic))
-    if opened_kid != new_key_id_bytes or opened_key != new_key:
-        raise HubError(
-            "error",
-            "Round-trip check failed: our own envelope does not open to the new "
-            "topic key. The new key was NOT stored.",
+    except HubError:
+        emit_err(
+            "note: topic %s is unchanged (still at epoch %d); the old key "
+            "(if any) is still current. Fix the cause and re-run."
+            % (topic_id, current_epoch)
         )
-
-    key_path = _merge_topic_key(ctx.profile, args.topic, new_key_id_hex, new_key)
+        raise
+    if genesis:
+        # Epoch 0 has no history: overwrite the pre-commit anchor with the
+        # final committed material.
+        key_path = _store_topic_key(ctx.profile, topic_id, final_kid, final_key)
+    else:
+        key_path = _merge_topic_key(ctx.profile, topic_id, final_kid, final_key)
 
     actor_name = me.get("name") or me.get("id") or "a member"
     actor_id = me.get("id") or ""
-    body = (
-        "[key rotation] %s rotated this topic's encryption key (now …%s). New messages "
-        "are encrypted under the new key; older messages remain readable with the "
-        "retained key. If you see ciphertext, run `hub sync` to fetch your new key envelope."
-        % (actor_name, new_key_id_hex[-8:])
-    )
+    if genesis:
+        body = (
+            "[key activation] %s activated this topic's encryption key "
+            "(epoch 1, …%s). Encrypted writes are now unblocked; if you see "
+            "ciphertext, run `hub sync` to fetch your key envelope."
+            % (actor_name, final_kid[-8:])
+        )
+    else:
+        body = (
+            "[key rotation] %s rotated this topic's encryption key (now …%s). "
+            "New messages are encrypted under the new key; older messages "
+            "remain readable with the retained key. If you see ciphertext, "
+            "run `hub sync` to fetch your new key envelope."
+            % (actor_name, final_kid[-8:])
+        )
     _post_system_entry(
         ctx,
         topic,
         "key_rotated",
         body,
         {
-            "key_id": new_key_id_hex,
-            "previous_key_id": old_key_id_hex,
+            "key_id": final_kid,
+            "previous_key_id": previous_key_id,
             "rotated_by": actor_id,
+            "genesis": genesis,
         },
     )
     pending = []
     for mid in keyless:
         name = participants[mid].get("name") or mid
-        _pending_distribution_notice(ctx, topic, new_key_id_hex, mid, name, rotated=True)
+        _pending_distribution_notice(
+            ctx, topic, final_kid, mid, name, rotated=not genesis
+        )
         pending.append(mid)
+    # The commit response is authoritative for the epoch (a stale_epoch
+    # retry may have committed a later epoch than first expected).
+    epoch = resp.get("epoch") if isinstance(resp, dict) else None
+    if not isinstance(epoch, int):
+        epoch = expected_epoch
     emit_json(
         {
-            "topic_id": str(args.topic),
-            "previous_key_id": old_key_id_hex,
-            "key_id": new_key_id_hex,
+            "topic_id": topic_id,
+            "epoch": epoch,
+            "previous_key_id": previous_key_id,
+            "key_id": final_kid,
+            "commitment": hashlib.sha256(final_key).hexdigest(),
+            "genesis_completed": genesis,
             "envelopes_posted": posted,
             "pending_key_distribution": pending,
+            "forced_commit": force_used,
             "topic_key_path": key_path,
         }
     )
@@ -1963,7 +2448,7 @@ def cmd_key_grant(args, transport):
     ctx = _ctx(args, transport)
     _require_nacl()
     topic = _e2ee_require_topic(ctx, args.topic)
-    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, args.topic, ctx)
+    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, args.topic, ctx, topic)
     key_id_bytes = bytes.fromhex(key_id_hex)
     participants = _topic_participants(ctx, args.topic)
     if args.member not in participants:
@@ -2068,7 +2553,7 @@ def cmd_topic_key_status(args, transport):
     ctx = _ctx(args, transport)
     topic = _e2ee_require_topic(ctx, args.topic)
     try:
-        current_id, _key = _e2ee_current_key(ctx.profile, args.topic, ctx)
+        current_id, _key = _e2ee_current_key(ctx.profile, args.topic, ctx, topic)
     except HubError:
         current_id = None
     participants = _topic_participants(ctx, args.topic)
@@ -3522,21 +4007,6 @@ def _retarget_client(ctx, args, circle_id):
     return ctx
 
 
-def _read_cursor(profile, circle_id=None):
-    try:
-        with open(cursor_path(profile, circle_id), "r", encoding="utf-8") as fh:
-            return int(fh.read().strip() or 0)
-    except (OSError, ValueError):
-        return 0
-
-
-def _write_cursor(profile, value, circle_id=None):
-    d = profile_dir(profile)
-    os.makedirs(d, mode=0o700, exist_ok=True)
-    with open(cursor_path(profile, circle_id), "w", encoding="utf-8") as fh:
-        fh.write(str(int(value)))
-
-
 # ---------------------------------------------------------------------------
 # Circles (v0.2.0: a profile can belong to many circles; one is active)
 # ---------------------------------------------------------------------------
@@ -3901,85 +4371,93 @@ def cmd_key_restore(args, transport):
     return 0
 
 
-def _sync_one_circle(ctx, transport, circle_id, circle_name, token, limit):
-    """Fetch a single circle's new entries WITHOUT advancing its cursor.
+_SYNC_TOPICS_MAX_PAGES = 10  # safety cap while following server paging
 
-    Returns (labeled_entries, new_cursor): the entries labeled with their
-    circle, plus the cursor value the caller must persist AFTER the entries
-    have been emitted (None when there is nothing new to acknowledge).
-    The cursor is returned, never written, so a failure downstream (a later
-    circle failing, or output never being emitted) cannot strand entries
-    behind an advanced cursor.
+
+def _delete_legacy_cursors(profile, circle_ids):
+    """Delete pre-sync-v2 cursor files WITHOUT reading them.
+
+    Read state moved server-side (topic_read_state, keyed per agent); the
+    first sync-v2 run bootstraps from 0 — every visible topic is reported
+    once as changed and the skill dedupes. The legacy files
+    ("<profile>/cursor" and "<profile>/cursor-<safe circle id>") are
+    removed so nothing consults them again. cursor_path() itself was
+    deleted with the old sync; the name mangling below mirrors it exactly
+    so every legacy file is caught.
     """
-    client = HubClient(ctx.server, token, debug=ctx.client.debug,
-                       transport=transport)
-    cursor = _read_cursor(ctx.profile, circle_id)
-    resp = client.call(
-        "GET", "/v1/sync", query={"after_gseq": cursor, "limit": limit}
-    )
-    entries = _as_list(resp, "entries")
-    labeled = []
-    for e in entries:
-        if isinstance(e, dict):
-            e = dict(e)
-            e["circle_id"] = circle_id
-            e["circle_name"] = circle_name
-        labeled.append(e)
-    # Decrypt E2EE entries with THIS circle's client (per-circle token);
-    # topic records are fetched once per topic, not per entry.
-    e2ee_flags = _e2ee_flags_for_entries(client, labeled)
-    # Phase 4: pick up rotated/granted key envelopes BEFORE decrypting, so a
-    # re-keyed topic's new key is usable on first sight.
-    _e2ee_refresh_after_sync(client, ctx.profile, e2ee_flags)
-    _decrypt_entries_for_display(client, ctx.profile, labeled, e2ee_flags)
-    new_cursor = None
-    if entries:
-        gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
-        gseqs = [g for g in gseqs if isinstance(g, int)]
+    base = os.path.join(profile_dir(profile), "cursor")
+    paths = [base]
+    for cid in circle_ids:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(cid))[:64] or "x"
+        paths.append(base + "-" + safe)
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _sync_topics_pages(client, limit):
+    """GET /v1/sync/topics, following page_token; returns the topic list.
+
+    Each topic carries topic_id, circle_id, circle_name, subject, kind,
+    e2ee, acked_seq, latest_seq, new_count, last_activity_ts, last_actor,
+    key_status (ok|pending|not_e2ee) and assigned_to_me (spec §1.4).
+    """
+    topics = []
+    page_token = None
+    for _ in range(_SYNC_TOPICS_MAX_PAGES):
+        query = {"limit": limit}
+        if page_token:
+            query["page_token"] = page_token
+        resp = client.call("GET", "/v1/sync/topics", query=query)
+        topics.extend(
+            t for t in _as_list(resp, "topics") if isinstance(t, dict)
+        )
+        # Paging: accept the documented `page_token` or a
+        # `next_page_token` alias; stop when the server sends neither or
+        # reports no more pages.
         nxt = None
         if isinstance(resp, dict):
-            nxt = resp.get("next_after_gseq")
-        if gseqs or isinstance(nxt, int):
-            new_cursor = nxt if isinstance(nxt, int) else max(gseqs)
-    return labeled, new_cursor
+            nxt = resp.get("page_token") or resp.get("next_page_token")
+            if not resp.get("has_more", True):
+                nxt = None
+        if not nxt:
+            break
+        page_token = nxt
+    return topics
+
+
+def _emit_sync_topics(client, limit, circle_id, circle_name):
+    """Emit one target's changed topics; HubErrors propagate to main()."""
+    labeled = []
+    for t in _sync_topics_pages(client, limit):
+        t = dict(t)
+        t["circle_id"] = circle_id
+        t["circle_name"] = circle_name or circle_id
+        labeled.append(t)
+    emit_json(labeled)
+    if not labeled:
+        emit_err("no changed topics")
+    return 0
 
 
 def cmd_sync(args, transport):
+    """Changed-topic discovery: one GET /v1/sync/topics per circle token.
+
+    Stateless — read state lives server-side per agent (topic_read_state),
+    so there are no client cursors to maintain. The first run after the
+    upgrade bootstraps from 0: every visible topic is reported once as
+    changed and the skill dedupes; legacy cursor files are deleted without
+    being read. Each emitted topic carries its circle (circle_id /
+    circle_name); the skill then drives per-topic `hub read` / `hub ack`.
+    One circle failing never loses the others' topics (a retry re-delivers;
+    nothing local moved), but the exit code is non-zero and names the
+    failed circle.
+    """
     ctx = _ctx(args, transport)
     circle_tokens = ctx.cfg.get("circle_tokens") or {}
-    if not circle_tokens:
-        # Legacy single-token profile: behavior unchanged.
-        cursor = _read_cursor(ctx.profile)
-        resp = ctx.client.call(
-            "GET", "/v1/sync", query={"after_gseq": cursor, "limit": args.limit}
-        )
-        entries = _as_list(resp, "entries")
-        e2ee_flags = _e2ee_flags_for_entries(ctx.client, entries)
-        # Phase 4: pick up rotated/granted key envelopes BEFORE decrypting, so a
-        # re-keyed topic's new key is usable on first sight.
-        _e2ee_refresh_after_sync(ctx.client, ctx.profile, e2ee_flags)
-        _decrypt_entries_for_display(ctx.client, ctx.profile, entries, e2ee_flags)
-        emit_json(entries)
-        if entries:
-            gseqs = [e.get("gseq") for e in entries if isinstance(e, dict)]
-            gseqs = [g for g in gseqs if isinstance(g, int)]
-            nxt = None
-            if isinstance(resp, dict):
-                nxt = resp.get("next_after_gseq")
-            _write_cursor(ctx.profile, nxt if isinstance(nxt, int) else max(gseqs))
-        else:
-            emit_err("no new entries (cursor gseq=%d)" % cursor)
-        return 0
-    # Multi-circle: one token per circle, one cursor per circle. The legacy
-    # bootstrap circle still syncs via its fallback token when present.
-    names = {
-        c.get("id"): c.get("name")
-        for c in _list_circles(ctx.client)
-        if isinstance(c, dict)
-    }
-    targets = [
-        (cid, tok) for cid, tok in circle_tokens.items() if tok
-    ]
+    targets = [(cid, tok) for cid, tok in circle_tokens.items() if tok]
     legacy_cid = ctx.cfg.get("family_id")
     if legacy_cid and legacy_cid not in dict(targets):
         try:
@@ -3987,31 +4465,42 @@ def cmd_sync(args, transport):
             targets.append((legacy_cid, tok))
         except HubError:
             pass
-    all_entries = []
-    pending_cursors = []  # (circle_id, value): written ONLY after emit
+    # Sync-v2 cutover: legacy cursor files are deleted WITHOUT being read.
+    _delete_legacy_cursors(ctx.profile, [cid for cid, _ in targets])
+    if not targets:
+        # No circle tokens at all (bare single-token profile): sync with the
+        # already-resolved client. Errors propagate (as the old legacy path
+        # did), they are not collected per-circle.
+        return _emit_sync_topics(
+            ctx.client, args.limit, _active_circle_id(ctx.cfg) or "default", None
+        )
+    names = {}
+    try:
+        names = {
+            c.get("id"): c.get("name")
+            for c in _list_circles(ctx.client)
+            if isinstance(c, dict)
+        }
+    except HubError:
+        pass  # labels fall back to the circle id; sync must not die here
+    all_topics = []
     errors = []  # (circle_name, message): per-circle partial results
     for cid, tok in targets:
+        client = HubClient(ctx.server, tok, debug=ctx.client.debug,
+                           transport=transport)
         try:
-            entries, new_cursor = _sync_one_circle(
-                ctx, transport, cid, names.get(cid, cid), tok, args.limit
-            )
+            topics = _sync_topics_pages(client, args.limit)
         except HubError as exc:
-            # One circle failing must not lose the others' entries, and must
-            # never advance any cursor: a retry re-delivers what we emit.
             errors.append((names.get(cid, cid), exc.friendly()))
             continue
-        all_entries.extend(entries)
-        if new_cursor is not None:
-            pending_cursors.append((cid, new_cursor))
-    # Emit first; only afterwards persist cursors — and only when every
-    # circle succeeded. Output for the healthy circles still goes out,
-    # then the failures are reported and we exit non-zero.
-    emit_json(all_entries)
-    if not all_entries:
-        emit_err("no new entries")
-    if not errors:
-        for cid, value in pending_cursors:
-            _write_cursor(ctx.profile, value, cid)
+        for t in topics:
+            t = dict(t)
+            t["circle_id"] = cid
+            t["circle_name"] = names.get(cid, cid)
+            all_topics.append(t)
+    emit_json(all_topics)
+    if not all_topics:
+        emit_err("no changed topics")
     for circle_name, msg in errors:
         emit_err("sync failed for circle %r: %s" % (circle_name, msg))
     return 1 if errors else 0
@@ -4029,16 +4518,85 @@ def cmd_topics(args, transport):
     return 0
 
 
+def _resolve_circle_soft(args, ctx):
+    """Circle for read/ack: --circle wins (retargets the client to that
+    circle's token); otherwise the profile's active circle id, or None when
+    the profile names none (bare single-token setups keep working with the
+    already-resolved client — the old read behavior).
+    """
+    if getattr(args, "circle", None):
+        return _resolve_circle(args, ctx)
+    return _active_circle_id(ctx.cfg)
+
+
 def cmd_read(args, transport):
+    """Read a topic's history, surfacing the server's read position.
+
+    --after omitted: the server defaults to this agent's acked position, so
+    the response covers exactly the unread range (spec §1.5). The output
+    always carries read_through_seq and read_receipt (bound to
+    member/agent/topic/from_seq/through_seq) — pass both to `hub ack`
+    together, after the entries are handled. Never ack before the read is
+    fully processed: acks are contiguous and receipt-bound.
+    """
     ctx = _ctx(args, transport)
+    circle_id = _resolve_circle_soft(args, ctx)
+    query = {"limit": args.limit}
+    if args.after is not None:
+        query["after_seq"] = args.after
+    if args.context is not None:
+        query["context"] = args.context
     resp = ctx.client.call(
         "GET",
-        "/v1/topics/%s/history" % urlparse.quote(args.topic, safe=""),
-        query={"after_seq": args.after, "limit": args.limit},
+        "/v1/topics/%s/history" % urlparse.quote(str(args.topic), safe=""),
+        query=query,
     )
+    resp = resp if isinstance(resp, dict) else {}
     entries = _as_list(resp, "entries")
     _decrypt_entries_for_display(ctx.client, ctx.profile, entries)
-    emit_json(entries)
+    emit_json(
+        {
+            "topic_id": str(args.topic),
+            "circle_id": circle_id,
+            "entries": entries,
+            "read_through_seq": resp.get("read_through_seq"),
+            "read_receipt": resp.get("read_receipt"),
+        }
+    )
+    return 0
+
+
+def cmd_ack(args, transport):
+    """Acknowledge read-through-seq on a topic (receipt-bound, contiguous).
+
+    Both --seq and --receipt are REQUIRED — taken together from a single
+    `hub read` response. There is no "ack everything" mode and no default:
+    ack exactly what was read, in order (the server 409s noncontiguous
+    acks). Never ack before the entries are fully handled (posted /
+    reported) — an ack is the delivery confirmation.
+    """
+    ctx = _ctx(args, transport)
+    circle_id = _resolve_circle_soft(args, ctx)
+    seq = args.seq
+    receipt = (args.receipt or "").strip()
+    # argparse required=True already rejects missing flags; guard empties
+    # and nonsense here with a message that teaches the pairing rule.
+    if seq is None or not receipt:
+        raise HubError(
+            "bad_request",
+            "`hub ack` requires BOTH --seq and --receipt, taken together "
+            "from one `hub read` response (read_through_seq + read_receipt). "
+            "There is no 'ack everything' mode: ack exactly what you read, "
+            "in order. Nothing was acknowledged.",
+        )
+    if seq < 0:
+        raise HubError("bad_request", "--seq must be >= 0 (got %d)." % seq)
+    resp = ctx.client.call(
+        "POST",
+        "/v1/topics/%s/ack" % urlparse.quote(str(args.topic), safe=""),
+        json_body={"seq": seq, "read_receipt": receipt},
+    )
+    emit_json(resp if isinstance(resp, dict) else {"ok": True})
     return 0
 
 
@@ -4084,31 +4642,45 @@ def cmd_post(args, transport):
 
 
 def _cmd_new_topic_e2ee(args, ctx, members):
-    """Create an E2EE topic: local keygen, encrypted subject, sealed envelopes.
+    """Create an E2EE topic: staged genesis (spec §1.4 / §2).
 
-    1. The identity keypair must already exist — _load_identity_key fails with
-       `hub key-init` guidance when it doesn't. Never auto-generated here.
+    1. The identity keypair must already exist — _load_identity_key fails
+       with `hub key-init` guidance when it doesn't. Never auto-generated
+       here.
     2. Generate the 32-byte topic key + random 128-bit key_id locally.
     3. Encrypt the subject (XChaCha20-Poly1305, nonce prepended, base64) and
-       POST the topic with e2ee=1 and initial_key_id (secfix F1: the server
-       records it as topics.current_key_id, the election source of truth).
-       The subject is opaque to the server.
+       POST the topic with e2ee=1. The v2 server leaves the topic at
+       epoch 0 with writes blocked (409 key_not_active): there is no
+       initial_key_id anymore — activation happens only via keys/commit
+       (the N04 flip-on-POST is gone).
     4. Re-encrypt the subject with the topic-bound AAD (now that the
-       server-generated topic id is known) and PATCH it immediately
-       (secfix F4).
-    5. Read back the authoritative participant list (the server auto-adds the
-       creator, and parents_only auto-adds grownups) and seal one envelope per
-       participant agent from the key directory.
-    6. Fetch our own envelope back and decrypt it: proves the server stored
-       what we sealed and that our private key opens it (round-trip check).
-    7. Persist key_id -> topic key at 0600 under topic_keys/<topic_id>.json.
+       server-generated topic id is known) and PATCH it immediately. The
+       subject PATCH is topic metadata, not a content write, so it is not
+       gated by the epoch-0 write block; it runs before any envelope is
+       distributed or any key stored locally.
+    5. Persist the key locally (0600) BEFORE the commit attempt
+       (crash-recovery anchor): if this process dies mid-ceremony, `hub
+       topic-rekey --topic <id>` completes the genesis from the stored key
+       (spec §4). Overwritten with the final committed material on success.
+    6. Seal one envelope per participant agent (staged — stored, never
+       flipped) and POST keys/commit with expected_epoch=1, via the shared
+       _run_staged_key_commit (spec §1.4 409 handling).
+    7. Post nothing else: the topic creation itself is the notice.
 
-    The topic key never leaves the machine except inside sealed envelopes and
-    is registered with note_secret() so it can never reach stdout/stderr.
+    Staged envelopes are invisible via GET until commit, so there is no
+    round-trip envelope check (the committer holds the key locally); the
+    commit response {topic_id, epoch, key_id} is the confirmation.
+
+    The topic key never leaves the machine except inside sealed envelopes
+    and is registered with note_secret() so it can never reach
+    stdout/stderr.
     """
     _require_nacl()
     profile = ctx.profile
-    priv = _load_identity_key(agent_key_path(profile))
+    # Proves the identity key exists (with `hub key-init` guidance when it
+    # does not); the private key itself is not needed below — envelopes are
+    # sealed to the RECIPIENTS' public keys.
+    _load_identity_key(agent_key_path(profile))
 
     subject = args.subject
     if len(subject) > _E2EE_SUBJECT_PLAINTEXT_MAX:
@@ -4137,7 +4709,6 @@ def _cmd_new_topic_e2ee(args, ctx, members):
             "participant_member_ids": members,
             "parents_only": bool(args.parents_only),
             "e2ee": 1,
-            "initial_key_id": key_id_hex,
         },
     )
     if not isinstance(topic, dict) or not isinstance(topic.get("topic"), dict):
@@ -4148,11 +4719,13 @@ def _cmd_new_topic_e2ee(args, ctx, members):
     topic_id = topic["topic"].get("id")
     if not topic_id:
         raise HubError("error", "Server did not return a topic id.")
-    quoted_tid = urlparse.quote(str(topic_id), safe="")
+    topic_id = str(topic_id)
+    quoted_tid = urlparse.quote(topic_id, safe="")
 
-    # F4: bind topic_id into the subject AAD now that it is known. A
-    # failed PATCH aborts loudly BEFORE any envelope is distributed or any
-    # key stored locally — the topic is left for the user to delete/retry.
+    # Bind topic_id into the subject AAD now that it is known. A failed
+    # PATCH aborts loudly BEFORE any envelope is distributed or any key
+    # stored locally — the topic is left at epoch 0 for the user to
+    # delete/retry.
     bound_subject = _e2ee_encrypt_subject(subject, topic_key, topic_id)
     try:
         ctx.client.call(
@@ -4165,99 +4738,52 @@ def _cmd_new_topic_e2ee(args, ctx, members):
             "error",
             "Created E2EE topic %s but the topic-bound subject PATCH failed "
             "(%s). The topic key was NOT stored locally and no envelopes "
-            "were distributed; delete the topic and retry once the cause "
-            "is fixed." % (topic_id, exc),
+            "were distributed; the topic sits at epoch 0 (writes blocked) — "
+            "delete it and retry once the cause is fixed." % (topic_id, exc),
         )
 
-    me = ctx.client.call("GET", "/v1/me")
-    if not isinstance(me, dict) or not me.get("id"):
-        raise HubError("error", "Unexpected /v1/me response from the server.")
-    my_member_id = me["id"]
-    my_agent_label = me.get("agent_label") or ""
+    # Crash-recovery anchor (spec §4): persist BEFORE the commit attempt so
+    # a genesis crash is completable via `hub topic-rekey --topic <id>`.
+    _store_topic_key(profile, topic_id, key_id_hex, topic_key)
 
-    detail = ctx.client.call("GET", "/v1/topics/%s" % quoted_tid)
-    participants = _as_list(detail, "participants")
-    participant_ids = sorted(
-        {p["member_id"] for p in participants if isinstance(p, dict) and p.get("member_id")}
-    )
-    if not participant_ids:
-        raise HubError("error", "Server returned no participants for the new topic.")
-
-    posted = 0
-    keyless_members = []
-    failures = []
-    for mid in participant_ids:
-        directory = ctx.client.call("GET", "/v1/agent-keys", query={"member_id": mid})
-        keys = _as_list(directory, "keys")
-        if not keys:
-            keyless_members.append(mid)
-            continue
-        for entry in keys:
-            if not isinstance(entry, dict):
-                continue
-            label = entry.get("agent_label") or ""
-            pub_b64 = entry.get("public_key") or ""
-            if not label or not pub_b64:
-                continue
-            envelope = _e2ee_seal_envelope(topic_id, key_id_bytes, topic_key, pub_b64)
-            try:
-                ctx.client.call(
-                    "POST",
-                    "/v1/topics/%s/envelopes" % quoted_tid,
-                    json_body={
-                        "member_id": mid,
-                        "agent_label": label,
-                        "key_id": key_id_hex,
-                        "envelope": envelope,
-                    },
-                )
-                posted += 1
-            except HubError as exc:
-                failures.append("%s/%s: %s" % (mid, label, exc))
-    if failures:
-        raise HubError(
-            "error",
-            "Created E2EE topic %s but %d envelope(s) failed to post: %s. "
-            "The topic key is NOT stored locally yet — re-run distribution for "
-            "these agents once the cause is fixed." % (topic_id, len(failures), "; ".join(failures)),
+    try:
+        (resp, final_kid, final_key, _participants, posted, keyless,
+         force_used) = _run_staged_key_commit(
+            ctx, topic_id, 1, key_id_hex, topic_key,
+            force_requested=bool(getattr(args, "force", False)),
+            yes=bool(getattr(args, "yes", False)),
+            what="genesis",
         )
-    if keyless_members:
+    except HubError:
         emit_err(
-            "warning: %d participant(s) have no registered agent keys and will see "
-            "only ciphertext until they run `hub key-init`: %s"
-            % (len(keyless_members), ", ".join(keyless_members))
+            "note: topic %s exists at epoch 0 (writes blocked); the genesis "
+            "key is stored locally — complete the ceremony with "
+            "`hub topic-rekey --topic %s` once the cause is fixed."
+            % (topic_id, topic_id)
         )
+        raise
 
-    # Round-trip check: fetch our own envelope back and open it. Proves the
-    # server stored exactly what we sealed and that our private key opens it.
-    own = ctx.client.call("GET", "/v1/topics/%s/envelopes" % quoted_tid)
-    own_envelopes = [
-        e
-        for e in _as_list(own, "envelopes")
-        if isinstance(e, dict) and e.get("key_id") == key_id_hex
-    ]
-    if not own_envelopes:
-        raise HubError(
-            "error",
-            "Round-trip check failed: our own envelope for topic %s is missing "
-            "server-side. The topic key is NOT stored locally." % topic_id,
-        )
-    opened_kid, opened_key = _e2ee_open_envelope(
-        own_envelopes[0].get("envelope") or "", priv, str(topic_id))
-    if opened_kid != key_id_bytes or opened_key != topic_key:
-        raise HubError(
-            "error",
-            "Round-trip check failed: our own envelope for topic %s does not "
-            "open to the generated topic key. The topic key is NOT stored "
-            "locally." % topic_id,
-        )
+    # Overwrite the pre-commit anchor with the final committed material
+    # (identical unless a burn forced regeneration inside the commit loop).
+    key_path = _store_topic_key(profile, topic_id, final_kid, final_key)
 
-    key_path = _store_topic_key(profile, str(topic_id), key_id_hex, topic_key)
+    if keyless:
+        emit_err(
+            "warning: %d participant(s) have no registered agent keys and "
+            "will see only ciphertext until they run `hub key-init` (their "
+            "key_status is pending; use the key-request flow or re-run "
+            "distribution once they have keys): %s"
+            % (len(keyless), ", ".join(keyless))
+        )
+    epoch = resp.get("epoch") if isinstance(resp, dict) else None
     result = dict(topic)
     result["e2ee"] = {
-        "key_id": key_id_hex,
+        "key_id": final_kid,
+        "epoch": epoch if isinstance(epoch, int) else 1,
+        "commitment": hashlib.sha256(final_key).hexdigest(),
         "envelopes_posted": posted,
-        "keyless_participants": keyless_members,
+        "keyless_participants": keyless,
+        "forced_commit": force_used,
         "topic_key_path": key_path,
     }
     emit_json(result)
@@ -4336,6 +4862,22 @@ def cmd_invite_member(args, transport):
     return 0
 
 
+def _e2ee_encrypt_content_field(ctx, topic, topic_id, plaintext):
+    """fh1-encrypt one content field under the topic's CURRENT key.
+
+    Shared by the N05 write paths (task title/description, task notes,
+    spawn briefings). `topic` is the pre-fetched topic record (avoids a
+    second GET); the caller has already run check_pii on the plaintext —
+    the server cannot scan ciphertext, so the CLI is the enforcement point.
+    """
+    _require_nacl()
+    topic_id = str(topic_id)
+    key_id_hex, topic_key = _e2ee_current_key(ctx.profile, topic_id, ctx, topic)
+    return _e2ee_encrypt_field(
+        plaintext.encode("utf-8"), topic_id, key_id_hex, topic_key
+    )
+
+
 def cmd_spawn(args, transport):
     ctx = _ctx(args, transport)
     briefing = _message_text(args, attr="briefing", file_attr="briefing_file")
@@ -4343,6 +4885,14 @@ def cmd_spawn(args, transport):
     members = _id_list(args.with_)
     if not members:
         raise HubError("bad_request", "At least one participant member ID is required.")
+    # N05 field-level contract (spec §1.5): on E2EE topics the briefing must
+    # be fh1 (encrypted under the PARENT topic's current key); the subject
+    # stays plaintext (routing metadata, as today). check_pii already ran
+    # on the plaintext above — the server cannot scan ciphertext, so the
+    # CLI is the enforcement point.
+    trec = _fetch_topic_record(ctx.client, args.topic)
+    if trec.get("e2ee") == 1:
+        briefing = _e2ee_encrypt_content_field(ctx, trec, args.topic, briefing)
     topic = ctx.client.call(
         "POST",
         "/v1/topics/%s/spawn" % urlparse.quote(args.topic, safe=""),
@@ -4365,6 +4915,7 @@ def cmd_task_new(args, transport):
             args, attr="description", file_attr="description_file"
         )
     check_pii(args.title, description)
+    trec = _fetch_topic_record(ctx.client, args.topic)
     payload = {"title": args.title}
     if description:
         payload["description"] = description
@@ -4374,6 +4925,18 @@ def cmd_task_new(args, transport):
         payload["parent_task_id"] = args.parent
     if args.due:
         payload["due_at"] = args.due
+    if trec.get("e2ee") == 1:
+        # N05 field-level contract (spec §1.5): title/description must be
+        # fh1; topic_id, status, owner/assignee ids, parent_task_id, due_at
+        # stay plaintext (indexing metadata). The server 400s
+        # plaintext_in_e2ee_topic otherwise.
+        payload["title"] = _e2ee_encrypt_content_field(
+            ctx, trec, args.topic, args.title
+        )
+        if description:
+            payload["description"] = _e2ee_encrypt_content_field(
+                ctx, trec, args.topic, description
+            )
     task = ctx.client.call(
         "POST",
         "/v1/topics/%s/tasks" % urlparse.quote(args.topic, safe=""),
@@ -4387,11 +4950,29 @@ def cmd_task_note(args, transport):
     ctx = _ctx(args, transport)
     message = _message_text(args)
     check_pii(message)
-    resp = ctx.client.call(
-        "POST",
-        "/v1/tasks/%s/notes" % urlparse.quote(args.task, safe=""),
-        json_body={"body": message},
-    )
+    body = message
+    if args.topic:
+        # N05: the note endpoint is task-scoped, so the CLI only knows the
+        # topic (and can only encrypt) when --topic is passed.
+        trec = _fetch_topic_record(ctx.client, args.topic)
+        if trec.get("e2ee") == 1:
+            body = _e2ee_encrypt_content_field(ctx, trec, args.topic, message)
+    try:
+        resp = ctx.client.call(
+            "POST",
+            "/v1/tasks/%s/notes" % urlparse.quote(args.task, safe=""),
+            json_body={"body": body},
+        )
+    except HubError as exc:
+        if getattr(exc, "server_code", None) == "plaintext_in_e2ee_topic" \
+                and not args.topic:
+            raise HubError(
+                "bad_request",
+                "The server rejected a plaintext note: this task lives in an "
+                "E2EE topic. Re-run with --topic <id> so the CLI can encrypt "
+                "the note under the topic key. Nothing was stored.",
+            )
+        raise
     emit_json(resp or {"ok": True})
     return 0
 
@@ -4458,6 +5039,55 @@ def cmd_me(args, transport):
             "member": me if isinstance(me, dict) else {},
         }
     )
+    return 0
+
+
+def cmd_token_revoke(args, transport):
+    """Emergency credential revocation (incident mechanism, spec §1.6/§3.8).
+
+    POSTs /v1/auth/revoke for --token-id. The revocation is immediate and
+    permanent: the token stops authenticating everywhere at once, on every
+    device/agent that holds it; there is no undo. Requires an explicit
+    confirmation prompt (bypass with --yes only when the incident demands
+    it — this is the one command where unattended use is expected to be
+    rare). If you revoke the token this CLI is currently using, re-enroll
+    the agent afterwards: every later call 401s until then.
+    """
+    ctx = _ctx(args, transport)
+    token_id = (args.token_id or "").strip()
+    if not token_id:
+        raise HubError(
+            "bad_request",
+            "--token-id is required: the id of the token to revoke (from "
+            "`hub me` / circle membership output — the token VALUE is never "
+            "accepted here). Nothing was revoked.",
+        )
+    if not args.yes:
+        emit_err(
+            "EMERGENCY REVOCATION: this permanently revokes token %r. The "
+            "token stops authenticating immediately on every device/agent "
+            "that holds it; there is no undo. Use this when a token is "
+            "suspected compromised (incident runbook §3.8), then re-enroll "
+            "the affected agent.\n"
+            "Type 'yes' to revoke, anything else aborts." % token_id
+        )
+        try:
+            answer = input()
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("yes", "y"):
+            emit_err("revocation cancelled: the token is still valid.")
+            return 1
+    # Request shape {"token_id": ...} mirrors the command's --token-id 1:1
+    # (spec keeps the endpoint but does not spell out the body; the
+    # server's 400 names the expected field if this ever drifts).
+    # Authenticated with the caller's (other) credential — revoking the
+    # token in use is allowed, and expected in the incident flow.
+    resp = ctx.client.call(
+        "POST", "/v1/auth/revoke", json_body={"token_id": token_id}
+    )
+    emit_json(resp if isinstance(resp, dict) else {"ok": True, "token_id": token_id})
+    emit_err("token %r revoked." % token_id)
     return 0
 
 
@@ -6030,10 +6660,11 @@ _RDH = argparse.RawDescriptionHelpFormatter
 _COMMAND_GROUPS = """\
 command groups:
   getting started   setup, me, verify-install, upgrade, rollback
-  reading           sync, topics, read, members, circles
+  reading           sync, topics, read, ack, members, circles
   writing           post, new-topic, invite, spawn
   tasks             task-new, task-note, task-done, tasks
-  circles           circle (create/use/join/transfer/...), invite-member
+  circles           circle (create/use/join/transfer/...), invite-member,
+                    token-revoke
   E2EE keys         key-init, key-backup, key-restore, key-wrap,
                     key-request, key-grant, key-fetch, topic-key-status,
                     topic-add-member, topic-remove-member, topic-rekey,
@@ -6185,19 +6816,25 @@ def build_parser():
     p = sub.add_parser(
         "sync",
         formatter_class=_RDH,
-        help="Print new entries across all visible topics",
-        description="Poll loop: print every new entry across all topics you "
-        "can see, as JSON, since your last cursor (stored per profile per "
-        "circle). Walks every stored circle token; each entry is labeled "
-        "with its circle. Run about every 15 minutes and whenever the "
-        "human asks 'anything new?'. For E2EE topics, fetches your key "
-        "envelopes before decrypting.",
+        help="Print changed topics across all circles (stateless)",
+        description="Poll loop: print every topic with unread entries across "
+        "all circles you belong to, as JSON. One GET /v1/sync/topics per "
+        "stored circle token; each topic is labeled with its circle "
+        "(circle_id / circle_name) and carries acked_seq, latest_seq, "
+        "new_count and key_status. Read state lives server-side per agent, "
+        "so there are no client cursors: the first run after the upgrade "
+        "bootstraps from 0 (every visible topic reported once — dedupe on "
+        "your side). Per topic, drive `hub read --topic <id> --circle <cid>` "
+        "then `hub ack`. Run about every 15 minutes and whenever the human "
+        "asks 'anything new?'.",
         epilog="examples:\n"
-        "  hub sync              # new entries since last cursor\n"
-        "  hub sync --limit 50   # cap the batch",
+        "  hub sync              # changed topics in every circle\n"
+        "  hub sync --limit 50   # page size per circle (pages followed "
+        "automatically)",
     )
     p.add_argument("--limit", type=int, default=200,
-                   help="Max entries to print (default: %(default)s)")
+                   help="Max topics per circle per page (default: %(default)s); "
+                        "pages are followed automatically")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser(
@@ -6219,20 +6856,60 @@ def build_parser():
     p = sub.add_parser(
         "read",
         formatter_class=_RDH,
-        help="Read a topic's history",
+        help="Read a topic's history (surfaces read position + receipt)",
         description="Print a topic's entries in order. Every entry has "
-        "seq, ts, actor, kind, body. Page with --after/--limit. For E2EE "
-        "topics the bodies are decrypted locally (needs your identity key).",
+        "seq, ts, actor, kind, body. Page with --after/--limit; --context "
+        "adds context entries before --after (flagged is_context). For "
+        "E2EE topics the bodies are decrypted locally (needs your identity "
+        "key). The output always carries read_through_seq and read_receipt: "
+        "pass both together to `hub ack` AFTER the entries are fully "
+        "handled — never ack before. Cross-family topic ids 404 by "
+        "construction.",
         epilog="examples:\n"
-        "  hub read --topic abc123\n"
-        "  hub read --topic abc123 --after 42 --limit 25",
+        "  hub read --topic abc123 --circle c111\n"
+        "  hub read --topic abc123 --after 42 --limit 25\n"
+        "  hub read --topic abc123 --after 42 --context 5",
     )
     p.add_argument("--topic", required=True, help="Topic id (see `hub topics`)")
-    p.add_argument("--after", type=int, default=0,
-                   help="Only entries after this seq (default: %(default)s)")
+    p.add_argument("--circle", default=None,
+                   help="Circle name or id (default: active circle — pass it "
+                        "explicitly; the skill always does)")
+    p.add_argument("--after", type=int, default=None,
+                   help="Only entries after this seq (default: the server's "
+                        "acked position for this agent)")
+    p.add_argument("--context", type=int, default=None,
+                   help="Context entries before --after, flagged is_context "
+                        "(server default 10, max 50)")
     p.add_argument("--limit", type=int, default=100,
                    help="Max entries (default: %(default)s)")
     p.set_defaults(func=cmd_read)
+
+    p = sub.add_parser(
+        "ack",
+        formatter_class=_RDH,
+        help="Acknowledge read-through-seq on a topic (receipt-bound)",
+        description="Acknowledge entries on a topic up to --seq, bound to "
+        "--receipt. BOTH flags are required — taken together from a single "
+        "`hub read` response (read_through_seq + read_receipt). There is no "
+        "'ack everything' mode and no default: ack exactly what was read, "
+        "in order (the server 409s noncontiguous acks). Never ack before "
+        "the entries are fully handled — an ack is the delivery "
+        "confirmation.",
+        epilog="example:\n"
+        "  hub ack --topic abc123 --circle c111 --seq 87 "
+        "--receipt <read_receipt from hub read>",
+    )
+    p.add_argument("--topic", required=True, help="Topic id (see `hub topics`)")
+    p.add_argument("--circle", default=None,
+                   help="Circle name or id (default: active circle — pass it "
+                        "explicitly; the skill always does)")
+    p.add_argument("--seq", type=int, required=True,
+                   help="Acknowledge through this entry seq "
+                        "(from `hub read`'s read_through_seq)")
+    p.add_argument("--receipt", required=True,
+                   help="Read receipt binding member/agent/topic/seq range "
+                        "(from `hub read`'s read_receipt)")
+    p.set_defaults(func=cmd_ack)
 
     p = sub.add_parser(
         "post",
@@ -6284,11 +6961,21 @@ def build_parser():
     p.add_argument("--parents-only", action="store_true",
                    help="Auto-include all parents, exclude kids")
     p.add_argument("--e2ee", action="store_true",
-                   help="End-to-end-encrypt the topic: subject is encrypted "
-                        "locally, one sealed key envelope is posted per "
-                        "participant agent, and the topic key is stored at "
+                   help="End-to-end-encrypt the topic (staged genesis): the "
+                        "subject is encrypted locally, one sealed key "
+                        "envelope is posted per participant agent (staged), "
+                        "and POST keys/commit activates epoch 1 — the server "
+                        "leaves the topic at epoch 0 (writes blocked) until "
+                        "the commit succeeds. The topic key is stored at "
                         "0600 under topic_keys/. Requires `hub key-init` "
                         "first.")
+    p.add_argument("--force", action="store_true",
+                   help="E2EE genesis only: commit even when some participant "
+                        "agents have no registered identity key (owner only, "
+                        "confirmed prompt; covers ONLY keyless agents)")
+    p.add_argument("--yes", action="store_true",
+                   help="Answer the --force confirmation prompt with 'yes' "
+                        "(only after your human explicitly approved)")
     p.set_defaults(func=cmd_new_topic)
 
     p = sub.add_parser(
@@ -6314,13 +7001,16 @@ def build_parser():
     p = sub.add_parser(
         "topic-add-member",
         formatter_class=_RDH,
-        help="E2EE: seal the current topic key for a new member's agents "
+        help="E2EE: seal topic keys for a new member's agents "
              "(envelope step; run after `hub invite`)",
-        description="Second step of adding someone to an E2EE topic: seal "
-        "the CURRENT topic key for each of the new member's registered "
-        "agents. New members never get old keys. If they have no "
-        "registered keys yet, the topic shows a visible 'pending key "
-        "distribution' notice — never silence.",
+        description="Second step of adding someone to an E2EE topic. The "
+        "key(s) sealed depend on the invite's --history grant (read from "
+        "the participant record): `from-join` members get NO key — they "
+        "stay key-pending until an owner runs `hub topic-rekey`; `full` "
+        "members get the CURRENT plus ALL committed epoch keys the local "
+        "keystore holds, so granted history is actually readable. If they "
+        "have no registered keys yet, the topic shows a visible 'pending "
+        "key distribution' notice — never silence.",
         epilog="example:\n  hub topic-add-member --topic abc123 --member <id1>",
     )
     p.add_argument("--topic", required=True, help="Topic id")
@@ -6348,14 +7038,30 @@ def build_parser():
         "topic-rekey",
         formatter_class=_RDH,
         help="E2EE: rotate the topic key after a membership change "
-             "(new key, fresh envelopes, plaintext rotation notice)",
-        description="Rotate an E2EE topic's key: new key, fresh sealed "
-        "envelopes for remaining members, and a plaintext rotation notice "
-        "everyone can read. Old messages stay readable with the retained "
-        "key. Run immediately after `hub topic-remove-member`.",
-        epilog="example:\n  hub topic-rekey --topic abc123",
+             "(staged commit; also completes a stuck genesis)",
+        description="Rotate an E2EE topic's key via the staged commit flow: "
+        "fresh key material + SHA256 commitment → sealed per-agent "
+        "envelopes (staged) → POST keys/commit. The old key is NOT needed. "
+        "The commit's 409s are handled automatically: burned key → fresh "
+        "material and restart (never re-seal); delta → seal and recommit; "
+        "superseded identity keys → re-seal to the active key; stale epoch "
+        "→ re-read and retry. Old messages stay readable with the retained "
+        "key. Run immediately after `hub topic-remove-member`. Also "
+        "completes a genesis stuck at epoch 0 (created, never committed).",
+        epilog="examples:\n"
+        "  hub topic-rekey --topic abc123\n"
+        "  hub topic-rekey --topic abc123 --force   # owner only, confirmed: "
+        "commit past agents with no identity key",
     )
     p.add_argument("--topic", required=True, help="Topic id")
+    p.add_argument("--force", action="store_true",
+                   help="Commit even when some participant agents have no "
+                        "registered identity key (owner only, confirmed "
+                        "prompt; covers ONLY keyless agents — never removed "
+                        "members, never superseded keys)")
+    p.add_argument("--yes", action="store_true",
+                   help="Answer the --force confirmation prompt with 'yes' "
+                        "(only after your human explicitly approved)")
     p.set_defaults(func=cmd_topic_rekey)
 
     p = sub.add_parser(
@@ -6502,6 +7208,28 @@ def build_parser():
     p.set_defaults(func=cmd_invite_member)
 
     p = sub.add_parser(
+        "token-revoke",
+        formatter_class=_RDH,
+        help="Emergency: permanently revoke a credential by token id",
+        description="Incident mechanism: permanently revoke a Bearer token "
+        "by its token id (POST /v1/auth/revoke). The revocation is "
+        "immediate and irreversible — the token stops authenticating "
+        "everywhere at once. Requires an explicit confirmation prompt "
+        "(bypass with --yes only when the incident demands it). If you "
+        "revoke the token this CLI is currently using, re-enroll the agent "
+        "afterwards: every later call 401s until then.",
+        epilog="example:\n"
+        "  hub token-revoke --token-id tok_abc123   # confirm at the prompt",
+    )
+    p.add_argument("--token-id", required=True,
+                   help="Id of the token to revoke (from `hub me` / circle "
+                        "membership output — the token VALUE is never "
+                        "accepted here)")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip the confirmation prompt (incident use only)")
+    p.set_defaults(func=cmd_token_revoke)
+
+    p = sub.add_parser(
         "spawn",
         formatter_class=_RDH,
         help="Spawn a linked child topic with a briefing",
@@ -6559,12 +7287,20 @@ def build_parser():
         formatter_class=_RDH,
         help="Add a progress note to a task",
         description="Add a progress note to a task. Narrate as you go — "
-        "the notes ARE the audit trail the requester's agent reads.",
+        "the notes ARE the audit trail the requester's agent reads. "
+        "When the task lives in an E2EE topic, pass --topic <id> so the "
+        "CLI encrypts the note under the topic key (the note endpoint is "
+        "task-scoped, so the CLI cannot discover the topic itself); "
+        "without it the server 400s plaintext_in_e2ee_topic.",
         epilog="examples:\n"
         "  hub task-note --task t123 --message \"Flights booked, conf 1503115306\"\n"
+        "  hub task-note --task t123 --topic abc123 --message \"Secret plan details\"\n"
         "  hub task-note --task t123 --message-file /tmp/progress.txt",
     )
     p.add_argument("--task", required=True, help="Task id")
+    p.add_argument("--topic", default=None,
+                   help="Topic id the task belongs to (required to encrypt "
+                        "the note when the topic is E2EE)")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--message", default=None, help="Note text")
     group.add_argument("--message-file", default=None,
