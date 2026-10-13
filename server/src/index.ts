@@ -4293,9 +4293,26 @@ async function handleTaskDone(
   const topicId = task['topic_id'] as string;
   // F14: an absent body is fine; malformed JSON is 400 (no longer swallowed).
   const body = await readOptionalJson(req);
-  const result = reqJsonData(body['result'], 'result', MAX_DATA);
-  // F08: completion results (JSON) are scanned too — string leaves, recursively.
-  if (result) piiGuardJson(JSON.parse(result));
+  // N05 (E2EE topics): the completion result is user content — it must arrive
+  // sealed (fh1), mirroring the task title/description contract. Plaintext
+  // topics keep the legacy JSON result shape.
+  const topicRow = await db.queryOne(`SELECT e2ee FROM topics WHERE id = ?`, [topicId]);
+  const doneE2ee = (topicRow?.['e2ee'] as number) === 1;
+  const rawResult = body['result'];
+  let result: string | null;
+  if (doneE2ee) {
+    if (rawResult === undefined || rawResult === null) {
+      result = null;
+    } else {
+      requireE2eeContent(rawResult, 'result');
+      result = rawResult as string;
+    }
+  } else {
+    result = reqJsonData(rawResult, 'result', MAX_DATA);
+    // F08: completion results (JSON) are scanned too — string leaves, recursively.
+    // Sealed (fh1) results are opaque — the CLI scans plaintext before encrypting.
+    if (result) piiGuardJson(JSON.parse(result));
+  }
   await assertNoOpenSubtasks(db, taskId);
   const ts = nowIso();
   // F12+F14: the completion and its task_done event commit in the SAME
@@ -4314,7 +4331,12 @@ async function handleTaskDone(
       kind: 'task_done',
       body: `Task completed`,
       auth,
-      data: JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
+      // N05: on E2EE topics the sealed result rides in `sealed` (mirroring
+      // task_created); task_id stays plaintext for the F06 visibility
+      // predicate. Plaintext topics keep the legacy embedded result shape.
+      data: doneE2ee
+        ? JSON.stringify({ task_id: taskId, sealed: result })
+        : JSON.stringify({ task_id: taskId, result: result ? JSON.parse(result) : null }),
       ts,
       pin: `EXISTS (SELECT 1 FROM tasks WHERE id = ? AND updated_at = ?)`,
       pinParams: [taskId, ts],

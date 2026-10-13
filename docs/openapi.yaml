@@ -1795,6 +1795,10 @@ paths:
       description: |
         Sets status to done, stores the `result` JSON, appends `task_done`.
         Rejected with 409 while any subtask is not in done/cancelled.
+        N05 (E2EE topics): `result` must be an fh1 sealed body (400
+        `plaintext_in_e2ee_topic` otherwise); the `task_done` entry data
+        carries it as `{"task_id": "…", "sealed": "fh1…"}` with `task_id`
+        plaintext for the F06 visibility predicate.
       parameters:
         - $ref: '#/components/parameters/TaskId'
       requestBody:
