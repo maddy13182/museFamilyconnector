@@ -5092,7 +5092,7 @@ def cmd_members(args, transport):
                 circle_name = c.get("name")
                 break
     except Exception:
-        pass
+        circle_name = None
     emit_json(
         {
             "circle_id": circle_id,
