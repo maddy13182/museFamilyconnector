@@ -608,7 +608,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
         self.assertEqual(rc, 0, "stderr: %s" % err)
         rc, out, err = self.run_cli(["read", "--topic", TOPIC_ID])
         self.assertEqual(rc, 0, "stderr: %s" % err)
-        entries = json.loads(out)
+        entries = json.loads(out)["entries"]
         bodies = [e["body"] for e in entries]
         self.assertIn("old secret", bodies)
         kinds = [e["kind"] for e in entries]

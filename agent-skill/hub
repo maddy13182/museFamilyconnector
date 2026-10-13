@@ -2063,7 +2063,7 @@ def _seal_history_keys(ctx, topic_id, member_id):
     the local key is cross-checked against the committed commitment (N07):
     a mismatch is refused loudly, never sealed.
 
-    Returns (posted, unavailable_key_ids, keyless).
+    Returns (posted, unavailable_key_ids, keyless, n_committed_epochs).
     """
     topic = _fetch_topic_record(ctx.client, topic_id)
     resp = ctx.client.call(
@@ -2109,7 +2109,7 @@ def _seal_history_keys(ctx, topic_id, member_id):
             "stored and the distribution is incomplete; fix the cause and "
             "re-run." % (len(failures), "; ".join(failures)),
         )
-    return posted, unavailable, keyless
+    return posted, unavailable, keyless, len(committed)
 
 
 def cmd_topic_add_member(args, transport):
@@ -2174,11 +2174,34 @@ def cmd_topic_add_member(args, transport):
                 }
             )
             continue
-        posted, unavailable, keyless = _seal_history_keys(ctx, topic_id, mid)
+        posted, unavailable, keyless, n_committed = _seal_history_keys(
+            ctx, topic_id, mid
+        )
         if keyless:
             name = participants[mid].get("name") or mid
             # rotated=False branch of the notice ignores key_id_hex.
             _pending_distribution_notice(ctx, topic, "", mid, name, rotated=False)
+        elif posted == 0:
+            # We hold none of the topic's committed epoch keys (or there are
+            # none yet): fail loudly rather than report a phantom success.
+            if n_committed == 0:
+                reason = (
+                    "the topic has no committed key epochs yet (epoch 0?) — "
+                    "complete the key ceremony first "
+                    "(`hub topic-rekey --topic %s`)" % topic_id
+                )
+            else:
+                reason = (
+                    "the local keystore holds none of the topic's %d "
+                    "committed epoch key(s) — fetch them first "
+                    "(`hub key-request` / `hub key-fetch`), then re-run"
+                    % n_committed
+                )
+            raise HubError(
+                "error",
+                "Cannot distribute keys to %s: %s. Nothing was sealed."
+                % (mid, reason),
+            )
         entry = {
             "member_id": mid,
             "history": "full",
