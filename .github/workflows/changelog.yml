@@ -1,6 +1,9 @@
 # Merge-level changelog consolidation: on every push to main, fold
-# changelog.d/ fragments into CHANGELOG.md's [Unreleased] section and commit
-# the result. PRs add fragments; this workflow assembles them.
+# changelog.d/ fragments into CHANGELOG.md's [Unreleased] section and open
+# a PR with the result. PRs add fragments; this workflow assembles them.
+#
+# The consolidation goes through a PR (not a direct push to main):
+# branch protection rejects direct pushes (GH006).
 name: Changelog
 
 on:
@@ -9,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 # Serialize runs: two rapid pushes must not consolidate concurrently.
 concurrency:
@@ -26,14 +30,27 @@ jobs:
       - name: Consolidate fragments
         run: python3 scripts/consolidate_changelog.py
 
-      - name: Commit if changed
+      - name: Open consolidation PR if changed
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git status --porcelain | grep -q .; then
+            branch="chore/consolidate-changelog"
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -B "$branch"
             git add CHANGELOG.md changelog.d/
             git commit -m "chore: consolidate changelog fragments"
-            git push
+            git push -u origin "$branch" --force-with-lease
+            if gh pr view "$branch" --json number >/dev/null 2>&1; then
+              echo "PR for $branch already exists; branch updated"
+            else
+              gh pr create \
+                --base main \
+                --head "$branch" \
+                --title "chore: consolidate changelog fragments" \
+                --body "Automated by the Changelog workflow after a push to main. Folds changelog.d/ fragments into CHANGELOG.md's [Unreleased] section and removes the processed fragments."
+            fi
           else
             echo "nothing to consolidate"
           fi
