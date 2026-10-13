@@ -34,6 +34,15 @@ hub = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hub)
 
 
+def _next_minor(v):
+    """A version strictly newer than v (minor bump), for upgrade fixtures."""
+    mm = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
+    return "%s.%d.0" % (mm.group(1), int(mm.group(2)) + 1)
+
+
+NEW_CLI_VERSION = _next_minor(hub._cli_version())
+
+
 UNREACHABLE = object()
 
 
@@ -424,7 +433,7 @@ class UpgradeThroughMainTest(VersionCheckBase):
             fh.write(old_bytes)
         os.chmod(target, 0o755)
 
-        new_version = "1.0.1"
+        new_version = NEW_CLI_VERSION
         new_bytes = self._stamp(old_bytes, new_version)
         digest = hashlib.sha256(new_bytes).hexdigest()
         server = "https://hub.example.test"

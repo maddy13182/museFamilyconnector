@@ -120,8 +120,10 @@ def _cli_version():
 
 def _skill_version():
     """Skill version from the `<!-- SKILL VERSION: x.y.z -->` header of
-    SKILL.md next to the script. Kept in lockstep with the CLI version;
-    "unknown" only when the header or the file is missing (dev checkout)."""
+    SKILL.md next to the script. Versioned INDEPENDENTLY of the CLI (see
+    docs/VERSIONING.md): skill-only doc changes cut skill-v* releases
+    without a CLI bump. "unknown" only when the header or the file is
+    missing (dev checkout)."""
     try:
         with open(
             os.path.join(_script_dir(), "SKILL.md"), "r", encoding="utf-8"
@@ -4400,19 +4402,28 @@ def _delete_legacy_cursors(profile, circle_ids):
 
 
 def _sync_topics_pages(client, limit):
-    """GET /v1/sync/topics, following page_token; returns the topic list.
+    """GET /v1/sync/topics, following page_token.
+
+    Returns (topics, versions): the topic list, plus the server's
+    update-advertisement stanza from the first page (`versions` with
+    server/cli/skill, or {} when the server predates it).
 
     Each topic carries topic_id, circle_id, circle_name, subject, kind,
     e2ee, acked_seq, latest_seq, new_count, last_activity_ts, last_actor,
     key_status (ok|pending|not_e2ee) and assigned_to_me (spec §1.4).
     """
     topics = []
+    versions = {}
     page_token = None
     for _ in range(_SYNC_TOPICS_MAX_PAGES):
         query = {"limit": limit}
         if page_token:
             query["page_token"] = page_token
         resp = client.call("GET", "/v1/sync/topics", query=query)
+        if not versions and isinstance(resp, dict):
+            v = resp.get("versions")
+            if isinstance(v, dict):
+                versions = v
         topics.extend(
             t for t in _as_list(resp, "topics") if isinstance(t, dict)
         )
@@ -4427,13 +4438,14 @@ def _sync_topics_pages(client, limit):
         if not nxt:
             break
         page_token = nxt
-    return topics
+    return topics, versions
 
 
 def _emit_sync_topics(client, limit, circle_id, circle_name):
     """Emit one target's changed topics; HubErrors propagate to main()."""
     labeled = []
-    for t in _sync_topics_pages(client, limit):
+    topics, versions = _sync_topics_pages(client, limit)
+    for t in topics:
         t = dict(t)
         t["circle_id"] = circle_id
         t["circle_name"] = circle_name or circle_id
@@ -4441,7 +4453,50 @@ def _emit_sync_topics(client, limit, circle_id, circle_name):
     emit_json(labeled)
     if not labeled:
         emit_err("no changed topics")
+    _maybe_nudge_updates(versions)
     return 0
+
+
+def _safe_is_newer(candidate, current):
+    """_is_newer that returns False (never raises) on unparseable input."""
+    try:
+        return _is_newer(candidate, current)
+    except HubError:
+        return False
+
+
+def _maybe_nudge_updates(versions):
+    """stderr nudge when the server advertises newer CLI/skill releases.
+
+    Best-effort only: never raises, never changes the sync result or exit
+    code. Servers predating the advertisement omit `versions`; garbage
+    values are ignored. The agent running the watcher sees stderr, so the
+    nudge reaches whoever needs to run `hub upgrade`.
+    """
+    try:
+        if not isinstance(versions, dict):
+            return
+        adv_cli = versions.get("cli")
+        if isinstance(adv_cli, str) and adv_cli and _safe_is_newer(adv_cli, VERSION):
+            emit_err(
+                "Update available: CLI %s (installed %s). Run `hub upgrade`."
+                % (adv_cli, VERSION)
+            )
+        adv_skill = versions.get("skill")
+        if (
+            isinstance(adv_skill, str)
+            and adv_skill
+            and _safe_is_newer(adv_skill, SKILL_VERSION)
+        ):
+            emit_err(
+                "Update available: skill %s (installed %s). "
+                "Run `hub upgrade` to refresh the skill docs."
+                % (adv_skill, SKILL_VERSION)
+            )
+    except Exception:
+        # Best-effort nudge: never break the sync for it. (return, not
+        # pass: bandit B110 flags try/except/pass.)
+        return
 
 
 def cmd_sync(args, transport):
@@ -4487,14 +4542,17 @@ def cmd_sync(args, transport):
         pass  # labels fall back to the circle id; sync must not die here
     all_topics = []
     errors = []  # (circle_name, message): per-circle partial results
+    adv_versions = {}  # update advertisement: first non-empty wins
     for cid, tok in targets:
         client = HubClient(ctx.server, tok, debug=ctx.client.debug,
                            transport=transport)
         try:
-            topics = _sync_topics_pages(client, args.limit)
+            topics, versions = _sync_topics_pages(client, args.limit)
         except HubError as exc:
             errors.append((names.get(cid, cid), exc.friendly()))
             continue
+        if not adv_versions and versions:
+            adv_versions = versions
         for t in topics:
             t = dict(t)
             t["circle_id"] = cid
@@ -4505,6 +4563,7 @@ def cmd_sync(args, transport):
         emit_err("no changed topics")
     for circle_name, msg in errors:
         emit_err("sync failed for circle %r: %s" % (circle_name, msg))
+    _maybe_nudge_updates(adv_versions)
     return 1 if errors else 0
 
 

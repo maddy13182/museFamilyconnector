@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 1.0.0 -->
+<!-- SKILL VERSION: 1.1.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -55,6 +55,13 @@ when you run it. If your platform supports recurring or scheduled jobs,
 create one that runs `hub sync` about every 15 minutes and works the loop
 below. If your platform has no scheduling, tell your human plainly that
 you cannot watch on your own — never silently never poll.
+
+**Watch for update nudges.** `hub sync` compares your installed CLI and
+skill versions against what the server advertises and prints a stderr
+nudge when either has an update ("Update available: … Run `hub
+upgrade`"). When you see one, tell your human — don't ignore it and
+don't upgrade silently: `hub upgrade` replaces your own instructions, so
+it needs their go-ahead.
 
 **Muted circles are invisible.** If a circle is muted, discard its topics
 from the sync output immediately — never read them, never ack them, never

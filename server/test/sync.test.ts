@@ -394,3 +394,22 @@ test('unchanged topics are omitted; new activity re-lists the topic', async () =
   assert.equal((s3.body.topics as any[])[0].last_actor, owner.memberId);
   assert.ok((s3.body.topics as any[])[0].last_activity_ts, 'last_activity_ts present');
 });
+
+// ---------------------------------------------------------------------------
+// Update advertisement (decoupled releases)
+// ---------------------------------------------------------------------------
+
+test('sync/topics carries a versions stanza for update advertisement', async () => {
+  const app = makeApp();
+  const a = await setupKeyedFamily(app, 'SyncFamVer');
+  const tid = await createPlainTopic(app, a.owner.token, 'Version topic');
+  await postEntry(app, a.owner.token, tid, 'hello');
+
+  const res = await syncTopics(app, a.owner.token);
+  assert.equal(res.status, 200);
+  const v = res.body.versions;
+  assert.ok(v && typeof v === 'object', 'versions stanza present');
+  assert.match(v.server, /^\d+\.\d+\.\d+$/, 'server version is semver');
+  assert.match(v.cli, /^\d+\.\d+\.\d+$/, 'advertised CLI version is semver');
+  assert.match(v.skill, /^\d+\.\d+\.\d+$/, 'advertised skill version is semver');
+});

@@ -81,15 +81,19 @@ class VersionSourceTests(unittest.TestCase):
         # The CLI reads its version from the single source of truth.
         self.assertEqual(hub.VERSION, _pyproject_version())
 
-    def test_skill_version_in_lockstep_with_cli(self):
-        self.assertEqual(hub.SKILL_VERSION, hub.VERSION)
+    def test_skill_version_independent_of_cli(self):
+        # Decoupled releases: the skill versions independently of the CLI.
+        # Both must be valid semver; they are not required to match.
+        self.assertRegex(hub.SKILL_VERSION, r"^\d+\.\d+\.\d+")
+        self.assertRegex(hub.VERSION, r"^\d+\.\d+\.\d+")
 
     def test_skill_md_has_version_header(self):
         with open(SKILL_MD_PATH, "r", encoding="utf-8") as f:
             head = f.read(2048)
         match = re.search(r"<!--\s*SKILL VERSION:\s*([0-9A-Za-z.\-+]+)\s*-->", head)
         self.assertIsNotNone(match, "SKILL.md must carry a SKILL VERSION header")
-        self.assertEqual(match.group(1), _pyproject_version())
+        # The CLI reads the header as its skill version (single source).
+        self.assertEqual(match.group(1), hub.SKILL_VERSION)
 
     def test_version_output_reports_both_versions(self):
         proc = subprocess.run(

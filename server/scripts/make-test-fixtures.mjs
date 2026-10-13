@@ -15,9 +15,12 @@
  *  1. Builds a complete, internally consistent fixture release in a temp
  *     dir — fixture hub bytes, phase-1 manifest (no skill_* fields, as
  *     embedded in the tarball), skill.tar.gz, phase-2 release manifest
- *     (adds skill_sha256 + skill_version), and a fixture pin carrying the
+ *     (adds skill_sha256 + skill_version), skill-release manifest (the
+ *     skill-v* tag's manifest.json), and a fixture pin carrying the
  *     skill fields. Mirrors server/test/client_dist.test.ts's makeRelease().
- *  2. Serves the fixture release over a loopback HTTP server.
+ *  2. Serves the fixture release over a loopback HTTP server — hub
+ *     artifacts under cli-v*, skill bundle under skill-v* (decoupled
+ *     releases).
  *  3. Runs the REAL bundle-client.mjs with the test-only env knobs
  *     (BUNDLE_CLIENT_MANIFEST_PATH / BUNDLE_CLIENT_BASE_URL) so the actual
  *     bundler code — pin validation, hash checks against pin AND release
@@ -117,13 +120,27 @@ async function main() {
     const tarballBytes = readFileSync(tarballPath);
     const skillSha = sha256hex(tarballBytes);
 
-    // Phase-2 manifest: what the release publishes (adds skill fields).
+    // Phase-2 manifest: what the CLI release publishes (adds skill fields).
     const releaseManifest = {
       ...phase1Manifest,
       skill_sha256: skillSha,
       skill_version: FIXTURE_SKILL_VERSION,
     };
     const releaseManifestBytes = Buffer.from(JSON.stringify(releaseManifest));
+
+    // Skill-release manifest: what a skill-v* release publishes. Decoupled
+    // releases serve the skill bundle from the skill-v tag, not the cli-v tag.
+    const skillReleaseManifest = {
+      type: 'skill',
+      skill_version: FIXTURE_SKILL_VERSION,
+      skill_sha256: skillSha,
+      cli_version: FIXTURE_VERSION,
+      hub_sha256: hubSha,
+      released_at: '2026-10-12T00:00:00Z',
+    };
+    const skillReleaseManifestBytes = Buffer.from(
+      JSON.stringify(skillReleaseManifest),
+    );
 
     // Fixture pin: what the manifest-PR step would write after a real release.
     const pin = {
@@ -137,7 +154,9 @@ async function main() {
     };
 
     // --- 2. Serve the fixture release over loopback HTTP ------------------
+    // Decoupled releases: hub artifacts under cli-v*, skill bundle under skill-v*.
     const tag = `cli-v${FIXTURE_VERSION}`;
+    const skillTag = `skill-v${FIXTURE_SKILL_VERSION}`;
     const files = {
       [`/${tag}/hub`]: { body: hubBytes, type: 'application/octet-stream' },
       [`/${tag}/hub.sigstore`]: {
@@ -148,9 +167,13 @@ async function main() {
         body: releaseManifestBytes,
         type: 'application/json',
       },
-      [`/${tag}/skill.tar.gz`]: {
+      [`/${skillTag}/skill.tar.gz`]: {
         body: tarballBytes,
         type: 'application/gzip',
+      },
+      [`/${skillTag}/manifest.json`]: {
+        body: skillReleaseManifestBytes,
+        type: 'application/json',
       },
     };
     server = createServer((req, res) => {
