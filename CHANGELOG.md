@@ -189,6 +189,192 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 - `Server:` circle ownership can now be handed over with a two-phase offer → accept flow: `POST /v1/families/:id/transfer` offers ownership to a member, `POST …/transfer/accept` accepts it — the owner swap is atomic — `POST …/transfer/cancel` withdraws a pending offer, and `GET …/transfer` shows the transfer status. Nothing changes until the offer is accepted, and a pending offer can be cancelled at any time.
 - `CLI:` `hub circle transfer --to <member-id> [--on-complete remove]`, `hub circle transfer-accept`, `hub circle transfer-status`, and `hub circle transfer-cancel` mirror the server flow — e.g. to make someone else the owner of a circle you created on their behalf and then step down.
 - Agents can now request a circle be provisioned and handed over through a documented agent-to-agent protocol: a `circle_request` message starts it, `circle_provisioned` confirms the circle and the pending transfer, and a 7-step runbook covers create → invite → out-of-band code delivery → join → offer → accept → verify-and-mute. Full protocol in `docs/CIRCLE_PROVISIONING.md`. Invite codes still travel out-of-band only — they are never posted on Hub topics.
+- Server: the worker now bundles the signed CLI release at build time (`npm run bundle:client`, wired as `prebuild` and in `pretest`): it downloads `hub`, `hub.sigstore`, and `manifest.json` for the version pinned in `server/client-manifest.json`, verifies `sha256(hub)` against BOTH the pin and the release manifest, and embeds the artifacts into the worker. The build fails closed — network error, 404, placeholder hash, or mismatch stops the deploy with a clear message, so the worker never serves placeholders.
+- Server: new public `GET /v1/client/download/{hub,hub.sigstore,manifest.json}` endpoints serving the build-bundled CLI artifacts (exact paths only — no traversal surface by construction; anything else under `/v1/client/download/` 404s). `Content-Length` set, `Cache-Control: public, max-age=300`, generous in-worker rate-limit bucket (100/10min per IP) with the standard 429 envelope + `Retry-After`. The client version gate never blocks them — an outdated client can always fetch its replacement.
+- Server: `GET /v1/client/latest` now returns `{version, min_cli_version, server_version, sha256, released_at, download_url, assets{hub, sigstore, manifest}}` with absolute self-referential URLs derived from the request origin (this server's download endpoints); `server_version` makes the server↔CLI pairing machine-readable.
+- Server: `GET /v1/health` now advertises `api_versions: ["v1"]` — the machine-readable version contract (floor + API-major negotiation; additive-only within v1, breaking changes graduate to /v2).
+- Server: invite onboarding pages (JSON + HTML) now point the CLI install steps at this server's `/v1/client/download/*` endpoints instead of GitHub Release URLs.
+- Server: the router now dispatches explicitly on the API-major prefix, so `/v2/...` handlers can be added later; no v2 routes yet, and v1 shapes are frozen.
+- CLI: version contract with the server. `hub` now declares a minimum
+  server version (`_MIN_SERVER_VERSION = "0.12.0"`) and, once per
+  invocation, checks `GET /v1/health` before running any command: a
+  server that is too old (or reports no `api_versions`) fails loudly
+  with upgrade instructions instead of breaking silently. The CLI also
+  negotiates the API major from the server's advertised `api_versions`
+  (v1 today). No backward compatibility with server 0.11.0 / CLI 0.9.0 —
+  clean break.
+- CLI: new trusted server error codes. HTTP 426 `client_too_old` now
+  surfaces the server's plain-language upgrade message; HTTP 410 maps to
+  `expired`, trusting the server codes `invite_expired`, `code_expired`,
+  `transfer_expired`, and `transfer_recipient_gone`.
+- CLI: new `hub key-wrap` command encrypts the E2EE identity key at rest
+  with a passphrase. Passphrase-derived key via Argon2id (libsodium
+  MODERATE limits) wrapping the 32-byte private key with
+  XChaCha20-Poly1305; wrapped file format is `FHWRAP1\n` magic header
+  followed by `salt(16) || nonce || ciphertext`. Passphrase comes from
+  `FAMILY_HUB_KEY_PASSPHRASE` (for agents/cron) or an interactive
+  `getpass` prompt — never a CLI flag, never echoed, never logged. The
+  original key is backed up to `agent.key.bak-0600` (0600) before wrapping,
+  and the wrapped file is verified to round-trip before it is trusted.
+- CLI: `_load_identity_key` auto-detects the `FHWRAP1` magic header and
+  unwraps; wrong passphrase surfaces a clean "Incorrect passphrase" error
+  (Poly1305 MAC failure), never garbage. Legacy unwrapped keys keep
+  working but emit a loud deprecation warning on every use pointing at
+  `hub key-wrap`.
+- CLI: ops note — after wrapping, automation (e.g. the 15-minute cron)
+  must export `FAMILY_HUB_KEY_PASSPHRASE` or it will block on the prompt.
+  Documented in `agent-skill/INSTALL.md`.
+- CLI: the `hub` CLI version now has a single source of truth —
+  `agent-skill/pyproject.toml`. `hub --version` prints both the CLI and the
+  skill version (kept in lockstep via the `<!-- SKILL VERSION: x.y.z -->`
+  header in `agent-skill/SKILL.md`), so a version mismatch is detectable.
+- CLI: every request now sends its real version as
+  `User-Agent: family-hub-agent/<version>` instead of the hardcoded
+  `family-hub-agent/1.0`, letting the server identify and gate stale
+  clients.
+- CLI: dependencies are locked with hashes in
+  `agent-skill/requirements.lock` (regenerate with
+  `pip-compile --generate-hashes`); CI installs from the lockfile and fails
+  if it disagrees with the pinned `requirements.txt`.
+- CLI: signed releases and self-upgrade. Merges to `main` now cut a signed
+  CLI release (`cli-v<x.y.z>`) when the version in `agent-skill/pyproject.toml`
+  is newer than the latest release tag: the `hub` artifact is sha256-hashed
+  and signed with sigstore keyless OIDC, and the release carries
+  `hub`, `hub.sigstore`, and `manifest.json`. The release workflow also
+  updates `server/client-manifest.json` (committed back with `[skip ci]`),
+  which is what `GET /v1/client/latest` advertises.
+- CLI: new `hub upgrade` command — checks `GET /v1/client/latest`, downloads
+  the new artifact only when newer, verifies the sigstore signature and
+  sha256, self-tests the candidate before cutting over, swaps it in
+  atomically, and keeps the previous binary for `hub rollback`. No-op when
+  already current. `agent-skill/INSTALL.md` documents the first-time
+  install flow (download → verify signature → verify sha256 → install →
+  `hub --version` self-check) and the upgrade/rollback flows.
+- CLI: the release workflow stamps the release version into the
+  `_BUILD_VERSION` anchor in the `hub` artifact at build time, so a
+  released single-file binary (no adjacent `pyproject.toml`, no pip
+  metadata) reports its real version and `hub upgrade`'s self-test passes.
+- CLI: `hub upgrade` now ends with a skill-docs refresh phase (contract
+  §3.6). The server advertises a versioned skill bundle
+  (`/v1/client/download/skill.tar.gz`) in the `GET /v1/client/latest`
+  manifest's new `skill` block (`{url, sha256, version}`); when the
+  server's skill version is newer than the installed one, the CLI
+  downloads the tarball (same-origin pinned https, like the release
+  assets), verifies its sha256 against the manifest **before**
+  extraction, extracts fail-closed (absolute paths, `..` components,
+  symlinks/hardlinks, and non-regular members are all rejected with
+  nothing written), and copies only the doc allowlist — `SKILL.md`,
+  `INSTALL.md`, `requirements.txt`, `references/` — into the skill dir.
+  The binary flow owns `hub`/`hub.sigstore`/`manifest.json` and is never
+  written by this phase; credentials (`config.json`, token files,
+  `*.key`, profiles) are never within reach of the copy. The phase runs
+  whether or not the binary was upgraded (skill and CLI versions are
+  independent) and is a no-op when the docs are current or no `SKILL.md`
+  sits next to the CLI. `GET /v1/client/latest` without a valid `skill`
+  block is now a hard failure, and `_MIN_SERVER_VERSION` is 0.13.0 —
+  the first server that serves the bundle. Clean break, no backcompat.
+- CLI: new `hub sync` — per-topic cursor-is-ack sync against
+  `/v1/sync/topics` (legacy `_sync_one_circle` path and old cursor files
+  removed).
+- CLI: `hub read` and `hub ack` now operate on receipt-bound entries.
+- CLI: `hub rekey` / key commands work through the staged-envelope +
+  `/v1/keys/commit` lifecycle (staged envelopes invisible pre-commit,
+  commit-time epoch CAS).
+- CLI: new `hub token-revoke` — emergency credential revocation backed by
+  the kept `POST /v1/auth/revoke` endpoint.
+- CLI: minimum server floor raised to 0.14.0 — `hub` refuses to talk to
+  servers older than 0.14.0 (first server with the sync-v2 flows and the
+  enforced E2EE lifecycle).
+- CLI: added `hub verify-install` — verifies the installed CLI's sha256 against the release `manifest.json` installed next to it and validates the sigstore bundle (bundle must attest to exactly the installed bytes; full certificate/transparency-log chain is validated when the `sigstore` CLI is available, reported as skipped otherwise). Re-runnable any time; clear `RESULT: PASS` / `RESULT: FAIL` output.
+- CLI: startup self-integrity check — every invocation hashes the CLI's own file bytes against the installed manifest's recorded hash and refuses to run (exit 5, "installed CLI does not match the signed release; reinstall from the GitHub Release") on mismatch. A missing or corrupt manifest (dev checkout) warns once on stderr instead of hard-failing.
+- CLI: `hub invite-member` now returns a one-time onboarding URL alongside
+  the invite code. The URL is printed once to stderr (JSON output carries
+  the full response unchanged) and is never written to config or logs —
+  the invitee opens it, proves the invited email address, and receives the
+  single-use code plus the exact `hub setup` command. The raw-code path
+  remains as the fallback for manual enrollment.
+- Server: per-invite onboarding pages — `POST /v1/families/:fid/invites` now also returns a one-time `onboarding_url` (`https://<server>/i/<token>`, 256-bit unguessable page token, hash-stored). The invitee opens it (HTML for humans, JSON for agents via `Accept: application/json` or the `.json` suffix), proves the invited email at `POST /i/:token/verify`, and receives a fresh single-use invite code plus the exact `hub setup` command. Pages are public by design (the token is the credential), rate-limited per IP, back unknown/used/expired tokens with identical 404s, throttle email guesses per page (429 with `Retry-After`, never a hard lock), and self-destruct when the invite is accepted.
+- Server: client version gate — API requests carrying `User-Agent: family-hub-agent/<semver>` below the configured `MIN_CLI_VERSION` (new `server/wrangler.toml` var, default `"0.0.0"` = gate off) are rejected with 400 `client_too_old` and an upgrade guidance message; the legacy `family-hub-agent/1.0` string counts as `0.0.0`; requests without a `family-hub-agent` user agent (browser dashboard, curl) and `GET /v1/health` / `GET /v1/client/latest` are never gated.
+- Server: new public `GET /v1/client/latest` endpoint returning the CLI release metadata (`version`, `min_cli_version`, `download_url`, `sha256`, `released_at`) sourced from the repo-controlled `server/client-manifest.json` (bundled at build time, no database read on the hot path; the release workflow is the only writer).
+- Server: key lifecycle audit — agent key registration, rotation (old fp → new fp), and token revocation now log the key fingerprint (`fp:` + first 16 hex of SHA-256 of the public key) chained to `agent_label`, `member_id`, and `family_id`, so any message can be traced end-to-end via key fp → agent_label → member_id → circle_id.
+- Skill: new agent behavior contract (`SKILL.md` §9) — the notification
+  format (who/what/your take/next step, then ask), ask-before-acting,
+  watcher discipline (surface and summarize; never post/reply/invite
+  autonomously), channel-per-circle, and the CLI discovery rule
+  (`hub <command> --help` before guessing flags).
+- Skill: progressive disclosure — `SKILL.md` keeps the operational core;
+  deep guides moved to `agent-skill/references/` (`e2ee.md`,
+  `circle-management.md`, `tasks.md`) with one-line pointers. No guidance
+  duplicated between core and references.
+- Server: new `GET /v1/client/download/skill.tar.gz` endpoint serving the versioned skill bundle (`SKILL.md`, `references/`, `INSTALL.md`, `requirements.txt`, plus the `hub` artifact, its sigstore bundle, and the release manifest), hash-verified at build time against both the pin's `skill_sha256` and the release manifest's `skill_sha256`; same rate-limit bucket, `Cache-Control`, and `Content-Disposition` conventions as the other download endpoints.
+- Server: `GET /v1/client/latest` now carries a `skill` block (`url`, `sha256`, `version`) for the bundled skill release.
+- Server: invite onboarding pages install the skill bundle first — download `skill.tar.gz` from this server, verify its sha256, extract, then verify the CLI signature as before. No GitHub URLs in the install flow.
+- Skill: §2 (Discovery) now instructs the agent to *set up* its watch, not
+  just intend it — create a recurring/scheduled job that runs `hub sync`
+  about every 15 minutes and surfaces new entries per the §9 notification
+  contract, or tell the human plainly if the platform has no scheduling.
+  Previously the skill said "run it on your schedule" without ever telling
+  the agent to create the schedule, so agents on platforms without one
+  silently never polled.
+- Server: new `GET /v1/sync/topics` replaces `GET /v1/sync` — per-topic
+  cursor-is-ack sync (the watch's cursor only advances past entries it has
+  actually delivered, so messages can no longer be silently skipped).
+- Server: new receipt-bound acks — `POST /v1/ack` acknowledges specific
+  entry receipts, and `hub` cursors bind to delivery, not to poll position.
+- Server: new `POST /v1/keys/commit` — staged key envelopes are committed
+  atomically with a monotonic `key_epoch` (CAS commit); the removed-member
+  commit path is rejected with 409 `recipients_removed_key_burned` and the
+  key is burned server-side instead.
+- CLI: `hub sync` rewritten onto `/v1/sync/topics` — per-topic cursors,
+  legacy cursor files are deleted without being read, and acks are
+  receipt-bound.
+
+### Changed
+- Server: the client version gate rejection is now HTTP **426 (Upgrade Required)** with code `client_too_old` (was 400); the plain-language upgrade message is unchanged. Gate exemptions now also cover `GET /v1/client/download/*` alongside `/v1/health` and `/v1/client/latest`.
+- Server: the Release CLI workflow no longer pushes `server/client-manifest.json` straight to `main` (branch protection rejects that push, GH006) — it now opens a PR (`release/manifest-cli-v<x.y.z>`) for owner merge; merging it triggers one no-op release run (no loop).
+- Server: fixed stale `docs/openapi.yaml` prose — in-worker rate limiting has existed since v0.11.0 (429s come from the in-worker bucket or edge rules, not edge rules alone). New `api-parity` CI job diffs route patterns extracted from the router against `docs/openapi.yaml` and fails on undocumented routes or stale prose.
+- CLI: complete `--help` coverage for all 41 subcommands. Every command
+  now carries a description, documented flags, and usage examples;
+  `hub --help` lists commands grouped by area (getting started, reading,
+  writing, tasks, circles, E2EE keys, admin). New `test_help_completeness`
+  contract test fails any future command that lands without help — help
+  text is a first-class interface agents read via `hub <command> --help`.
+- CLI: `hub upgrade` now downloads the signed release assets (`hub`,
+  `hub.sigstore`, `manifest.json`) from the hub server's
+  `/v1/client/download/*` endpoints (URLs from `/v1/client/latest`)
+  instead of GitHub Releases, and prints the server's required minimum
+  CLI version. All verification is unchanged: sha256 against both
+  manifests, mandatory sigstore verification, candidate self-test
+  before and after the atomic cutover, `hub.prev` rollback. The
+  sigstore certificate identity is unchanged — same bytes, same seal,
+  only the host changed.
+- CLI: first-time install (`INSTALL.md`) now downloads the signed
+  release from the hub server rather than GitHub Releases; the
+  signature/hash verification steps are unchanged.
+- Server: E2EE key lifecycle is now staged — key envelopes are posted as
+  staged (invisible pre-commit) and only take effect on `/v1/keys/commit`;
+  stale keys can no longer become current without the monotonic epoch
+  commit (N03).
+- Server (N05): plaintext tasks/briefings are rejected inside E2EE topics —
+  every E2EE write is ciphertext-enforced at write time, no exceptions.
+- Server: write-time key gates — posting to an E2EE topic requires a
+  current committed key; key fetch returns only the current key envelope.
+- Server (R1): replay protection on key commits — a commit for an already
+  superseded epoch is rejected instead of re-applied.
+- Server: member removal on an E2EE topic sets `rotation_required`, and
+  removing a member after a staged (uncommitted) key exists burns the
+  staged key — writes pause until a fresh key is committed, so a removed
+  party never receives future messages.
+
+### Removed
+- Server: deleted six endpoints with zero clients (clean break, no
+  deprecation window): `GET /v1/sync` (superseded by `/v1/sync/topics`),
+  `POST /v1/auth/rotate` (re-enroll covers rotation), `GET
+  /v1/topics/:tid/export`, `POST /v1/entries/:eid/redact`, and `GET` /
+  `PATCH /v1/tasks/:tid` (the CLI uses task `notes` / `done` instead).
+- Server: `POST /v1/auth/revoke` is kept — emergency credential
+  revocation is security-critical and gets a CLI command (`hub
+  token-revoke`) plus a runbook entry instead of being deleted.
 ### Fixed
 - Server: `GET /v1/health` now reports the server's actual release version
   (read from `server/package.json` at build time) instead of a stale
@@ -268,6 +454,26 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
   resolves the circle via `GET /v1/families` with the new token instead of
   crashing; if even that fails, the token is persisted under a pending key
   with a precise recovery step rather than being dropped.
+## Fixed
+- E2EE security-review fixes. Server: `topics.current_key_id` is now the
+  single source of truth for key election — `POST /v1/topics` with `e2ee=1`
+  requires `initial_key_id` (the creator's key id), and introducing a new
+  `key_id` via `POST /v1/topics/:id/envelopes` is an owner/parent-only
+  rotation (403 otherwise) that advances `current_key_id` atomically; this
+  stops a participant from downgrading victims to a removed member's key or
+  hijacking encryption to an attacker key. Envelope re-POSTs now preserve
+  the original `created_at` (no recency forgery). New `PATCH
+  /v1/topics/:id/subject` (participant-only, E2EE-only) lets the CLI
+  re-encrypt the subject with the topic-bound AAD immediately after creation.
+  `POST /v1/topics/:id/entries` skips the server PII scan for well-formed
+  `fh1.*` ciphertext bodies. CLI: sealed envelopes now bind
+  `topic_id || 0x00 || key_id || topic_key` and cross-topic transplants are
+  rejected, never stored; key election reads the server-advertised
+  `current_key_id` instead of envelope recency; `hub topic-rekey` requires
+  owner/parent role and fails loudly otherwise; `hub new-topic --e2ee` sends
+  `initial_key_id` and does the topic-bound subject PATCH two-step;
+  identity-key backup restore clamps Argon2 `opslimit`/`memlimit` from the
+  backup file (loud error on violation, never an OOM crash).
 ## [0.2.0] - 2026-10-10
 
 ### Added
