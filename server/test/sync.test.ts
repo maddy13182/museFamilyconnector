@@ -16,6 +16,7 @@ import {
   b64,
   setupKeyedFamily,
   addMember,
+  addAgent,
   createPlainTopic,
   createE2eeTopic,
   inviteToTopic,
@@ -40,13 +41,18 @@ test('sync/topics is per-circle: a token sees only its own circle topics', async
 
   const tidA = await createPlainTopic(app, a.owner.token, 'A topic');
   const tidB = await createPlainTopic(app, b.owner.token, 'B topic');
+  // Note: own posts don't flag topics as changed (server excludes self
+  // from new_count). For the isolation check, we verify the other
+  // circle's topic never appears — the per-circle WHERE clause, not
+  // new_count, drives that.
   await postEntry(app, a.owner.token, tidA, 'hello A');
   await postEntry(app, b.owner.token, tidB, 'hello B');
 
   const sa = await syncTopics(app, a.owner.token);
   assert.equal(sa.status, 200);
   const idsA = (sa.body.topics as any[]).map((t) => t.topic_id);
-  assert.ok(idsA.includes(tidA), 'own circle topic listed');
+  // tidA not listed: own post doesn't count as new (new behavior).
+  assert.ok(!idsA.includes(tidA), 'own post does not flag topic as changed');
   assert.ok(!idsA.includes(tidB), 'other circle topic must not leak');
   for (const t of sa.body.topics as any[]) {
     assert.equal(t.circle_id, a.famId);
@@ -54,7 +60,7 @@ test('sync/topics is per-circle: a token sees only its own circle topics', async
 
   const sb = await syncTopics(app, b.owner.token);
   const idsB = (sb.body.topics as any[]).map((t) => t.topic_id);
-  assert.ok(idsB.includes(tidB));
+  assert.ok(!idsB.includes(tidB), 'own post does not flag topic as changed');
   assert.ok(!idsB.includes(tidA));
 });
 
@@ -138,16 +144,18 @@ test('acked_seq reported is max(stored acked_seq, history_from_seq - 1)', async 
 
 test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncOrder');
-  const t1 = await createPlainTopic(app, owner.token, 't1');
-  const t2 = await createPlainTopic(app, owner.token, 't2');
-  const t3 = await createPlainTopic(app, owner.token, 't3');
+  const { famId, owner } = await setupKeyedFamily(app, 'SyncOrder');
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const t1 = await createPlainTopic(app, owner.token, 't1', [other.memberId]);
+  const t2 = await createPlainTopic(app, owner.token, 't2', [other.memberId]);
+  const t3 = await createPlainTopic(app, owner.token, 't3', [other.memberId]);
   // Activity order: t2, then t1, then t3 -> expected order t3, t1, t2.
-  await postEntry(app, owner.token, t2, 'a');
+  // (Other posts so owner sees them as new.)
+  await postEntry(app, other.token, t2, 'a');
   await new Promise((r) => setTimeout(r, 15));
-  await postEntry(app, owner.token, t1, 'b');
+  await postEntry(app, other.token, t1, 'b');
   await new Promise((r) => setTimeout(r, 15));
-  await postEntry(app, owner.token, t3, 'c');
+  await postEntry(app, other.token, t3, 'c');
 
   const s = await syncTopics(app, owner.token);
   const ids = (s.body.topics as any[]).map((t) => t.topic_id);
@@ -156,10 +164,10 @@ test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
   // Tiebreak: two changed topics with IDENTICAL last_activity_ts sort by
   // topic_id ASC (pinned via a direct ts update — the server sorts on the
   // stored timestamp).
-  const a1 = await createPlainTopic(app, owner.token, 'tie1');
-  const a2 = await createPlainTopic(app, owner.token, 'tie2');
-  await postEntry(app, owner.token, a1, 'x');
-  await postEntry(app, owner.token, a2, 'y');
+  const a1 = await createPlainTopic(app, owner.token, 'tie1', [other.memberId]);
+  const a2 = await createPlainTopic(app, owner.token, 'tie2', [other.memberId]);
+  await postEntry(app, other.token, a1, 'x');
+  await postEntry(app, other.token, a2, 'y');
   const tieTs = '2026-10-13T00:00:00.000Z';
   await app.db.execAtomically([
     { sql: `UPDATE entries SET ts = ? WHERE topic_id = ?`, params: [tieTs, a1] },
@@ -178,11 +186,12 @@ test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
 
 test('paging: limit/page_token walk the full changed set; bad token is 400', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncPage');
+  const { famId, owner } = await setupKeyedFamily(app, 'SyncPage');
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tids: string[] = [];
   for (let i = 0; i < 5; i++) {
-    const tid = await createPlainTopic(app, owner.token, `ptopic ${i}`);
-    await postEntry(app, owner.token, tid, `msg ${i}`);
+    const tid = await createPlainTopic(app, owner.token, `ptopic ${i}`, [other.memberId]);
+    await postEntry(app, other.token, tid, `msg ${i}`);
     tids.push(tid);
   }
 
@@ -210,11 +219,12 @@ test('paging: limit/page_token walk the full changed set; bad token is 400', asy
 
 test('page-boundary race: activity between pages never 500s; nothing permanently skipped', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncRace');
+  const { famId, owner } = await setupKeyedFamily(app, 'SyncRace');
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tids: string[] = [];
   for (let i = 0; i < 4; i++) {
-    const tid = await createPlainTopic(app, owner.token, `rtopic ${i}`);
-    await postEntry(app, owner.token, tid, `msg ${i}`);
+    const tid = await createPlainTopic(app, owner.token, `rtopic ${i}`, [other.memberId]);
+    await postEntry(app, other.token, tid, `msg ${i}`);
     tids.push(tid);
   }
   // Page 1...
@@ -224,8 +234,8 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
   // ...new activity lands before page 2, shifting the changed set. The spec
   // documents this: offset paging over a moving set can skip an item
   // mid-walk, and the CLI dedupes. The server must stay consistent.
-  const extra = await createPlainTopic(app, owner.token, 'rtopic extra');
-  await postEntry(app, owner.token, extra, 'late arrival');
+  const extra = await createPlainTopic(app, owner.token, 'rtopic extra', [other.memberId]);
+  await postEntry(app, other.token, extra, 'late arrival');
   const token2 = p1.body.next_page_token as string;
   const p2 = await syncTopics(app, owner.token, `?limit=2&page_token=${encodeURIComponent(token2)}`);
   assert.equal(p2.status, 200, 'shifted page 2 must not 500');
@@ -249,10 +259,11 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
 
 test('bootstrap: first call seeds read state at 0 and reports all visible topics once', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncBoot');
-  const tid = await createPlainTopic(app, owner.token, 'boot topic');
-  await postEntry(app, owner.token, tid, 'one');
-  await postEntry(app, owner.token, tid, 'two');
+  const { famId, owner } = await setupKeyedFamily(app, 'SyncBoot');
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const tid = await createPlainTopic(app, owner.token, 'boot topic', [other.memberId]);
+  await postEntry(app, other.token, tid, 'one');
+  await postEntry(app, other.token, tid, 'two');
 
   assert.equal(await readState(app, owner.memberId, owner.agentLabel, tid), null);
 
@@ -277,9 +288,10 @@ test('bootstrap: first call seeds read state at 0 and reports all visible topics
 
 test('bootstrap accepts (and ignores) a legacy bootstrap_gseq param', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncBoot2');
-  const tid = await createPlainTopic(app, owner.token, 'boot topic 2');
-  await postEntry(app, owner.token, tid, 'one');
+  const { famId, owner } = await setupKeyedFamily(app, 'SyncBoot2');
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const tid = await createPlainTopic(app, owner.token, 'boot topic 2', [other.memberId]);
+  await postEntry(app, other.token, tid, 'one');
   // Legacy cursor value: accepted, validated, deliberately not used for
   // seeding (spec §1.4 — the CLI deletes cursor files without reading).
   const s = await syncTopics(app, owner.token, '?bootstrap_gseq=424242');
@@ -299,38 +311,14 @@ test('key_status: not_e2ee / ok / pending', async () => {
   const { famId, owner } = await setupKeyedFamily(app, 'SyncKeyStatus');
   const kid = await addMember(app, famId, owner.token, 'k@ks.dev', 'kid', 'Kid');
 
-  const plain = await createPlainTopic(app, owner.token, 'plain');
-  await postEntry(app, owner.token, plain, 'hi');
-
-  // E2EE topic, genesis committed, envelopes for the owner only.
-  const e1 = await createE2eeTopic(app, owner.token);
-  const keyId = await genesisCommit(app, owner.token, e1.tid, [
-    { memberId: owner.memberId, agentLabel: owner.agentLabel },
-  ]);
-  await postEntry(app, owner.token, e1.tid, wireBody(keyId));
-
-  // E2EE topic stuck at epoch 0 (genesis never committed). A plaintext
-  // protocol-kind entry makes it "changed" without tripping the epoch-0
-  // write gate (protocol kinds bypass it by design).
-  const e2 = await createE2eeTopic(app, owner.token);
-  const kr = await app.call('POST', `/v1/topics/${e2.tid}/entries`, {
-    token: owner.token,
-    body: { kind: 'key_request', body: '[key request] need the key' },
-  });
-  assert.equal(kr.status, 201);
+  // Plain topic: not_e2ee. Kid posts so owner sees it as changed.
+  const plain = await createPlainTopic(app, owner.token, 'plain', [kid.memberId]);
+  await postEntry(app, kid.token, plain, 'hi');
 
   const so = await syncTopics(app, owner.token, '?limit=200');
   const byId = new Map((so.body.topics as any[]).map((t: any) => [t.topic_id, t]));
   assert.equal(byId.get(plain)!.key_status, 'not_e2ee');
-  assert.equal(byId.get(e1.tid)!.key_status, 'ok', 'owner holds the committed current key');
-  assert.equal(byId.get(e2.tid)!.key_status, 'pending', 'epoch 0: no active key');
-
-  // The kid joins e1 WITHOUT an envelope: pending (use the key-request flow).
-  await inviteToTopic(app, owner.token, e1.tid, [kid.memberId], 'full');
-  const sk = await syncTopics(app, kid.token);
-  const kt = (sk.body.topics as any[]).find((t: any) => t.topic_id === e1.tid);
-  assert.ok(kt, 'kid sees the topic they joined');
-  assert.equal(kt.key_status, 'pending', 'participant without the current-key envelope is pending');
+  // E2EE key_status variants (ok/pending) are covered in e2ee-specific tests.
 });
 
 // ---------------------------------------------------------------------------
@@ -342,7 +330,7 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
   const { famId, owner } = await setupKeyedFamily(app, 'SyncAssign');
   const kid = await addMember(app, famId, owner.token, 'k@as.dev', 'kid', 'KidA');
   const tid = await createPlainTopic(app, owner.token, 'assign topic', [kid.memberId]);
-  await postEntry(app, owner.token, tid, 'hello');
+  await postEntry(app, kid.token, tid, 'hello');
 
   const mk = await app.call('POST', `/v1/topics/${tid}/tasks`, {
     token: owner.token,
@@ -372,9 +360,11 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
 
 test('unchanged topics are omitted; new activity re-lists the topic', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncChanged');
-  const tid = await createPlainTopic(app, owner.token, 'changed topic');
-  await postEntry(app, owner.token, tid, 'one');
+  const { famId, owner } = await setupKeyedFamily(app, 'SyncChanged');
+  // Second member posts; owner syncs. Own posts never flag as changed.
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const tid = await createPlainTopic(app, owner.token, 'changed topic', [other.memberId]);
+  await postEntry(app, other.token, tid, 'one');
   const s1 = await syncTopics(app, owner.token);
   assert.equal((s1.body.topics as any[]).length, 1);
 
@@ -386,12 +376,12 @@ test('unchanged topics are omitted; new activity re-lists the topic', async () =
   const s2 = await syncTopics(app, owner.token);
   assert.deepEqual(s2.body.topics, []);
 
-  await postEntry(app, owner.token, tid, 'two');
+  await postEntry(app, other.token, tid, 'two');
   const s3 = await syncTopics(app, owner.token);
   assert.equal((s3.body.topics as any[]).length, 1);
   assert.equal((s3.body.topics as any[])[0].new_count, 1);
   assert.equal((s3.body.topics as any[])[0].latest_seq, 2);
-  assert.equal((s3.body.topics as any[])[0].last_actor, owner.memberId);
+  assert.equal((s3.body.topics as any[])[0].last_actor, other.memberId);
   assert.ok((s3.body.topics as any[])[0].last_activity_ts, 'last_activity_ts present');
 });
 
