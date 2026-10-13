@@ -328,7 +328,17 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 - CLI: `hub sync` rewritten onto `/v1/sync/topics` — per-topic cursors,
   legacy cursor files are deleted without being read, and acks are
   receipt-bound.
-
+- Decoupled releases: the skill docs now ship on their own cadence. A
+  `SKILL VERSION` header bump (with no CLI bump) cuts a `skill-v*` release;
+  the server always fetches `skill.tar.gz` from the `skill-v*` tag named by
+  the pinned `skill_version`. `GET /v1/sync/topics` carries a `versions`
+  stanza (server/cli/skill) so `hub sync` can nudge the agent on stderr
+  when a CLI or skill update is available (`hub upgrade` to pull it).
+  Server 1.2.0, CLI 1.1.0, skill 1.1.0.
+- Server: `GET /v1/me` now returns `is_hub_owner` — true when the caller's
+  principal holds the owner role in at least one circle. Agents learn from
+  `hub me` whether they may create circles (`POST /v1/families` while setup
+  is locked) instead of discovering it via a 403.
 ### Changed
 - Server: the client version gate rejection is now HTTP **426 (Upgrade Required)** with code `client_too_old` (was 400); the plain-language upgrade message is unchanged. Gate exemptions now also cover `GET /v1/client/download/*` alongside `/v1/health` and `/v1/client/latest`.
 - Server: the Release CLI workflow no longer pushes `server/client-manifest.json` straight to `main` (branch protection rejects that push, GH006) — it now opens a PR (`release/manifest-cli-v<x.y.z>`) for owner merge; merging it triggers one no-op release run (no loop).
