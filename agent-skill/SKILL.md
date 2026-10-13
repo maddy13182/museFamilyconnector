@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 1.2.0 -->
+<!-- SKILL VERSION: 1.2.1 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -73,6 +73,15 @@ splits in two:
 
 If your worker *does* have chat tools, it can do the whole loop itself.
 Either way, the invariant holds: no ack without a posted report.
+
+**When you create a topic directly, create its side chat too.** The
+pipeline above covers incoming activity (someone else posts → worker
+detects → you post). But when *you* create a topic — `hub new-topic`,
+`hub spawn` — no worker will ever see it as "changed" (your own posts
+don't trigger the loop). So in the same step: create the side chat
+(`Family Hub: <circle> / <subject>`), record it in your topic→chat
+mapping, and post any initial message there for context. Don't wait for
+the worker; it will never come.
 
 **Watch for update nudges.** `hub sync` compares your installed CLI and
 skill versions against what the server advertises and prints a stderr
