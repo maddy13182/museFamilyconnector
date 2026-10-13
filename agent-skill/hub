@@ -6353,7 +6353,7 @@ def _install_skill_docs(staging_dir, skill_dir):
             for d in dirs:
                 # 0755 on doc dirs: the x bit is required for traversal; no
                 # executables live here (the allowlist is docs only).
-                os.chmod(os.path.join(root, d), 0o755)  # nosec B103
+                os.chmod(os.path.join(root, d), 0o755)
             for f in files:
                 os.chmod(os.path.join(root, f), 0o644)
         refreshed.append(_SKILL_DOC_DIR + "/")
