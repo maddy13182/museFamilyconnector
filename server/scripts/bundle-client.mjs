@@ -2,13 +2,16 @@
 /**
  * bundle-client.mjs — fail-closed CLI artifact bundling.
  *
- * Reads server/client-manifest.json, downloads the four release artifacts
- * (hub, hub.sigstore, manifest.json, skill.tar.gz) for the pinned CLI
- * version from the GitHub Release, verifies sha256(hub) against BOTH the
- * pin AND the release's own manifest.json, verifies sha256(skill.tar.gz)
- * against BOTH the pin's skill_sha256 AND the release manifest's
- * skill_sha256, structurally validates the tarball (no absolute paths, no
- * `..`, no links, decompressed-size cap), then writes
+ * Reads server/client-manifest.json, downloads the hub artifacts
+ * (hub, hub.sigstore, manifest.json) for the pinned CLI version from its
+ * GitHub Release, verifies sha256(hub) against BOTH the pin AND the
+ * release's own manifest.json, then downloads the skill bundle
+ * (skill.tar.gz + the skill release's manifest.json) from the
+ * skill-v{skill_version} tag — decoupled releases: the skill ships on its
+ * own cadence. Verifies sha256(skill.tar.gz) against BOTH the pin's
+ * skill_sha256 AND the skill release manifest's skill_sha256,
+ * structurally validates the tarball (no absolute paths, no `..`, no
+ * links, decompressed-size cap), then writes
  * server/src/client-dist.generated.ts (gitignored) exporting the four
  * artifacts as base64 string constants. index.ts serves them from the
  * generated module — no placeholders, no runtime fetch.
@@ -291,21 +294,30 @@ async function main() {
   }
   const tag = `cli-v${pin.version}`;
   const base = `${assetBase}/${tag}`;
+  // Decoupled releases: the skill bundle ships on its own cadence
+  // (skill-v* tags), independent of the CLI release that carries the hub.
+  // The pin's skill_version selects the tag; the pin's skill_sha256 is the
+  // authority the downloaded bytes are checked against.
+  const skillTag = `skill-v${pin.skillVersion}`;
+  const skillBase = `${assetBase}/${skillTag}`;
   const urls = {
     hub: `${base}/hub`,
     sigstore: `${base}/hub.sigstore`,
     manifest: `${base}/manifest.json`,
-    skill: `${base}/skill.tar.gz`,
+    skill: `${skillBase}/skill.tar.gz`,
+    skillManifest: `${skillBase}/manifest.json`,
   };
 
   console.error(`bundle-client: fetching CLI ${tag} (pin sha256 ${pin.sha256.slice(0, 16)}…, skill sha256 ${pin.skillSha256.slice(0, 16)}…)`);
   const tmpDir = mkdtempSync(join(tmpdir(), 'bundle-client-'));
-  const [hubBuf, sigstoreBuf, releaseManifestBuf, skillBuf] = await Promise.all([
-    fetchBytes(urls.hub, tmpDir),
-    fetchBytes(urls.sigstore, tmpDir),
-    fetchBytes(urls.manifest, tmpDir),
-    fetchBytes(urls.skill, tmpDir),
-  ]);
+  const [hubBuf, sigstoreBuf, releaseManifestBuf, skillBuf, skillManifestBuf] =
+    await Promise.all([
+      fetchBytes(urls.hub, tmpDir),
+      fetchBytes(urls.sigstore, tmpDir),
+      fetchBytes(urls.manifest, tmpDir),
+      fetchBytes(urls.skill, tmpDir),
+      fetchBytes(urls.skillManifest, tmpDir),
+    ]);
 
   // 1) sha256(hub) must equal the pin.
   const got = sha256hex(hubBuf);
@@ -341,17 +353,29 @@ async function main() {
     );
   }
 
-  // 2b) The release's own manifest must carry a valid skill_sha256 that
-  //     agrees with the pin (TOCTOU across the two fetches, same as hub).
-  //     This is the PHASE-2 manifest; the tarball itself embeds phase-1
-  //     (checked below), so the two can never be confused.
-  const releaseSkillSha = releaseManifest.skill_sha256;
+  // 2b) The skill release's own manifest (from the skill-v* tag) must
+  //     carry a valid skill_sha256 that agrees with the pin (TOCTOU across
+  //     the two fetches, same as hub). Decoupled releases: the CLI
+  //     release's manifest no longer speaks for the skill bundle.
+  let skillManifest;
+  try {
+    skillManifest = JSON.parse(skillManifestBuf.toString('utf-8'));
+  } catch (e) {
+    fail(`skill release manifest.json is not valid JSON: ${e.message}`);
+  }
+  if (skillManifest.skill_version !== pin.skillVersion) {
+    fail(
+      `skill release manifest skill_version ${JSON.stringify(skillManifest.skill_version)} ` +
+        `!= pin ${pin.skillVersion} — refusing to embed`,
+    );
+  }
+  const releaseSkillSha = skillManifest.skill_sha256;
   if (!/^[0-9a-f]{64}$/i.test(releaseSkillSha ?? '')) {
-    fail(`release manifest.json carries no valid skill_sha256 — refusing to embed`);
+    fail(`skill release manifest.json carries no valid skill_sha256 — refusing to embed`);
   }
   if (releaseSkillSha.toLowerCase() !== pin.skillSha256) {
     fail(
-      `release manifest skill_sha256 ${releaseSkillSha} != pin skill_sha256 ` +
+      `skill release manifest skill_sha256 ${releaseSkillSha} != pin skill_sha256 ` +
         `${pin.skillSha256} — the release was republished under the same tag; refusing to embed`,
     );
   }

@@ -3663,6 +3663,15 @@ async function handleSyncTopics(
     topics: page,
     has_more: hasMore,
     next_page_token: hasMore ? encodePageToken(offset + limit) : null,
+    // Update advertisement (decoupled releases): the client compares these
+    // against its installed CLI + skill versions on `hub sync` and nudges
+    // the agent to run `hub upgrade` when either is newer. Additive — old
+    // clients ignore it.
+    versions: {
+      server: SERVER_VERSION,
+      cli: clientManifest.version,
+      skill: clientManifest.skill_version,
+    },
   });
 }
 

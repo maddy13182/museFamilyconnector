@@ -4,6 +4,9 @@
 Compares <base>...HEAD (default base: origin/main). Fails with a message on
 stderr when:
   - functional code changed but the component's version was not bumped,
+  - bundled skill docs changed (SKILL.md, references/, INSTALL.md,
+    requirements.txt) but the SKILL VERSION header was not bumped
+    (decoupled releases: doc changes ship via skill-v* releases),
   - a version was bumped but no changelog fragment was added,
   - a fragment has a bad name/type or is empty,
   - the bump level is smaller than the fragment types require
@@ -42,6 +45,17 @@ SKILL_VERSION_RE = re.compile(r'^VERSION = "([^"]+)"', re.M)
 # Contract C6: pyproject.toml is the single source of truth for the CLI version.
 SKILL_TOML_FILE = "agent-skill/pyproject.toml"
 SKILL_TOML_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.M)
+# Decoupled releases: the skill ships on its own cadence. These are the
+# agent-skill/ paths bundled into skill.tar.gz (see release.yml); changing
+# any of them requires a SKILL VERSION header bump so the change ships.
+SKILL_DOC_PATHS = (
+    "agent-skill/SKILL.md",
+    "agent-skill/INSTALL.md",
+    "agent-skill/requirements.txt",
+)
+SKILL_DOCS_PREFIX = "agent-skill/references/"
+SKILL_HEADER_FILE = "agent-skill/SKILL.md"
+SKILL_HEADER_RE = re.compile(r"<!--\s*SKILL VERSION:\s*([0-9A-Za-z.\-+]+)\s*-->")
 
 
 def sh(*args: str) -> str:
@@ -94,6 +108,16 @@ def skill_version_at(ref: str | None) -> str:
     return m.group(1)
 
 
+def skill_header_version_at(ref: str | None) -> str:
+    raw = file_at(ref, SKILL_HEADER_FILE) if ref else _read_worktree(SKILL_HEADER_FILE)
+    if raw is None:
+        raise ValueError(f"{SKILL_HEADER_FILE} missing at {ref}")
+    m = SKILL_HEADER_RE.search(raw[:4096])
+    if not m:
+        raise ValueError(f"no SKILL VERSION header in {SKILL_HEADER_FILE} at {ref or 'worktree'}")
+    return m.group(1)
+
+
 def _read_worktree(path: str) -> str | None:
     try:
         with open(path) as fh:
@@ -113,6 +137,12 @@ def main() -> int:
         p.startswith("server/src/") or p.startswith("server/migrations/") for p in changed
     )
     skill_changed = any(p == "agent-skill/hub" for p in changed)
+    # Decoupled releases: bundled skill docs (SKILL.md, references/,
+    # INSTALL.md, requirements.txt) ship via skill-v* releases, so a
+    # change to any of them requires a SKILL VERSION header bump.
+    skill_docs_changed = any(
+        p in SKILL_DOC_PATHS or p.startswith(SKILL_DOCS_PREFIX) for p in changed
+    )
 
     errors: list[str] = []
 
@@ -140,6 +170,22 @@ def main() -> int:
                 )
             else:
                 bumps["skill"] = (old, new)
+        except ValueError as e:
+            errors.append(str(e))
+    if skill_docs_changed:
+        try:
+            old, new = semver(skill_header_version_at(base)), semver(
+                skill_header_version_at(None)
+            )
+            if new <= old:
+                errors.append(
+                    f"skill docs changed but the SKILL VERSION header in "
+                    f"{SKILL_HEADER_FILE} was not bumped "
+                    f"(base {'.'.join(map(str, old))}, now {'.'.join(map(str, new))}); "
+                    f"skill-only doc changes ship via skill-v* releases)"
+                )
+            else:
+                bumps["skill_docs"] = (old, new)
         except ValueError as e:
             errors.append(str(e))
 

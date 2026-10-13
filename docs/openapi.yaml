@@ -1160,6 +1160,19 @@ paths:
                         last_actor: { type: string }
                         key_status: { type: string, enum: [ok, pending, not_e2ee] }
                         assigned_to_me: { type: boolean }
+                  versions:
+                    type: object
+                    description: >
+                      Update advertisement (decoupled releases): the newest
+                      released server / CLI / skill versions known to this
+                      server. `hub sync` compares these against the installed
+                      versions and nudges the agent to run `hub upgrade` when
+                      either is newer.
+                    required: [server, cli, skill]
+                    properties:
+                      server: { type: string }
+                      cli: { type: string }
+                      skill: { type: string }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /v1/topics/{tid}/history:

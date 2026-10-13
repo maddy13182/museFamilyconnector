@@ -24,7 +24,7 @@
 # This workflow cannot be fully tested without cutting a real release;
 # validate changes by dry-running the decision/build/sign steps on a
 # scratch branch before merging.
-name: Release CLI
+name: Release CLI and skill
 
 on:
   push:
@@ -39,7 +39,7 @@ permissions:
 
 # Two merges racing must not cut two releases for the same version.
 concurrency:
-  group: cli-release
+  group: family-hub-release
   cancel-in-progress: false
 
 jobs:
@@ -66,6 +66,23 @@ jobs:
           )
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
+      # Decoupled releases: the skill ships on its own cadence. The SKILL
+      # VERSION header is the single source of truth for the skill version;
+      # a header bump (with no CLI bump) cuts a skill-v* release below.
+      - name: Read skill version (SKILL.md header)
+        id: skillver
+        run: |
+          ver=$(python3 - <<'EOF'
+          import re, sys
+          text = open("agent-skill/SKILL.md", encoding="utf-8").read(4096)
+          m = re.search(r"<!--\s*SKILL VERSION:\s*([0-9A-Za-z.\-+]+)\s*-->", text)
+          if not m:
+              sys.exit("agent-skill/SKILL.md has no SKILL VERSION header")
+          print(m.group(1))
+          EOF
+          )
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
       - name: Latest cli-v* release tag
         id: latest
         env:
@@ -75,20 +92,27 @@ jobs:
             --jq '[.[] | .tagName | select(startswith("cli-v"))][0] // empty')
           echo "tag=${tag:-none}" >> "$GITHUB_OUTPUT"
 
+      - name: Latest skill-v* release tag
+        id: latest_skill
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release list --limit 50 --json tagName \
+            --jq '[.[] | .tagName | select(startswith("skill-v"))][0] // empty')
+          echo "tag=${tag:-none}" >> "$GITHUB_OUTPUT"
+
       - name: Decide whether to release
         id: decide
         env:
           NEW_VERSION: ${{ steps.cli.outputs.version }}
           OLD_TAG: ${{ steps.latest.outputs.tag }}
+          NEW_SKILL_VERSION: ${{ steps.skillver.outputs.version }}
+          OLD_SKILL_TAG: ${{ steps.latest_skill.outputs.tag }}
         run: |
           python3 - <<'EOF'
           import os, re
-          new = os.environ["NEW_VERSION"]
-          old = os.environ["OLD_TAG"]
-          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", new):
-              raise SystemExit("refusing: CLI version %r is not semver" % new)
-          def key(v):
-              v = v.removeprefix("cli-v")
+          def key(v, prefix):
+              v = v.removeprefix(prefix)
               m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?", v)
               if not m:
                   raise SystemExit("refusing: existing tag %r is not semver" % v)
@@ -96,10 +120,27 @@ jobs:
               pre = m.group(4) or ""
               # stable sorts above its own prerelease: (nums, is_stable, pre)
               return (nums, pre == "", pre)
-          release = key(new) > key(old) if old != "none" else True
+          new = os.environ["NEW_VERSION"]
+          old = os.environ["OLD_TAG"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", new):
+              raise SystemExit("refusing: CLI version %r is not semver" % new)
+          release = key(new, "cli-v") > key(old, "cli-v") if old != "none" else True
+          # Decoupled releases: a skill-version bump with no CLI bump cuts a
+          # skill-v* release. When a CLI release fires it covers the skill
+          # (same tarball, tagged skill-v* too), so skill_release only drives
+          # the standalone path.
+          snew = os.environ["NEW_SKILL_VERSION"]
+          sold = os.environ["OLD_SKILL_TAG"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?", snew):
+              raise SystemExit("refusing: skill version %r is not semver" % snew)
+          skill_release = (
+              key(snew, "skill-v") > key(sold, "skill-v") if sold != "none" else True
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("release=%s\n" % ("true" if release else "false"))
+              fh.write("skill_release=%s\n" % ("true" if skill_release else "false"))
           print("cli=%s latest=%s -> release=%s" % (new, old, release))
+          print("skill=%s latest=%s -> skill_release=%s" % (snew, sold, skill_release))
           EOF
 
       - name: Build the hub artifact
@@ -273,8 +314,9 @@ jobs:
       # Phase 2 of 2. Rewrites dist/manifest.json ADDING the skill fields.
       # skill_version is read from the `<!-- SKILL VERSION: x.y.z -->`
       # header of agent-skill/SKILL.md (single source of truth for the
-      # skill version; the release cadence itself stays CLI-driven — a
-      # skill-only change ships with the next CLI release).
+      # skill version. Decoupled releases: a skill-version bump with no
+      # CLI bump cuts a skill-v* release via the skill-only path below;
+      # the CLI path also tags skill-v* so the bundle URL stays uniform).
       # The tarball from the previous step embeds the PHASE-1 manifest, so
       # phase-1 and phase-2 differ ONLY by these two fields (hub sha256 is
       # identical); bundle-client.mjs machine-checks that invariant.
@@ -323,6 +365,53 @@ jobs:
             --title "Family Hub CLI v${VERSION}" \
             --notes "Signed CLI release. Before installing: download all four assets, verify the sigstore signature, verify the sha256 of hub AND of skill.tar.gz against manifest.json, then install — see agent-skill/INSTALL.md. skill.tar.gz is the full skill bundle (SKILL.md, references/, INSTALL.md, requirements.txt, plus the hub artifact, its sigstore bundle, and this manifest); the server hosts it at /v1/client/download/skill.tar.gz."
           echo "created=true" >> "$GITHUB_OUTPUT"
+
+      # Decoupled releases: the skill bundle also ships under its own tag
+      # (skill-v{skill_version}) so bundle-client.mjs can always fetch it
+      # from skill-v{pin.skillVersion} — whether it was cut standalone or
+      # as part of a CLI release.
+      - name: Create skill-v release (CLI path)
+        if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.cli.outputs.version }}
+          SKILL_SHA256: ${{ steps.skill.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          skill_ver=$(python3 - <<'EOF'
+          import re
+          text = open("agent-skill/SKILL.md", encoding="utf-8").read(4096)
+          m = re.search(r"<!--\s*SKILL VERSION:\s*([0-9A-Za-z.\-+]+)\s*-->", text)
+          print(m.group(1))
+          EOF
+          )
+          python3 - "$skill_ver" "$SKILL_SHA256" "${VERSION}" <<'EOF'
+          import datetime, hashlib, json, sys
+          skill_ver, skill_sha, cli_ver = sys.argv[1], sys.argv[2], sys.argv[3]
+          hub_sha = hashlib.sha256(open("dist/hub", "rb").read()).hexdigest()
+          manifest = {
+              "type": "skill",
+              "skill_version": skill_ver,
+              "skill_sha256": skill_sha,
+              "cli_version": cli_ver,
+              "hub_sha256": hub_sha,
+              "released_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open("dist/skill-manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          EOF
+          tag="skill-v${skill_ver}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; not recreating"
+            exit 0
+          fi
+          gh release create "$tag" dist/skill.tar.gz dist/skill-manifest.json \
+            --title "Family Hub skill v${skill_ver}" \
+            --notes "Skill bundle shipped with CLI v${VERSION}. Agents learn of it via the versions stanza on GET /v1/sync/topics — run \`hub upgrade\` to refresh."
+
+      - name: Open the manifest-update PR
 
       - name: Open the manifest-update PR
         if: steps.decide.outputs.release == 'true' && steps.create.outputs.created == 'true'
@@ -399,4 +488,203 @@ jobs:
               --head "$branch" \
               --title "chore: pin client manifest to CLI v${VERSION}" \
               --body "Automated by the Release CLI workflow after cutting \`cli-v${VERSION}\`. Updates \`server/client-manifest.json\` (version, download_url provenance, sha256, skill_sha256, skill_version, released_at); \`min_cli_version\` is intentionally untouched — the deploy runbook raises it deliberately. Merge, then deploy the server so the build bundles the newly pinned artifacts (including skill.tar.gz)."
+          fi
+
+      # --- Decoupled skill releases -------------------------------------
+      # When the SKILL VERSION header moves without a CLI bump, the skill
+      # ships on its own: skill-v* tag, skill.tar.gz built from the current
+      # docs + the latest CLI release's hub artifacts (verified), and a
+      # manifest PR that re-pins only the skill fields. The CLI path above
+      # covers the skill when it fires (same tarball, tagged skill-v* too),
+      # so these steps run only when the CLI release does NOT.
+
+      - name: Fetch CLI artifacts for skill-only build
+        if: steps.decide.outputs.release != 'true' && steps.decide.outputs.skill_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$CLI_TAG" = "none" ]; then
+            echo "refusing: skill-only release needs a CLI release to bundle its hub from" >&2
+            exit 1
+          fi
+          rm -rf dist
+          mkdir -p dist
+          base="https://github.com/maddy13182/museFamilyconnector/releases/download/${CLI_TAG}"
+          curl -sSL --fail -o dist/hub "$base/hub"
+          curl -sSL --fail -o dist/hub.sigstore "$base/hub.sigstore"
+          curl -sSL --fail -o dist/cli-manifest.json "$base/manifest.json"
+          # Verify the hub against the release manifest before bundling it.
+          python3 - <<'EOF'
+          import hashlib, json, sys
+          hub = open("dist/hub", "rb").read()
+          man = json.load(open("dist/cli-manifest.json", encoding="utf-8"))
+          want = man.get("sha256") or (man.get("files") or {}).get("hub")
+          got = hashlib.sha256(hub).hexdigest()
+          if not want or got != want.lower():
+              sys.exit("refusing: downloaded hub sha256 %s != release manifest %s" % (got, want))
+          print("hub verified against %s: %s" % (man.get("version"), got[:16]))
+          EOF
+          chmod +x dist/hub
+
+      - name: Build skill bundle (skill-only)
+        if: steps.decide.outputs.release != 'true' && steps.decide.outputs.skill_release == 'true'
+        id: skillonly
+        run: |
+          set -euo pipefail
+          # Reconstruct the phase-1 manifest (no skill_* fields): the cli-v
+          # release publishes only the phase-2 manifest, and phase-2 was
+          # built by ADDING the skill fields to phase-1, so stripping them
+          # restores it byte-identically (bundle-client.mjs check 7 demands
+          # phase-1 inside the tarball).
+          python3 - <<'EOF'
+          import json
+          man = json.load(open("dist/cli-manifest.json", encoding="utf-8"))
+          phase1 = {k: v for k, v in man.items() if k not in ("skill_sha256", "skill_version")}
+          assert "skill_sha256" not in phase1 and "skill_version" not in phase1
+          with open("dist/manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(phase1, fh, indent=2)
+              fh.write("\n")
+          print("phase-1 manifest reconstructed for CLI", phase1["version"])
+          EOF
+          rm -rf dist/skill-stage
+          mkdir -p dist/skill-stage
+          cp agent-skill/SKILL.md agent-skill/INSTALL.md agent-skill/requirements.txt dist/skill-stage/
+          cp -r agent-skill/references dist/skill-stage/references
+          find dist/skill-stage/references \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
+          cp dist/hub dist/hub.sigstore dist/skill-stage/
+          cp dist/manifest.json dist/skill-stage/manifest.json  # phase-1
+          # Same contract as the CLI path's "Build skill bundle" step above:
+          # explicit allowlist, root:root ownership, relative members only.
+          # Keep the two in sync.
+          tar --owner=0 --group=0 --numeric-owner -czf dist/skill.tar.gz -C dist/skill-stage \
+            SKILL.md references INSTALL.md requirements.txt hub hub.sigstore manifest.json
+          rm -rf dist/skill-stage
+          python3 - <<'EOF'
+          import sys, tarfile
+          tf = tarfile.open("dist/skill.tar.gz")
+          members = tf.getmembers()
+          top = set()
+          for m in members:
+              n = m.name
+              if n.startswith("/") or n.startswith("./") or ".." in n.split("/"):
+                  sys.exit("refusing: bundle member has unsafe path %r" % n)
+              if m.issym() or m.islnk():
+                  sys.exit("refusing: bundle member is a link %r" % n)
+              if m.uid != 0 or m.gid != 0:
+                  sys.exit("refusing: bundle member %r has non-root ownership" % n)
+              segs = n.split("/")
+              if ("tests" in segs or "__pycache__" in segs
+                      or n.endswith("pyproject.toml") or n.endswith("requirements.lock")
+                      or n.endswith(".pyc") or "hub.prev" in segs[-1]):
+                  sys.exit("refusing: bundle member violates the exclusion list: %r" % n)
+              top.add(segs[0])
+          want = {"SKILL.md", "references", "INSTALL.md", "requirements.txt",
+                  "hub", "hub.sigstore", "manifest.json"}
+          if top != want:
+              sys.exit("refusing: bundle top-level members %r != allowlist %r" % (sorted(top), sorted(want)))
+          print("skill bundle members OK:", len(members), "members")
+          EOF
+          sum=$(sha256sum dist/skill.tar.gz | cut -d' ' -f1)
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "skill.tar.gz sha256=$sum"
+
+      - name: Write skill-release manifest.json
+        if: steps.decide.outputs.release != 'true' && steps.decide.outputs.skill_release == 'true'
+        env:
+          SKILL_VERSION: ${{ steps.skillver.outputs.version }}
+          SKILL_SHA256: ${{ steps.skillonly.outputs.sha256 }}
+          CLI_TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          python3 - <<'EOF'
+          import datetime, json, os, re
+          skill_sha = os.environ["SKILL_SHA256"]
+          if not re.fullmatch(r"[0-9a-f]{64}", skill_sha):
+              raise SystemExit("refusing: skill sha256 %r is not 64-hex" % skill_sha)
+          cli_man = json.load(open("dist/cli-manifest.json", encoding="utf-8"))
+          manifest = {
+              "type": "skill",
+              "skill_version": os.environ["SKILL_VERSION"],
+              "skill_sha256": skill_sha,
+              "cli_version": cli_man["version"],
+              "hub_sha256": cli_man["sha256"],
+              "released_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open("dist/skill-manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          EOF
+
+      - name: Create skill GitHub Release
+        if: steps.decide.outputs.release != 'true' && steps.decide.outputs.skill_release == 'true'
+        id: create_skill
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKILL_VERSION: ${{ steps.skillver.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="skill-v${SKILL_VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "release $tag already exists; not recreating"
+            exit 0
+          fi
+          gh release create "$tag" dist/skill.tar.gz dist/skill-manifest.json \
+            --title "Family Hub skill v${SKILL_VERSION}" \
+            --notes "Skill-only release (docs). skill.tar.gz bundles the current skill docs with the latest CLI release's hub artifact; the server hosts it at /v1/client/download/skill.tar.gz. Agents learn of it via the versions stanza on GET /v1/sync/topics — run \`hub upgrade\` to refresh."
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open the skill manifest-update PR
+        if: steps.decide.outputs.release != 'true' && steps.decide.outputs.skill_release == 'true' && steps.create_skill.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKILL_VERSION: ${{ steps.skillver.outputs.version }}
+          SKILL_SHA256: ${{ steps.skillonly.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          branch="release/manifest-skill-v${SKILL_VERSION}"
+          if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+            echo "branch $branch already exists; not recreating"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          python3 - <<'EOF'
+          import datetime, json, os, re
+          path = "server/client-manifest.json"
+          with open(path, encoding="utf-8") as fh:
+              manifest = json.load(fh)
+          skill_sha = os.environ["SKILL_SHA256"]
+          if not re.fullmatch(r"[0-9a-f]{64}", skill_sha):
+              raise SystemExit("refusing: skill sha256 %r is not 64-hex" % skill_sha)
+          # Skill-only release: re-pin ONLY the skill fields. CLI fields
+          # (version, sha256, download_url, min_cli_version) are untouched.
+          manifest["skill_version"] = os.environ["SKILL_VERSION"]
+          manifest["skill_sha256"] = skill_sha
+          manifest["released_at"] = datetime.datetime.now(
+              datetime.timezone.utc
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          EOF
+          git add server/client-manifest.json
+          if git diff --cached --quiet; then
+            echo "no manifest change to commit"
+            exit 0
+          fi
+          git commit -m "chore: pin client manifest to skill v${SKILL_VERSION}"
+          git push -u origin "$branch"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo "PR for $branch already exists; not recreating"
+          else
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore: pin client manifest to skill v${SKILL_VERSION}" \
+              --body "Automated by the release workflow after cutting \`skill-v${SKILL_VERSION}\` (skill-only release). Updates \`server/client-manifest.json\` skill fields (skill_version, skill_sha256, released_at); CLI fields untouched. Merge, then deploy the server so the build bundles the newly pinned skill.tar.gz from the skill-v tag."
           fi

@@ -5,17 +5,20 @@ This project follows [Semantic Versioning 2.0.0](https://semver.org):
 
 ## One version per component, one source each
 
-The server and the agent skill version **independently**. Each has exactly
-one source of truth — never hardcode a version anywhere else:
+The server, the CLI, and the skill docs version **independently**. Each has
+exactly one source of truth — never hardcode a version anywhere else:
 
 | Component | Source | Reported by |
 |---|---|---|
 | Server (API + dashboard) | `server/package.json` → `version` | `GET /v1/health` (`version`), every log line (`v`) |
 | Agent skill (CLI) | `agent-skill/pyproject.toml` → `version` (single source of truth, contract C6) | `hub --version` |
+| Skill docs (SKILL.md, references/, INSTALL.md) | `agent-skill/SKILL.md` → `<!-- SKILL VERSION: x.y.z -->` header | `hub upgrade`'s skill check; the `versions` stanza on `GET /v1/sync/topics` |
 
-There is no repo-root `VERSION` file. The two components usually release
-together, but a server-only change bumps only the server version and vice
-versa.
+There is no repo-root `VERSION` file. The three components usually release
+together, but each bumps only on its own changes: a server-only change
+bumps only the server version, a CLI-only change only the CLI version, and
+a skill-doc-only change only the SKILL VERSION header (which cuts a
+`skill-v*` release — see below).
 
 ## What bumps what
 
@@ -52,9 +55,11 @@ components released at different versions, name both
 2. Bump the component's version in its single source.
 3. Add `changelog.d/` fragment(s).
 4. Open a PR. CI enforces: functional code changes require a version bump,
-   a bump requires fragment(s), and the bump level must cover the fragment
+   bundled skill-doc changes require a SKILL VERSION header bump, a bump
+   requires fragment(s), and the bump level must cover the fragment
    types (`removed` → major, `added`/`changed`/`deprecated` → minor,
-   `fixed`/`security` → patch). Docs-only PRs are exempt.
+   `fixed`/`security` → patch). Non-shipped docs (repo docs, comments,
+   CI/workflow text) are exempt.
 5. Merge via PR only — direct pushes to `main` are blocked by branch
    protection (see README's repository-settings checklist).
 
@@ -111,7 +116,7 @@ mechanism.)
 ### CLI release → manifest PR → deploy
 
 1. Bump `agent-skill/pyproject.toml`; add fragment(s); merge to `main`.
-2. The **Release CLI** workflow (`.github/workflows/release.yml`) builds the
+2. The **Release CLI and skill** workflow (`.github/workflows/release.yml`) builds the
    `hub` artifact, signs it with sigstore (keyless OIDC), writes the release
    manifest in **two phases** (phase 1 without skill fields → build
    `skill.tar.gz` embedding the phase-1 manifest → phase 2 rewrites the
@@ -133,10 +138,33 @@ mechanism.)
      `skill_*` fields differ); the `manifest.json` uploaded to the release
      is phase-2. `skill_version` comes from the
      `<!-- SKILL VERSION: x.y.z -->` header of `agent-skill/SKILL.md`.
-   - **Release cadence stays CLI-driven:** the workflow only cuts a release
-     when `agent-skill/pyproject.toml` is newer than the latest `cli-v*`
-     tag. A skill-only change (SKILL.md edit, skill version bump) ships
-     with the next CLI release — bump `pyproject.toml` to force one.
+   - **Release cadence is decoupled:** the workflow cuts a release when
+     `agent-skill/pyproject.toml` is newer than the latest `cli-v*` tag
+     (CLI release) AND/OR when the SKILL VERSION header is newer than the
+     latest `skill-v*` tag (skill-only release). A skill-only change ships
+     as `skill-v<x.y.z>` without touching the CLI: the workflow downloads
+     the latest CLI release's hub artifacts (verified), bundles them with
+     the current docs, and opens a manifest PR re-pinning only the skill
+     fields. Every release — CLI or skill-only — also publishes the skill
+     bundle under its `skill-v*` tag, so the server always fetches it from
+     `skill-v{skill_version}`.
+
+### Skill-only release → manifest PR → deploy
+
+1. Bump the `<!-- SKILL VERSION: x.y.z -->` header in
+   `agent-skill/SKILL.md`; add fragment(s); merge to `main`. (CI's version
+   gate requires the header bump for any bundled-doc change.)
+2. The **Release CLI and skill** workflow sees the header ahead of the
+   latest `skill-v*` tag and cuts `skill-v<x.y.z>`: `skill.tar.gz` (current
+   docs + the latest CLI release's verified hub artifacts) and a small
+   skill-release `manifest.json`. It then opens a PR
+   (`release/manifest-skill-v<x.y.z>`) re-pinning **only** the skill fields
+   (`skill_version`, `skill_sha256`, `released_at`) in
+   `server/client-manifest.json` — CLI fields untouched.
+3. **Owner merges the manifest PR, then deploys the server** so the build
+   bundles the newly pinned `skill.tar.gz` from the `skill-v*` tag.
+   Agents learn of the update on their next `hub sync` via the `versions`
+   stanza and refresh with `hub upgrade`.
 3. **Owner merges the manifest PR.** `min_cli_version` in the pin is never
    raised automatically — raise it deliberately, only after the fleet
    reports at-or-above the new CLI version. The pin now also carries

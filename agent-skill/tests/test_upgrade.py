@@ -34,12 +34,24 @@ hub = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hub)
 
 
+def _next_minor(v):
+    """A version strictly newer than v (minor bump), for upgrade fixtures.
+    Keeps tests green across version bumps without hardcoded literals."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
+    return "%s.%d.0" % (m.group(1), int(m.group(2)) + 1)
+
+
+# Fixture versions, always newer than the installed CLI/skill under test.
+NEW_CLI_VERSION = _next_minor(hub._cli_version())
+NEW_SKILL_VERSION = _next_minor(hub.SKILL_VERSION)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def make_manifest(version="1.0.1", sha256="0" * 64,
+def make_manifest(version=NEW_CLI_VERSION, sha256="0" * 64,
                   server="https://hub.example.test",
                   skill_version="0.11.0", skill_sha256="1" * 64):
     """The new /v1/client/latest shape (spec §3.5 + §3.6): assets served by
@@ -380,7 +392,7 @@ class UpgradeTest(unittest.TestCase):
         # never GitHub. All three fetched URLs must be exactly the
         # manifest's assets.* entries.
         fx = UpgradeFixture(self)
-        new_version = "1.0.1"
+        new_version = NEW_CLI_VERSION
         new_bytes = stamp_version(fx.old_bytes, new_version)
         manifest, downloads = self._downloads_for(new_version, new_bytes)
         requested = []
@@ -420,7 +432,7 @@ class UpgradeTest(unittest.TestCase):
 
     def test_full_upgrade_flow(self):
         fx = UpgradeFixture(self)
-        new_version = "1.0.1"
+        new_version = NEW_CLI_VERSION
         new_bytes = stamp_version(fx.old_bytes, new_version)
         manifest, downloads = self._downloads_for(new_version, new_bytes)
         rc, out = fx.run_upgrade(manifest, downloads)
@@ -442,8 +454,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_sha_mismatch_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "1.0.1")
-        manifest = make_manifest(version="1.0.1", sha256="f" * 64)
+        new_bytes = stamp_version(fx.old_bytes, NEW_CLI_VERSION)
+        manifest = make_manifest(version=NEW_CLI_VERSION, sha256="f" * 64)
         downloads = {manifest["assets"]["hub"]: new_bytes}
         with self.assertRaises(hub.HubError) as ctx:
             fx.run_upgrade(manifest, downloads)
@@ -453,9 +465,9 @@ class UpgradeTest(unittest.TestCase):
 
     def test_release_manifest_disagreement_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "1.0.1")
+        new_bytes = stamp_version(fx.old_bytes, NEW_CLI_VERSION)
         digest = hashlib.sha256(new_bytes).hexdigest()
-        manifest = make_manifest(version="1.0.1", sha256=digest)
+        manifest = make_manifest(version=NEW_CLI_VERSION, sha256=digest)
         assets = manifest["assets"]
         downloads = {
             assets["hub"]: new_bytes,
@@ -472,8 +484,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_bad_signature_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "1.0.1")
-        manifest, downloads = self._downloads_for("1.0.1", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, NEW_CLI_VERSION)
+        manifest, downloads = self._downloads_for(NEW_CLI_VERSION, new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -486,8 +498,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_missing_sigstore_package_refuses(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "1.0.1")
-        manifest, downloads = self._downloads_for("1.0.1", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, NEW_CLI_VERSION)
+        manifest, downloads = self._downloads_for(NEW_CLI_VERSION, new_bytes)
         with mock.patch.object(hub, "_script_path", return_value=fx.target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=lambda url, what, timeout=90: downloads[url]), \
@@ -499,8 +511,8 @@ class UpgradeTest(unittest.TestCase):
 
     def test_failed_self_test_restores_previous(self):
         fx = UpgradeFixture(self)
-        new_bytes = stamp_version(fx.old_bytes, "1.0.1")
-        manifest, downloads = self._downloads_for("1.0.1", new_bytes)
+        new_bytes = stamp_version(fx.old_bytes, NEW_CLI_VERSION)
+        manifest, downloads = self._downloads_for(NEW_CLI_VERSION, new_bytes)
         real_self_test = hub._self_test
 
         def flaky_self_test(path, expect_version=None):
@@ -534,7 +546,7 @@ class RollbackTest(unittest.TestCase):
     def test_rollback_restores_previous(self):
         fx = UpgradeFixture(self)
         # Simulate a completed upgrade: current = 0.7.0, prev = 0.6.0.
-        new_bytes = stamp_version(fx.old_bytes, "1.0.1")
+        new_bytes = stamp_version(fx.old_bytes, NEW_CLI_VERSION)
         with open(fx.target, "wb") as fh:
             fh.write(new_bytes)
         self._with_prev(fx, fx.old_bytes)

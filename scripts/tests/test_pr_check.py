@@ -30,6 +30,8 @@ def init_repo() -> Path:
     (tmp / "server" / "src" / "index.ts").write_text("// v1\n")
     (tmp / "agent-skill").mkdir()
     (tmp / "agent-skill" / "hub").write_text('#!/usr/bin/env python3\nVERSION = "0.2.0"\n')
+    (tmp / "agent-skill" / "pyproject.toml").write_text('[project]\nversion = "0.2.0"\n')
+    (tmp / "agent-skill" / "SKILL.md").write_text("<!-- SKILL VERSION: 0.2.0 -->\n# skill\n")
     (tmp / "changelog.d").mkdir()
     (tmp / "changelog.d" / "README.md").write_text("fragments\n")
     (tmp / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
@@ -123,13 +125,48 @@ class TestPrCheckIntegration(unittest.TestCase):
 
     def test_skill_bump_independent(self):
         # Skill-only change: only the skill version must bump, not the server's.
+        # (C6: pyproject.toml is the version source of truth.)
         (self.repo / "agent-skill" / "hub").write_text(
             '#!/usr/bin/env python3\nVERSION = "0.3.0"\n# new command\n'
+        )
+        (self.repo / "agent-skill" / "pyproject.toml").write_text(
+            '[project]\nversion = "0.3.0"\n'
         )
         (self.repo / "changelog.d" / "thing.added.md").write_text("- CLI: new.\n")
         self.commit_all()
         rc, out = run_check(self.repo)
         self.assertEqual(rc, 0, out)
+
+    def test_skill_docs_require_header_bump(self):
+        # Bundled skill docs changed but the SKILL VERSION header did not:
+        # must fail (decoupled releases need the bump to ship the docs).
+        (self.repo / "agent-skill" / "SKILL.md").write_text(
+            "<!-- SKILL VERSION: 0.2.0 -->\n# skill\n\nNew guidance.\n"
+        )
+        self.commit_all()
+        rc, out = run_check(self.repo)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("SKILL VERSION", out)
+
+    def test_skill_docs_header_bump_passes(self):
+        (self.repo / "agent-skill" / "SKILL.md").write_text(
+            "<!-- SKILL VERSION: 0.3.0 -->\n# skill\n\nNew guidance.\n"
+        )
+        (self.repo / "changelog.d" / "docs.changed.md").write_text("- docs\n")
+        self.commit_all()
+        rc, out = run_check(self.repo)
+        self.assertEqual(rc, 0, out)
+
+    def test_skill_docs_bump_without_fragment_fails(self):
+        (self.repo / "agent-skill" / "references").mkdir()
+        (self.repo / "agent-skill" / "references" / "x.md").write_text("# x\n")
+        (self.repo / "agent-skill" / "SKILL.md").write_text(
+            "<!-- SKILL VERSION: 0.2.1 -->\n# skill\n"
+        )
+        self.commit_all()
+        rc, out = run_check(self.repo)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("fragment", out.lower())
 
     def test_docs_only_passes_without_bump(self):
         (self.repo / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n- typo\n")
