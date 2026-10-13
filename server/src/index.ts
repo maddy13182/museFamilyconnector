@@ -824,6 +824,119 @@ async function keyFingerprint(publicKey: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Sync v2 read receipts (spec §1.4).
+//
+// GET /v1/topics/:tid/history issues a receipt binding
+// (member_id, agent_label, topic_id, from_seq, through_seq); POST
+// /v1/topics/:tid/ack must present a receipt whose HMAC verifies before the
+// ack advances. Receipts are stateless (server restart loses nothing): the
+// HMAC is the whole credential.
+//
+// Wire format: `fhrr1.<from_seq>.<through_seq>.<hmac_hex64>` where the HMAC
+// is HMAC-SHA256(READ_RECEIPT_SECRET, canonical) and canonical is a
+// pipe-joined, version-tagged payload. The member/agent/topic binding lives
+// INSIDE the HMAC, so a receipt minted for one agent cannot be replayed by
+// another (cross-agent replay fails verification).
+//
+// The secret is read from env (READ_RECEIPT_SECRET) and never logged. When
+// unset the server fails closed with 500 misconfigured — receipts are
+// never silently disabled.
+// ---------------------------------------------------------------------------
+
+const RECEIPT_PREFIX = 'fhrr1';
+
+function receiptCanonical(
+  memberId: string,
+  agentLabel: string,
+  topicId: string,
+  fromSeq: number,
+  throughSeq: number,
+): string {
+  return ['fh-read-receipt', 'v1', memberId, agentLabel, topicId, String(fromSeq), String(throughSeq)].join(
+    '|',
+  );
+}
+
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** Constant-time hex comparison (no early exit on first mismatch). */
+function constantTimeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function readReceiptSecret(env: Env): string {
+  const s = env.READ_RECEIPT_SECRET;
+  if (!s) {
+    throw new HttpError(
+      500,
+      'misconfigured',
+      'READ_RECEIPT_SECRET is not set — read receipts cannot be issued or verified',
+    );
+  }
+  return s;
+}
+
+async function issueReadReceipt(
+  env: Env,
+  memberId: string,
+  agentLabel: string,
+  topicId: string,
+  fromSeq: number,
+  throughSeq: number,
+): Promise<string> {
+  const mac = await hmacSha256Hex(
+    readReceiptSecret(env),
+    receiptCanonical(memberId, agentLabel, topicId, fromSeq, throughSeq),
+  );
+  return `${RECEIPT_PREFIX}.${fromSeq}.${throughSeq}.${mac}`;
+}
+
+const RECEIPT_MAC_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Verify a receipt binds THIS (member_id, agent_label, topic_id).
+ * Returns the bound (from_seq, through_seq). 403 invalid_read_receipt on
+ * any malformation or HMAC mismatch (forgery / cross-agent replay).
+ */
+async function verifyReadReceipt(
+  env: Env,
+  receipt: string,
+  memberId: string,
+  agentLabel: string,
+  topicId: string,
+): Promise<{ from_seq: number; through_seq: number }> {
+  const bad = (): HttpError =>
+    new HttpError(403, 'invalid_read_receipt', 'read_receipt failed verification');
+  const parts = receipt.split('.');
+  if (parts.length !== 4 || parts[0] !== RECEIPT_PREFIX) throw bad();
+  const fromSeq = /^\d+$/.test(parts[1]) ? Number(parts[1]) : NaN;
+  const throughSeq = /^\d+$/.test(parts[2]) ? Number(parts[2]) : NaN;
+  if (!Number.isSafeInteger(fromSeq) || !Number.isSafeInteger(throughSeq)) throw bad();
+  if (!RECEIPT_MAC_RE.test(parts[3])) throw bad();
+  const expected = await hmacSha256Hex(
+    readReceiptSecret(env),
+    receiptCanonical(memberId, agentLabel, topicId, fromSeq, throughSeq),
+  );
+  if (!constantTimeEqualHex(parts[3], expected)) throw bad();
+  return { from_seq: fromSeq, through_seq: throughSeq };
+}
+
+// ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
 
@@ -2412,25 +2525,32 @@ async function handleAgentKeyRotate(
   });
 }
 
-// E2EE (Phase 2) — POST /v1/topics/:tid/envelopes {member_id, agent_label,
-// key_id, envelope} — store one sealed topic-key envelope for a recipient
-// agent. The envelope blob is opaque to the server: format-validated
-// (base64) and stored, never inspected.
+// E2EE (sync v2, spec §1.5) — POST /v1/topics/:tid/envelopes
+// {member_id, agent_label, key_id, envelope} — STAGED distribution. The
+// envelope blob is opaque to the server: format-validated (base64) and
+// stored, never inspected.
+//
+// N04 fix: non-current key_id envelopes are STORED, never flipped. The old
+// behavior ("first POST with a new key_id flips topics.current_key_id")
+// let a bare envelope POST elect the encryption key with no completeness
+// check; now only POST /v1/topics/:tid/keys/commit advances the epoch and
+// flips current_key_id.
 //
 // Access control (defense in depth; crypto is per-agent but the blob store
 // still gates on membership):
 //   - caller must be a current participant of the topic (403 otherwise;
 //     404 when the topic doesn't exist in the caller's family);
+//   - a key_id different from the topic's current_key_id INTRODUCES a key
+//     (rotation/genesis staging) and is allowed only for owner/parent
+//     callers (403 otherwise); the key_id is stored as staged — the commit
+//     decides whether it activates;
 //   - the target (member_id, agent_label) must be a current participant
 //     AND hold an ACTIVE (non-superseded) registered public key (400
-//     otherwise — sealing to an agent with no key on file is meaningless);
-//   - KEY ELECTION (secfix F1): topics.current_key_id is the single source
-//     of truth for "the current key". POSTing an envelope whose key_id
-//     differs from current_key_id INTRODUCES a new key (rotation) and is
-//     allowed only for owner/parent callers (403 otherwise); on success
-//     current_key_id advances to the new key_id in the same atomic batch.
-//     This stops a participant from downgrading victims to a removed
-//     member's key or hijacking encryption to an attacker key.
+//     otherwise — sealing to an agent with no key on file is meaningless).
+// The server records the target's ACTIVE identity-key id at POST time
+// (topic_key_envelopes.identity_key_id) so keys/commit can reject envelopes
+// sealed to superseded keys. On re-POST the recorded id refreshes to the
+// key active at the latest POST (the blob was presumably re-sealed).
 // Re-POSTing the same (topic_id, member_id, agent_label, key_id) replaces
 // the stored envelope — idempotent distribution — and PRESERVES the
 // original created_at (secfix F3): re-POSTing must not forge recency.
@@ -2446,21 +2566,17 @@ async function handlePostEnvelope(
   const targetAgentLabel = reqString(body['agent_label'], 'agent_label', 1, 80);
   const keyId = reqKeyId(body['key_id'], 'key_id');
   const envelope = reqEnvelopeB64(body['envelope'], 'envelope');
-  // F1: a key_id different from the topic's current_key_id is a rotation —
-  // owner/parent privilege. (current_key_id is NULL only for topics created
-  // before this column existed; the same gate bootstraps those.)
+  // Introducing a key_id (one the topic has not committed) is an
+  // owner/parent privilege — a participant must not stage keys for victims.
+  // Staging stores the envelope; it NEVER flips topics.current_key_id (N04).
   const currentKeyId = topic['current_key_id'] as string | null;
-  let rotates = false;
-  if (keyId !== currentKeyId) {
-    if (auth.role !== 'owner' && auth.role !== 'parent') {
-      throw new HttpError(
-        403,
-        'forbidden',
-        'Only an owner or parent may introduce a new topic key (rotation). ' +
-          'Ask an owner/parent to run `hub topic-rekey`.',
-      );
-    }
-    rotates = true;
+  if (keyId !== currentKeyId && auth.role !== 'owner' && auth.role !== 'parent') {
+    throw new HttpError(
+      403,
+      'forbidden',
+      'Only an owner or parent may introduce a new topic key. ' +
+        'Ask an owner/parent to run `hub topic-rekey`.',
+    );
   }
   const targetPart = await db.queryOne(
     `SELECT member_id FROM topic_participants WHERE topic_id = ? AND member_id = ?`,
@@ -2470,7 +2586,7 @@ async function handlePostEnvelope(
     throw new HttpError(400, 'bad_request', 'envelope target must be a current participant of this topic');
   }
   const targetKey = await db.queryOne(
-    `SELECT 1 FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
+    `SELECT id FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL`,
     [targetMemberId, targetAgentLabel],
   );
   if (!targetKey) {
@@ -2481,29 +2597,29 @@ async function handlePostEnvelope(
     );
   }
   const ts = nowIso();
-  const ops: { sql: string; params: (string | number | null)[] }[] = [
+  await db.execAtomically([
     {
-      // F3: ON CONFLICT updates only the envelope blob — created_at keeps
-      // its original value, so a re-POST cannot forge recency.
-      sql: `INSERT INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at)
-            VALUES (?,?,?,?,?,?)
+      // F3: ON CONFLICT updates only the envelope blob (and the
+      // server-observed identity_key_id) — created_at keeps its original
+      // value, so a re-POST cannot forge recency.
+      sql: `INSERT INTO topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope, created_at, identity_key_id)
+            VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(topic_id, member_id, agent_label, key_id)
-            DO UPDATE SET envelope = excluded.envelope`,
-      params: [tid, targetMemberId, targetAgentLabel, keyId, envelope, ts],
+            DO UPDATE SET envelope = excluded.envelope, identity_key_id = excluded.identity_key_id`,
+      params: [tid, targetMemberId, targetAgentLabel, keyId, envelope, ts, targetKey['id'] as string],
     },
-  ];
-  if (rotates) {
-    ops.push({
-      sql: `UPDATE topics SET current_key_id = ? WHERE id = ?`,
-      params: [keyId, tid],
-    });
-  }
-  await db.execAtomically(ops);
+  ]);
   const row = await db.queryOne(
     `SELECT created_at FROM topic_key_envelopes
       WHERE topic_id = ? AND member_id = ? AND agent_label = ? AND key_id = ?`,
     [tid, targetMemberId, targetAgentLabel, keyId],
   );
+  logEvent('info', 'envelope_staged', {
+    endpoint: 'envelopes',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+  });
   return json(
     {
       topic_id: tid,
@@ -2516,11 +2632,16 @@ async function handlePostEnvelope(
   );
 }
 
-// E2EE (Phase 2) — GET /v1/topics/:tid/envelopes — return ONLY the caller's
-// own envelopes: rows are matched on the caller's (member_id, agent_label)
-// taken from the Bearer <redacted> never from caller-supplied input. One agent
-// can never fetch another agent's envelopes. 403 when the caller is not a
-// participant (404 when the topic doesn't exist in the caller's family).
+// E2EE (sync v2, spec §1.5) — GET /v1/topics/:tid/envelopes — return ONLY
+// the caller's own envelopes for COMMITTED epochs: rows are matched on the
+// caller's (member_id, agent_label) taken from the Bearer <redacted> never
+// from caller-supplied input, and joined against the topic's epoch log, so
+// staged (uncommitted) keys stay invisible until keys/commit activates
+// them — an uncommitted key must never be treated as usable. Each envelope
+// carries its epoch's `commitment` (hex SHA256 of the topic key, NULL for
+// grandfathered pre-migration epochs) so the CLI can verify-on-open (N07).
+// 403 when the caller is not a participant (404 when the topic doesn't
+// exist in the caller's family).
 async function handleGetEnvelopes(
   db: DbClient,
   auth: AuthContext,
@@ -2528,12 +2649,22 @@ async function handleGetEnvelopes(
 ): Promise<Response> {
   await requireParticipant(db, auth, tid);
   const rows = await db.queryAll(
-    `SELECT topic_id, member_id, agent_label, key_id, envelope, created_at
-       FROM topic_key_envelopes
-      WHERE topic_id = ? AND member_id = ? AND agent_label = ?
-      ORDER BY created_at ASC`,
+    `SELECT e.topic_id, e.member_id, e.agent_label, e.key_id, e.envelope,
+            e.created_at, k.epoch, k.commitment
+       FROM topic_key_envelopes e
+       JOIN topic_key_epochs k
+         ON k.topic_id = e.topic_id AND k.key_id = e.key_id
+      WHERE e.topic_id = ? AND e.member_id = ? AND e.agent_label = ?
+      ORDER BY k.epoch ASC, e.created_at ASC`,
     [tid, auth.member_id, auth.agent_label],
   );
+  logEvent('info', 'envelopes_listed', {
+    endpoint: 'envelopes',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    count: rows.length,
+  });
   return json({ envelopes: rows });
 }
 
@@ -2871,9 +3002,25 @@ async function handlePatchTopicSubject(
   return json({ topic: updated });
 }
 
-// GET /v1/topics/:tid/history?after_seq=&limit=
+// GET /v1/topics/:tid/history?after_seq=&limit=&context=
+//
+// Sync v2 (spec §1.4): `context` (default 10, max 50) prepends up to that
+// many entries immediately BEFORE `after_seq` (bounded below by the
+// caller's history_from_seq), each flagged `is_context: true` — they are
+// re-reads for orientation, not new reads. The page entries carry
+// `is_context: false`.
+//
+// Every response includes `read_through_seq` (the highest newly-read seq
+// in this page — context rows excluded; max(after, floor-1) when the page
+// is empty) and a `read_receipt` HMAC binding
+// (member_id, agent_label, topic_id, from_seq, through_seq), where
+// from_seq = max(after, history_from_seq - 1) + 1 is the REQUESTED
+// boundary (so gaps can't deadlock acks) and through_seq =
+// read_through_seq (only what this page actually showed). POST
+// /v1/topics/:tid/ack verifies the receipt before advancing read state.
 async function handleHistory(
   db: DbClient,
+  env: Env,
   req: Request,
   auth: AuthContext,
   tid: string,
@@ -2882,14 +3029,51 @@ async function handleHistory(
   const url = new URL(req.url);
   const after = parseSeqCursor(url.searchParams.get('after_seq'));
   const limit = parseLimit(url.searchParams.get('limit'), 100, 500);
+  const context = parseLimit(url.searchParams.get('context'), 10, 50);
   const rows = await db.queryAll(
     `SELECT * FROM entries
       WHERE topic_id = ? AND seq > ? AND seq >= ?
       ORDER BY seq ASC LIMIT ?`,
     [tid, after, history_from_seq, limit],
   );
+  const ctxRows = await db.queryAll(
+    `SELECT * FROM entries
+      WHERE topic_id = ? AND seq <= ? AND seq >= ?
+      ORDER BY seq DESC LIMIT ?`,
+    [tid, after, history_from_seq, context],
+  );
+  ctxRows.reverse();
+  const entries = [
+    ...ctxRows.map((r) => ({ ...publicEntry(r), is_context: true })),
+    ...rows.map((r) => ({ ...publicEntry(r), is_context: false })),
+  ];
   const maxRow = await db.queryOne(`SELECT MAX(seq) AS m FROM entries WHERE topic_id = ?`, [tid]);
-  return json({ entries: rows.map(publicEntry), max_seq: (maxRow?.['m'] as number | null) ?? 0 });
+  const fromSeq = Math.max(after, history_from_seq - 1) + 1;
+  const readThroughSeq =
+    rows.length > 0 ? (rows[rows.length - 1]['seq'] as number) : fromSeq - 1;
+  const readReceipt = await issueReadReceipt(
+    env,
+    auth.member_id,
+    auth.agent_label,
+    tid,
+    fromSeq,
+    readThroughSeq,
+  );
+  logEvent('info', 'topic_history', {
+    endpoint: 'history',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    returned: rows.length,
+    context: ctxRows.length,
+    read_through_seq: readThroughSeq,
+  });
+  return json({
+    entries,
+    max_seq: (maxRow?.['m'] as number | null) ?? 0,
+    read_through_seq: readThroughSeq,
+    read_receipt: readReceipt,
+  });
 }
 
 // GET /v1/topics/:tid/export — full topic JSON for offline copy / migration.
@@ -3206,6 +3390,644 @@ async function handleSync(db: DbClient, req: Request, auth: AuthContext): Promis
   // page (clients MUST prefer next_after_gseq as their poll cursor).
   const maxGseq = nextAfter;
   return json({ entries, max_gseq: maxGseq, next_after_gseq: nextAfter, has_more: hasMore });
+}
+
+// ---------------------------------------------------------------------------
+// Sync v2 (spec §1.3, §1.4).
+// ---------------------------------------------------------------------------
+
+/** Opaque page token: base64url(JSON {o: offset}). btoa/atob (not Buffer)
+ *  so this runs in the Worker runtime too; the payload is ASCII-only. */
+function encodePageToken(offset: number): string {
+  return btoa(JSON.stringify({ o: offset }))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function decodePageToken(v: string | null): number {
+  if (v === null || v === undefined || v === '') return 0;
+  try {
+    const b64 = v.replace(/-/g, '+').replace(/_/g, '/');
+    const parsed: unknown = JSON.parse(atob(b64));
+    const o = (parsed as { o?: unknown } | null)?.o;
+    if (typeof o === 'number' && Number.isInteger(o) && o >= 0) return o;
+  } catch {
+    /* fall through to 400 */
+  }
+  throw new HttpError(400, 'bad_request', 'page_token is invalid');
+}
+
+/**
+ * GET /v1/sync/topics — changed-topic discovery, ONE call per circle token
+ * (spec §1.3: the Bearer <redacted> exactly one (member_id, family_id); the
+ * server never crosses family boundaries, so there is no cross-circle sync).
+ *
+ * Changed = the topic has a VISIBLE entry (seq >= the caller's
+ * history_from_seq) with seq > max(acked_seq, history_from_seq - 1), where
+ * a missing read-state row counts as acked_seq 0 (all visible unread).
+ *
+ * Params: `bootstrap_gseq` (first call only), `limit`, `page_token`.
+ * Bootstrap decision (spec-ambiguous, documented): the first call carries
+ * no cursor and is a deliberate full re-read — every visible topic seeds a
+ * read-state row with acked_seq 0 and reports as changed once. `bootstrap_gseq`
+ * is accepted and validated but NOT used for seeding: the CLI deletes legacy
+ * cursor files without reading them, so any value sent would be unreliable;
+ * seeding-from-cursor was rejected in favor of the spec's headline behavior.
+ *
+ * Field decisions (spec-ambiguous, documented):
+ * - `acked_seq` is the EFFECTIVE read position
+ *   max(stored acked_seq, history_from_seq - 1).
+ * - `latest_seq` / `new_count` / `last_activity_ts` / `last_actor` are
+ *   computed over VISIBLE entries only (seq >= history_from_seq).
+ * - `e2ee` is 0/1 (integer), matching the existing topic JSON shape.
+ * - `key_status`: 'not_e2ee' for plaintext topics; for E2EE topics 'ok'
+ *   when the caller's agent holds an envelope for the committed current
+ *   key (current_epoch >= 1), else 'pending' (epoch 0 or no envelope —
+ *   use the key-request flow). rotation_required does not change it: the
+ *   agent still holds its current key; only writes pause.
+ * - `assigned_to_me`: an open/in_progress/blocked task in the topic is
+ *   assigned to the caller AND visible to them (F06 history floor).
+ * Paging is offset-based over (last_activity_ts DESC, topic_id ASC);
+ * changed sets can shift between pages — the CLI dedupes.
+ */
+async function handleSyncTopics(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+): Promise<Response> {
+  const url = new URL(req.url);
+  // Accepted, validated, intentionally not used for seeding (see above).
+  parseSeqCursor(url.searchParams.get('bootstrap_gseq'));
+  const limit = parseLimit(url.searchParams.get('limit'), 50, 200);
+  const offset = decodePageToken(url.searchParams.get('page_token'));
+
+  const rows = await db.queryAll(
+    `SELECT t.id AS topic_id, t.family_id AS circle_id, f.name AS circle_name,
+            t.subject, t.kind, t.e2ee,
+            t.current_epoch, t.current_key_id, t.rotation_required,
+            p.history_from_seq,
+            COALESCE(rs.acked_seq, 0) AS acked_seq,
+            (SELECT MAX(e.seq) FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq) AS latest_seq,
+            (SELECT COUNT(*) FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
+                AND e.seq > MAX(COALESCE(rs.acked_seq, 0), p.history_from_seq - 1)) AS new_count,
+            (SELECT e.ts FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
+              ORDER BY e.seq DESC LIMIT 1) AS last_activity_ts,
+            (SELECT e.actor_member_id FROM entries e
+              WHERE e.topic_id = t.id AND e.seq >= p.history_from_seq
+              ORDER BY e.seq DESC LIMIT 1) AS last_actor
+       FROM topics t
+       JOIN topic_participants p ON p.topic_id = t.id AND p.member_id = ?
+       JOIN families f ON f.id = t.family_id
+       LEFT JOIN topic_read_state rs
+         ON rs.topic_id = t.id AND rs.member_id = ? AND rs.agent_label = ?
+      WHERE t.family_id = ?`,
+    [auth.member_id, auth.member_id, auth.agent_label, auth.family_id],
+  );
+
+  const changed = rows.filter((r) => (r['new_count'] as number) > 0);
+  const topicIds = rows.map((r) => r['topic_id'] as string);
+
+  // Seed read-state rows (acked 0) for every visible topic lacking one —
+  // this is the bootstrap full re-read; later joins only add rows.
+  const ts = nowIso();
+  if (topicIds.length > 0) {
+    await db.execAtomically(
+      topicIds.map((topicId) => ({
+        sql: `INSERT INTO topic_read_state(member_id, agent_label, topic_id, acked_seq, updated_at)
+              SELECT ?,?,?,0,?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM topic_read_state
+                  WHERE member_id = ? AND agent_label = ? AND topic_id = ?)`,
+        params: [auth.member_id, auth.agent_label, topicId, ts, auth.member_id, auth.agent_label, topicId],
+      })),
+    );
+  }
+
+  // key_status: caller's agents holding an envelope for the committed
+  // current key.
+  let okTopics = new Set<string>();
+  if (topicIds.length > 0) {
+    const placeholders = topicIds.map(() => '?').join(',');
+    const okRows = await db.queryAll(
+      `SELECT e.topic_id FROM topic_key_envelopes e
+         JOIN topics t ON t.id = e.topic_id
+        WHERE e.member_id = ? AND e.agent_label = ?
+          AND t.current_epoch >= 1 AND e.key_id = t.current_key_id
+          AND e.topic_id IN (${placeholders})`,
+      [auth.member_id, auth.agent_label, ...topicIds],
+    );
+    okTopics = new Set(okRows.map((r) => r['topic_id'] as string));
+  }
+
+  // assigned_to_me: open task assigned to the caller and visible to them.
+  let assignedTopics = new Set<string>();
+  if (topicIds.length > 0) {
+    const placeholders = topicIds.map(() => '?').join(',');
+    const aRows = await db.queryAll(
+      `SELECT DISTINCT topic_id FROM tasks
+        WHERE assignee_member_id = ?
+          AND status NOT IN ('done','cancelled')
+          AND ${TASK_VISIBLE_TO_MEMBER}
+          AND topic_id IN (${placeholders})`,
+      [auth.member_id, auth.member_id, ...topicIds],
+    );
+    assignedTopics = new Set(aRows.map((r) => r['topic_id'] as string));
+  }
+
+  const topics = changed.map((r) => {
+    const e2ee = r['e2ee'] as number;
+    const topicId = r['topic_id'] as string;
+    const keyStatus = e2ee !== 1 ? 'not_e2ee' : okTopics.has(topicId) ? 'ok' : 'pending';
+    const effectiveAcked = Math.max(r['acked_seq'] as number, (r['history_from_seq'] as number) - 1);
+    return {
+      topic_id: topicId,
+      circle_id: r['circle_id'],
+      circle_name: r['circle_name'],
+      subject: r['subject'],
+      kind: r['kind'],
+      e2ee,
+      acked_seq: effectiveAcked,
+      latest_seq: r['latest_seq'],
+      new_count: r['new_count'],
+      last_activity_ts: r['last_activity_ts'],
+      last_actor: r['last_actor'],
+      key_status: keyStatus,
+      assigned_to_me: assignedTopics.has(topicId),
+    };
+  });
+  topics.sort((a, b) => {
+    const ta = (a['last_activity_ts'] as string | null) ?? '';
+    const tb = (b['last_activity_ts'] as string | null) ?? '';
+    if (ta !== tb) return tb < ta ? -1 : 1;
+    return (a['topic_id'] as string) < (b['topic_id'] as string) ? -1 : 1;
+  });
+
+  const page = topics.slice(offset, offset + limit);
+  const hasMore = offset + limit < topics.length;
+  logEvent('info', 'sync_topics', {
+    endpoint: 'sync/topics',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    family_id: auth.family_id,
+    changed: topics.length,
+    returned: page.length,
+    has_more: hasMore,
+  });
+  return json({
+    topics: page,
+    has_more: hasMore,
+    next_page_token: hasMore ? encodePageToken(offset + limit) : null,
+  });
+}
+
+/**
+ * POST /v1/topics/:tid/ack — receipt-bound, contiguous ack (spec §1.4).
+ * Body { seq, read_receipt }, both required.
+ *
+ * 1. HMAC-verify the receipt; it must bind THIS
+ *    (member_id, agent_label, topic_id) — cross-agent replay fails here.
+ * 2. effective = max(acked_seq, history_from_seq - 1).
+ * 3. seq <= effective → no-op success (idempotent).
+ * 4. Else require from_seq <= effective + 1 AND seq <= through_seq,
+ *    else 409 noncontiguous_ack (the client must read+ack pages in order).
+ * 5. Atomic max() upsert of read state.
+ */
+async function handleAck(
+  db: DbClient,
+  env: Env,
+  req: Request,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  const { history_from_seq } = await requireParticipant(db, auth, tid);
+  const body = await readJson(req);
+  const seqRaw = body['seq'];
+  if (typeof seqRaw !== 'number' || !Number.isInteger(seqRaw) || seqRaw < 0) {
+    throw new HttpError(400, 'bad_request', 'seq must be a non-negative integer');
+  }
+  const seq = seqRaw;
+  const receiptRaw = body['read_receipt'];
+  if (typeof receiptRaw !== 'string' || receiptRaw.length === 0 || receiptRaw.length > 512) {
+    throw new HttpError(400, 'bad_request', 'read_receipt is required');
+  }
+  const { from_seq, through_seq } = await verifyReadReceipt(
+    env,
+    receiptRaw,
+    auth.member_id,
+    auth.agent_label,
+    tid,
+  );
+  const state = await db.queryOne(
+    `SELECT acked_seq FROM topic_read_state
+      WHERE member_id = ? AND agent_label = ? AND topic_id = ?`,
+    [auth.member_id, auth.agent_label, tid],
+  );
+  const acked = state ? (state['acked_seq'] as number) : 0;
+  const effective = Math.max(acked, history_from_seq - 1);
+  if (seq <= effective) {
+    logEvent('info', 'topic_ack', {
+      endpoint: 'ack',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      outcome: 'noop',
+      acked_seq: effective,
+    });
+    return json({ topic_id: tid, acked_seq: effective });
+  }
+  if (from_seq > effective + 1 || seq > through_seq) {
+    logEvent('warn', 'topic_ack', {
+      endpoint: 'ack',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      outcome: 'rejected',
+      code: 'noncontiguous_ack',
+    });
+    throw new HttpError(
+      409,
+      'noncontiguous_ack',
+      'Ack is not contiguous with read state: read the topic in order (from_seq must be <= acked+1) and ack only seqs covered by the receipt (seq <= through_seq)',
+    );
+  }
+  // Atomic max(): concurrent acks can never move the cursor backwards.
+  const ts = nowIso();
+  await db.execAtomically([
+    {
+      sql: `INSERT INTO topic_read_state(member_id, agent_label, topic_id, acked_seq, updated_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(member_id, agent_label, topic_id)
+            DO UPDATE SET acked_seq = max(topic_read_state.acked_seq, excluded.acked_seq),
+                          updated_at = excluded.updated_at`,
+      params: [auth.member_id, auth.agent_label, tid, seq, ts],
+    },
+  ]);
+  logEvent('info', 'topic_ack', {
+    endpoint: 'ack',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    outcome: 'advanced',
+    acked_seq: seq,
+  });
+  return json({ topic_id: tid, acked_seq: seq });
+}
+
+/**
+ * Map a keys/commit write-conflict (UNIQUE/PK backstop fired by a
+ * concurrent commit that won the race between our pre-checks and the
+ * atomic batch) to the spec's 409 codes. SQLite/D1 constraint messages
+ * name the offending columns; the mapping is deliberately narrow so an
+ * unexpected constraint still surfaces as stale_epoch (retry-safe).
+ */
+function commitConflictError(e: unknown): HttpError {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/commitment/i.test(msg)) {
+    return new HttpError(
+      409,
+      'key_material_reuse',
+      'Identical key material was committed under a different key_id (concurrent commit won)',
+    );
+  }
+  if (/key_id/i.test(msg)) {
+    return new HttpError(
+      409,
+      'key_reuse',
+      'key_id was already used for this topic (concurrent commit won)',
+    );
+  }
+  return new HttpError(
+    409,
+    'stale_epoch',
+    'A concurrent key commit won the race; re-read the topic and retry',
+  );
+}
+
+function agentPairKey(memberId: string, agentLabel: string): string {
+  return memberId + '\n' + agentLabel;
+}
+
+function splitAgentPairKey(k: string): [string, string] {
+  const i = k.indexOf('\n');
+  return [k.slice(0, i), k.slice(i + 1)];
+}
+
+/**
+ * POST /v1/topics/:tid/keys/commit — staged atomic key activation
+ * (spec §1.4). Handles GENESIS (expected_epoch 1, topic at epoch 0) and
+ * ROTATION (expected_epoch = current_epoch + 1).
+ * Body { expected_epoch, key_id, commitment, force }. Owner/parent only.
+ *
+ * Single transaction: epoch+1 check (409 stale_epoch), key_id unused
+ * (409 key_reuse), commitment 64-hex and unused (409 key_material_reuse),
+ * then the set-equality of STAGED vs CURRENT agents:
+ *   staged = agents with an envelope row for key_id sealed to their
+ *            CURRENTLY-ACTIVE identity key (envelope.identity_key_id must
+ *            match the agent's active agent_keys row);
+ *   current = LIVE agents of current participant members — distinct
+ *            (member_id, agent_label) from non-revoked agent_tokens.
+ *            (Decision: revoked agents cannot fetch envelopes, so they do
+ *            not gate completeness; keyless-but-live agents DO, via force.)
+ *   - staged − current ≠ ∅ → 409 recipients_removed_key_burned {removed}:
+ *     the removed party saw this key material, so the server deletes its
+ *     staged rows and the client MUST generate fresh key material and
+ *     restart — resealing is insufficient. force cannot override.
+ *   - an agent WITH an active identity key but no staged envelope for it
+ *     (missing row, or sealed to a superseded key) → 409
+ *     superseded_identity_key {agents}: not force-overridable, the owner
+ *     must (re-)seal to the active key.
+ *   - an agent with NO active identity key at all → 409
+ *     incomplete_distribution {missing}; force (OWNER-only) may commit —
+ *     the only case force covers. The epoch row records forced=1 +
+ *     forced_missing; those agents get key_status pending and use the
+ *     key-request flow.
+ *   - equal → commit: INSERT the epoch row (recipients = staged set) and
+ *     CAS-update topics (current_key_id, current_epoch, clear
+ *     rotation_required) in ONE atomic batch. The epoch PK plus the
+ *     key_id/commitment UNIQUEs are the race backstops: a concurrent
+ *     commit that wins surfaces as a constraint error, mapped to 409.
+ */
+async function handleKeysCommit(
+  db: DbClient,
+  _env: Env,
+  req: Request,
+  auth: AuthContext,
+  tid: string,
+): Promise<Response> {
+  const { topic } = await requireParticipant(db, auth, tid);
+  if ((topic['e2ee'] as number) !== 1) {
+    throw new HttpError(400, 'bad_request', 'keys/commit is only valid for E2EE topics');
+  }
+  if (auth.role !== 'owner' && auth.role !== 'parent') {
+    throw new HttpError(403, 'forbidden', 'Only an owner or parent may commit a topic key');
+  }
+  const body = await readJson(req);
+  const expectedRaw = body['expected_epoch'];
+  if (typeof expectedRaw !== 'number' || !Number.isInteger(expectedRaw) || expectedRaw < 1) {
+    throw new HttpError(400, 'bad_request', 'expected_epoch must be a positive integer');
+  }
+  const expectedEpoch = expectedRaw;
+  const keyId = reqKeyId(body['key_id'], 'key_id');
+  const commitmentRaw = body['commitment'];
+  if (typeof commitmentRaw !== 'string' || !/^[0-9a-fA-F]{64}$/.test(commitmentRaw)) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      'commitment must be 64 hex chars (SHA256 of the topic key)',
+    );
+  }
+  const commitment = commitmentRaw.toLowerCase();
+  const forceRaw = body['force'];
+  if (forceRaw !== undefined && forceRaw !== true && forceRaw !== false) {
+    throw new HttpError(400, 'bad_request', 'force must be a boolean');
+  }
+  const force = forceRaw === true;
+  // force is owner-only even though plain commits allow parents.
+  if (force && auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only an owner may force-commit a topic key');
+  }
+
+  const currentEpoch = (topic['current_epoch'] as number | null) ?? 0;
+  if (expectedEpoch !== currentEpoch + 1) {
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'stale_epoch',
+    });
+    throw new HttpError(
+      409,
+      'stale_epoch',
+      `expected_epoch ${expectedEpoch} does not follow the topic's current epoch ${currentEpoch}`,
+    );
+  }
+  // Pre-checks; the UNIQUE backstops below catch races (mapped to 409).
+  const usedKey = await db.queryOne(
+    `SELECT 1 FROM topic_key_epochs WHERE topic_id = ? AND key_id = ?`,
+    [tid, keyId],
+  );
+  if (usedKey) {
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'key_reuse',
+    });
+    throw new HttpError(
+      409,
+      'key_reuse',
+      'key_id was already used for this topic — generate fresh key material',
+    );
+  }
+  const usedCommitment = await db.queryOne(
+    `SELECT 1 FROM topic_key_epochs WHERE topic_id = ? AND commitment = ?`,
+    [tid, commitment],
+  );
+  if (usedCommitment) {
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'key_material_reuse',
+    });
+    throw new HttpError(
+      409,
+      'key_material_reuse',
+      'Identical key material was already committed under a different key_id',
+    );
+  }
+
+  // staged: envelope rows for key_id sealed to the agent's currently-active
+  // identity key. Envelopes sealed to superseded keys (or to agents whose
+  // member has since left the topic — their key rows are never deleted)
+  // simply do not appear here.
+  const stagedRows = await db.queryAll(
+    `SELECT e.member_id, e.agent_label FROM topic_key_envelopes e
+       JOIN agent_keys k ON k.id = e.identity_key_id
+      WHERE e.topic_id = ? AND e.key_id = ?
+        AND k.member_id = e.member_id AND k.agent_label = e.agent_label
+        AND k.superseded_at IS NULL`,
+    [tid, keyId],
+  );
+  const staged = new Set(
+    stagedRows.map((r) => agentPairKey(r['member_id'] as string, r['agent_label'] as string)),
+  );
+  // current: live agents of current participant members.
+  const currentRows = await db.queryAll(
+    `SELECT DISTINCT t.member_id, t.agent_label
+       FROM agent_tokens t
+       JOIN topic_participants p ON p.member_id = t.member_id
+      WHERE p.topic_id = ? AND t.revoked_at IS NULL`,
+    [tid],
+  );
+  const current = new Set(
+    currentRows.map((r) => agentPairKey(r['member_id'] as string, r['agent_label'] as string)),
+  );
+  const activeRows = await db.queryAll(
+    `SELECT member_id, agent_label FROM agent_keys WHERE superseded_at IS NULL`,
+  );
+  const activeSet = new Set(
+    activeRows.map((r) => agentPairKey(r['member_id'] as string, r['agent_label'] as string)),
+  );
+
+  const removed = [...staged].filter((a) => !current.has(a));
+  if (removed.length > 0) {
+    // BURN: a removed party is assumed to have seen this key material (their
+    // envelope was staged), so the whole key is unusable — delete ALL of
+    // its staged rows. The client MUST generate fresh key material and
+    // restart: resealing the same key is insufficient. (The server does not
+    // keep a separate burn registry — the spec places the fresh-material
+    // obligation on the client; a same-key_id recommit would require
+    // deliberately re-sealing to the full current set, and the removed
+    // member can no longer be sealed to at all: envelope POST targets must
+    // be current participants.) force cannot override: committing would
+    // hand future messages to the removed party.
+    await db.execAtomically([
+      {
+        sql: `DELETE FROM topic_key_envelopes WHERE topic_id = ? AND key_id = ?`,
+        params: [tid, keyId],
+      },
+    ]);
+    const removedPairs = removed.map((a) => {
+      const [member_id, agent_label] = splitAgentPairKey(a);
+      return { member_id, agent_label };
+    });
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'recipients_removed_key_burned',
+      removed_count: removedPairs.length,
+    });
+    throw new HttpError(
+      409,
+      'recipients_removed_key_burned',
+      'Key burned: envelopes were staged for agents who are no longer participants — they saw this key material. The staged rows were deleted; generate fresh key material and restart (resealing is insufficient).',
+    );
+  }
+
+  const missing = [...current].filter((a) => !staged.has(a));
+  const superseded = missing.filter((a) => activeSet.has(a));
+  const keyless = missing.filter((a) => !activeSet.has(a));
+  if (superseded.length > 0) {
+    const agents = superseded.map((a) => {
+      const [member_id, agent_label] = splitAgentPairKey(a);
+      return { member_id, agent_label };
+    });
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: 'superseded_identity_key',
+      agent_count: agents.length,
+    });
+    throw new HttpError(
+      409,
+      'superseded_identity_key',
+      'Some agents have no envelope sealed to their ACTIVE identity key (missing or sealed to a superseded key). Re-seal to the active key and recommit; force cannot override this.',
+    );
+  }
+  let forced = 0;
+  let forcedMissing: string | null = null;
+  if (keyless.length > 0) {
+    if (!force) {
+      const agents = keyless.map((a) => {
+        const [member_id, agent_label] = splitAgentPairKey(a);
+        return { member_id, agent_label };
+      });
+      logEvent('warn', 'key_commit_rejected', {
+        endpoint: 'keys/commit',
+        member_id: auth.member_id,
+        agent_label: auth.agent_label,
+        topic_id: tid,
+        code: 'incomplete_distribution',
+        agent_count: agents.length,
+      });
+      throw new HttpError(
+        409,
+        'incomplete_distribution',
+        'Some current agents have no active identity key and no envelope. Seal the delta and recommit, or retry with force:true (owner only) to commit without them.',
+      );
+    }
+    forced = 1;
+    forcedMissing = JSON.stringify(
+      keyless.map((a) => {
+        const [member_id, agent_label] = splitAgentPairKey(a);
+        return [member_id, agent_label];
+      }),
+    );
+  }
+
+  // Single atomic batch: INSERT the epoch row, then CAS-advance the topic
+  // (clearing rotation_required). The (topic_id, epoch) PK plus the
+  // (topic_id, key_id) / (topic_id, commitment) UNIQUEs are the race
+  // backstops — a concurrent commit that wins raises a constraint error,
+  // mapped to 409 below.
+  const ts = nowIso();
+  const recipients = JSON.stringify(
+    [...staged].map((a) => {
+      const [member_id, agent_label] = splitAgentPairKey(a);
+      return [member_id, agent_label];
+    }),
+  );
+  try {
+    await db.execAtomically([
+      {
+        sql: `INSERT INTO topic_key_epochs(
+                topic_id, epoch, key_id, commitment, recipients,
+                forced, forced_missing, created_at, created_by)
+              VALUES (?,?,?,?,?,?,?,?,?)`,
+        params: [tid, expectedEpoch, keyId, commitment, recipients, forced, forcedMissing, ts, auth.member_id],
+      },
+      {
+        sql: `UPDATE topics
+                 SET current_key_id = ?, current_epoch = ?, rotation_required = 0
+               WHERE id = ? AND current_epoch = ?`,
+        params: [keyId, expectedEpoch, tid, expectedEpoch - 1],
+      },
+    ]);
+  } catch (e) {
+    const mapped = commitConflictError(e);
+    logEvent('warn', 'key_commit_rejected', {
+      endpoint: 'keys/commit',
+      member_id: auth.member_id,
+      agent_label: auth.agent_label,
+      topic_id: tid,
+      code: mapped.code,
+    });
+    throw mapped;
+  }
+  // CAS sanity check: execAtomically reports no row counts, so re-read.
+  // (The epoch PK makes a silent half-apply impossible — a lost race would
+  // have raised above — this is belt-and-braces.)
+  const after = await db.queryOne(`SELECT current_epoch, current_key_id FROM topics WHERE id = ?`, [
+    tid,
+  ]);
+  if (after!['current_epoch'] !== expectedEpoch || after!['current_key_id'] !== keyId) {
+    throw new HttpError(
+      409,
+      'stale_epoch',
+      'A concurrent key commit won the race; re-read the topic and retry',
+    );
+  }
+  logEvent('info', 'key_epoch_committed', {
+    endpoint: 'keys/commit',
+    member_id: auth.member_id,
+    agent_label: auth.agent_label,
+    topic_id: tid,
+    epoch: expectedEpoch,
+    forced,
+  });
+  return json({ topic_id: tid, epoch: expectedEpoch, key_id: keyId });
 }
 
 // POST /v1/topics/:tid/tasks
@@ -3802,6 +4624,8 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     if (path === '/v1/topics' && method === 'POST') return await handleCreateTopic(db, env, req, auth);
     if (path === '/v1/topics' && method === 'GET') return await handleListTopics(db, req, auth);
     if (path === '/v1/sync' && method === 'GET') return await handleSync(db, req, auth);
+    // Sync v2 (spec §1.4): per-circle-token changed-topic discovery.
+    if (path === '/v1/sync/topics' && method === 'GET') return await handleSyncTopics(db, req, auth);
 
     const famInvite = /^\/v1\/families\/([^/]+)\/invites$/.exec(path);
     if (famInvite && method === 'POST') {
@@ -3828,9 +4652,9 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       }
     }
 
-    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes|subject)$/.exec(path);
+    const topicSub = /^\/v1\/topics\/([^/]+)\/(history|export|invite|spawn|entries|tasks|envelopes|subject|ack)$/.exec(path);
     if (topicSub && method === 'GET' && topicSub[2] === 'history') {
-      return await handleHistory(db, req, auth, decodeURIComponent(topicSub[1]));
+      return await handleHistory(db, env, req, auth, decodeURIComponent(topicSub[1]));
     }
     if (topicSub && method === 'GET' && topicSub[2] === 'export') {
       return await handleExport(db, auth, decodeURIComponent(topicSub[1]));
@@ -3866,6 +4690,17 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     const topicOnly = /^\/v1\/topics\/([^/]+)$/.exec(path);
     if (topicOnly && method === 'GET') {
       return await handleGetTopic(db, auth, decodeURIComponent(topicOnly[1]));
+    }
+
+    // Sync v2 (spec §1.4) — receipt-bound contiguous ack.
+    if (topicSub && method === 'POST' && topicSub[2] === 'ack') {
+      return await handleAck(db, env, req, auth, decodeURIComponent(topicSub[1]));
+    }
+    // E2EE (sync v2, spec §1.4) — POST /v1/topics/:tid/keys/commit:
+    // staged atomic key activation (genesis + rotation).
+    const topicKeysCommit = /^\/v1\/topics\/([^/]+)\/keys\/commit$/.exec(path);
+    if (topicKeysCommit && method === 'POST') {
+      return await handleKeysCommit(db, env, req, auth, decodeURIComponent(topicKeysCommit[1]));
     }
 
     // E2EE Phase 4 — DELETE /v1/topics/:tid/participants/:mid (owner/parent).

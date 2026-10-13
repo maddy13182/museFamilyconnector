@@ -446,12 +446,25 @@ test('envelope GET: each agent sees only its own envelopes; non-participant 403'
     assert.equal(r.status, 201);
   }
 
-  // Owner sees exactly their own envelope.
+  // Sync v2: staged envelopes are invisible until keys/commit activates the
+  // epoch. Commit the staged key (genesis, expected_epoch 1).
+  const commitment = hex(32);
+  const commit = await app.call('POST', `/v1/topics/${tid}/keys/commit`, {
+    token: owner.token,
+    body: { expected_epoch: 1, key_id: keyId, commitment },
+  });
+  assert.equal(commit.status, 200, `commit failed: ${JSON.stringify(commit.body)}`);
+  assert.equal(commit.body.epoch, 1);
+  assert.equal(commit.body.key_id, keyId);
+
+  // Owner sees exactly their own envelope, with the epoch commitment (N07).
   const ownGet = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: owner.token });
   assert.equal(ownGet.status, 200);
   assert.equal(ownGet.body.envelopes.length, 1);
   assert.equal(ownGet.body.envelopes[0].agent_label, owner.agentLabel);
   assert.equal(ownGet.body.envelopes[0].key_id, keyId);
+  assert.equal(ownGet.body.envelopes[0].epoch, 1);
+  assert.equal(ownGet.body.envelopes[0].commitment, commitment);
 
   // bee-agent sees exactly its own — never bee2-agent's, never the owner's.
   const bGet = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: agentB.token });

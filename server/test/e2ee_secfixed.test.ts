@@ -186,7 +186,7 @@ test('F1: kid participant introducing a new key_id is 403; current_key_id unchan
   assert.equal(n!['c'], 0);
 });
 
-test('F1: owner introducing a new key_id succeeds and advances current_key_id', async () => {
+test('F1: owner introducing a new key_id stages it — current_key_id does NOT advance (N04)', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SecfixF1d');
   const keyId = hex(16);
@@ -194,6 +194,9 @@ test('F1: owner introducing a new key_id succeeds and advances current_key_id', 
   assert.equal(res.status, 201);
   const tid = res.body.topic.id as string;
 
+  // Sync v2 (N04 fix): POSTing an envelope with a new key_id STORES it
+  // (staged) but no longer flips topics.current_key_id — only
+  // POST /v1/topics/:tid/keys/commit activates a key.
   const rotatedKeyId = hex(16);
   const rot = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
     token: owner.token,
@@ -204,12 +207,22 @@ test('F1: owner introducing a new key_id succeeds and advances current_key_id', 
     }),
   });
   assert.equal(rot.status, 201);
-  assert.equal(await currentKeyId(app, tid), rotatedKeyId);
+  assert.equal(await currentKeyId(app, tid), keyId, 'current_key_id must not flip on envelope POST');
+  const n = await app.db.queryOne(
+    `SELECT COUNT(*) AS c FROM topic_key_envelopes WHERE topic_id = ? AND key_id = ?`,
+    [tid, rotatedKeyId],
+  );
+  assert.equal(n!['c'], 1, 'staged envelope must be stored');
 
-  // GET /v1/topics/:id advertises the new current key (the CLI elects from it).
+  // GET /v1/topics/:id still advertises the old current key.
   const detail = await app.call('GET', `/v1/topics/${tid}`, { token: owner.token });
   assert.equal(detail.status, 200);
-  assert.equal(detail.body.topic.current_key_id, rotatedKeyId);
+  assert.equal(detail.body.topic.current_key_id, keyId);
+
+  // The staged envelope is invisible via GET until keys/commit.
+  const staged = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: owner.token });
+  assert.equal(staged.status, 200);
+  assert.equal(staged.body.envelopes.length, 0, 'staged envelopes must stay invisible pre-commit');
 });
 
 test('F1: re-POST of the CURRENT key_id by a kid is distribution, not rotation (201)', async () => {
