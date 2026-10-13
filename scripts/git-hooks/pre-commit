@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Pre-commit hook: catch version-bump and workflow issues before they reach CI.
+# Install with: ./scripts/install-git-hooks.sh
+#
+# Checks (fast, local-only):
+#   1. If bundled skill docs changed (staged), SKILL VERSION header must be bumped.
+#   2. If a version was bumped (staged), a changelog fragment must exist with
+#      a type matching the bump level.
+#   3. Workflow YAML: every step must have `run:` or `uses:` (catches the
+#      empty-step bug that broke the release workflow in PR #36).
+#
+# This mirrors scripts/pr_check.py but operates on staged changes vs HEAD,
+# so developers get feedback at commit time instead of waiting for CI.
+
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+fail=0
+say() { echo "pre-commit: $*"; }
+err() { say "ERROR: $*"; fail=1; }
+
+# --- 1. Skill docs changed -> SKILL VERSION must be bumped ---
+SKILL_DOCS=(
+  "agent-skill/SKILL.md"
+  "agent-skill/INSTALL.md"
+  "agent-skill/requirements.txt"
+)
+skill_docs_changed=0
+for f in "${SKILL_DOCS[@]}"; do
+  if git diff --cached --name-only | grep -qx "$f"; then
+    skill_docs_changed=1; break
+  fi
+done
+if git diff --cached --name-only | grep -q "^agent-skill/references/"; then
+  skill_docs_changed=1
+fi
+
+get_skill_ver() { # $1 = git rev (HEAD or :0 for staged)
+  git show "$1:agent-skill/SKILL.md" 2>/dev/null \
+    | grep -oP '<!--\s*SKILL VERSION:\s*\K[0-9A-Za-z.\-+]+' | head -1
+}
+
+if [ "$skill_docs_changed" = 1 ]; then
+  old_ver=$(get_skill_ver HEAD || true)
+  new_ver=$(get_skill_ver :0 || true)
+  if [ "$old_ver" = "$new_ver" ]; then
+    err "bundled skill docs changed but SKILL VERSION header was not bumped ($old_ver -> $new_ver). Bump it in agent-skill/SKILL.md."
+  else
+    say "skill version bump: $old_ver -> $new_ver"
+  fi
+fi
+
+# --- 2. Version bumped -> changelog fragment must match ---
+# Check staged fragments against the staged version bump.
+staged_frags=$(git diff --cached --name-only --diff-filter=A | grep "^changelog.d/.*\.md$" || true)
+if [ -n "$staged_frags" ]; then
+  # Determine bump level from SKILL VERSION change (staged vs HEAD).
+  old_ver=$(get_skill_ver HEAD || echo "0.0.0")
+  new_ver=$(get_skill_ver :0 || echo "0.0.0")
+  if [ "$old_ver" != "$new_ver" ]; then
+    IFS=. read -r oMaj oMin oPat <<< "$old_ver"
+    IFS=. read -r nMaj nMin nPat <<< "$new_ver"
+    if [ "$nMaj" != "$oMaj" ]; then level=2; lname="major"
+    elif [ "$nMin" != "$oMin" ]; then level=1; lname="minor"
+    else level=0; lname="patch"; fi
+    say "skill bump level: $lname ($old_ver -> $new_ver)"
+    # Fragment types and their minimum levels.
+    for frag in $staged_frags; do
+      base=$(basename "$frag")
+      ftype=$(echo "$base" | sed -E 's/^[a-z0-9-]+\.([a-z]+)\.md$/\1/')
+      case "$ftype" in
+        removed) need=2 ;;
+        added|changed|deprecated) need=1 ;;
+        fixed|security) need=0 ;;
+        *) err "fragment $base has unknown type '$ftype'"; continue ;;
+      esac
+      if [ "$level" -lt "$need" ]; then
+        needname="major"; [ "$need" = 1 ] && needname="minor"; [ "$need" = 0 ] && needname="patch"
+        err "fragment $base (type '$ftype') requires at least a $needname bump, but skill went $old_ver -> $new_ver ($lname)."
+      fi
+    done
+  fi
+fi
+
+# --- 3. Workflow YAML: every step needs run: or uses: ---
+for wf in $(git diff --cached --name-only | grep "^\.github/workflows/.*\.yml$" || true); do
+  # Validate the staged version of the file.
+  if ! git show ":0:$wf" | python3 -c "
+import sys, yaml
+data = yaml.safe_load(sys.stdin)
+bad = []
+for job_id, job in (data.get('jobs') or {}).items():
+    for i, step in enumerate(job.get('steps') or []):
+        if 'run' not in step and 'uses' not in step:
+            bad.append(f\"{job_id}/{step.get('name', f'step-{i}')}\")
+if bad:
+    print('STEPS WITHOUT run:/uses:: ' + ', '.join(bad))
+    sys.exit(1)
+" 2>/dev/null; then
+    # Fall through to a clearer message if python/yaml is missing.
+    :
+  fi
+  out=$(git show ":0:$wf" | python3 -c "
+import sys, yaml
+try:
+    data = yaml.safe_load(sys.stdin)
+except Exception as e:
+    print(f'YAML parse error: {e}'); sys.exit(1)
+bad = []
+for job_id, job in (data.get('jobs') or {}).items():
+    for i, step in enumerate(job.get('steps') or []):
+        if 'run' not in step and 'uses' not in step:
+            bad.append(f\"{job_id}/{step.get('name', f'step-{i}')}\")
+if bad:
+    print('empty steps: ' + ', '.join(bad)); sys.exit(1)
+" 2>&1) || err "workflow $wf: $out"
+done
+
+if [ "$fail" = 1 ]; then
+  say "commit blocked — fix the errors above."
+  exit 1
+fi
+say "checks passed."
