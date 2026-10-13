@@ -260,3 +260,22 @@ test('migration 0005 backfill: one principal per distinct email', async () => {
   assert.ok(pid.startsWith('pr_'));
   assert.ok(!pid.includes('mahesh'), 'principal id must not embed the email');
 });
+
+test('GET /v1/me exposes is_hub_owner for agent discovery', async () => {
+  const { app, ownerToken, kidToken, strangerToken } = await lockedSetup();
+
+  const ownerMe = await app.call('GET', '/v1/me', { token: ownerToken });
+  assert.equal(ownerMe.status, 200);
+  assert.equal(ownerMe.body.is_hub_owner, true);
+  assert.equal(ownerMe.body.role, 'owner');
+
+  const kidMe = await app.call('GET', '/v1/me', { token: kidToken });
+  assert.equal(kidMe.status, 200);
+  assert.equal(kidMe.body.is_hub_owner, false);
+  assert.equal(kidMe.body.role, 'kid');
+
+  // Owner of a different circle is still a hub owner (any-circle rule).
+  const strangerMe = await app.call('GET', '/v1/me', { token: strangerToken });
+  assert.equal(strangerMe.status, 200);
+  assert.equal(strangerMe.body.is_hub_owner, true);
+});

@@ -907,7 +907,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [id, family_id, name, email, role, created_at, agent_label]
+                required: [id, family_id, name, email, role, created_at, agent_label, is_hub_owner]
                 properties:
                   id: { type: string }
                   family_id: { type: string }
@@ -918,6 +918,13 @@ paths:
                   agent_label:
                     type: string
                     description: The agent label recorded when this token was issued.
+                  is_hub_owner:
+                    type: boolean
+                    description: >
+                      True when the caller's principal holds the owner role in
+                      at least one circle — i.e. this agent may create circles
+                      (POST /v1/families while setup is locked). Lets the agent
+                      learn this from `hub me` instead of via a 403.
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ------------------------------------------------------------------- topics
