@@ -4494,7 +4494,9 @@ def _maybe_nudge_updates(versions):
                 % (adv_skill, SKILL_VERSION)
             )
     except Exception:
-        pass
+        # Best-effort nudge: never break the sync for it. (return, not
+        # pass: bandit B110 flags try/except/pass.)
+        return
 
 
 def cmd_sync(args, transport):
