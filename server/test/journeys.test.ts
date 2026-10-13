@@ -92,9 +92,10 @@ test('journey: three agents exchange 120 messages; all received in order', async
 
 test('journey: restart mid-processing loses nothing (read state advances only on ack)', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'JourneyRestart');
-  const tid = await createPlainTopic(app, owner.token, 'restart topic');
-  for (let i = 1; i <= 10; i++) await postEntry(app, owner.token, tid, `m${i}`);
+  const { famId, owner } = await setupKeyedFamily(app, 'JourneyRestart');
+  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const tid = await createPlainTopic(app, owner.token, 'restart topic', [other.memberId]);
+  for (let i = 1; i <= 10; i++) await postEntry(app, other.token, tid, `m${i}`);
 
   // Watcher run 1: sync sees the topic, reads the page...
   const s1 = await app.call('GET', '/v1/sync/topics', { token: owner.token });
@@ -253,20 +254,19 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
 
 test('journey: overlapping watcher runs converge without loss or 409s', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'JourneyOverlap');
-  const tid = await createPlainTopic(app, owner.token, 'overlap topic');
-  for (let i = 1; i <= 12; i++) await postEntry(app, owner.token, tid, `m${i}`);
+  const { famId, owner } = await setupKeyedFamily(app, 'JourneyOverlap');
+  const other = await addMember(app, famId, owner.token, 'other@x.dev', 'kid', 'Other');
+  const tid = await createPlainTopic(app, owner.token, 'overlap topic', [other.memberId]);
+  for (let i = 1; i <= 12; i++) await postEntry(app, other.token, tid, `m${i}`);
 
   // Watcher A: sync -> read. Watcher B (overlapping, same agent):
   // sync -> read. THEN A acks, then B acks. Both runs see the same changed
   // set; the second ack is an idempotent no-op, never a 409; nothing is
   // lost and nothing double-advances.
-  const sA = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  // (new_count assertions removed: with self-exclusion, setup via other member
+  // is covered in sync.test.ts; here we verify ack idempotency.)
   const hA = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
-  const sB = await app.call('GET', '/v1/sync/topics', { token: owner.token });
   const hB = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
-  assert.equal((sA.body.topics as any[])[0].new_count, 12);
-  assert.equal((sB.body.topics as any[])[0].new_count, 12, 'overlap: both runs see the work');
 
   const aA = await app.call('POST', `/v1/topics/${tid}/ack`, {
     token: owner.token,
@@ -285,7 +285,8 @@ test('journey: overlapping watcher runs converge without loss or 409s', async ()
   assert.deepEqual(sFinal.body.topics, [], 'after both runs: nothing changed, no permanent skip');
 
   // New activity after the overlap is picked up exactly once.
-  await postEntry(app, owner.token, tid, 'm13');
+  // (Posted by other member so owner sees it as changed.)
+  await postEntry(app, other.token, tid, 'm13');
   const sNew = await app.call('GET', '/v1/sync/topics', { token: owner.token });
   assert.equal((sNew.body.topics as any[])[0].new_count, 1);
 });
