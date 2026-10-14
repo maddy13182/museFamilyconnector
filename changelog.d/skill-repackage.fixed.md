@@ -1,0 +1,1 @@
+Repackaged skill bundle (v1.2.2) embedding CLI 1.1.1. The v1.2.1 bundle contained hub 1.1.0, which failed the bundle-client's embedded-hub invariant after the manifest pinned CLI 1.1.1. No doc changes; binary-only refresh.
