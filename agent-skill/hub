@@ -5492,6 +5492,13 @@ def _circle_member_path(family_id, member_id):
         urlparse.quote(family_id, safe=""), urlparse.quote(member_id, safe=""))
 
 
+def _server_owner_path(principal_id=None):
+    base = "/v1/server/owners"
+    if principal_id:
+        return "%s/%s" % (base, urlparse.quote(principal_id, safe=""))
+    return base
+
+
 def _emit_json_result(resp):
     """Print an endpoint response — structural secret-scrubbed.
 
@@ -5514,6 +5521,47 @@ def cmd_circle_remove_member(args, transport):
     resp = ctx.client.call(
         "DELETE",
         _circle_member_path(family_id, member_id),
+    )
+    return _emit_json_result(resp)
+
+
+def cmd_server_owners(args, transport):
+    """List the server owners (server-owner only)."""
+    ctx = _ctx(args, transport)
+    resp = ctx.client.call("GET", _server_owner_path())
+    return _emit_json_result(resp)
+
+
+def cmd_server_promote(args, transport):
+    """Promote a principal to server owner (server-owner only)."""
+    ctx = _ctx(args, transport)
+    body = {}
+    principal_id = (args.principal_id or "").strip()
+    member_id = (args.member_id or "").strip()
+    if principal_id:
+        body["principal_id"] = principal_id
+    elif member_id:
+        body["member_id"] = member_id
+    else:
+        raise HubError("bad_request",
+                       "Provide --principal or --member.")
+    resp = ctx.client.call(
+        "POST",
+        _server_owner_path(),
+        json_body=body,
+    )
+    return _emit_json_result(resp)
+
+
+def cmd_server_demote(args, transport):
+    """Demote a server owner (server-owner only)."""
+    ctx = _ctx(args, transport)
+    principal_id = (args.principal_id or "").strip()
+    if not principal_id:
+        raise HubError("bad_request", "A --principal id is required.")
+    resp = ctx.client.call(
+        "DELETE",
+        _server_owner_path(principal_id),
     )
     return _emit_json_result(resp)
 
@@ -7607,6 +7655,59 @@ def build_parser():
                    metavar="MEMBER_ID",
                    help="Member id to remove from the circle")
     c.set_defaults(func=cmd_circle_remove_member)
+
+    p = sub.add_parser(
+        "server",
+        formatter_class=_RDH,
+        help="Server ownership control plane (server owners only)",
+        description="Manage server owners: list who can create circles, "
+        "promote a principal to server owner, or demote one. Server "
+        "ownership is separate from circle ownership — owning a circle "
+        "does not grant these powers. Run `hub server <action> --help` "
+        "for each action's flags.",
+        epilog="examples:\n"
+        "  hub server owners\n"
+        "  hub server promote --member 123e4567-e89b-12d3-a456-426614174000\n"
+        "  hub server demote --principal pr_abc123",
+    )
+    ssub = p.add_subparsers(dest="server_action", required=True,
+                            metavar="<action>")
+    c = ssub.add_parser(
+        "owners",
+        formatter_class=_RDH,
+        help="List the server owners",
+        description="List the principals registered as server owners. "
+        "Only server owners can create circles and manage this list.",
+        epilog="example:\n  hub server owners",
+    )
+    c.set_defaults(func=cmd_server_owners)
+    c = ssub.add_parser(
+        "promote",
+        formatter_class=_RDH,
+        help="Promote a principal to server owner (server owner only)",
+        description="Promote a principal to server owner, giving them "
+        "circle-creation power. Identify the principal directly, or pass "
+        "one of their member ids and the server resolves it.",
+        epilog="example:\n  hub server promote "
+        "--member 123e4567-e89b-12d3-a456-426614174000",
+    )
+    c.add_argument("--principal", default=None, dest="principal_id", metavar="PRINCIPAL_ID",
+                   help="Principal id to promote")
+    c.add_argument("--member", default=None, dest="member_id", metavar="MEMBER_ID",
+                   help="Member id whose principal gets promoted")
+    c.set_defaults(func=cmd_server_promote)
+    c = ssub.add_parser(
+        "demote",
+        formatter_class=_RDH,
+        help="Demote a server owner (server owner only)",
+        description="Remove a principal from the server owners. The last "
+        "server owner cannot be demoted — an empty list would lock "
+        "everyone out of circle creation and promotion.",
+        epilog="example:\n  hub server demote --principal pr_abc123",
+    )
+    c.add_argument("--principal", required=True, dest="principal_id", metavar="PRINCIPAL_ID",
+                   help="Principal id to demote")
+    c.set_defaults(func=cmd_server_demote)
 
     p = sub.add_parser(
         "dashboard-token",

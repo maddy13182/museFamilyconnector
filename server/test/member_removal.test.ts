@@ -211,15 +211,28 @@ test('removal drops topic participation and arms E2EE rotation', async () => {
 test('removed owner loses hub-owner powers (cannot create circles)', async () => {
   const { app, famId, ownerToken } = await setup();
   const o2 = await inviteJoin(app, famId, ownerToken, 'suresh@fam.dev', 'owner', 'Suresh');
-  // o2 is a hub owner via this circle: can create while locked... but the
-  // fixture isn't locked here. Instead assert the choke point: after
-  // removal, o2's token is dead, so circle creation 401s rather than 403s.
   app.env.SETUP_LOCKED = '1';
+
+  // New authority model (server_owners): an invited circle owner is not a
+  // server owner, so circle creation is 403 even before removal.
   const before = await app.call('POST', '/v1/families', {
     token: o2.token,
     body: { name: 'o2 circle' },
   });
-  assert.equal(before.status, 201);
+  assert.equal(before.status, 403);
+
+  // And removal neutralizes even a PROMOTED server owner: the credential
+  // is revoked at the auth choke point (401), not merely forbidden (403).
+  const pro = await app.call('POST', '/v1/server/owners', {
+    token: ownerToken,
+    body: { member_id: o2.memberId },
+  });
+  assert.equal(pro.status, 201);
+  const canCreate = await app.call('POST', '/v1/families', {
+    token: o2.token,
+    body: { name: 'o2 promoted circle' },
+  });
+  assert.equal(canCreate.status, 201);
 
   const rm = await removeMember(app, famId, ownerToken, o2.memberId);
   assert.equal(rm.status, 200);

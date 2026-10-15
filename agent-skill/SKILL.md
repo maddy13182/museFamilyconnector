@@ -298,6 +298,9 @@ not by convention. If you get a **403**, it is final:
 | First-time setup | `hub setup` (see INSTALL.md) |
 | Verify the installed CLI against the signed release | `hub verify-install` |
 | Emergency: revoke a credential | `hub token-revoke --token-id <id>` — suspected compromise runbook, §2 (confirmation required; re-enroll afterwards) |
+| List server owners (server owners only) | `hub server owners` — server owners can create circles; circle owners cannot |
+| Promote a server owner (server owners only) | `hub server promote --principal <id> \| --member <member-id>` |
+| Demote a server owner (server owners only) | `hub server demote --principal <id>` — the last server owner cannot be demoted |
 
 Global flags: `--profile <name>` (separate config/tokens/keystore per agent on one
 machine — run one watcher per member, §2), `--server <url>` (override — see below), `--debug` (sanitized
