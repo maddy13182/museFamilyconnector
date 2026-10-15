@@ -1,3 +1,4 @@
+import { b64 } from './syncv2_helpers.js';
 // Server ownership control plane (migration 0012).
 //
 // The design under test: creating circles is a server-operator power gated
@@ -8,17 +9,18 @@
 // batch as the principal/family/member rows: no gap, no second step.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { makeApp, TestApp } from './app.js';
+import { makeClientApp as makeApp } from './fixture-client.js';
+import type { TestClientApp as TestApp } from './fixture-client.js';
 
 async function bootstrap(app: TestApp, name: string, ownerName: string, email: string) {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: ownerName, owner_email: email },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
   return { famId: fam.body.family.id as string, token: red.body.token as string };
@@ -32,15 +34,15 @@ async function inviteAccept(
   role: string,
   displayName: string,
 ) {
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: inviterToken,
     body: { email, role },
   });
   assert.equal(inv.status, 201);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` } },
+    `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
@@ -61,14 +63,14 @@ test('bootstrap seeds the operator as a server owner (no gap)', async () => {
   const rows = await app.db.queryAll(`SELECT * FROM server_owners`);
   assert.equal(rows.length, 1);
 
-  const list = await app.call('GET', '/v1/server/owners', { token: a.token });
+  const list = await app.call('GET', '/v2/server/owners', { token: a.token });
   assert.equal(list.status, 200);
   assert.equal(list.body.owners.length, 1);
   assert.equal(list.body.owners[0].principal_id, rows[0]['principal_id']);
   assert.equal(list.body.owners[0].name, 'Mahesh');
   assert.equal(list.body.owners[0].email, 'mahesh@a.dev');
 
-  const me = await app.call('GET', '/v1/me', { token: a.token });
+  const me = await app.call('GET', '/v2/me', { token: a.token });
   assert.equal(me.body.is_hub_owner, true);
 });
 
@@ -78,17 +80,17 @@ test('a circle owner who was not bootstrapped cannot create circles', async () =
   const { app, ownerToken, famId } = await lockedSetup();
   const prem = await inviteAccept(app, famId, ownerToken, 'prem@x.dev', 'owner', 'Prem');
 
-  const create = await app.call('POST', '/v1/families', {
+  const create = await app.call('POST', '/v2/families', {
     token: prem.token,
     body: { name: 'Prem Circle' },
   });
   assert.equal(create.status, 403);
   assert.equal(create.body.error.code, 'forbidden');
 
-  const list = await app.call('GET', '/v1/server/owners', { token: prem.token });
+  const list = await app.call('GET', '/v2/server/owners', { token: prem.token });
   assert.equal(list.status, 403);
 
-  const me = await app.call('GET', '/v1/me', { token: prem.token });
+  const me = await app.call('GET', '/v2/me', { token: prem.token });
   assert.equal(me.body.is_hub_owner, false);
 });
 
@@ -96,7 +98,7 @@ test('promote by member_id grants circle-creation power (idempotent)', async () 
   const { app, ownerToken, famId } = await lockedSetup();
   const prem = await inviteAccept(app, famId, ownerToken, 'prem@x.dev', 'owner', 'Prem');
 
-  const pro = await app.call('POST', '/v1/server/owners', {
+  const pro = await app.call('POST', '/v2/server/owners', {
     token: ownerToken,
     body: { member_id: prem.memberId },
   });
@@ -104,7 +106,7 @@ test('promote by member_id grants circle-creation power (idempotent)', async () 
   assert.ok(pro.body.owner.principal_id);
 
   // Idempotent: promoting again returns the row, no duplicate.
-  const again = await app.call('POST', '/v1/server/owners', {
+  const again = await app.call('POST', '/v2/server/owners', {
     token: ownerToken,
     body: { member_id: prem.memberId },
   });
@@ -113,13 +115,13 @@ test('promote by member_id grants circle-creation power (idempotent)', async () 
   assert.equal(count?.['c'], 2); // Mahesh (bootstrap) + Prem
 
   // Prem can now create circles.
-  const create = await app.call('POST', '/v1/families', {
+  const create = await app.call('POST', '/v2/families', {
     token: prem.token,
     body: { name: 'Prem Circle' },
   });
   assert.equal(create.status, 201);
 
-  const list = await app.call('GET', '/v1/server/owners', { token: ownerToken });
+  const list = await app.call('GET', '/v2/server/owners', { token: ownerToken });
   assert.equal(list.body.owners.length, 2);
 });
 
@@ -132,13 +134,13 @@ test('promote by principal_id; validations', async () => {
 
   // 403: a non-server-owner cannot promote (even themselves) — checked
   // before Prem holds any server power.
-  const evil = await app.call('POST', '/v1/server/owners', {
+  const evil = await app.call('POST', '/v2/server/owners', {
     token: prem.token,
     body: { member_id: prem.memberId },
   });
   assert.equal(evil.status, 403);
 
-  const pro = await app.call('POST', '/v1/server/owners', {
+  const pro = await app.call('POST', '/v2/server/owners', {
     token: ownerToken,
     body: { principal_id: principal },
   });
@@ -146,16 +148,16 @@ test('promote by principal_id; validations', async () => {
   assert.equal(pro.body.owner.principal_id, principal);
 
   // 400: neither id given.
-  const bad = await app.call('POST', '/v1/server/owners', { token: ownerToken, body: {} });
+  const bad = await app.call('POST', '/v2/server/owners', { token: ownerToken, body: {} });
   assert.equal(bad.status, 400);
 
   // 404: unknown principal / member.
-  const noPrin = await app.call('POST', '/v1/server/owners', {
+  const noPrin = await app.call('POST', '/v2/server/owners', {
     token: ownerToken,
     body: { principal_id: 'pr_doesnotexist' },
   });
   assert.equal(noPrin.status, 404);
-  const noMem = await app.call('POST', '/v1/server/owners', {
+  const noMem = await app.call('POST', '/v2/server/owners', {
     token: ownerToken,
     body: { member_id: '00000000-0000-0000-0000-000000000000' },
   });
@@ -169,21 +171,21 @@ test('demote removes power; the last server owner is protected', async () => {
   const premPrincipal = row?.['principal_id'] as string;
 
   // Promote, then demote.
-  const pro = await app.call('POST', '/v1/server/owners', {
+  const pro = await app.call('POST', '/v2/server/owners', {
     token: ownerToken,
     body: { principal_id: premPrincipal },
   });
   assert.equal(pro.status, 201);
   const dem = await app.call(
     'DELETE',
-    `/v1/server/owners/${encodeURIComponent(premPrincipal)}`,
+    `/v2/server/owners/${encodeURIComponent(premPrincipal)}`,
     { token: ownerToken },
   );
   assert.equal(dem.status, 200);
   assert.equal(dem.body.removed, premPrincipal);
 
   // Power is gone again.
-  const create = await app.call('POST', '/v1/families', {
+  const create = await app.call('POST', '/v2/families', {
     token: prem.token,
     body: { name: 'Nope' },
   });
@@ -196,19 +198,19 @@ test('demote removes power; the last server owner is protected', async () => {
   const maheshPrincipal = meRow?.['principal_id'] as string;
   const last = await app.call(
     'DELETE',
-    `/v1/server/owners/${encodeURIComponent(maheshPrincipal)}`,
+    `/v2/server/owners/${encodeURIComponent(maheshPrincipal)}`,
     { token: ownerToken },
   );
   assert.equal(last.status, 400);
 
   // 404: not a server owner.
-  const missing = await app.call('DELETE', '/v1/server/owners/pr_nope', { token: ownerToken });
+  const missing = await app.call('DELETE', '/v2/server/owners/pr_nope', { token: ownerToken });
   assert.equal(missing.status, 404);
 
   // 403: a non-server-owner cannot demote.
   const evil = await app.call(
     'DELETE',
-    `/v1/server/owners/${encodeURIComponent(maheshPrincipal)}`,
+    `/v2/server/owners/${encodeURIComponent(maheshPrincipal)}`,
     { token: prem.token },
   );
   assert.equal(evil.status, 403);

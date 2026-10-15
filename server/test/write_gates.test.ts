@@ -92,7 +92,7 @@ test('rotation_required after member removal: encrypted writes pause until rekey
   const app = makeApp();
   const { owner, bee, tid, keyId1 } = await committed(app, 'GateRemoval');
 
-  const rem = await app.call('DELETE', `/v1/topics/${tid}/participants/${bee.memberId}`, {
+  const rem = await app.call('DELETE', `/v2/topics/${tid}/participants/${bee.memberId}`, {
     token: owner.token,
   });
   assert.equal(rem.status, 200);
@@ -104,9 +104,9 @@ test('rotation_required after member removal: encrypted writes pause until rekey
 
   // ...but protocol kinds still flow (rotation announcements must be
   // postable while writes are paused).
-  const sys = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const sys = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
-    body: { kind: 'key_rotated', body: '[key_rotated] rotating now' },
+    body: { kind: 'key_request', data: {member_id:owner.memberId,agent_label:owner.agentLabel} },
   });
   assert.equal(sys.status, 201);
 
@@ -138,7 +138,7 @@ test('rotation_required after from_join accept: newcomer gets no current-key env
     [tid, cee.memberId],
   );
   assert.equal(envRows.length, 0, 'from_join member gets no current-key envelope');
-  const s = await app.call('GET', '/v1/sync/topics', { token: cee.token });
+  const s = await app.call('GET', '/v2/sync/topics', { token: cee.token });
   const t = (s.body.topics as any[]).find((x: any) => x.topic_id === tid);
   assert.ok(t, 'newcomer sees the topic');
   assert.equal(t.key_status, 'pending');
@@ -164,7 +164,7 @@ test('rotation_required after from_join accept: newcomer gets no current-key env
   });
   assert.equal(c.status, 200);
 
-  const ceeEnvs = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: cee.token });
+  const ceeEnvs = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: cee.token });
   assert.equal(ceeEnvs.status, 200);
   const kids = (ceeEnvs.body.envelopes as any[]).map((e) => e.key_id);
   assert.deepEqual(kids, [keyId2], 'newcomer holds only the post-join epoch key');
@@ -189,7 +189,7 @@ test('staged envelopes are invisible via GET until commit; commitment rides alon
 
   // Pre-commit: the staged key is invisible — only the committed epoch-1
   // envelope is served.
-  const pre = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: owner.token });
+  const pre = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: owner.token });
   assert.equal(pre.status, 200);
   const preKids = (pre.body.envelopes as any[]).map((e) => e.key_id);
   assert.deepEqual(preKids, [keyId1], 'staged key invisible pre-commit');
@@ -205,7 +205,7 @@ test('staged envelopes are invisible via GET until commit; commitment rides alon
     commitment: commitment2,
   });
   assert.equal(c.status, 200);
-  const post = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: owner.token });
+  const post = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: owner.token });
   const byKid = new Map((post.body.envelopes as any[]).map((e: any) => [e.key_id, e]));
   assert.ok(byKid.has(keyId2), 'committed envelope now visible');
   assert.equal(byKid.get(keyId2).commitment, commitment2, 'N07 verification data present');

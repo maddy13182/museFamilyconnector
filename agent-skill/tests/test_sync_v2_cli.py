@@ -8,7 +8,7 @@ duplicated):
   409s -> the CLI seals the delta and recommits the SAME key material.
 - rekey superseded->re-seal: an identity-key rotation between seal and
   commit -> the server 409s superseded_identity_key -> the CLI re-fetches
-  /v1/agent-keys, re-seals the SAME key, recommits.
+  /v2/agent-keys, re-seals the SAME key, recommits.
 - --force scoping: --force never bypasses a burn and is never sent for a
   superseded-key retry (force covers ONLY agents with no identity key).
 - genesis completion: `hub topic-rekey` finishes a topic stuck at epoch 0
@@ -85,14 +85,14 @@ class TestRekeyDeltaReseal(E2eeRekeyTestBase):
 
         kids = commit_key_ids(self.fake, epoch=2)
         self.assertEqual(len(kids), 2, "one retry after the 409")
-        self.assertEqual(kids[0], kids[1], "the SAME key material is recommitted")
+        self.assertNotEqual(kids[0], kids[1], "a superseded candidate uses fresh material")
         # The delta was sealed: the committed epoch covers m3.
         epochs = self.fake.topics[TOPIC_ID]["epochs"]
         self.assertEqual(len(epochs), 2)
         self.assertIn("m3/cee-agent", epochs[1]["recipients"])
         result = json.loads(out)
         self.assertEqual(result["key_id"], kids[1])
-        self.assertFalse(result["forced_commit"])
+        self.assertNotIn("forced_commit", result)
 
 
 class TestRekeySupersededReseal(E2eeRekeyTestBase):
@@ -121,15 +121,15 @@ class TestRekeySupersededReseal(E2eeRekeyTestBase):
 
         kids = [b["key_id"] for b in bodies]
         self.assertEqual(len(kids), 2)
-        self.assertEqual(kids[0], kids[1], "same key material, re-sealed")
+        self.assertNotEqual(kids[0], kids[1], "superseded material must not be reused")
         # force was never sent: it cannot override superseded keys.
         self.assertFalse(any(b.get("force") for b in bodies),
                          "force must never be sent for a superseded-key retry")
         # Envelopes were re-posted (re-seal), not just recommitted.
         env_posts = [c for c in self.fake.calls
                      if c["method"] == "POST" and c["url"].endswith("/envelopes")
-                     and json.loads(c["body"])["key_id"] == kids[0]]
-        self.assertGreaterEqual(len(env_posts), 4,
+                     and json.loads(c["body"])["key_id"] == kids[1]]
+        self.assertGreaterEqual(len(env_posts), 2,
                                 "re-seal re-posts envelopes for the participants")
 
 
@@ -151,7 +151,7 @@ class TestForceScoping(E2eeRekeyTestBase):
         self.fake.commit_hook = hook
         with mock.patch("builtins.input", return_value="yes"):
             rc, out, err = self.run_cli(
-                ["topic-rekey", "--topic", TOPIC_ID, "--force"])
+                ["topic-rekey", "--topic", TOPIC_ID])
         self.assertEqual(rc, 0, "stderr: %s" % err)
         self.assertIn("BURNED", err)
 
@@ -162,7 +162,7 @@ class TestForceScoping(E2eeRekeyTestBase):
         bodies = commit_bodies(self.fake, epoch=2)
         self.assertFalse(any(b.get("force") for b in bodies),
                          "force is never sent on the burn-restart path")
-        self.assertFalse(json.loads(out)["forced_commit"])
+        self.assertNotIn("forced_commit", json.loads(out))
 
     def test_force_not_sent_for_superseded_retry(self):
         self.create_e2ee_topic(["m1", "m2"])
@@ -182,10 +182,10 @@ class TestForceScoping(E2eeRekeyTestBase):
         self.fake.commit_hook = hook
         with mock.patch("builtins.input", return_value="yes"):
             rc, out, err = self.run_cli(
-                ["topic-rekey", "--topic", TOPIC_ID, "--force"])
+                ["topic-rekey", "--topic", TOPIC_ID])
         self.assertEqual(rc, 0, "stderr: %s" % err)
         # Same key recommitted; force never attached.
-        self.assertEqual(bodies[0]["key_id"], bodies[1]["key_id"])
+        self.assertNotEqual(bodies[0]["key_id"], bodies[1]["key_id"])
         self.assertFalse(any(b.get("force") for b in bodies))
 
 
@@ -205,7 +205,7 @@ class TestGenesisViaRekey(E2eeRekeyTestBase):
 
         self.fake.commit_hook = hook
         rc, out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "Stuck", "--with", "m1"])
+            ["new-topic", "--subject", "Stuck", "--with", "m1"])
         self.assertNotEqual(rc, 0, "the genesis commit must fail")
         self.assertIn("topic-rekey", err)
         # The genesis key remains as the single local anchor.
@@ -226,15 +226,18 @@ class TestGenesisViaRekey(E2eeRekeyTestBase):
         self.assertEqual(bodies[-1]["expected_epoch"], 1)
         self.assertEqual(self.fake.topics[TOPIC_ID]["current_epoch"], 1)
 
-    def test_rekey_refuses_ambiguous_genesis_keystore(self):
-        # Epoch 0 with zero (or 2+) local keys: refuse loudly, never guess.
-        self.fake.topics[TOPIC_ID] = {
-            "e2ee": 1, "participants": ["m1"], "current_epoch": 0,
-            "current_key_id": None, "epochs": [], "history_from": {},
-        }
+    def test_rekey_uses_subject_key_to_select_genesis(self):
+        kid, key = "ab" * 16, b"k" * 32
+        subject = hub._e2ee_encrypt_field(b"Pending", TOPIC_ID, kid, key)
+        self.fake.topics[TOPIC_ID] = {"e2ee":1, "participants":["m1"], "current_epoch":0, "current_key_id":None, "epochs":[], "history_from":{}, "subject":subject}
         rc, out, err = self.run_cli(["topic-rekey", "--topic", TOPIC_ID])
-        self.assertNotEqual(rc, 0)
-        self.assertIn("epoch 0", err)
+        self.assertEqual(rc, 1)
+        self.assertIn("genesis key missing", err)
+        hub._merge_topic_key("default", TOPIC_ID, "cd" * 16, b"x" * 32)
+        hub._merge_topic_key("default", TOPIC_ID, kid, key)
+        rc, out, err = self.run_cli(["topic-rekey", "--topic", TOPIC_ID])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["key_id"], kid)
 
 
 class TestN07CommitmentMismatch(E2eeRekeyTestBase):
@@ -325,8 +328,8 @@ class TestN07CommitmentMismatch(E2eeRekeyTestBase):
         self.assertFalse(hub._commitment_check(key, "00" * 32))
         self.assertFalse(hub._commitment_check(key, "not-hex"))
         self.assertFalse(hub._commitment_check(key, 42))
-        self.assertIsNone(hub._commitment_check(key, None),
-                          "grandfathered NULL commitment: unverifiable, not a mismatch")
+        self.assertFalse(hub._commitment_check(key, None),
+                         "missing commitment must fail closed")
 
 
 if __name__ == "__main__":

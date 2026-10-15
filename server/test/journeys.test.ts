@@ -20,15 +20,24 @@ import {
   setupKeyedFamily,
   addMember,
   addAgent,
-  createPlainTopic,
+  createActiveTopic,
   createE2eeTopic,
   inviteToTopic,
-  postEntry,
+  postEntry as rawPostEntry,
   postEnvelope,
   commitKey,
   wireBody,
   readState,
 } from './syncv2_helpers.js';
+
+const postedBodies = new Map<string,string>();
+async function postEntry(app: TestApp, token: string, tid: string, text: string) {
+  const row=await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?',[tid]);
+  const body=text.startsWith('fh1.')?text:wireBody(row!.current_key_id as string);
+  const result=await rawPostEntry(app,token,tid,body);
+  if(result.status===201) postedBodies.set(text,body);
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // 1. Three agents, 100+ messages, all received in topic order
@@ -42,7 +51,7 @@ test('journey: three agents exchange 120 messages; all received in order', async
   const km = await addMember(app, famId, owner.token, 'kid@j.dev', 'kid', 'Kid');
   const kid = await addAgent(app, owner.token, km.memberId, 'kid-agent', true);
 
-  const tid = await createPlainTopic(app, owner.token, 'big group', [parent.memberId, kid.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'big group', [parent.memberId, kid.memberId]);
   const agents = [owner, parent, kid];
   const N = 120;
   for (let i = 0; i < N; i++) {
@@ -58,7 +67,7 @@ test('journey: three agents exchange 120 messages; all received in order', async
     const seen: string[] = [];
     let after = 0;
     for (;;) {
-      const h = await app.call('GET', `/v1/topics/${tid}/history?after_seq=${after}&limit=25`, {
+      const h = await app.call('GET', `/v2/topics/${tid}/history?after_seq=${after}&limit=25`, {
         token: a.token,
       });
       assert.equal(h.status, 200);
@@ -70,7 +79,7 @@ test('journey: three agents exchange 120 messages; all received in order', async
     }
     assert.equal(seen.length, N, `${a.agentLabel} received all ${N}`);
     for (let i = 0; i < N; i++) {
-      assert.equal(seen[i], `message ${i} from ${agents[i % agents.length].agentLabel}`);
+      assert.equal(seen[i], postedBodies.get(`message ${i} from ${agents[i % agents.length].agentLabel}`));
     }
   }
 
@@ -79,7 +88,7 @@ test('journey: three agents exchange 120 messages; all received in order', async
   const lm = await addMember(app, famId, owner.token, 'late@j.dev', 'parent', 'Late');
   const late = await addAgent(app, owner.token, lm.memberId, 'late-agent', true);
   await inviteToTopic(app, owner.token, tid, [late.memberId], 'full');
-  const s = await app.call('GET', '/v1/sync/topics', { token: late.token });
+  const s = await app.call('GET', '/v2/sync/topics', { token: late.token });
   const t = (s.body.topics as any[]).find((x: any) => x.topic_id === tid);
   assert.ok(t);
   assert.equal(t.new_count, N + 1);
@@ -92,28 +101,28 @@ test('journey: three agents exchange 120 messages; all received in order', async
 
 test('journey: restart mid-processing loses nothing (read state advances only on ack)', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'JourneyRestart');
+  const { owner } = await setupKeyedFamily(app, 'JourneyRestart');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
-  const tid = await createPlainTopic(app, owner.token, 'restart topic', [other.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'restart topic', [other.memberId]);
   for (let i = 1; i <= 10; i++) await postEntry(app, other.token, tid, `m${i}`);
 
   // Watcher run 1: sync sees the topic, reads the page...
-  const s1 = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  const s1 = await app.call('GET', '/v2/sync/topics', { token: owner.token });
   assert.equal((s1.body.topics as any[])[0].new_count, 10);
-  const h1 = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
+  const h1 = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
   assert.equal(h1.status, 200);
   // ...then CRASHES before acking. Restart: sync still reports everything.
-  const s2 = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  const s2 = await app.call('GET', '/v2/sync/topics', { token: owner.token });
   assert.equal((s2.body.topics as any[])[0].new_count, 10, 'unacked entries return after restart');
   assert.equal((s2.body.topics as any[])[0].acked_seq, 0);
 
   // Partial ack, then another crash: only the unacked tail returns.
-  const a1 = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const a1 = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: owner.token,
     body: { seq: 4, read_receipt: h1.body.read_receipt },
   });
   assert.equal(a1.status, 200);
-  const s3 = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  const s3 = await app.call('GET', '/v2/sync/topics', { token: owner.token });
   assert.equal((s3.body.topics as any[])[0].new_count, 6);
   assert.equal((s3.body.topics as any[])[0].acked_seq, 4);
 
@@ -127,7 +136,7 @@ test('journey: restart mid-processing loses nothing (read state advances only on
     },
   ]);
   assert.equal(await readState(app, owner.memberId, owner.agentLabel, tid), null);
-  const s4 = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  const s4 = await app.call('GET', '/v2/sync/topics', { token: owner.token });
   assert.equal((s4.body.topics as any[])[0].new_count, 10, 'read-state loss -> full re-read, no silent loss');
 });
 
@@ -143,21 +152,21 @@ test('journey: one human, two circles — no cross-circle access anywhere', asyn
   // member_id is per-family by design).
   assert.notEqual(a.owner.memberId, b.owner.memberId);
 
-  const tidA = await createPlainTopic(app, a.owner.token, 'circle A secrets');
+  const tidA = await createActiveTopic(app, a.owner.token, 'circle A secrets');
   await postEntry(app, a.owner.token, tidA, 'A-only message');
 
   // Circle-B token: the topic does not exist for them.
   for (const [method, path, body] of [
-    ['GET', `/v1/topics/${tidA}`, undefined],
-    ['GET', `/v1/topics/${tidA}/history`, undefined],
-    ['POST', `/v1/topics/${tidA}/ack`, { seq: 1, read_receipt: 'x' }],
-    ['POST', `/v1/topics/${tidA}/entries`, { body: 'intruder' }],
-    ['GET', `/v1/topics/${tidA}/envelopes`, undefined],
+    ['GET', `/v2/topics/${tidA}`, undefined],
+    ['GET', `/v2/topics/${tidA}/history`, undefined],
+    ['POST', `/v2/topics/${tidA}/ack`, { seq: 1, read_receipt: 'x' }],
+    ['POST', `/v2/topics/${tidA}/entries`, { body: 'intruder' }],
+    ['GET', `/v2/topics/${tidA}/envelopes`, undefined],
   ] as const) {
     const r = await app.call(method, path, { token: b.owner.token, body });
     assert.ok(r.status === 404 || r.status === 403, `${method} ${path} -> ${r.status}`);
   }
-  const sb = await app.call('GET', '/v1/sync/topics', { token: b.owner.token });
+  const sb = await app.call('GET', '/v2/sync/topics', { token: b.owner.token });
   assert.deepEqual(sb.body.topics, [], 'circle B sync shows nothing from circle A');
 });
 
@@ -191,8 +200,8 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
       );
     }
   };
-  const commit = async (epoch: number, keyId: string, force = false) =>
-    commitKey(app, owner.token, tid, { expectedEpoch: epoch, keyId, commitment: hex(32), force });
+  const commit = async (epoch: number, keyId: string) =>
+    commitKey(app, owner.token, tid, { expectedEpoch: epoch, keyId, commitment: hex(32) });
 
   const k1 = hex(16);
   await stageAll(k1);
@@ -203,7 +212,7 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
   const k2 = hex(16);
   await stageAll(k2);
   assert.equal(
-    (await app.call('DELETE', `/v1/topics/${tid}/participants/${bee.memberId}`, { token: owner.token })).status,
+    (await app.call('DELETE', `/v2/topics/${tid}/participants/${bee.memberId}`, { token: owner.token })).status,
     200,
   );
   const burned = await commit(2, k2);
@@ -216,8 +225,8 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
   assert.equal((await commit(2, k2b)).status, 200);
   assert.equal((await postEntry(app, owner.token, tid, wireBody(k2b))).status, 201);
   // Bee is out: 403 on reads, and no envelope path back in.
-  assert.equal((await app.call('GET', `/v1/topics/${tid}/history`, { token: bee.token })).status, 403);
-  const beeEnv = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: bee.token });
+  assert.equal((await app.call('GET', `/v2/topics/${tid}/history`, { token: bee.token })).status, 403);
+  const beeEnv = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: bee.token });
   assert.equal(beeEnv.status, 403);
 
   // --- Join interleaved with rotation: 409 -> seal delta -> recommit.
@@ -241,7 +250,7 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
     const w = await postEntry(app, tok, tid, wireBody(kFinal));
     assert.equal(w.status, 201, `${label} writes after the rotations`);
   }
-  const hist = await app.call('GET', `/v1/topics/${tid}/history?after_seq=0&limit=100`, {
+  const hist = await app.call('GET', `/v2/topics/${tid}/history?after_seq=0&limit=100`, {
     token: dee.token,
   });
   // Dee joined at full history: sees everything from the floor up.
@@ -256,7 +265,7 @@ test('journey: overlapping watcher runs converge without loss or 409s', async ()
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'JourneyOverlap');
   const other = await addMember(app, famId, owner.token, 'other@x.dev', 'kid', 'Other');
-  const tid = await createPlainTopic(app, owner.token, 'overlap topic', [other.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'overlap topic', [other.memberId]);
   for (let i = 1; i <= 12; i++) await postEntry(app, other.token, tid, `m${i}`);
 
   // Watcher A: sync -> read. Watcher B (overlapping, same agent):
@@ -265,28 +274,28 @@ test('journey: overlapping watcher runs converge without loss or 409s', async ()
   // lost and nothing double-advances.
   // (new_count assertions removed: with self-exclusion, setup via other member
   // is covered in sync.test.ts; here we verify ack idempotency.)
-  const hA = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
-  const hB = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
+  const hA = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
+  const hB = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
 
-  const aA = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const aA = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: owner.token,
     body: { seq: hA.body.read_through_seq, read_receipt: hA.body.read_receipt },
   });
   assert.equal(aA.status, 200);
   assert.equal(aA.body.acked_seq, 12);
-  const aB = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const aB = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: owner.token,
     body: { seq: hB.body.read_through_seq, read_receipt: hB.body.read_receipt },
   });
   assert.equal(aB.status, 200, 'overlapping ack is an idempotent no-op, never a 409');
   assert.equal(aB.body.acked_seq, 12, 'overlapping acks converge on the same cursor');
 
-  const sFinal = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  const sFinal = await app.call('GET', '/v2/sync/topics', { token: owner.token });
   assert.deepEqual(sFinal.body.topics, [], 'after both runs: nothing changed, no permanent skip');
 
   // New activity after the overlap is picked up exactly once.
   // (Posted by other member so owner sees it as changed.)
   await postEntry(app, other.token, tid, 'm13');
-  const sNew = await app.call('GET', '/v1/sync/topics', { token: owner.token });
+  const sNew = await app.call('GET', '/v2/sync/topics', { token: owner.token });
   assert.equal((sNew.body.topics as any[])[0].new_count, 1);
 });

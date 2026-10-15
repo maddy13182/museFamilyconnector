@@ -7,7 +7,7 @@
 // fh1} — F06's json_extract predicate on task_id keeps working), task notes,
 // spawn briefings, task_done results (fh1-required on E2EE topics), the
 // key_request exemption (plus the other plaintext-by-design system kinds),
-// and the deleted PATCH /v1/tasks/:id (the spec table's PATCH row is vacuous
+// and the deleted PATCH /v2/tasks/:id (the spec table's PATCH row is vacuous
 // — the deletion IS the enforcement).
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -47,7 +47,7 @@ test('N05 entries: plaintext body/data rejected; sealed accepted', async () => {
   assert.equal(plain.status, 400);
   assert.equal(plain.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const plainData = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const plainData = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
     body: { kind: 'message', body: wireBody(keyId), data: { note: 'plaintext metadata' } },
   });
@@ -58,7 +58,7 @@ test('N05 entries: plaintext body/data rejected; sealed accepted', async () => {
   // body. Client-side that means passing the wire body as a plain string
   // value (reqJsonData JSON-encodes it); pre-encoding double-quotes it and
   // is rightly rejected.
-  const sealedData = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const sealedData = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
     body: {
       kind: 'message',
@@ -67,7 +67,7 @@ test('N05 entries: plaintext body/data rejected; sealed accepted', async () => {
     },
   });
   assert.equal(sealedData.status, 201);
-  const doubleEncoded = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const doubleEncoded = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
     body: {
       kind: 'message',
@@ -82,15 +82,15 @@ test('N05 entries: plaintext body/data rejected; sealed accepted', async () => {
   assert.equal(ok.status, 201);
 });
 
-test('N05 protocol kinds are plaintext by design (key_request exempt + siblings)', async () => {
+test('N05 protocol kinds cannot smuggle free-text bodies', async () => {
   const app = makeApp();
   const { owner, tid } = await sealedTopic(app, 'N05Proto');
   for (const kind of ['key_request', 'key_rotated', 'pending_key_distribution', 'topic_archived']) {
-    const r = await app.call('POST', `/v1/topics/${tid}/entries`, {
+    const r = await app.call('POST', `/v2/topics/${tid}/entries`, {
       token: owner.token,
       body: { kind, body: `[${kind}] plaintext system notice` },
     });
-    assert.equal(r.status, 201, `kind ${kind} must stay plaintext-postable`);
+    assert.equal(r.status, 400, `kind ${kind} must reject free-text content`);
   }
 });
 
@@ -98,14 +98,14 @@ test('N05 tasks: plaintext title/description rejected; sealed accepted; task_cre
   const app = makeApp();
   const { owner, tid, keyId } = await sealedTopic(app, 'N05Tasks');
 
-  const plainTitle = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const plainTitle = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
     body: { title: 'Book the flights' },
   });
   assert.equal(plainTitle.status, 400);
   assert.equal(plainTitle.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const plainDesc = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const plainDesc = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
     body: { title: wireBody(keyId), description: 'plaintext description' },
   });
@@ -114,7 +114,7 @@ test('N05 tasks: plaintext title/description rejected; sealed accepted; task_cre
 
   const title = wireBody(keyId);
   const desc = wireBody(keyId);
-  const ok = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const ok = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
     body: { title, description: desc },
   });
@@ -126,32 +126,33 @@ test('N05 tasks: plaintext title/description rejected; sealed accepted; task_cre
   // task_created: body is the sealed title (no `Task created: ...` leak),
   // data = {task_id plaintext, sealed fh1}. F06's visibility predicate does
   // json_extract(data,'$.task_id') — it must stay plaintext.
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
+  const hist = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
   const created = (hist.body.entries as any[]).find((e) => e.kind === 'task_created');
   assert.ok(created, 'task_created entry exists');
   assert.ok(!created.body.includes('Task created:'), 'no plaintext title leak in the body');
-  const data = created.data as { task_id?: string; sealed?: string };
+  const data = created.data as { task_id?: string; title?: string; description?: string };
   assert.equal(data.task_id, taskId, 'task_id stays plaintext for F06');
-  assert.ok(data.sealed && data.sealed.startsWith('fh1.'), 'sealed carries the fh1 description');
+  assert.equal(data.title, title);
+  assert.equal(data.description, desc);
 });
 
 test('N05 task notes: plaintext rejected; sealed accepted', async () => {
   const app = makeApp();
   const { owner, tid, keyId } = await sealedTopic(app, 'N05Notes');
-  const t = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
     body: { title: wireBody(keyId) },
   });
   const taskId = t.body.task.id as string;
 
-  const plain = await app.call('POST', `/v1/tasks/${taskId}/notes`, {
+  const plain = await app.call('POST', `/v2/tasks/${taskId}/notes`, {
     token: owner.token,
     body: { body: 'progress: half done' },
   });
   assert.equal(plain.status, 400);
   assert.equal(plain.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const ok = await app.call('POST', `/v1/tasks/${taskId}/notes`, {
+  const ok = await app.call('POST', `/v2/tasks/${taskId}/notes`, {
     token: owner.token,
     body: { body: wireBody(keyId) },
   });
@@ -159,38 +160,28 @@ test('N05 task notes: plaintext rejected; sealed accepted', async () => {
   assert.equal(ok.body.entry.kind, 'task_note');
 });
 
-test('N05 spawn: plaintext briefing rejected on E2EE parents; sealed accepted', async () => {
-  const app = makeApp();
-  const { owner, tid, keyId } = await sealedTopic(app, 'N05Spawn');
-
-  const plain = await app.call('POST', `/v1/topics/${tid}/spawn`, {
-    token: owner.token,
-    body: {
-      subject: 'child',
-      participant_member_ids: [owner.memberId],
-      briefing: 'Mom covers Thursday pickup.',
-    },
-  });
-  assert.equal(plain.status, 400);
-  assert.equal(plain.body.error.code, 'plaintext_in_e2ee_topic');
-
-  const briefing = wireBody(keyId);
-  const ok = await app.call('POST', `/v1/topics/${tid}/spawn`, {
-    token: owner.token,
-    body: { subject: 'child', participant_member_ids: [owner.memberId], briefing },
-  });
-  assert.equal(ok.status, 201);
-  const childId = ok.body.topic.id as string;
-  const hist = await app.call('GET', `/v1/topics/${childId}/history`, { token: owner.token });
-  assert.equal((hist.body.entries as any[])[0].kind, 'briefing');
-  assert.equal((hist.body.entries as any[])[0].body, briefing);
+test('N05 linked topic has independent encryption and cannot reuse the parent key', async () => {
+ const app=makeApp();const {owner,tid,keyId}=await sealedTopic(app,'N05Spawn');
+ const plain=await app.call('POST',`/v2/topics/${tid}/spawn`,{token:owner.token,body:{subject:'child',briefing:'private'}});
+ assert.equal(plain.status,400);
+ const childKey=hex(16);
+ const child=await app.call('POST',`/v2/topics/${tid}/spawn`,{token:owner.token,body:{topic_id:hex(16),subject:wireBody(childKey),participant_member_ids:[owner.memberId]}});
+ assert.equal(child.status,201);const childId=child.body.topic.id;
+ assert.equal(child.body.topic.current_epoch,0);
+ assert.equal((await postEntry(app,owner.token,childId,wireBody(childKey))).status,409);
+ await postEnvelope(app,owner.token,childId,owner.memberId,owner.agentLabel,childKey);
+ assert.equal((await commitKey(app,owner.token,childId,{expectedEpoch:1,keyId:childKey,commitment:hex(32)})).status,200);
+ assert.equal((await postEntry(app,owner.token,childId,wireBody(keyId))).status,409);
+ const briefing=wireBody(childKey);
+ const posted=await app.call('POST',`/v2/topics/${childId}/entries`,{token:owner.token,body:{kind:'briefing',body:briefing}});
+ assert.equal(posted.status,201);assert.equal(posted.body.entry.body,briefing);
 });
 
 test('N05 task_done: result must be fh1 on E2EE topics (absent result is fine)', async () => {
   const app = makeApp();
   const { owner, tid, keyId } = await sealedTopic(app, 'N05Done');
   const mk = async () => {
-    const t = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+    const t = await app.call('POST', `/v2/topics/${tid}/tasks`, {
       token: owner.token,
       body: { title: wireBody(keyId) },
     });
@@ -199,7 +190,7 @@ test('N05 task_done: result must be fh1 on E2EE topics (absent result is fine)',
   };
 
   const t1 = await mk();
-  const plainResult = await app.call('POST', `/v1/tasks/${t1}/done`, {
+  const plainResult = await app.call('POST', `/v2/tasks/${t1}/done`, {
     token: owner.token,
     body: { result: { summary: 'all done' } },
   });
@@ -208,40 +199,40 @@ test('N05 task_done: result must be fh1 on E2EE topics (absent result is fine)',
 
   const t2 = await mk();
   const sealedResult = wireBody(keyId);
-  const ok = await app.call('POST', `/v1/tasks/${t2}/done`, {
+  const ok = await app.call('POST', `/v2/tasks/${t2}/done`, {
     token: owner.token,
     body: { result: sealedResult },
   });
   assert.equal(ok.status, 200);
   // task_done entry: task_id plaintext, sealed result under `sealed`.
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
+  const hist = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
   const done = (hist.body.entries as any[]).find((e) => e.kind === 'task_done');
   assert.ok(done, 'task_done entry exists');
   assert.equal((done.data as any).task_id, t2);
-  assert.equal((done.data as any).sealed, sealedResult);
+  assert.equal((done.data as any).result, sealedResult);
 
   // No result at all: allowed (result null).
   const t3 = await mk();
-  const none = await app.call('POST', `/v1/tasks/${t3}/done`, {
+  const none = await app.call('POST', `/v2/tasks/${t3}/done`, {
     token: owner.token,
     body: {},
   });
   assert.equal(none.status, 200);
 });
 
-test('PATCH /v1/tasks/:id is deleted (spec §1.6): the N05 PATCH row is vacuous', async () => {
+test('PATCH /v2/tasks/:id is deleted (spec §1.6): the N05 PATCH row is vacuous', async () => {
   const app = makeApp();
   const { owner, tid, keyId } = await sealedTopic(app, 'N05PatchGone');
-  const t = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
     body: { title: wireBody(keyId) },
   });
   const taskId = t.body.task.id as string;
   for (const method of ['GET', 'PATCH']) {
-    const r = await app.call(method, `/v1/tasks/${taskId}`, {
+    const r = await app.call(method, `/v2/tasks/${taskId}`, {
       token: owner.token,
       body: method === 'PATCH' ? { title: wireBody(keyId) } : undefined,
     });
-    assert.equal(r.status, 404, `${method} /v1/tasks/:id must be gone`);
+    assert.equal(r.status, 404, `${method} /v2/tasks/:id must be gone`);
   }
 });

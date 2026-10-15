@@ -107,21 +107,21 @@ def good_bundle(new_skill_version="0.12.0"):
 
 
 def make_manifest(skill_version, tarball_bytes, server=SERVER):
-    """A valid /v1/client/latest payload with a skill block (contract §3.6)."""
+    """A valid /v2/client/latest payload with a skill block (contract §3.6)."""
     return {
         "version": "0.12.0",
         "min_cli_version": "0.10.0",
         "server_version": "1.0.0",
-        "download_url": server + "/v1/client/download/hub",
+        "download_url": server + "/v2/client/download/hub",
         "sha256": "0" * 64,
         "released_at": "2026-10-12T00:00:00Z",
         "assets": {
-            "hub": server + "/v1/client/download/hub",
-            "sigstore": server + "/v1/client/download/hub.sigstore",
-            "manifest": server + "/v1/client/download/manifest.json",
+            "hub": server + "/v2/client/download/hub",
+            "sigstore": server + "/v2/client/download/hub.sigstore",
+            "manifest": server + "/v2/client/download/manifest.json",
         },
         "skill": {
-            "url": server + "/v1/client/download/skill.tar.gz",
+            "url": server + "/v2/client/download/skill.tar.gz",
             "sha256": hashlib.sha256(tarball_bytes).hexdigest(),
             "version": skill_version,
         },
@@ -240,7 +240,7 @@ class SkillBlockValidationTest(unittest.TestCase):
         for bad in (
             "http://hub.example.test/skill.tar.gz",  # not https
             "ftp://hub.example.test/skill.tar.gz",
-            "/v1/client/download/skill.tar.gz",  # not absolute
+            "/v2/client/download/skill.tar.gz",  # not absolute
             "not a url",
         ):
             m = make_manifest("0.12.0", b"fake-tarball")
@@ -296,7 +296,7 @@ class RefreshFlowTest(unittest.TestCase):
         # Exactly one download: the skill tarball, pinned to the server origin.
         self.assertEqual(
             fx.requested,
-            [(SERVER + "/v1/client/download/skill.tar.gz", "skill bundle 0.12.0", SERVER)],
+            [(SERVER + "/v2/client/download/skill.tar.gz", "skill bundle 0.12.0", SERVER)],
         )
         # Sensible modes: docs 0644.
         self.assertEqual(
@@ -497,13 +497,13 @@ class RefreshFlowTest(unittest.TestCase):
 
 
 class FakeTransport:
-    """Serve GET /v1/client/latest; nothing else is needed."""
+    """Serve GET /v2/client/latest; nothing else is needed."""
 
     def __init__(self, manifest):
         self.manifest = manifest
 
     def __call__(self, method, url, headers, body_bytes):
-        if not url.endswith("/v1/client/latest"):
+        if not url.endswith("/v2/client/latest"):
             raise AssertionError("unexpected URL: %s" % url)
         return 200, json.dumps(self.manifest)
 

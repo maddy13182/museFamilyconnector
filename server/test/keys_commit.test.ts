@@ -1,4 +1,4 @@
-// POST /v1/topics/:tid/keys/commit — staged atomic key activation
+// POST /v2/topics/:tid/keys/commit — staged atomic key activation
 // (spec §1.4).
 //
 // Covers: genesis (epoch-0 writes blocked with 409 key_not_active, then
@@ -26,7 +26,7 @@ import {
   addMember,
   addAgent,
   createE2eeTopic,
-  createPlainTopic,
+  createActiveTopic,
   inviteToTopic,
   postEntry,
   postEnvelope,
@@ -111,23 +111,23 @@ test('genesis: encrypted writes blocked at epoch 0 (409 key_not_active), then ac
 
   const rows = await epochRows(app, tid);
   assert.equal(rows.length, 1);
-  assert.equal(rows[0]['forced'], 0);
+  assert.equal(Object.hasOwn(rows[0], 'forced'), false);
 
   // Writes unblocked now.
   const ok = await postEntry(app, owner.token, tid, wireBody(kid));
   assert.equal(ok.status, 201);
 });
 
-test('keys/commit on a plaintext topic is 400; kid caller is 403', async () => {
+test('keys/commit rejects a stale epoch and denies kid callers', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'CommitScope');
-  const plain = await createPlainTopic(app, owner.token, 'plain');
+  const plain = await createActiveTopic(app, owner.token, 'plain');
   const r = await commitKey(app, owner.token, plain, {
     expectedEpoch: 1,
     keyId: hex(16),
     commitment: hex(32),
   });
-  assert.equal(r.status, 400);
+  assert.equal(r.status, 409);
 
   const kid = await addMember(app, famId, owner.token, 'kid@c.dev', 'kid', 'Kid');
   const { tid } = await createE2eeTopic(app, owner.token, { participantIds: [kid.memberId] });
@@ -152,7 +152,7 @@ test('commit body validation: bad expected_epoch / key_id / commitment / force',
     ['non-hex commitment', { ...good, commitment: 'z'.repeat(64) }],
     ['force string', { ...good, force: 'yes' }],
   ] as const) {
-    const r = await app.call('POST', `/v1/topics/${tid}/keys/commit`, {
+    const r = await app.call('POST', `/v2/topics/${tid}/keys/commit`, {
       token: owner.token,
       body,
     });
@@ -167,7 +167,7 @@ test('commit body validation: bad expected_epoch / key_id / commitment / force',
 test('rotation: epoch 1 -> 2 flips current_key_id and clears rotation_required', async () => {
   const { app, owner, bee, tid, epoch1KeyId } = await setupCommittedTopic(makeApp(), 'CommitRot');
   // A removal arms rotation_required; the rotation must clear it.
-  await app.call('DELETE', `/v1/topics/${tid}/participants/${bee.memberId}`, {
+  await app.call('DELETE', `/v2/topics/${tid}/participants/${bee.memberId}`, {
     token: owner.token,
   });
   assert.equal(await rotationRequired(app, tid), 1);
@@ -280,7 +280,7 @@ test('burn: removal interleaved with rotation burns the key (staged rows deleted
   await postEnvelope(app, owner.token, tid, owner.memberId, owner.agentLabel, keyId2);
   await postEnvelope(app, owner.token, tid, bee.memberId, bee.agentLabel, keyId2);
   // ...then bee is removed before the commit.
-  const rem = await app.call('DELETE', `/v1/topics/${tid}/participants/${bee.memberId}`, {
+  const rem = await app.call('DELETE', `/v2/topics/${tid}/participants/${bee.memberId}`, {
     token: owner.token,
   });
   assert.equal(rem.status, 200);
@@ -318,7 +318,6 @@ test('burn: removal interleaved with rotation burns the key (staged rows deleted
     expectedEpoch: 2,
     keyId: keyId2,
     commitment: hex(32),
-    force: true,
   });
   assert.equal(forced.status, 409);
 
@@ -327,7 +326,7 @@ test('burn: removal interleaved with rotation burns the key (staged rows deleted
   const freshId = hex(16);
   const envRemoved = await postEnvelope(app, owner.token, tid, bee.memberId, bee.agentLabel, freshId);
   assert.equal(envRemoved.status, 400);
-  const gone = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: bee.token });
+  const gone = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: bee.token });
   assert.equal(gone.status, 403);
 
   // Fresh material + full current set commits cleanly (epoch 2).
@@ -386,87 +385,9 @@ test('join during rotation: 409, seal the delta, recommit the SAME key', async (
 // Force audit + keyless agents
 // ---------------------------------------------------------------------------
 
-test('force: keyless agents gate the commit; owner force records the audit', async () => {
-  const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'CommitForce');
-  // Dee joins as a participant but never registers an identity key.
-  const dm = await addMember(app, famId, owner.token, 'dee@k.dev', 'parent', 'Dee');
-  const { tid } = await createE2eeTopic(app, owner.token, { participantIds: [dm.memberId] });
 
-  const keyId = hex(16);
-  const env = await postEnvelope(app, owner.token, tid, owner.memberId, owner.agentLabel, keyId);
-  assert.equal(env.status, 201);
-  // Envelopes cannot even be staged for Dee (no identity key on file).
-  const envDee = await postEnvelope(app, owner.token, tid, dm.memberId, 'dee-agent', keyId);
-  assert.equal(envDee.status, 400);
 
-  const blocked = await commitKey(app, owner.token, tid, {
-    expectedEpoch: 1,
-    keyId,
-    commitment: hex(32),
-  });
-  assert.equal(blocked.status, 409);
-  assert.equal(blocked.body.error.code, 'incomplete_distribution');
 
-  const forced = await commitKey(app, owner.token, tid, {
-    expectedEpoch: 1,
-    keyId,
-    commitment: hex(32),
-    force: true,
-  });
-  assert.equal(forced.status, 200, `forced commit failed: ${JSON.stringify(forced.body)}`);
-
-  // The epoch row records the force audit.
-  const rows = await epochRows(app, tid);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0]['forced'], 1);
-  const missing = JSON.parse(rows[0]['forced_missing'] as string) as Array<[string, string]>;
-  assert.deepEqual(missing, [[dm.memberId, 'dee-agent']]);
-
-  // Dee is key-pending in sync (uses the key-request flow). The topic needs
-  // a visible entry to show up as changed.
-  const posted = await postEntry(app, owner.token, tid, wireBody(keyId));
-  assert.equal(posted.status, 201);
-  const deeAgent = await addAgent(app, owner.token, dm.memberId, 'dee-agent', false);
-  const s = await app.call('GET', '/v1/sync/topics', { token: deeAgent.token });
-  const t = (s.body.topics as any[]).find((x: any) => x.topic_id === tid);
-  assert.ok(t, 'dee sees the topic');
-  assert.equal(t.key_status, 'pending');
-});
-
-test('force is owner-only: a parent force-commit is 403 (plain parent commit is fine)', async () => {
-  const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'CommitForce403');
-  const pm = await addMember(app, famId, owner.token, 'par@k.dev', 'parent', 'Par');
-  const parent = await addAgent(app, owner.token, pm.memberId, 'par-agent', true);
-  const { tid } = await createE2eeTopic(app, owner.token, { participantIds: [parent.memberId] });
-
-  const keyId = hex(16);
-  await postEnvelope(app, owner.token, tid, owner.memberId, owner.agentLabel, keyId);
-  await postEnvelope(app, owner.token, tid, parent.memberId, parent.agentLabel, keyId);
-
-  // Plain commit by a parent: allowed.
-  const plain = await commitKey(app, parent.token, tid, {
-    expectedEpoch: 1,
-    keyId,
-    commitment: hex(32),
-  });
-  assert.equal(plain.status, 200);
-
-  // Epoch 2 with a keyless member: parent may NOT force.
-  const dm = await addMember(app, famId, owner.token, 'dee2@k.dev', 'parent', 'Dee2');
-  await inviteToTopic(app, owner.token, tid, [dm.memberId], 'full');
-  const keyId2 = hex(16);
-  await postEnvelope(app, owner.token, tid, owner.memberId, owner.agentLabel, keyId2);
-  await postEnvelope(app, owner.token, tid, parent.memberId, parent.agentLabel, keyId2);
-  const forced = await commitKey(app, parent.token, tid, {
-    expectedEpoch: 2,
-    keyId: keyId2,
-    commitment: hex(32),
-    force: true,
-  });
-  assert.equal(forced.status, 403);
-});
 
 // ---------------------------------------------------------------------------
 // Superseded identity keys
@@ -482,7 +403,7 @@ test('superseded_identity_key: envelope sealed to the old key is not force-overr
   await postEnvelope(app, owner.token, tid, bee.memberId, bee.agentLabel, keyId2);
   // ...then bee rotates their identity key: the staged envelope is now
   // sealed to a SUPERSEDED key.
-  const rot = await app.call('POST', '/v1/agent-keys/rotate', {
+  const rot = await app.call('POST', '/v2/agent-keys/rotate', {
     token: bee.token,
     body: { agent_public_key: b64(32) },
   });
@@ -501,7 +422,6 @@ test('superseded_identity_key: envelope sealed to the old key is not force-overr
     expectedEpoch: 2,
     keyId: keyId2,
     commitment: commitment2,
-    force: true,
   });
   assert.equal(forced.status, 409);
   assert.equal(forced.body.error.code, 'superseded_identity_key');
@@ -563,7 +483,7 @@ test('epoch log is append-only: no UPDATE/DELETE path exists', async () => {
 
   // No endpoint mutates the log: non-POST verbs on the commit path 404.
   for (const method of ['PUT', 'PATCH', 'DELETE', 'GET']) {
-    const r = await app.call(method, `/v1/topics/${tid}/keys/commit`, { token: owner.token });
+    const r = await app.call(method, `/v2/topics/${tid}/keys/commit`, { token: owner.token });
     assert.equal(r.status, 404, `${method} keys/commit must not exist`);
   }
   void bee;
@@ -587,37 +507,30 @@ test('epoch log is append-only: no UPDATE/DELETE path exists', async () => {
   );
 });
 
-test('epoch log: grandfathered NULL commitments are accepted (UNIQUE allows multiple NULLs)', async () => {
+test('epoch log: missing commitments fail closed and uniqueness prevents key reuse', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'EpochNull');
+  const { owner } = await setupKeyedFamily(app, 'EpochRequired');
   const { tid } = await createE2eeTopic(app, owner.token);
   const ts = new Date().toISOString();
-  // Two pre-migration epochs with NULL commitments: both accepted.
-  await app.db.execAtomically([
-    {
-      sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, forced, forced_missing, created_at, created_by)
-            VALUES (?,?,?,?,?,?,?,?,?)`,
-      params: [tid, 0, hex(16), null, '[]', 0, null, ts, owner.memberId],
-    },
-    {
-      sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, forced, forced_missing, created_at, created_by)
-            VALUES (?,?,?,?,?,?,?,?,?)`,
-      params: [tid, 1, hex(16), null, '[]', 0, null, ts, owner.memberId],
-    },
-  ]);
+  await assertRejects(app.db.execAtomically([{
+    sql: `INSERT INTO topic_key_epochs(topic_id,epoch,key_id,commitment,recipients,created_at,created_by) VALUES (?,?,?,?,?,?,?)`,
+    params: [tid,1,hex(16),null,'[]',ts,owner.memberId],
+  }]), 'an unverifiable epoch must be rejected');
+  await app.db.execAtomically([{
+    sql: `INSERT INTO topic_key_epochs(topic_id,epoch,key_id,commitment,recipients,created_at,created_by) VALUES (?,?,?,?,?,?,?)`,
+    params: [tid,1,hex(16),hex(32),'[]',ts,owner.memberId],
+  }]);
   const rows = await epochRows(app, tid);
-  assert.equal(rows.length, 2);
-  assert.ok(rows.every((r) => r['commitment'] === null));
-
+  assert.equal(rows.length, 1);
   // But key_id reuse is still rejected at the DB level (the backstop the
   // commit's 409 key_reuse leans on).
   const dupKey = rows[0]['key_id'] as string;
   await assertRejects(
     app.db.execAtomically([
       {
-        sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, forced, forced_missing, created_at, created_by)
-              VALUES (?,?,?,?,?,?,?,?,?)`,
-        params: [tid, 2, dupKey, hex(32), '[]', 0, null, ts, owner.memberId],
+        sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, created_at, created_by)
+              VALUES (?,?,?,?,?,?,?)`,
+        params: [tid, 2, dupKey, hex(32), '[]', ts, owner.memberId],
       },
     ]),
     'duplicate (topic_id, key_id) must violate the UNIQUE backstop',
@@ -626,17 +539,17 @@ test('epoch log: grandfathered NULL commitments are accepted (UNIQUE allows mult
   const c1 = hex(32);
   await app.db.execAtomically([
     {
-      sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, forced, forced_missing, created_at, created_by)
-            VALUES (?,?,?,?,?,?,?,?,?)`,
-      params: [tid, 2, hex(16), c1, '[]', 0, null, ts, owner.memberId],
+      sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, created_at, created_by)
+            VALUES (?,?,?,?,?,?,?)`,
+      params: [tid, 2, hex(16), c1, '[]', ts, owner.memberId],
     },
   ]);
   await assertRejects(
     app.db.execAtomically([
       {
-        sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, forced, forced_missing, created_at, created_by)
-              VALUES (?,?,?,?,?,?,?,?,?)`,
-        params: [tid, 3, hex(16), c1, '[]', 0, null, ts, owner.memberId],
+        sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, created_at, created_by)
+              VALUES (?,?,?,?,?,?,?)`,
+        params: [tid, 3, hex(16), c1, '[]', ts, owner.memberId],
       },
     ]),
     'duplicate (topic_id, commitment) must violate the UNIQUE backstop',
@@ -645,9 +558,9 @@ test('epoch log: grandfathered NULL commitments are accepted (UNIQUE allows mult
   await assertRejects(
     app.db.execAtomically([
       {
-        sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, forced, forced_missing, created_at, created_by)
-              VALUES (?,?,?,?,?,?,?,?,?)`,
-        params: [tid, 2, hex(16), hex(32), '[]', 0, null, ts, owner.memberId],
+        sql: `INSERT INTO topic_key_epochs(topic_id, epoch, key_id, commitment, recipients, created_at, created_by)
+              VALUES (?,?,?,?,?,?,?)`,
+        params: [tid, 2, hex(16), hex(32), '[]', ts, owner.memberId],
       },
     ]),
     'duplicate (topic_id, epoch) must violate the primary key',

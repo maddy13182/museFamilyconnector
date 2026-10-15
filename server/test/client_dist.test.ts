@@ -4,7 +4,7 @@
 // Covers: health api_versions; download endpoints (content types, exact
 // bytes vs the bundled artifacts, headers, fixed-path 404s, rate limit —
 // including the skill.tar.gz bundle and its shared rate-limit bucket);
-// /v1/client/latest skill block; bundle-client.mjs fail-closed modes
+// /v2/client/latest skill block; bundle-client.mjs fail-closed modes
 // (placeholder hash, 404, sha mismatch — hub and skill — missing
 // skill_sha256 pin, release manifest without skill_sha256, unsafe tarball
 // members, phase-2 manifest embedded by mistake) plus the success path
@@ -64,11 +64,11 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 // Health: the version contract.
 // ---------------------------------------------------------------------------
 
-test('health advertises api_versions ["v1"] with the server version', async () => {
+test('health advertises api_versions ["v2"] with the server version', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/health');
+  const res = await app.call('GET', '/v2/health');
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body.api_versions, ['v1']);
+  assert.deepEqual(res.body.api_versions, ['v2']);
   assert.equal(res.body.version, pkg.version);
 });
 
@@ -76,9 +76,9 @@ test('health advertises api_versions ["v1"] with the server version', async () =
 // Download endpoints.
 // ---------------------------------------------------------------------------
 
-test('GET /v1/client/download/hub serves the exact pinned artifact bytes', async () => {
+test('GET /v2/client/download/hub serves the exact pinned artifact bytes', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/client/download/hub', { rawBytes: true });
+  const res = await app.call('GET', '/v2/client/download/hub', { rawBytes: true });
   assert.equal(res.status, 200);
   assert.equal(res.headers['content-type'], 'application/octet-stream');
   assert.equal(res.headers['content-disposition'], 'attachment; filename="hub"');
@@ -94,9 +94,9 @@ test('GET /v1/client/download/hub serves the exact pinned artifact bytes', async
   assert.equal(res.headers['x-content-type-options'], 'nosniff');
 });
 
-test('GET /v1/client/download/hub.sigstore serves JSON as an attachment', async () => {
+test('GET /v2/client/download/hub.sigstore serves JSON as an attachment', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/client/download/hub.sigstore');
+  const res = await app.call('GET', '/v2/client/download/hub.sigstore');
   assert.equal(res.status, 200);
   assert.equal(res.headers['content-type'], 'application/json');
   assert.equal(res.headers['content-disposition'], 'attachment; filename="hub.sigstore"');
@@ -105,9 +105,9 @@ test('GET /v1/client/download/hub.sigstore serves JSON as an attachment', async 
   assert.deepEqual(res.body, bundled);
 });
 
-test('GET /v1/client/download/manifest.json serves the release manifest', async () => {
+test('GET /v2/client/download/manifest.json serves the release manifest', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/client/download/manifest.json');
+  const res = await app.call('GET', '/v2/client/download/manifest.json');
   assert.equal(res.status, 200);
   assert.equal(res.headers['content-type'], 'application/json');
   assert.equal(res.headers['content-disposition'], 'attachment; filename="manifest.json"');
@@ -118,9 +118,9 @@ test('GET /v1/client/download/manifest.json serves the release manifest', async 
   assert.equal(res.body.sha256, manifest.sha256);
 });
 
-test('GET /v1/client/download/skill.tar.gz serves the exact bundled skill bundle', async () => {
+test('GET /v2/client/download/skill.tar.gz serves the exact bundled skill bundle', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/client/download/skill.tar.gz', { rawBytes: true });
+  const res = await app.call('GET', '/v2/client/download/skill.tar.gz', { rawBytes: true });
   assert.equal(res.status, 200);
   assert.equal(res.headers['content-type'], 'application/gzip');
   assert.equal(res.headers['content-disposition'], 'attachment; filename="skill.tar.gz"');
@@ -136,38 +136,38 @@ test('GET /v1/client/download/skill.tar.gz serves the exact bundled skill bundle
   assert.equal(res.headers['x-content-type-options'], 'nosniff');
 });
 
-test('GET /v1/client/latest carries the skill block for the bundled release', async () => {
+test('GET /v2/client/latest carries the skill block for the bundled release', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/client/latest');
+  const res = await app.call('GET', '/v2/client/latest');
   assert.equal(res.status, 200);
-  assert.equal(res.body.skill.url, 'https://hub.test/v1/client/download/skill.tar.gz');
+  assert.equal(res.body.skill.url, 'https://hub.test/v2/client/download/skill.tar.gz');
   assert.equal(res.body.skill.sha256, manifest.skill_sha256);
   assert.equal(res.body.skill.version, manifest.skill_version);
 });
 
-test('anything else under /v1/client/download/ 404s (fixed asset map)', async () => {
+test('anything else under /v2/client/download/ 404s (fixed asset map)', async () => {
   const app = makeApp();
   for (const p of [
-    '/v1/client/download/',
-    '/v1/client/download/other',
-    '/v1/client/download/hub/', // trailing slash
-    '/v1/client/download/HUB', // case-sensitive
-    '/v1/client/download/hub.sigstore.bak',
-    '/v1/client/download/hub%00',
-    '/v1/client/download/skill.tar.gz/', // trailing slash
-    '/v1/client/download/SKILL.TAR.GZ', // case-sensitive
-    '/v1/client/download/skill.tar.gz.bak',
+    '/v2/client/download/',
+    '/v2/client/download/other',
+    '/v2/client/download/hub/', // trailing slash
+    '/v2/client/download/HUB', // case-sensitive
+    '/v2/client/download/hub.sigstore.bak',
+    '/v2/client/download/hub%00',
+    '/v2/client/download/skill.tar.gz/', // trailing slash
+    '/v2/client/download/SKILL.TAR.GZ', // case-sensitive
+    '/v2/client/download/skill.tar.gz.bak',
   ]) {
     const res = await app.call('GET', p);
     assert.equal(res.status, 404, `${p} must 404`);
     assert.equal(res.body.error.code, 'not_found');
   }
   // Encoded `..` is normalized by the URL parser BEFORE dispatch
-  // (/v1/client/download/%2e%2e/health -> /v1/client/health) — it can only
+  // (/v2/client/download/%2e%2e/health -> /v2/client/health) — it can only
   // resolve to another literal path string, and dispatch is exact-match, so
   // it lands on the unknown-path fallthrough (401 without a token), never
   // on an unregistered file. No traversal surface by construction.
-  const trav = await app.call('GET', '/v1/client/download/%2e%2e/health');
+  const trav = await app.call('GET', '/v2/client/download/%2e%2e/health');
   assert.equal(trav.status, 401);
 });
 
@@ -176,10 +176,10 @@ test('downloads are rate-limited with the standard 429 envelope + Retry-After', 
   // Generous bucket: 100 per 10 min per IP (endpoint-specific key, so this
   // test is isolated from the other download tests).
   for (let i = 0; i < 100; i++) {
-    const r = await app.call('GET', '/v1/client/download/manifest.json');
+    const r = await app.call('GET', '/v2/client/download/manifest.json');
     assert.equal(r.status, 200, `request ${i + 1} should pass`);
   }
-  const limited = await app.call('GET', '/v1/client/download/manifest.json');
+  const limited = await app.call('GET', '/v2/client/download/manifest.json');
   assert.equal(limited.status, 429);
   assert.equal(limited.body.error.code, 'rate_limited');
   assert.ok(Number(limited.headers['retry-after']) > 0, 'Retry-After must be set');
@@ -190,12 +190,12 @@ test('downloads share one rate-limit bucket across all four assets', async () =>
   // 50 manifest.json + 50 skill.tar.gz = 100 against the shared
   // 'client_download' bucket; the 101st request (any asset) 429s.
   for (let i = 0; i < 50; i++) {
-    const a = await app.call('GET', '/v1/client/download/manifest.json');
+    const a = await app.call('GET', '/v2/client/download/manifest.json');
     assert.equal(a.status, 200, `manifest request ${i + 1} should pass`);
-    const b = await app.call('GET', '/v1/client/download/skill.tar.gz', { rawBytes: true });
+    const b = await app.call('GET', '/v2/client/download/skill.tar.gz', { rawBytes: true });
     assert.equal(b.status, 200, `skill request ${i + 1} should pass`);
   }
-  const limited = await app.call('GET', '/v1/client/download/skill.tar.gz');
+  const limited = await app.call('GET', '/v2/client/download/skill.tar.gz');
   assert.equal(limited.status, 429);
   assert.equal(limited.body.error.code, 'rate_limited');
   assert.ok(Number(limited.headers['retry-after']) > 0, 'Retry-After must be set');
@@ -315,7 +315,7 @@ async function makeRelease(dir: string, version = '9.9.9'): Promise<ReleaseFixtu
     signature: 'hub.sigstore',
   };
   const skillTarGz = await buildSkillTarball(dir, {
-    'SKILL.md': '<!-- SKILL VERSION: 1.2.3 -->\n# skill\n',
+    'SKILL.md': '<!-- SKILL VERSION: 2.2.3 -->\n# skill\n',
     'INSTALL.md': '# install\n',
     'requirements.txt': 'sigstore>=3.0,<4.0\n',
     'references/a.md': '# a\n',
@@ -327,13 +327,13 @@ async function makeRelease(dir: string, version = '9.9.9'): Promise<ReleaseFixtu
   const releaseManifest: Record<string, unknown> = {
     ...phase1Manifest,
     skill_sha256: skillSha,
-    skill_version: '1.2.3',
+    skill_version: '2.2.3',
   };
   // Decoupled releases: the skill bundle is served from the skill-v* tag
   // with its own manifest (bundle-client.mjs check 2b).
   const skillReleaseManifest: Record<string, unknown> = {
     type: 'skill',
-    skill_version: '1.2.3',
+    skill_version: '2.2.3',
     skill_sha256: skillSha,
     cli_version: version,
     hub_sha256: hubSha,
@@ -345,10 +345,10 @@ async function makeRelease(dir: string, version = '9.9.9'): Promise<ReleaseFixtu
     download_url: `http://stub.invalid/cli-v${version}/hub`,
     sha256: hubSha,
     skill_sha256: skillSha,
-    skill_version: '1.2.3',
+    skill_version: '2.2.3',
     released_at: '2026-10-12T00:00:00Z',
   };
-  return { pin, hubBytes, phase1Manifest, releaseManifest, skillReleaseManifest, skillTarGz, skillVersion: '1.2.3' };
+  return { pin, hubBytes, phase1Manifest, releaseManifest, skillReleaseManifest, skillTarGz, skillVersion: '2.2.3' };
 }
 
 function stubFiles(fx: ReleaseFixture): Record<string, { body: string | Uint8Array }> {
@@ -392,7 +392,7 @@ async function evilSkillTarball(
       '        ti = tarfile.TarInfo(name)',
       '        ti.size = len(data)',
       '        tf.addfile(ti, io.BytesIO(data))',
-      '    add("SKILL.md", b"<!-- SKILL VERSION: 1.2.3 -->\\n")',
+      '    add("SKILL.md", b"<!-- SKILL VERSION: 2.2.3 -->\\n")',
       '    if kind == "traversal":',
       '        add("../evil.txt", b"evil")',
       '    elif kind == "symlink":',
@@ -402,7 +402,7 @@ async function evilSkillTarball(
       '        tf.addfile(ti)',
       '    elif kind == "phase2":',
       '        manifest["skill_sha256"] = "f" * 64',
-      '        manifest["skill_version"] = "1.2.3"',
+      '        manifest["skill_version"] = "2.2.3"',
       '    add("hub", hub)',
       '    add("manifest.json", json.dumps(manifest).encode())',
       '',
@@ -428,7 +428,7 @@ test('bundler fails closed on a placeholder pin hash', async () => {
           version: '9.9.9',
           sha256: 'PENDING-release-workflow-fills-this-in',
           skill_sha256: 'a'.repeat(64),
-          skill_version: '1.2.3',
+          skill_version: '2.2.3',
         },
         stub.url,
       ),
@@ -462,15 +462,15 @@ test('bundler fails closed on HTTP 404 from the release server', async () => {
     '/cli-v9.9.9/hub': { status: 404, body: '' },
     '/cli-v9.9.9/hub.sigstore': { status: 404, body: '' },
     '/cli-v9.9.9/manifest.json': { status: 404, body: '' },
-    '/skill-v1.2.3/skill.tar.gz': { status: 404, body: '' },
-    '/skill-v1.2.3/skill-manifest.json': { status: 404, body: '' },
+    '/skill-v2.2.3/skill.tar.gz': { status: 404, body: '' },
+    '/skill-v2.2.3/skill-manifest.json': { status: 404, body: '' },
   });
   try {
     const pin = {
       version: '9.9.9',
       sha256: 'b'.repeat(64),
       skill_sha256: 'a'.repeat(64),
-      skill_version: '1.2.3',
+      skill_version: '2.2.3',
     };
     const r = await runBundler(bundlerEnv(dir, pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
@@ -500,7 +500,7 @@ test('bundler fails closed on skill.tar.gz sha256 mismatch (tampered bundle)', a
   const fx = await makeRelease(dir);
   // A different but structurally valid bundle: the hash check must catch it.
   const other = await buildSkillTarball(join(mkdtempSync(join(tmpdir(), 'bundle-skillmm2-'))), {
-    'SKILL.md': '<!-- SKILL VERSION: 1.2.3 -->\n# different skill\n',
+    'SKILL.md': '<!-- SKILL VERSION: 2.2.3 -->\n# different skill\n',
     hub: fx.hubBytes,
     'manifest.json': JSON.stringify(fx.phase1Manifest),
   });
@@ -509,7 +509,7 @@ test('bundler fails closed on skill.tar.gz sha256 mismatch (tampered bundle)', a
     fx.pin.skill_sha256,
     'fixture sanity: the tampered bundle must hash differently',
   );
-  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/skill.tar.gz': { body: other } });
+  const stub = await stubServer({ ...stubFiles(fx), '/skill-v2.2.3/skill.tar.gz': { body: other } });
   try {
     const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
@@ -542,7 +542,7 @@ test('bundler fails closed when the skill release manifest has no skill_sha256',
   // bundle the skill release never published.
   const skillReleaseManifest: Record<string, unknown> = { ...fx.skillReleaseManifest };
   delete skillReleaseManifest.skill_sha256;
-  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
+  const stub = await stubServer({ ...stubFiles(fx), '/skill-v2.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
   try {
     const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
@@ -557,7 +557,7 @@ test('bundler fails closed when the skill release manifest version disagrees wit
   const fx = await makeRelease(dir);
   // The skill-v tag was republished under a different skill version.
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_version: '9.9.9' };
-  const stub = await stubServer({ ...stubFiles(fx), '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
+  const stub = await stubServer({ ...stubFiles(fx), '/skill-v2.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) } });
   try {
     const r = await runBundler(bundlerEnv(dir, fx.pin, stub.url));
     assert.notEqual(r.code, 0, 'must fail');
@@ -577,8 +577,8 @@ test('bundler fails closed on a tarball with a path-traversal member', async () 
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
     ...stubFiles(fx),
-    '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
-    '/skill-v1.2.3/skill.tar.gz': { body: evil },
+    '/skill-v2.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
+    '/skill-v2.2.3/skill.tar.gz': { body: evil },
   });
   try {
     const r = await runBundler(bundlerEnv(dir, pin, stub.url));
@@ -598,8 +598,8 @@ test('bundler fails closed on a tarball with a symlink member', async () => {
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
     ...stubFiles(fx),
-    '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
-    '/skill-v1.2.3/skill.tar.gz': { body: evil },
+    '/skill-v2.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
+    '/skill-v2.2.3/skill.tar.gz': { body: evil },
   });
   try {
     const r = await runBundler(bundlerEnv(dir, pin, stub.url));
@@ -621,8 +621,8 @@ test('bundler fails closed when the tarball embeds a phase-2 manifest', async ()
   const skillReleaseManifest = { ...fx.skillReleaseManifest, skill_sha256: evilSha };
   const stub = await stubServer({
     ...stubFiles(fx),
-    '/skill-v1.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
-    '/skill-v1.2.3/skill.tar.gz': { body: evil },
+    '/skill-v2.2.3/skill-manifest.json': { body: JSON.stringify(skillReleaseManifest) },
+    '/skill-v2.2.3/skill.tar.gz': { body: evil },
   });
   try {
     const r = await runBundler(bundlerEnv(dir, pin, stub.url));

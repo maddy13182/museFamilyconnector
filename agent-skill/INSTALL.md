@@ -6,19 +6,16 @@ it first, then invites everyone else.
 ## Prerequisites
 
 - Python 3.8+.
-- **PyNaCl + the `mnemonic` package** (pinned in `requirements.txt`):
-  `pip install -r requirements.txt`. These are needed for the E2EE identity
-  key commands (`setup` key generation, `key-init`, `key-backup`,
-  `key-restore`). The stdlib-only property ended with E2EE Phase 1 — every
-  other `hub` command keeps working without them, and key commands fail
-  with a clear message telling you how to install them.
+- **PyNaCl + mnemonic** are mandatory for normal use. Install from
+  `requirements.txt` (exact direct dependency pins; checkout CI uses `requirements.lock`); no plaintext fallback.
+- Protocol-2 server, CLI and skill (2.0.0+); older releases are incompatible.
 - An **invite code** from the family owner (sent over text/email — the code is
   single-use, expires in 7 days, and grants no read access by itself).
 
 ## Step 1 — Get the files
 
 **The one-bundle flow (recommended).** The server publishes the whole
-installable skill as one signed bundle: `GET /v1/client/latest` names the
+installable skill as one signed bundle: `GET /v2/client/latest` names the
 current skill version and its download URL (the manifest's `skill` block:
 `{url, sha256, version}`). The bundle is `skill.tar.gz` — `SKILL.md`,
 `references/`, `INSTALL.md`, `requirements.txt`, plus the signed `hub`
@@ -38,7 +35,7 @@ Verify **before** extracting or installing — in this order:
 # 1. Hash: proves the bytes are exactly the published bundle.
 python3 - <<'EOF'
 import hashlib
-want = "<sha256-from-the-invite-page>"   # or from GET /v1/client/latest
+want = "<sha256-from-the-invite-page>"   # or from GET /v2/client/latest
 got = hashlib.sha256(open("skill.tar.gz", "rb").read()).hexdigest()
 assert got == want, "sha256 MISMATCH — do not install"
 print("sha256 OK:", got)
@@ -104,12 +101,12 @@ with is detectable here — keep them in lockstep (see "Upgrading" below).
 ## Upgrading — `hub upgrade`
 
 `hub upgrade` asks the server what the current signed release is
-(`GET /v1/client/latest` — which also states the server's required
+(`GET /v2/client/latest` — which also states the server's required
 minimum CLI version), and only when it is newer than the installed
 CLI does it:
 
 1. Download `hub`, `hub.sigstore`, and `manifest.json` from the server's
-   own download endpoints (`/v1/client/download/*`, the URLs in the
+   own download endpoints (`/v2/client/download/*`, the URLs in the
    manifest's `assets` map).
 2. Verify the sigstore signature (refuses if the `sigstore` package is
    missing — it will not skip verification).
@@ -153,7 +150,7 @@ hub rollback   # restores hub.prev; the rolled-back-from binary becomes the new 
 ## Step 2 — Run setup
 
 ```sh
-hub setup
+hub setup --store file
 ```
 
 It asks for three things (or pass them as flags):
@@ -168,38 +165,36 @@ It asks for three things (or pass them as flags):
 On success the server returns your member record and **one** bearer token.
 `hub setup` **never prints the token**. Where it lives depends on `--store`:
 
-- `--store env` (default, recommended for Muse agents): hub stores nothing.
-  Your agent harness injects `FAMILY_HUB_TOKEN` from your **Secure Vault**
-  every time it runs `hub`. Save the token into the vault via your platform's
-  secure flow right after setup — the server will never show it again.
-- `--store file`: writes the token to a `0600` file under
-  `~/.config/family-hub/profiles/<name>/token`. Simple, but anyone with your
-  machine user can read it. Fine for a personal server, not for shared boxes.
-- `--store vault-cmd`: hub runs your helper (e.g. `op read …`) on every
-  invocation and takes the token from its stdout. Nothing stored at all.
+- `--store file` is the default: the CLI saves the credential in a private 0600
+  profile file before continuing. Agent commands never print it.
+- Environment and vault-helper lookup are available for an already-provisioned
+  credential. They are runtime lookup methods only, not setup storage options. Setup always
+  persists the newly minted credential privately; it rejects ephemeral enrollment
+  sinks before consuming the code.
+
+The identity recovery phrase is saved in a private `recovery-phrase.txt` file in
+that profile, never printed. Save it privately off-machine; do not ask Muse to
+read its words into chat. `hub key-backup` creates an encrypted backup too.
 
 Precedence at runtime is: `FAMILY_HUB_TOKEN` → vault helper → `0600` file.
 
 ## Step 3 — Poll on a schedule
 
-Add a recurring job that runs `hub sync` about every 15 minutes. The agent
-finds changed topics, reads them in order, and surfaces anything needing
-the human's attention (SKILL.md §2).
+Schedule the **complete Muse workflow** about every 15 minutes: discover changed
+topics with `hub sync`, read each topic, deliver its report to the matching Muse
+chat, then acknowledge the successfully delivered read receipt. Scheduling only
+the `hub sync` CLI prints JSON; it does not notify anybody.
 
-Cron example (the scheduler injects the credential — **never paste the token
-into the crontab**):
+On a platform with a background worker, have it prepare the per-topic report and
+receipt for the main Muse agent, which posts to the chat before acknowledging.
+If the worker has chat tools, it can deliver and acknowledge itself. If scheduling
+or chat creation is unavailable, say so and use manual checks. Follow SKILL.md §2;
+never claim that automatic notifications work until the human has received a test.
 
-```cron
-*/15 * * * * /home/you/workspace/skills/family-hub/hub sync --limit 200
-```
-
-With the platform scheduler / hooks: create a 15-minute cron whose command is
-`hub sync`, with `FAMILY_HUB_TOKEN` bound from the Secure Vault (same binding
-the agent's tool calls use). Multiple agents on one machine: give each its own
-`--profile` so tokens and keystores don't collide — read state is tracked
-per agent on the server, and you run one watcher per member (SKILL.md §2). If you wrapped the identity key with
-`hub key-wrap`, bind `FAMILY_HUB_KEY_PASSPHRASE` the same way — see
-"Protecting the identity key at rest" below.
+Use private profile storage or the platform's secure runtime credential injection.
+Multiple agents on one machine need separate profiles and private keys. If the
+identity is wrapped, supply `FAMILY_HUB_KEY_PASSPHRASE` from secure storage for
+scheduled invocations; never paste it or the bearer credential into job text.
 
 > **Wrapped keys + cron.** If you wrapped the agent key with
 > `hub key-wrap`, every non-interactive invocation (this cron included)
@@ -254,19 +249,10 @@ error — never garbage output.
 Legacy unwrapped keys keep working, but `hub` prints a loud deprecation
 warning on every use pointing at `hub key-wrap`.
 
-> **Ops note — read this if you run `hub` on a schedule.** After wrapping,
-> any automation (e.g. the 15-minute `hub sync` cron from Step 3) must
-> export `FAMILY_HUB_KEY_PASSPHRASE=<passphrase>` in its environment, or it
-> will block forever on the passphrase prompt. Bind it from your secret
-> manager / vault the same way you bind `FAMILY_HUB_TOKEN` — never paste
-> it into the crontab.
->
-> ```cron
-> */15 * * * * FAMILY_HUB_KEY_PASSPHRASE=<from vault> /home/you/workspace/skills/family-hub/hub sync --limit 200
-> ```
->
-> (Use your scheduler's secret binding for the value; the literal above is
-> illustrative only.)
+For scheduled agent workflows, bind the wrapped-key passphrase through the
+scheduler's secret store. Missing passphrases can cause an interactive prompt;
+configure unattended secret access before enabling the watcher. Never put literal
+secrets in job commands, and schedule the complete read/report/ack workflow.
 
 ## For non-Muse agents
 
@@ -311,9 +297,9 @@ is not the layer that saves you there.
 | `Access denied` (403) | You're not a participant — ask an owner/parent to invite you; don't work around it |
 | `Blocked` (exit 4 / 422) | Your text tripped the PII scan — rephrase without card numbers/SSNs and retry |
 | `Cannot reach the Hub server` | Check `--server` / config URL and network |
-| `warning: token file … is readable by others` | `chmod 600` the file, or switch to `--store env` |
+| `warning: token file … is readable by others` | `chmod 600` the file |
 | `hub upgrade`: `sigstore` not installed | `pip install "sigstore>=3.0,<4.0"`, then retry — the upgrade refuses rather than skipping verification |
 | `hub upgrade`: signature/sha256 FAILED | Do **not** install; the artifact may be tampered — tell the family owner |
 | cron job hangs on a prompt | `agent.key` is wrapped and the job lacks `FAMILY_HUB_KEY_PASSPHRASE` — bind it from the Secure Vault (see Step 3) |
 | `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the server |
-| `RESULT: FAIL` from `hub verify-install` | Reinstall from the server (artifact + `manifest.json` + `hub.sigstore` via `/v1/client/download/*`, or `hub upgrade`); don't keep using the failed copy |
+| `RESULT: FAIL` from `hub verify-install` | Reinstall from the server (artifact + `manifest.json` + `hub.sigstore` via `/v2/client/download/*`, or `hub upgrade`); don't keep using the failed copy |

@@ -114,7 +114,7 @@ class UserAgentTests(unittest.TestCase):
     def test_user_agent_carries_real_version(self):
         recorder = _Recorder()
         client = hub.HubClient("https://hub.example", transport=recorder)
-        client.call("GET", "/v1/health", auth=False)
+        client.call("GET", "/v2/health", auth=False)
         self.assertTrue(recorder.calls)
         self.assertEqual(
             recorder.calls[0]["User-Agent"],

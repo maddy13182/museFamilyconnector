@@ -57,7 +57,7 @@ const BUNDLER = join(HERE, 'bundle-client.mjs');
 const FIXTURE_DIR = join(SERVER_DIR, '.test-fixtures');
 
 const FIXTURE_VERSION = '9.9.9';
-const FIXTURE_SKILL_VERSION = '1.2.3';
+const FIXTURE_SKILL_VERSION = '2.2.3';
 
 function sha256hex(buf) {
   return createHash('sha256').update(buf).digest('hex');

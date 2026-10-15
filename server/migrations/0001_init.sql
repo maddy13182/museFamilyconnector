@@ -75,7 +75,7 @@ CREATE TABLE topics(
     CHECK(link_visibility IN ('placeholder','hidden')),
   -- E2EE (v0.7.0+, clean slate): 1 = end-to-end encrypted topic, 0 =
   -- plaintext. Per-topic opt-in; plaintext topics behave exactly as before.
-  e2ee INTEGER NOT NULL DEFAULT 0,
+  e2ee INTEGER NOT NULL DEFAULT 1 CHECK(e2ee = 1),
   -- E2EE key election (secfix F1): the key_id (32 hex chars) of the CURRENT
   -- topic key. Set at E2EE topic creation from the creator's initial_key_id;
   -- afterwards only an owner/parent may introduce a new key_id (rotation),
@@ -130,7 +130,7 @@ CREATE TABLE tasks(
   assignee_member_id TEXT NULL REFERENCES members(id),
   parent_task_id TEXT NULL REFERENCES tasks(id),
   due_at TEXT NULL,
-  result TEXT NULL,          -- JSON, set on done
+  result TEXT NULL,          -- fh1 ciphertext of JSON, set on done
   created_by TEXT NOT NULL REFERENCES members(id),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL

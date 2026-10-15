@@ -29,14 +29,14 @@ export async function setupKeyedFamily(
   app: TestApp,
   name: string,
 ): Promise<{ famId: string; owner: Party }> {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: 'Ow', owner_email: `o-${name}@x.dev` },
   });
   assert.equal(fam.status, 201);
   const famId = (await app.db.queryOne('SELECT id FROM families WHERE name = ?', [name]))!['id'] as string;
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
     { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
@@ -59,15 +59,15 @@ export async function addMember(
   role: string,
   displayName: string,
 ): Promise<{ token: string; memberId: string }> {
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: inviterToken,
     body: { email, role },
   });
   assert.equal(inv.status, 201);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` } },
+    `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
@@ -82,17 +82,18 @@ export async function addAgent(
   label: string,
   withKey: boolean,
 ): Promise<Party> {
-  const m = await app.call('POST', '/v1/provisioning-codes', {
+  const m = await app.call('POST', '/v2/provisioning-codes', {
     token: minterToken,
     body: { member_id: memberId, agent_label: label },
   });
   assert.equal(m.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(m.body.provisioning_code)}/redeem`,
-    { body: withKey ? { agent_public_key: b64(32) } : {} },
+    `/v2/provisioning-codes/${encodeURIComponent(m.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: (await app.db.queryOne('SELECT public_key FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL',[memberId,label]))?.public_key ?? b64(32) } },
   );
   assert.equal(red.status, 201);
+  if (!withKey) await app.db.execAtomically([{sql: 'DELETE FROM agent_keys WHERE member_id = ? AND agent_label = ?',params:[memberId,label]}]);
   return { token: red.body.token as string, memberId: red.body.member.id as string, agentLabel: label };
 }
 
@@ -101,32 +102,28 @@ export async function createE2eeTopic(
   token: string,
   opts: { participantIds?: string[]; subject?: string; initialKeyId?: string } = {},
 ): Promise<{ status: number; body: any; tid: string }> {
-  const res = await app.call('POST', '/v1/topics', {
+  const res = await app.call('POST', '/v2/topics', {
     token,
     body: {
-      subject: opts.subject ?? b64(64),
+      topic_id: hex(16),
+      subject: opts.subject ?? wireBody(opts.initialKeyId ?? hex(16)),
       kind: 'group',
       participant_member_ids: opts.participantIds ?? [],
-      e2ee: 1,
-      initial_key_id: opts.initialKeyId ?? hex(16),
     },
   });
   assert.equal(res.status, 201);
   return { status: res.status, body: res.body, tid: res.body.topic.id as string };
 }
 
-export async function createPlainTopic(
-  app: TestApp,
-  token: string,
-  subject: string,
-  participantIds: string[] = [],
+/** An active encrypted topic for read/ack business journeys. */
+export async function createActiveTopic(
+  app: TestApp, token: string, _subject: string, participantIds: string[] = [],
 ): Promise<string> {
-  const res = await app.call('POST', '/v1/topics', {
-    token,
-    body: { subject, kind: 'group', participant_member_ids: participantIds },
-  });
-  assert.equal(res.status, 201);
-  return res.body.topic.id as string;
+  const { tid } = await createE2eeTopic(app, token, {participantIds});
+  const row = await app.call('GET', `/v2/topics/${tid}`, {token});
+  const keys = await app.call('GET', '/v2/agent-keys', {token});
+  await genesisCommit(app, token, tid, keys.body.keys.filter((k: any)=>row.body.participants.some((p: any)=>p.member_id===k.member_id)).map((k: any)=>({memberId:k.member_id,agentLabel:k.agent_label})));
+  return tid;
 }
 
 export async function inviteToTopic(
@@ -136,7 +133,7 @@ export async function inviteToTopic(
   memberIds: string[],
   historyFrom: 'full' | 'from_join' = 'full',
 ): Promise<void> {
-  const res = await app.call('POST', `/v1/topics/${tid}/invite`, {
+  const res = await app.call('POST', `/v2/topics/${tid}/invite`, {
     token,
     body: { member_ids: memberIds, history_from: historyFrom },
   });
@@ -151,7 +148,7 @@ export async function postEnvelope(
   targetAgentLabel: string,
   keyId: string,
 ): Promise<{ status: number; body: any }> {
-  return app.call('POST', `/v1/topics/${tid}/envelopes`, {
+  return app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token,
     body: {
       member_id: targetMemberId,
@@ -169,19 +166,20 @@ export interface CommitOpts {
   force?: boolean;
 }
 
-/** POST /v1/topics/:tid/keys/commit. Returns the raw call result. */
+/** POST /v2/topics/:tid/keys/commit. Returns the raw call result. */
 export async function commitKey(
   app: TestApp,
   token: string,
   tid: string,
   opts: CommitOpts,
 ): Promise<{ status: number; body: any }> {
-  return app.call('POST', `/v1/topics/${tid}/keys/commit`, {
+  return app.call('POST', `/v2/topics/${tid}/keys/commit`, {
     token,
     body: {
       expected_epoch: opts.expectedEpoch,
       key_id: opts.keyId,
       commitment: opts.commitment,
+      subject: wireBody(opts.keyId),
       ...(opts.force !== undefined ? { force: opts.force } : {}),
     },
   });
@@ -204,7 +202,7 @@ export async function postEntry(
   body: string,
   extra: Record<string, unknown> = {},
 ): Promise<{ status: number; body: any }> {
-  return app.call('POST', `/v1/topics/${tid}/entries`, {
+  return app.call('POST', `/v2/topics/${tid}/entries`, {
     token,
     body: { kind: 'message', body, ...extra },
   });

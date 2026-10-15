@@ -42,7 +42,7 @@ try:
 except ImportError:
     HAVE_CRYPTO = False
 
-REDEEM_PATH = "/v1/provisioning-codes/fhp_E2EE01/redeem"
+REDEEM_PATH = "/v2/provisioning-codes/fhp_E2EE01/redeem"
 
 
 class FakeHub:
@@ -62,8 +62,8 @@ class FakeHub:
         path = urlparse.urlparse(url).path
         if (
             method.upper() == "GET"
-            and path == "/v1/health"
-            and ("GET", "/v1/health") not in self.routes
+            and path == "/v2/health"
+            and ("GET", "/v2/health") not in self.routes
         ):
             # The fake models a current (1.0.0) server: auto-answer the
             # per-invocation version check in main().
@@ -76,7 +76,7 @@ class FakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
             )
         self.calls.append(
             {
@@ -123,7 +123,7 @@ class E2EETestBase(unittest.TestCase):
         os.environ.pop("FAMILY_HUB_VAULT_CMD", None)
         self.fake = FakeHub()
         # Fresh version-check state per test (the fake auto-answers
-        # /v1/health as a current server; see FakeHub.__call__).
+        # /v2/health as a current server; see FakeHub.__call__).
         hub._reset_server_version_cache()
 
     def tearDown(self):
@@ -224,13 +224,13 @@ class TestSetupKey(E2EETestBase):
                 },
             },
         )
-        self.fake.add("GET", "/v1/me", 200, {"id": "m9", "name": "Owner"})
+        self.fake.add("GET", "/v2/me", 200, {"id": "m9", "name": "Owner"})
 
     def test_setup_sends_public_key_in_redeem(self):
         self._add_redeem()
         rc, out, err = self.run_cli(
             ["setup", "--server", "https://hub.example",
-             "--invite", "fhp_E2EE01", "--store", "env"]
+             "--invite", "fhp_E2EE01", "--store", "file"]
         )
         self.assertEqual(rc, 0)
         bodies = self.fake.bodies_for("POST", REDEEM_PATH)
@@ -242,12 +242,13 @@ class TestSetupKey(E2EETestBase):
         priv = self.read_key()
         self.assertEqual(hub._public_key_b64(priv), pub_b64)
         self.assertEqual(self.file_mode(self.key_path()), 0o600)
-        # The 24-word phrase was printed once and decodes to the same key.
-        phrase_lines = [
-            ln for ln in out.splitlines() if len(ln.split()) == 24
-        ]
-        self.assertEqual(len(phrase_lines), 1, "exactly one 24-word phrase line")
-        self.assertEqual(hub._privkey_from_phrase(phrase_lines[0]), priv)
+        # Recovery material is private, never emitted into the agent transcript.
+        phrase_path = os.path.join(hub.profile_dir("default"), "recovery-phrase.txt")
+        with open(phrase_path, encoding="utf-8") as stream:
+            phrase = stream.read().strip()
+        self.assertEqual(hub._privkey_from_phrase(phrase), priv)
+        self.assertEqual(self.file_mode(phrase_path), 0o600)
+        self.assertNotIn(phrase, out + err)
         # The raw key itself never appears in output.
         self.assertNotIn(priv.hex(), out + err)
         self.assertNotIn(base64.b64encode(priv).decode(), out + err)
@@ -259,7 +260,7 @@ class TestSetupKey(E2EETestBase):
         ):
             rc, out, err = self.run_cli(
                 ["setup", "--server", "https://hub.example",
-                 "--invite", "fhp_E2EE01", "--store", "env"]
+                 "--invite", "fhp_E2EE01", "--store", "file"]
             )
         self.assertNotEqual(rc, 0)
         self.assertIn("PyNaCl", err)
@@ -342,11 +343,11 @@ class TestBackupRestore(E2EETestBase):
 
 class TestKeyInit(E2EETestBase):
     def _add_directory(self, keys):
-        self.fake.add("GET", "/v1/me", 200,
+        self.fake.add("GET", "/v2/me", 200,
                       {"id": "m1", "name": "Tester", "agent_label": "test-agent"})
-        self.fake.add("GET", "/v1/agent-keys", 200, {"keys": keys})
+        self.fake.add("GET", "/v2/agent-keys", 200, {"keys": keys})
         self.fake.add(
-            "POST", "/v1/agent-keys/rotate", 200,
+            "POST", "/v2/agent-keys/rotate", 200,
             {"member_id": "m1", "agent_label": "test-agent",
              "public_key": "PENDING", "created_at": "2026-10-11T00:00:00Z"},
         )
@@ -356,7 +357,7 @@ class TestKeyInit(E2EETestBase):
         self._add_directory(keys=[])
         rc, out, err = self.run_cli(["key-init"])
         self.assertEqual(rc, 0)
-        rotates = self.fake.bodies_for("POST", "/v1/agent-keys/rotate")
+        rotates = self.fake.bodies_for("POST", "/v2/agent-keys/rotate")
         self.assertEqual(len(rotates), 1)
         sent = rotates[0]["agent_public_key"]
         self.assertEqual(sent, hub._public_key_b64(self.read_key()))
@@ -365,14 +366,14 @@ class TestKeyInit(E2EETestBase):
         # Second run: the directory now shows our key -> no rotate call.
         self.fake.calls.clear()
         self.fake.add(
-            "GET", "/v1/agent-keys", 200,
+            "GET", "/v2/agent-keys", 200,
             {"keys": [{"member_id": "m1", "agent_label": "test-agent",
                        "public_key": sent, "created_at": "2026-10-11T00:00:00Z"}]},
         )
         rc, out, err = self.run_cli(["key-init"])
         self.assertEqual(rc, 0)
         self.assertIn("already registered", out)
-        self.assertEqual(self.fake.bodies_for("POST", "/v1/agent-keys/rotate"), [])
+        self.assertEqual(self.fake.bodies_for("POST", "/v2/agent-keys/rotate"), [])
 
     def test_key_init_registers_preexisting_local_key(self):
         # Agent generated a key at setup (invite path) but never registered.
@@ -381,7 +382,7 @@ class TestKeyInit(E2EETestBase):
         self._add_directory(keys=[])
         rc, out, err = self.run_cli(["key-init"])
         self.assertEqual(rc, 0)
-        rotates = self.fake.bodies_for("POST", "/v1/agent-keys/rotate")
+        rotates = self.fake.bodies_for("POST", "/v2/agent-keys/rotate")
         self.assertEqual(len(rotates), 1)
 
     def test_key_material_never_in_debug_output(self):

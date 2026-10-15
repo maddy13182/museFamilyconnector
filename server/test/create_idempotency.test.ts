@@ -1,18 +1,19 @@
-// Idempotent creates: POST /v1/families, /v1/topics, /v1/families/:id/invites
+import { b64 } from './syncv2_helpers.js';
+// Idempotent creates: POST /v2/families, /v2/topics, /v2/families/:id/invites
 // honor Idempotency-Key; circle names are unique (case-insensitive).
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { makeApp } from './app.js';
+import { makeClientApp as makeApp } from './fixture-client.js';
 
 async function bootstrapOwner(app: ReturnType<typeof makeApp>, name: string, email: string) {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: 'Owner', owner_email: email },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
   );
   assert.equal(red.status, 201);
   return { famId: fam.body.family.id as string, token: red.body.token as string };
@@ -21,7 +22,7 @@ async function bootstrapOwner(app: ReturnType<typeof makeApp>, name: string, ema
 test('duplicate circle name (case-insensitive) -> 409 circle_name_taken', async () => {
   const app = makeApp();
   await bootstrapOwner(app, 'Close Friends', 'a@t.dev');
-  const dup = await app.call('POST', '/v1/families', {
+  const dup = await app.call('POST', '/v2/families', {
     body: { name: 'close friends', owner_name: 'O2', owner_email: 'b@t.dev' },
   });
   assert.equal(dup.status, 409);
@@ -34,7 +35,7 @@ test('locked create: same Idempotency-Key twice -> one circle, deduped, fresh co
   app.env.SETUP_LOCKED = '1';
 
   const key = 'create-key-1';
-  const first = await app.call('POST', '/v1/families', {
+  const first = await app.call('POST', '/v2/families', {
 token,
     body: { name: 'Gym', kind: 'general' },
     headers: { 'idempotency-key': key },
@@ -44,7 +45,7 @@ token,
   const fid = first.body.id as string;
   const code1 = first.body.provisioning_code as string;
 
-  const second = await app.call('POST', '/v1/families', {
+  const second = await app.call('POST', '/v2/families', {
 token,
     body: { name: 'Gym', kind: 'general' },
     headers: { 'idempotency-key': key },
@@ -56,15 +57,15 @@ token,
   assert.ok(code2 && code2 !== code1, 'dedup must mint a fresh code');
 
   // Only one circle row exists.
-  const families = await app.call('GET', '/v1/families', { token });
+  const families = await app.call('GET', '/v2/families', { token });
   assert.equal(families.body.families.filter((f: any) => f.name === 'Gym').length, 1);
 
   // Both codes redeem (first was never delivered in the failure scenario).
   for (const code of [code1, code2]) {
     const red = await app.call(
       'POST',
-      `/v1/provisioning-codes/${encodeURIComponent(code)}/redeem`,
-      { body: {} },
+      `/v2/provisioning-codes/${encodeURIComponent(code)}/redeem`,
+      { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
     );
     assert.equal(red.status, 201);
   }
@@ -76,7 +77,7 @@ test('dedup after redeem revokes the orphaned token', async () => {
   app.env.SETUP_LOCKED = '1';
 
   const key = 'create-key-orphan';
-  const first = await app.call('POST', '/v1/families', {
+  const first = await app.call('POST', '/v2/families', {
 token,
     body: { name: 'Book', kind: 'general' },
     headers: { 'idempotency-key': key },
@@ -85,14 +86,14 @@ token,
   // Redeem succeeded but the response was lost (client holds nothing).
   const red1 = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(code1)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(code1)}/redeem`,
+    { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
   );
   assert.equal(red1.status, 201);
   const orphanToken = red1.body.token as string;
 
   // Client retries the create with the same key.
-  const second = await app.call('POST', '/v1/families', {
+  const second = await app.call('POST', '/v2/families', {
 token,
     body: { name: 'Book', kind: 'general' },
     headers: { 'idempotency-key': key },
@@ -100,42 +101,43 @@ token,
   assert.equal(second.body.deduped, true);
 
   // The orphaned token is revoked: it no longer authenticates.
-  const probe = await app.call('GET', '/v1/families', { token: orphanToken });
+  const probe = await app.call('GET', '/v2/families', { token: orphanToken });
   assert.equal(probe.status, 401);
 
   // The fresh code works.
   const red2 = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(second.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(second.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
   );
   assert.equal(red2.status, 201);
 });
 
 test('redeem of used code returns member + token_already_issued', async () => {
   const app = makeApp();
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name: 'F', owner_name: 'M', owner_email: 'm@t.dev' },
   });
   const code = fam.body.provisioning_code as string;
-  const path = `/v1/provisioning-codes/${encodeURIComponent(code)}/redeem`;
-  const red1 = await app.call('POST', path, { body: {} });
+  const path = `/v2/provisioning-codes/${encodeURIComponent(code)}/redeem`;
+  const red1 = await app.call('POST', path, { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } });
   assert.equal(red1.status, 201);
-  const red2 = await app.call('POST', path, { body: {} });
+  const red2 = await app.call('POST', path, { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } });
   assert.equal(red2.status, 409);
   assert.equal(red2.body.error.code, 'code_used');
   assert.equal(red2.body.token_already_issued, true);
   assert.ok(red2.body.member && red2.body.member.id);
 });
 
-test('topic create is idempotent with a key', async () => {
+test('topic create is idempotent with its client-generated operation ID', async () => {
   const app = makeApp();
   const { token } = await bootstrapOwner(app, 'Fam A', 'a@t.dev');
   const key = 'topic-key-1';
+  const payload = {topic_id:'a'.repeat(32),subject:'fh1.'+'b'.repeat(32)+'.'+'c'.repeat(32)+'.'+b64(40),kind:'group',participant_member_ids:[]};
   const mk = () =>
-    app.call('POST', '/v1/topics', {
+    app.rawCall('POST', '/v2/topics', {
 token,
-      body: { subject: 'T', kind: 'group', participant_member_ids: [] },
+      body: payload,
       headers: { 'idempotency-key': key },
     });
   const first = await mk();
@@ -151,7 +153,7 @@ test('invite create is idempotent with a key (fresh code on dedup)', async () =>
   const { token, famId } = await bootstrapOwner(app, 'Fam A', 'a@t.dev');
   const key = 'invite-key-1';
   const mk = () =>
-    app.call('POST', `/v1/families/${famId}/invites`, {
+    app.call('POST', `/v2/families/${famId}/invites`, {
 token,
       body: { email: 'n@t.dev', role: 'parent' },
       headers: { 'idempotency-key': key },
