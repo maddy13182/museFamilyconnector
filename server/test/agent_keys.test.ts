@@ -313,6 +313,8 @@ test('rotate marks the old key superseded, keeps the row, and activates the new 
 test('rotate with no prior key is the initial registration path', async () => {
   const app = makeApp();
   const { owner } = await setupFamily(app, 'KeyFam5');
+  // Fault injection: explicit registration repair after identity-row loss.
+  await app.db.execAtomically([{sql:'DELETE FROM agent_keys WHERE member_id = ?',params:[owner.memberId]}]);
   const key = b64(32);
   const rot = await app.call('POST', '/v2/agent-keys/rotate', {
     token: owner.token,

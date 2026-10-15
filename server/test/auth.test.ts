@@ -1,4 +1,3 @@
-import { b64 } from './syncv2_helpers.js';
 // Unit/integration tests: the resolveToken() choke point (SPEC §7).
 import { test } from 'node:test';
 import assert from 'node:assert';

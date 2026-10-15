@@ -128,7 +128,7 @@ test('forged receipt -> 403 invalid_read_receipt', async () => {
 
 test('cross-agent receipt replay -> 403 (binding is inside the HMAC)', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'AckXAgent');
+  const { owner } = await setupKeyedFamily(app, 'AckXAgent');
   const tid = await createActiveTopic(app, owner.token, 'xagent topic');
   await postN(app, owner.token, tid, 4);
 

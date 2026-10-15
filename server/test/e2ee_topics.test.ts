@@ -54,13 +54,12 @@ async function setupKeyedFamily(app: TestApp, name: string): Promise<{ famId: st
 }
 
 // Extra agent for an existing member (distinct token + agent_label),
-// optionally with a registered identity key.
+// always registers its identity at enrollment.
 async function addAgent(
   app: TestApp,
   minterToken: string,
   memberId: string,
   label: string,
-  withKey: boolean,
 ): Promise<Party> {
   const m = await app.call('POST', '/v2/provisioning-codes', {
     token: minterToken,
@@ -76,7 +75,7 @@ async function addAgent(
   return { token: red.body.token as string, memberId: red.body.member.id as string, agentLabel: label };
 }
 
-// Extra member via the invite flow (no identity key unless added later).
+// Extra member via mandatory identity enrollment.
 async function addMember(
   app: TestApp,
   famId: string,
@@ -107,15 +106,11 @@ async function createTopic(
   return app.call('POST', '/v2/topics', { token, body });
 }
 
-function plaintextBody(subject = 'plain subject'): Record<string, unknown> {
-  return { subject, kind: 'group', participant_member_ids: [] };
-}
-
 // ---------------------------------------------------------------------------
 // Topic creation with e2ee
 // ---------------------------------------------------------------------------
 
-test('e2ee=1 without a registered creator key is 400 with key-init guidance', async () => {
+test('Topic creation without a registered creator key is 400 with key-init guidance', async () => {
   const app = makeApp();
   const fam = await app.call('POST', '/v2/families', {
     body: { name: 'NoKeyFam', owner_name: 'Ow', owner_email: 'o-nokeyfam@x.dev' },
@@ -124,7 +119,7 @@ test('e2ee=1 without a registered creator key is 400 with key-init guidance', as
   const red = await app.call(
     'POST',
     `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: b64(32) } }, // no agent_public_key: this agent has no E2EE identity
+    { body: { agent_public_key: b64(32) } }, // Fault injection below models a lost identity registration.
   );
   assert.equal(red.status, 201);
   await app.db.execAtomically([{sql:'DELETE FROM agent_keys WHERE member_id = ?',params:[red.body.member.id]}]);
@@ -141,7 +136,7 @@ test('e2ee=1 without a registered creator key is 400 with key-init guidance', as
   assert.equal(n!['c'], 0);
 });
 
-test('e2ee=1 with a registered key creates the topic; subject stored opaque as-is', async () => {
+test('Topic creation with a registered key creates the topic; subject stored opaque as-is', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'E2eeFam1');
   const ciphertextSubject = wireBody(hex(16)); // simulated client-side ciphertext
@@ -213,7 +208,7 @@ test('envelope POST: target must be a participant with an ACTIVE registered key'
   const memberB = await addMember(app, famId, owner.token, 'b@e.dev', 'parent', 'Bee');
   const memberC = await addMember(app, famId, owner.token, 'c@e.dev', 'parent', 'Cee');
   // B's agent registers an identity key (via rotate = initial registration).
-  const agentB = await addAgent(app, owner.token, memberB.memberId, 'bee-agent', false);
+  const agentB = await addAgent(app, owner.token, memberB.memberId, 'bee-agent');
   const rot = await app.call('POST', '/v2/agent-keys/rotate', {
     token: agentB.token,
     body: { agent_public_key: b64(32) },
@@ -268,7 +263,7 @@ test('envelope POST: target must be a participant with an ACTIVE registered key'
   // CURRENT active key, not the superseded one. Register a fresh agent to
   // test the superseded-only case.
   assert.equal(superseded.status, 201);
-  const agentB2 = await addAgent(app, owner.token, memberB.memberId, 'bee2-agent', true);
+  const agentB2 = await addAgent(app, owner.token, memberB.memberId, 'bee2-agent');
   await app.call('POST', '/v2/agent-keys/rotate', {
     token: agentB2.token,
     body: { agent_public_key: b64(32) },
@@ -370,8 +365,8 @@ test('envelope GET: each agent sees only its own envelopes; non-participant 403'
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'E2eeFam8');
   const memberB = await addMember(app, famId, owner.token, 'b@e.dev', 'parent', 'Bee');
-  const agentB = await addAgent(app, owner.token, memberB.memberId, 'bee-agent', true);
-  const agentB2 = await addAgent(app, owner.token, memberB.memberId, 'bee2-agent', true);
+  const agentB = await addAgent(app, owner.token, memberB.memberId, 'bee-agent');
+  const agentB2 = await addAgent(app, owner.token, memberB.memberId, 'bee2-agent');
 
   const topic = await createTopic(app, owner.token, {
     topic_id: hex(16), subject: wireBody(hex(16)),

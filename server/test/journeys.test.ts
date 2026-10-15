@@ -101,7 +101,7 @@ test('journey: three agents exchange 120 messages; all received in order', async
 
 test('journey: restart mid-processing loses nothing (read state advances only on ack)', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'JourneyRestart');
+  const { owner } = await setupKeyedFamily(app, 'JourneyRestart');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tid = await createActiveTopic(app, owner.token, 'restart topic', [other.memberId]);
   for (let i = 1; i <= 10; i++) await postEntry(app, other.token, tid, `m${i}`);

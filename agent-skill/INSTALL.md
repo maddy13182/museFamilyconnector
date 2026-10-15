@@ -180,24 +180,21 @@ Precedence at runtime is: `FAMILY_HUB_TOKEN` → vault helper → `0600` file.
 
 ## Step 3 — Poll on a schedule
 
-Add a recurring job that runs `hub sync` about every 15 minutes. The agent
-finds changed topics, reads them in order, and surfaces anything needing
-the human's attention (SKILL.md §2).
+Schedule the **complete Muse workflow** about every 15 minutes: discover changed
+topics with `hub sync`, read each topic, deliver its report to the matching Muse
+chat, then acknowledge the successfully delivered read receipt. Scheduling only
+the `hub sync` CLI prints JSON; it does not notify anybody.
 
-Cron example (the scheduler injects the credential — **never paste the token
-into the crontab**):
+On a platform with a background worker, have it prepare the per-topic report and
+receipt for the main Muse agent, which posts to the chat before acknowledging.
+If the worker has chat tools, it can deliver and acknowledge itself. If scheduling
+or chat creation is unavailable, say so and use manual checks. Follow SKILL.md §2;
+never claim that automatic notifications work until the human has received a test.
 
-```cron
-*/15 * * * * /home/you/workspace/skills/family-hub/hub sync --limit 200
-```
-
-With the platform scheduler / hooks: create a 15-minute cron whose command is
-`hub sync`, with `FAMILY_HUB_TOKEN` bound from the Secure Vault (same binding
-the agent's tool calls use). Multiple agents on one machine: give each its own
-`--profile` so tokens and keystores don't collide — read state is tracked
-per agent on the server, and you run one watcher per member (SKILL.md §2). If you wrapped the identity key with
-`hub key-wrap`, bind `FAMILY_HUB_KEY_PASSPHRASE` the same way — see
-"Protecting the identity key at rest" below.
+Use private profile storage or the platform's secure runtime credential injection.
+Multiple agents on one machine need separate profiles and private keys. If the
+identity is wrapped, supply `FAMILY_HUB_KEY_PASSPHRASE` from secure storage for
+scheduled invocations; never paste it or the bearer credential into job text.
 
 > **Wrapped keys + cron.** If you wrapped the agent key with
 > `hub key-wrap`, every non-interactive invocation (this cron included)
@@ -252,19 +249,10 @@ error — never garbage output.
 Legacy unwrapped keys keep working, but `hub` prints a loud deprecation
 warning on every use pointing at `hub key-wrap`.
 
-> **Ops note — read this if you run `hub` on a schedule.** After wrapping,
-> any automation (e.g. the 15-minute `hub sync` cron from Step 3) must
-> export `FAMILY_HUB_KEY_PASSPHRASE=<passphrase>` in its environment, or it
-> will block forever on the passphrase prompt. Bind it from your secret
-> manager / vault the same way you bind `FAMILY_HUB_TOKEN` — never paste
-> it into the crontab.
->
-> ```cron
-> */15 * * * * FAMILY_HUB_KEY_PASSPHRASE=<from vault> /home/you/workspace/skills/family-hub/hub sync --limit 200
-> ```
->
-> (Use your scheduler's secret binding for the value; the literal above is
-> illustrative only.)
+For scheduled agent workflows, bind the wrapped-key passphrase through the
+scheduler's secret store. Missing passphrases can cause an interactive prompt;
+configure unattended secret access before enabling the watcher. Never put literal
+secrets in job commands, and schedule the complete read/report/ack workflow.
 
 ## For non-Muse agents
 

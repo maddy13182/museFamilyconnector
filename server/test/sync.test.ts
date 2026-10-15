@@ -13,15 +13,12 @@ import assert from 'node:assert';
 import {
   makeApp,
   TestApp,
-  b64,
   setupKeyedFamily,
   addMember,
   addAgent,
   createActiveTopic,
-  createE2eeTopic,
   inviteToTopic,
   postEntry as rawPostEntry,
-  genesisCommit,
   wireBody,
   readState,
 } from './syncv2_helpers.js';
@@ -149,7 +146,7 @@ test('acked_seq reported is max(stored acked_seq, history_from_seq - 1)', async 
 
 test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncOrder');
+  const { owner } = await setupKeyedFamily(app, 'SyncOrder');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const t1 = await createActiveTopic(app, owner.token, 't1', [other.memberId]);
   const t2 = await createActiveTopic(app, owner.token, 't2', [other.memberId]);
@@ -191,7 +188,7 @@ test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
 
 test('paging: limit/page_token walk the full changed set; bad token is 400', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncPage');
+  const { owner } = await setupKeyedFamily(app, 'SyncPage');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tids: string[] = [];
   for (let i = 0; i < 5; i++) {
@@ -224,7 +221,7 @@ test('paging: limit/page_token walk the full changed set; bad token is 400', asy
 
 test('page-boundary race: activity between pages never 500s; nothing permanently skipped', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncRace');
+  const { owner } = await setupKeyedFamily(app, 'SyncRace');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tids: string[] = [];
   for (let i = 0; i < 4; i++) {
@@ -264,7 +261,7 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
 
 test('bootstrap: first call seeds read state at 0 and reports all visible topics once', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncBoot');
+  const { owner } = await setupKeyedFamily(app, 'SyncBoot');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tid = await createActiveTopic(app, owner.token, 'boot topic', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
@@ -293,7 +290,7 @@ test('bootstrap: first call seeds read state at 0 and reports all visible topics
 
 test('bootstrap accepts (and ignores) a legacy bootstrap_gseq param', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncBoot2');
+  const { owner } = await setupKeyedFamily(app, 'SyncBoot2');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tid = await createActiveTopic(app, owner.token, 'boot topic 2', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
@@ -365,7 +362,7 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
 
 test('unchanged topics are omitted; new activity re-lists the topic', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncChanged');
+  const { owner } = await setupKeyedFamily(app, 'SyncChanged');
   // Second member posts; owner syncs. Own posts never flag as changed.
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tid = await createActiveTopic(app, owner.token, 'changed topic', [other.memberId]);

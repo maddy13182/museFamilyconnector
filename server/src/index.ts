@@ -18,7 +18,6 @@ import {
 import {
   sha256hex,
   credentialHash,
-  randomBase62,
   newAgentToken,
   newInviteCode,
   newInvitePageToken,
@@ -2076,7 +2075,7 @@ async function cancelExpiredTransfer(db: DbClient, transfer: Row): Promise<void>
 // POST /v2/families/:fid/transfer — owner offers ownership to another member.
 async function handleOfferOwnership(
   db: DbClient,
-  env: Env,
+  _env: Env,
   req: Request,
   auth: AuthContext,
   fid: string,
@@ -3281,7 +3280,7 @@ async function handleRemoveParticipant(
   tid: string,
   mid: string,
 ): Promise<Response> {
-  const { topic } = await requireParticipant(db, auth, tid);
+  await requireParticipant(db, auth, tid);
   if (auth.role !== 'owner' && auth.role !== 'parent') {
     throw new HttpError(403, 'forbidden', 'Only owner/parent can remove members from a topic');
   }
