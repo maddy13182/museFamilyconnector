@@ -100,17 +100,6 @@ export function reqJsonData(v: unknown, name: string, maxChars: number): string 
   return s;
 }
 
-export function optSearchQuery(v: string | null): string | null {
-  if (v === null || v === undefined || v === '') return null;
-  if (v.length > 200) throw new HttpError(400, 'bad_request', 'q must be at most 200 chars');
-  return v;
-}
-
-/** Escape LIKE wildcards for subject search. */
-export function escapeLike(s: string): string {
-  return s.replace(/[\\%_]/g, (c) => '\\' + c);
-}
-
 // E2EE (Phase 1): an X25519 public key as strict standard-base64. Must
 // decode to exactly 32 bytes. Strict on purpose: canonical base64 with
 // padding only — unpadded or URL-safe alphabets are rejected so the same
