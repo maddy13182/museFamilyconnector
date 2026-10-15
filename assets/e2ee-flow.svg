@@ -10,7 +10,7 @@
 
   <rect x="0" y="0" width="640" height="980" rx="24" fill="#122E2C"/>
   <text x="320" y="62" font-size="24" font-weight="800" fill="#FAF6EF" text-anchor="middle" letter-spacing="1">END-TO-END ENCRYPTION</text>
-  <text x="320" y="94" font-size="16" fill="#C9D8D4" text-anchor="middle">What the server sees: sealed envelopes, never plaintext</text>
+  <text x="320" y="94" font-size="16" fill="#C9D8D4" text-anchor="middle">Optional per topic · metadata stays visible to the server</text>
 
   <!-- Step 1 -->
   <g filter="url(#soft3)">
@@ -19,7 +19,7 @@
     <text x="120" y="216" font-size="28" font-weight="800" fill="#FFFFFF" text-anchor="middle">1</text>
     <text x="172" y="188" font-size="22" font-weight="800" fill="#C2703D">SEAL</text>
     <text x="172" y="220" font-size="18" font-weight="700" fill="#2D2A26">Mom's agent locks the message</text>
-    <text x="172" y="248" font-size="15" fill="#5A554C">with the topic's sealed key — on her own device</text>
+    <text x="172" y="248" font-size="15" fill="#5A554C">with the topic key — on her own device</text>
   </g>
 
   <line x1="320" y1="280" x2="320" y2="326" stroke="#8A8478" stroke-width="3" marker-end="url(#arrowD)"/>
@@ -30,7 +30,7 @@
     <circle cx="120" cy="411" r="30" fill="#E8B96A"/>
     <text x="120" y="422" font-size="28" font-weight="800" fill="#122E2C" text-anchor="middle">2</text>
     <text x="172" y="394" font-size="22" font-weight="800" fill="#E8B96A">STORE</text>
-    <text x="172" y="426" font-size="18" font-weight="700" fill="#FAF6EF">Family Hub stores only ciphertext</text>
+    <text x="172" y="426" font-size="18" font-weight="700" fill="#FAF6EF">Hub stores encrypted content</text>
     <text x="172" y="454" font-size="15" fill="#E8B96A">a sealed envelope it cannot open</text>
   </g>
 
@@ -55,9 +55,9 @@
     <text x="120" y="834" font-size="28" font-weight="800" fill="#FFFFFF" text-anchor="middle">4</text>
     <text x="172" y="806" font-size="22" font-weight="800" fill="#2F6F6A">OPEN</text>
     <text x="172" y="838" font-size="18" font-weight="700" fill="#2D2A26">Dad's agent unseals it</text>
-    <text x="172" y="866" font-size="15" fill="#5A554C">with his own sealed key — on his own device</text>
+    <text x="172" y="866" font-size="15" fill="#5A554C">with his copy of the topic key — on his device</text>
   </g>
 
-  <text x="320" y="936" font-size="15" fill="#C9D8D4" text-anchor="middle">Keys never leave devices · removing a member re-keys the topic</text>
+  <text x="320" y="936" font-size="15" fill="#C9D8D4" text-anchor="middle">Private keys stay local · remove a member, then rotate the topic key</text>
   <text x="320" y="958" font-size="15" fill="#C9D8D4" text-anchor="middle">24-word recovery phrase restores an agent's identity</text>
 </svg>

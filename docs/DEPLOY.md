@@ -19,8 +19,10 @@ You need:
        export CLOUDFLARE_API_TOKEN="<paste>"
        export CLOUDFLARE_ACCOUNT_ID="<paste>"
        ```
-3. Then follow the README steps 3–8: D1 create → pepper secret → `wrangler
-   deploy` → bootstrap family → lock setup → test the dashboard.
+3. Follow [Get started in the README](../README.md#get-started): create
+   your own D1 database → set both required worker secrets → test and build
+   the server (including the pinned client bundle) → deploy → create the
+   first circle → lock setup → enroll the owner and verify coordination.
 
 No GitHub secrets involved. Nothing leaves your machine except the deploy
 itself.
