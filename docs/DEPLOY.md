@@ -1,7 +1,7 @@
 # Family Hub — Deploy guide
 
-Two ways to deploy. **A** is the primary path (your agent deploys from your
-machine, following the README). **B** is optional.
+Two ways to deploy. **A** is the primary path (Muse deploys from its
+execution environment or your computer). **B** is optional.
 
 ## A. Deploy from your machine (recommended)
 
@@ -19,10 +19,10 @@ You need:
        export CLOUDFLARE_API_TOKEN="<paste>"
        export CLOUDFLARE_ACCOUNT_ID="<paste>"
        ```
-3. Follow [Get started in the README](../README.md#get-started): create
-   your own D1 database → set both required worker secrets → test and build
-   the server (including the pinned client bundle) → deploy → create the
-   first circle → lock setup → enroll the owner and verify coordination.
+3. Follow the [Muse setup procedure](MUSE_SETUP.md#deployment-procedure):
+   create your own D1 database → set both required worker secrets → test and
+   build the server → deploy → create the first circle → lock public setup →
+   enroll the owner and verify a conversation and its Muse chat.
 
 No GitHub secrets involved. Nothing leaves your machine except the deploy
 itself.
