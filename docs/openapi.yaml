@@ -648,6 +648,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '410': { $ref: '#/components/responses/Gone' }
 
+  /v1/families/{fid}/members/{mid}:
+    delete:
+      tags: [families]
+      operationId: removeCircleMember
+      summary: Soft-remove a member from the circle (owner only)
+      description: |
+        Only the circle owner may remove members. Removal is soft: the
+        member row is retained (history references it) with `removed_at`
+        set, every agent token of the member is revoked effective now,
+        their topic participation is dropped (E2EE topics they were in
+        get `rotation_required` — rekey next), and pending ownership
+        transfers involving them are cancelled. The freed email becomes
+        re-invitable. You cannot remove yourself (→ 400; use the
+        ownership transfer to step off) and the last owner cannot be
+        removed (→ 400).
+      parameters:
+        - $ref: '#/components/parameters/FamilyId'
+        - $ref: '#/components/parameters/MemberId'
+      responses:
+        '200':
+          description: Member removed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed: { type: string, description: Member id removed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   # -------------------------------------------------------------------- auth
   /v1/auth/revoke:
     post:
@@ -2062,6 +2095,11 @@ components:
   parameters:
     FamilyId:
       name: fid
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+    MemberId:
+      name: mid
       in: path
       required: true
       schema: { type: string, minLength: 1 }

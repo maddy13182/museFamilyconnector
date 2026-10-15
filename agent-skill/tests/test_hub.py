@@ -958,6 +958,65 @@ class TestCircleTransfer(HubTestBase):
 
 
 # ---------------------------------------------------------------------------
+# Circle member removal: remove-member
+# ---------------------------------------------------------------------------
+
+
+class TestCircleRemoveMember(HubTestBase):
+    def parse(self, argv):
+        return hub.build_parser().parse_args(argv)
+
+    def call_paths(self):
+        return [(c["method"], urlparse.urlparse(c["url"]).path)
+                for c in self.fake.calls]
+
+    def test_remove_member_parses(self):
+        a = self.parse(["circle", "remove-member", "--member", "m9"])
+        self.assertEqual(a.circle_action, "remove-member")
+        self.assertEqual(a.member_id, "m9")
+        self.assertIsNone(a.circle)
+
+    def test_remove_member_requires_member(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["circle", "remove-member"])
+
+    def test_remove_member_deletes_member_path(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("DELETE", "/v1/families/c111/members/m9", 200,
+                      {"removed": "m9"})
+        rc, out, _ = self.run_cli(["circle", "remove-member",
+                                   "--member", "m9"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("DELETE", "/v1/families/c111/members/m9")])
+        self.assertIn('"removed": "m9"', out)
+        self.assertTokenAbsent(out)
+
+    def test_remove_member_rejects_blank_member(self):
+        self.seed_config(family_id="c111")
+        rc, _out, err = self.run_cli(["circle", "remove-member",
+                                      "--member", "   "])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.fake.calls, [])
+        self.assertIn("--member", err)
+
+    def test_remove_member_respects_circle_override(self):
+        self.seed_config(family_id="c111",
+                         circle_tokens={"c222": "fh_C222_tok"})
+        self.fake.add("GET", "/v1/families", 200,
+                      {"families": [{"id": "c222", "name": "Friends"}]})
+        self.fake.add("DELETE", "/v1/families/c222/members/m9", 200,
+                      {"removed": "m9"})
+        rc, _out, _ = self.run_cli(
+            ["circle", "remove-member", "--member", "m9",
+             "--circle", "Friends"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("GET", "/v1/families"),
+                          ("DELETE", "/v1/families/c222/members/m9")])
+
+
+# ---------------------------------------------------------------------------
 # Sync v2: per-circle changed-topic discovery (no client cursors)
 # ---------------------------------------------------------------------------
 

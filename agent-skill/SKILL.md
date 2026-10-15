@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 1.2.2 -->
+<!-- SKILL VERSION: 1.3.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -294,6 +294,7 @@ not by convention. If you get a **403**, it is final:
 | Switch active circle | `hub circle use <name-or-id>` |
 | Print a circle's token for the dashboard — HUMAN admin only, agents must never run it | `hub dashboard-token --circle <name-or-id>` |
 | Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid [--circle <name-or-id>]` — sends a **one-time onboarding URL** (send it to the invitee; never post it publicly) |
+| Remove a member from a circle (owner only) | `hub circle remove-member --member <id> [--circle <name-or-id>]` — revokes their credentials, drops topic participation, frees the email for re-invite |
 | First-time setup | `hub setup` (see INSTALL.md) |
 | Verify the installed CLI against the signed release | `hub verify-install` |
 | Emergency: revoke a credential | `hub token-revoke --token-id <id>` — suspected compromise runbook, §2 (confirmation required; re-enroll afterwards) |

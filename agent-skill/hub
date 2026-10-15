@@ -5487,6 +5487,37 @@ def cmd_circle_transfer_cancel(args, transport):
     return _emit_transfer_result(resp)
 
 
+def _circle_member_path(family_id, member_id):
+    return "/v1/families/%s/members/%s" % (
+        urlparse.quote(family_id, safe=""), urlparse.quote(member_id, safe=""))
+
+
+def _emit_json_result(resp):
+    """Print an endpoint response — structural secret-scrubbed.
+
+    These endpoints never issue credentials (only IDs), but if a server
+    ever slipped a secret field into its response, it must not reach
+    stdout — hence the scrub (same keys as the debug-dump scrubber).
+    """
+    emit_json(_scrub_sensitive_value(resp if isinstance(resp, dict) else
+                                     {"ok": True}))
+    return 0
+
+
+def cmd_circle_remove_member(args, transport):
+    """Remove a member from the active circle (owner only)."""
+    ctx = _ctx(args, transport)
+    family_id = _resolve_circle(args, ctx)
+    member_id = (args.member_id or "").strip()
+    if not member_id:
+        raise HubError("bad_request", "A --member id is required.")
+    resp = ctx.client.call(
+        "DELETE",
+        _circle_member_path(family_id, member_id),
+    )
+    return _emit_json_result(resp)
+
+
 def cmd_dashboard_token(args, transport):
     """Print the stored token for a circle (for pasting into the dashboard).
 
@@ -7558,6 +7589,24 @@ def build_parser():
     c.add_argument("--circle", default=None, metavar="NAME_OR_ID",
                    help="Circle name or id (default: active circle)")
     c.set_defaults(func=cmd_circle_transfer_cancel)
+    c = csub.add_parser(
+        "remove-member",
+        formatter_class=_RDH,
+        help="Remove a member from the circle (owner only)",
+        description="Soft-remove a member from a circle. Only the circle "
+        "owner can remove members. Removal revokes the member's "
+        "credentials, drops their topic participation, and frees their "
+        "email for re-invite. You cannot remove yourself (use "
+        "`hub circle transfer` to step off), and the last owner of a "
+        "circle cannot be removed.",
+        epilog="example:\n  hub circle remove-member --member <member-id>",
+    )
+    c.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                   help="Circle name or id (default: active circle)")
+    c.add_argument("--member", required=True, dest="member_id",
+                   metavar="MEMBER_ID",
+                   help="Member id to remove from the circle")
+    c.set_defaults(func=cmd_circle_remove_member)
 
     p = sub.add_parser(
         "dashboard-token",

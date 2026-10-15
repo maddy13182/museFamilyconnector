@@ -1,0 +1,18 @@
+-- 0011: soft member removal.
+--
+-- Member rows are never physically deleted: invites, topics, entries,
+-- tasks, the audit trail and ownership transfers all reference members(id)
+-- with NOT NULL foreign keys, so a physical DELETE would fail (test SQLite
+-- enforces FKs) or destroy circle history. Removal is therefore soft, in
+-- the spirit of the ownership-transfer doctrine (0008): "revocation plus
+-- role removal IS the removal". DELETE /v1/families/:fid/members/:mid sets
+-- removed_at, revokes every agent token of the member, and drops their
+-- topic participation. A removed member:
+--   - fails closed at the auth choke point (resolveToken 401s),
+--   - no longer counts as a circle owner (isHubOwner ignores removed rows),
+--   - disappears from member listings,
+--   - frees their email for re-invite (the already_member 409 ignores
+--     removed rows), so a replacement identity can be provisioned — this
+--     is the recovery path for orphan members created by a setup run
+--     whose credential was never persisted.
+ALTER TABLE members ADD COLUMN removed_at TEXT NULL;
