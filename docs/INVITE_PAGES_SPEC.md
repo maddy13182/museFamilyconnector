@@ -40,7 +40,7 @@ CREATE INDEX idx_invite_pages_invite ON invite_pages(invite_code_hash);
 ```
 
 - One row per invite, created **atomically with the invite** in
-  `POST /v1/families/:fid/invites` — in the SAME `execAtomically` batch as
+  `POST /v2/families/:fid/invites` — in the SAME `execAtomically` batch as
   the `invites` INSERT. **Both code paths**: the normal path AND the
   idempotency-hit path (which mints a fresh code) must mint a fresh page
   token.
@@ -55,7 +55,7 @@ CREATE INDEX idx_invite_pages_invite ON invite_pages(invite_code_hash);
 
 All new routes are **public by design** (the token is the credential). Place
 them with the other public routes in `routeRequest()`, BEFORE the Bearer
-choke point. They are NOT `/v1/*`, so the client version gate does not
+choke point. They are NOT `/v2/*`, so the client version gate does not
 apply (correct — an un-enrolled invitee has no client version to gate).
 
 ### 3.1 `GET /i/:token` and `GET /i/:token.json`
@@ -138,11 +138,11 @@ apply (correct — an un-enrolled invitee has no client version to gate).
   "expires_at": "<iso>",
   "client": {
     "version": "<from client-manifest>",
-    "download_url": "https://<this-server>/v1/client/download/hub",
+    "download_url": "https://<this-server>/v2/client/download/hub",
     "sha256": "<...>",
     "skill": {
       "version": "<skill version from client-manifest>",
-      "download_url": "https://<this-server>/v1/client/download/skill.tar.gz",
+      "download_url": "https://<this-server>/v2/client/download/skill.tar.gz",
       "sha256": "<bundle sha256>"
     }
   },
@@ -150,7 +150,7 @@ apply (correct — an un-enrolled invitee has no client version to gate).
     "summary": "Install the Family Hub skill bundle, verify its hash, verify the CLI signature, then run hub setup.",
     "steps": [
       "mkdir -p ~/workspace/skills/family-hub && cd ~/workspace/skills/family-hub",
-      "curl -sSLO https://<this-server>/v1/client/download/skill.tar.gz",
+      "curl -sSLO https://<this-server>/v2/client/download/skill.tar.gz",
       "python3 -c \"import hashlib; assert hashlib.sha256(open('skill.tar.gz','rb').read()).hexdigest()=='<bundle sha256>', 'skill bundle hash mismatch'\"",
       "tar -xzf skill.tar.gz",
       "chmod +x hub",
@@ -165,7 +165,7 @@ apply (correct — an un-enrolled invitee has no client version to gate).
 ```
 
 Derive the install-step URLs from the request origin as
-`https://<this-server>/v1/client/download/skill.tar.gz` — the install flow
+`https://<this-server>/v2/client/download/skill.tar.gz` — the install flow
 starts with the skill bundle from THIS server (the bundle carries the CLI
 artifacts inside it); the GitHub Release URL in the pin file is
 provenance only and never surfaces in the user-facing flow.
@@ -230,7 +230,7 @@ build time by `bundle-client.mjs` (the server cannot build without it).
 
 ### 4.1 `hub invite-member`
 
-- Server `POST /v1/families/:fid/invites` now also returns
+- Server `POST /v2/families/:fid/invites` now also returns
   `onboarding_url: "https://<origin>/i/<token>"` (origin = request origin).
   (Additive field — backwards compatible.)
 - CLI `cmd_invite_member`: pass through the JSON (it already emits the
@@ -293,7 +293,7 @@ against in-memory SQLite):
    surrounding spaces) → 200 with code + setup_command.
 8. Verify with wrong email 10+ times rapidly → 429 (backoff), and the real
    email STILL succeeds after the cooldown (no hard lock).
-9. Full lifecycle: verify → `POST /v1/invites/:code/accept` → page 404s
+9. Full lifecycle: verify → `POST /v2/invites/:code/accept` → page 404s
    (self-destruct).
 10. `redactPath('/i/fhip_secret/verify') === '/i/[redacted]'` (unit).
 11. Rate-limit bucket: 11 rapid GETs → 429 on the 11th (mirrors existing

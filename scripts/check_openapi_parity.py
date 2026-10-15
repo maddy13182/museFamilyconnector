@@ -12,8 +12,8 @@ Allowlist: GET / (dashboard HTML, not part of the API contract) and
 endpoints tagged `x-spec-note: PROPOSED` (spec'd but not yet implemented).
 
 Route-pattern extraction handles the dispatch idioms used in index.ts:
-  - `path === '/v1/x' && method === 'GET'`
-  - `path.startsWith('/v1/a/') && path.endsWith('/b') && method === 'POST'`
+  - `path === '/v2/x' && method === 'GET'`
+  - `path.startsWith('/v2/a/') && path.endsWith('/b') && method === 'POST'`
   - `const r = /^\\/v1\\/x\\/([^/]+)$/.exec(path); if (r && method === 'GET')`
 Any dispatch idiom the extractor does not recognize fails the check loudly
 so new route styles force a script update instead of passing silently.
@@ -358,7 +358,8 @@ def main():
         errors.append("stale 429 prose: in-worker rate limiting exists since v0.11.0")
     if "rejected with 400 `client_too_old`" in spec:
         errors.append("stale gate prose: client_too_old is 426 now, not 400")
-    m = re.search(r"ErrorCode:\n(?:.*\n)*?.*?enum: \[([^\]]*)\]", spec)
+    block = re.search(r"^    ErrorCode:\n((?:^      .*\n)*)", spec, re.M)
+    m = re.search(r"enum:\s*(\[[^]]*\]|(?:\n[ \t]*-[^\n]+)+)", block.group(1)) if block else None
     if not m or "client_too_old" not in m.group(1):
         errors.append("ErrorCode enum is missing client_too_old")
 

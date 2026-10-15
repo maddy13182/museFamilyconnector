@@ -1,3 +1,8 @@
+> Historical design notes. Protocol 2 supersedes optional encryption, v1 routes,
+> legacy subject formats and force commits described below. Use [INSTALL.md](INSTALL.md),
+> [SECURITY.md](SECURITY.md) and [the encryption guide](../agent-skill/references/e2ee.md)
+> for the implemented contract.
+
 # Family Hub — Final Build Spec
 
 **Status:** final spec (not implemented — no code changes authorized yet)
@@ -87,7 +92,7 @@ Bearer tokens bind exactly one `(member_id, family_id)`; `member_id` itself
 is per-family. Every topic-scoped endpoint 404s cross-family
 (`getTopicInFamily` — never leaks cross-family existence). Therefore:
 
-- There is **no cross-circle sync**. `GET /v1/sync/topics` is called **once
+- There is **no cross-circle sync**. `GET /v2/sync/topics` is called **once
   per circle token**; the server never crosses family boundaries and there is
   no `principal_id` resolution. (This preserves the existing blast-radius
   boundary: one token, one circle.)
@@ -97,7 +102,7 @@ is per-family. Every topic-scoped endpoint 404s cross-family
 
 ### 1.4 New endpoints
 
-**`GET /v1/sync/topics`** — changed-topic discovery, per circle token.
+**`GET /v2/sync/topics`** — changed-topic discovery, per circle token.
 Params: `bootstrap_gseq` (first call only), `limit`, `page_token`. Returns
 per changed topic: `topic_id, circle_id, circle_name, subject, kind, e2ee,
 acked_seq, latest_seq, new_count, last_activity_ts, last_actor,
@@ -108,7 +113,7 @@ as unread once, duplicates handled by the skill's dedupe rule (§3). The CLI
 deletes legacy cursor files without reading them. (Deliberate simplification
 for the first production cut: no MIN-over-cursors logic.)
 
-**`POST /v1/topics/:tid/ack`** — receipt-bound, contiguous ack.
+**`POST /v2/topics/:tid/ack`** — receipt-bound, contiguous ack.
 Body `{ "seq", "read_receipt" }`, both required. Server:
 1. HMAC-verify receipt; must bind this `(member_id, agent_label, topic_id)`;
    extract `(from_seq, through_seq)`.
@@ -118,7 +123,7 @@ Body `{ "seq", "read_receipt" }`, both required. Server:
    else 409 `noncontiguous_ack`.
 5. Atomic `max()` upsert. Response `{ topic_id, acked_seq }`.
 
-**`POST /v1/topics/:tid/keys/commit`** — staged atomic key activation.
+**`POST /v2/topics/:tid/keys/commit`** — staged atomic key activation.
 Handles **genesis** (`expected_epoch: 1`, topic at epoch 0) and **rotation**
 (`expected_epoch: current_epoch + 1`). Body
 `{ expected_epoch, key_id, commitment, force }`. Owner/parent only. Single
@@ -174,7 +179,7 @@ may hold keys, so they gate future writes:
 
 ### 1.5 Changed endpoints
 
-**`POST /v1/topics/:tid/envelopes`** — staged distribution. Remove the
+**`POST /v2/topics/:tid/envelopes`** — staged distribution. Remove the
 "first POST with a new key_id flips `current_key_id`" behavior (the N04
 core defect): non-current `key_id` envelopes are **stored, never flipped**.
 Only the commit flips. Existing checks stay (owner/parent to introduce;
@@ -182,13 +187,13 @@ target must be a current participant with an identity key). The server
 records the recipient's active identity-key id on the envelope row (for the
 commit's superseded-key check).
 
-**`GET /v1/topics/:tid/envelopes`** — return only envelopes whose `key_id`
+**`GET /v2/topics/:tid/envelopes`** — return only envelopes whose `key_id`
 is in the topic's epoch log (committed epochs). Staged (uncommitted) keys
 are invisible to normal recipients until commit — an uncommitted key must
 never be treated as usable. (The committer already holds the key locally;
 no special-case fetch is needed.)
 
-**`GET /v1/topics/:tid/history`** — add `context` (default 10, max 50;
+**`GET /v2/topics/:tid/history`** — add `context` (default 10, max 50;
 flagged `is_context`); every response includes `read_through_seq` and
 `read_receipt` binding `(member, agent_label, topic, from_seq, through_seq)`
 where `from_seq = max(after, history_from_seq − 1) + 1` (the *requested*
@@ -216,14 +221,14 @@ nonsecret indexing metadata stays plaintext:
 Violation → 400 `plaintext_in_e2ee_topic`. Exempt protocol kind:
 `key-request` (plaintext by design).
 
-**`POST /v1/topics/:tid/entries` — write-time key checks (E2EE).**
+**`POST /v2/topics/:tid/entries` — write-time key checks (E2EE).**
 Server-side, independent of client version (verified client bug:
 single-key keystores post with the old key without consulting the server):
 for fh1 bodies, parse `key_id` → require `current_epoch ≥ 1`, else 409
 `key_not_active`; require `key_id == current_key_id`, else 409 `stale_key`;
 require `rotation_required == 0`, else 409 `rotation_required`.
 
-**`POST /v1/topics/:tid/entries` — R1 replay.** If body matches
+**`POST /v2/topics/:tid/entries` — R1 replay.** If body matches
 `^fh1\.[0-9a-f]{32}\.([0-9a-f]{32})\.`, extract `msg_id` into
 `entries.msg_id`. On unique conflict: if the stored body **equals** the
 incoming body → treat as successful retry (return the existing entry);
@@ -233,24 +238,24 @@ else 409 `msg_id_conflict` (genuine conflict — same id, different payload).
 
 | Removed | Handler | Note |
 |---|---|---|
-| `GET /v1/sync` | `handleSync` | Replaced by `/v1/sync/topics`. |
-| `POST /v1/auth/rotate` | `handleRotate` | No client; no security imperative (re-enroll covers rotation). |
-| `GET /v1/topics/:tid/export` | `handleExport` | No client. |
-| `POST /v1/entries/:eid/redact` | `handleRedact` | No client. |
-| `GET`/`PATCH /v1/tasks/:tid` | `handleGetTask`, `handlePatchTask` | No client (CLI uses `notes`/`done`). |
+| `GET /v2/sync` | `handleSync` | Replaced by `/v2/sync/topics`. |
+| `POST /v2/auth/rotate` | `handleRotate` | No client; no security imperative (re-enroll covers rotation). |
+| `GET /v2/topics/:tid/export` | `handleExport` | No client. |
+| `POST /v2/entries/:eid/redact` | `handleRedact` | No client. |
+| `GET`/`PATCH /v2/tasks/:tid` | `handleGetTask`, `handlePatchTask` | No client (CLI uses `notes`/`done`). |
 
-**Kept:** `POST /v1/auth/revoke` — emergency credential revocation is a
+**Kept:** `POST /v2/auth/revoke` — emergency credential revocation is a
 security-critical capability; deletion without a replacement is
 unacceptable. It gets what it lacked: a CLI command (`hub token-revoke`)
 and a runbook entry (§3). `docs/openapi.yaml` loses the removed paths +
-stale PROPOSED `/v1/auth/tokens`; `SPEC.md` table updated;
+stale PROPOSED `/v2/auth/tokens`; `SPEC.md` table updated;
 `check_openapi_parity.py` must pass and joins required checks.
 
 ---
 
 ## 2. CLI changes
 
-- **`hub sync`** — per-circle loop (one `GET /v1/sync/topics` per circle
+- **`hub sync`** — per-circle loop (one `GET /v2/sync/topics` per circle
   token, §1.3); first run bootstraps from 0 (full re-read once; dedupe
   handles repeats); legacy cursor files deleted without being read.
   Deleted: `_sync_one_circle`, cursor read/write, old entry-emitting path.

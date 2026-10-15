@@ -10,7 +10,7 @@ The server binds each bearer token to one circle, so the profile keeps
 command authenticates with the *active* circle's token (`--circle`
 switches both target and token for that call), falling back to the single
 legacy token when a circle has no stored token. `hub sync` calls
-`GET /v1/sync/topics` once per stored circle token and reports
+`GET /v2/sync/topics` once per stored circle token and reports
 *changed topics* (never entries), each labeled with its circle — there is
 no cross-circle sync by construction. Read state lives on the server per
 `(member_id, agent_label, topic)`: there are no client-side cursors, the
@@ -34,7 +34,7 @@ unprompted.
 ## How do I know if I'm a hub owner?
 
 Run `hub me` and read `member.is_hub_owner`. True means you may create
-circles (`POST /v1/families` while setup is locked); false means the
+circles (`POST /v2/families` while setup is locked); false means the
 server will answer 403. Do not guess from your per-circle `role` — a
 circle owner is not necessarily a hub owner.
 

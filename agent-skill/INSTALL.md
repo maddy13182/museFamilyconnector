@@ -6,19 +6,16 @@ it first, then invites everyone else.
 ## Prerequisites
 
 - Python 3.8+.
-- **PyNaCl + the `mnemonic` package** (pinned in `requirements.txt`):
-  `pip install -r requirements.txt`. These are needed for the E2EE identity
-  key commands (`setup` key generation, `key-init`, `key-backup`,
-  `key-restore`). The stdlib-only property ended with E2EE Phase 1 — every
-  other `hub` command keeps working without them, and key commands fail
-  with a clear message telling you how to install them.
+- **PyNaCl + mnemonic** are mandatory for normal use. Install from
+  `requirements.txt` (exact direct dependency pins; checkout CI uses `requirements.lock`); no plaintext fallback.
+- Protocol-2 server, CLI and skill (2.0.0+); older releases are incompatible.
 - An **invite code** from the family owner (sent over text/email — the code is
   single-use, expires in 7 days, and grants no read access by itself).
 
 ## Step 1 — Get the files
 
 **The one-bundle flow (recommended).** The server publishes the whole
-installable skill as one signed bundle: `GET /v1/client/latest` names the
+installable skill as one signed bundle: `GET /v2/client/latest` names the
 current skill version and its download URL (the manifest's `skill` block:
 `{url, sha256, version}`). The bundle is `skill.tar.gz` — `SKILL.md`,
 `references/`, `INSTALL.md`, `requirements.txt`, plus the signed `hub`
@@ -38,7 +35,7 @@ Verify **before** extracting or installing — in this order:
 # 1. Hash: proves the bytes are exactly the published bundle.
 python3 - <<'EOF'
 import hashlib
-want = "<sha256-from-the-invite-page>"   # or from GET /v1/client/latest
+want = "<sha256-from-the-invite-page>"   # or from GET /v2/client/latest
 got = hashlib.sha256(open("skill.tar.gz", "rb").read()).hexdigest()
 assert got == want, "sha256 MISMATCH — do not install"
 print("sha256 OK:", got)
@@ -104,12 +101,12 @@ with is detectable here — keep them in lockstep (see "Upgrading" below).
 ## Upgrading — `hub upgrade`
 
 `hub upgrade` asks the server what the current signed release is
-(`GET /v1/client/latest` — which also states the server's required
+(`GET /v2/client/latest` — which also states the server's required
 minimum CLI version), and only when it is newer than the installed
 CLI does it:
 
 1. Download `hub`, `hub.sigstore`, and `manifest.json` from the server's
-   own download endpoints (`/v1/client/download/*`, the URLs in the
+   own download endpoints (`/v2/client/download/*`, the URLs in the
    manifest's `assets` map).
 2. Verify the sigstore signature (refuses if the `sigstore` package is
    missing — it will not skip verification).
@@ -153,7 +150,7 @@ hub rollback   # restores hub.prev; the rolled-back-from binary becomes the new 
 ## Step 2 — Run setup
 
 ```sh
-hub setup
+hub setup --store file
 ```
 
 It asks for three things (or pass them as flags):
@@ -168,15 +165,16 @@ It asks for three things (or pass them as flags):
 On success the server returns your member record and **one** bearer token.
 `hub setup` **never prints the token**. Where it lives depends on `--store`:
 
-- `--store env` (default, recommended for Muse agents): hub stores nothing.
-  Your agent harness injects `FAMILY_HUB_TOKEN` from your **Secure Vault**
-  every time it runs `hub`. Save the token into the vault via your platform's
-  secure flow right after setup — the server will never show it again.
-- `--store file`: writes the token to a `0600` file under
-  `~/.config/family-hub/profiles/<name>/token`. Simple, but anyone with your
-  machine user can read it. Fine for a personal server, not for shared boxes.
-- `--store vault-cmd`: hub runs your helper (e.g. `op read …`) on every
-  invocation and takes the token from its stdout. Nothing stored at all.
+- `--store file` is the default: the CLI saves the credential in a private 0600
+  profile file before continuing. Agent commands never print it.
+- Environment and vault-helper lookup are available for an already-provisioned
+  credential. They are runtime lookup methods only, not setup storage options. Setup always
+  persists the newly minted credential privately; it rejects ephemeral enrollment
+  sinks before consuming the code.
+
+The identity recovery phrase is saved in a private `recovery-phrase.txt` file in
+that profile, never printed. Save it privately off-machine; do not ask Muse to
+read its words into chat. `hub key-backup` creates an encrypted backup too.
 
 Precedence at runtime is: `FAMILY_HUB_TOKEN` → vault helper → `0600` file.
 
@@ -311,9 +309,9 @@ is not the layer that saves you there.
 | `Access denied` (403) | You're not a participant — ask an owner/parent to invite you; don't work around it |
 | `Blocked` (exit 4 / 422) | Your text tripped the PII scan — rephrase without card numbers/SSNs and retry |
 | `Cannot reach the Hub server` | Check `--server` / config URL and network |
-| `warning: token file … is readable by others` | `chmod 600` the file, or switch to `--store env` |
+| `warning: token file … is readable by others` | `chmod 600` the file |
 | `hub upgrade`: `sigstore` not installed | `pip install "sigstore>=3.0,<4.0"`, then retry — the upgrade refuses rather than skipping verification |
 | `hub upgrade`: signature/sha256 FAILED | Do **not** install; the artifact may be tampered — tell the family owner |
 | cron job hangs on a prompt | `agent.key` is wrapped and the job lacks `FAMILY_HUB_KEY_PASSPHRASE` — bind it from the Secure Vault (see Step 3) |
 | `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the server |
-| `RESULT: FAIL` from `hub verify-install` | Reinstall from the server (artifact + `manifest.json` + `hub.sigstore` via `/v1/client/download/*`, or `hub upgrade`); don't keep using the failed copy |
+| `RESULT: FAIL` from `hub verify-install` | Reinstall from the server (artifact + `manifest.json` + `hub.sigstore` via `/v2/client/download/*`, or `hub upgrade`); don't keep using the failed copy |

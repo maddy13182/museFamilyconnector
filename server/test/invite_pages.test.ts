@@ -1,9 +1,10 @@
+import { b64 } from './syncv2_helpers.js';
 // Invite onboarding pages (v0.11.0): per-invite single-use pages at
 // /i/<page-token>. The inviter shares the onboarding URL; the invitee
 // proves the invited email and receives a fresh single-use invite code.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { makeApp } from './app.js';
+import { makeClientApp as makeApp } from './fixture-client.js';
 import { redactPath } from '../src/index.js';
 import manifestJson from '../client-manifest.json' with { type: 'json' };
 // The pin carries skill_sha256/skill_version for CLI releases cut after the
@@ -25,21 +26,21 @@ function ip(n: number) {
 }
 
 async function bootstrapOwner(app: App, name: string, email: string) {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: 'Owner', owner_email: email },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
   return { famId: fam.body.family.id as string, token: red.body.token as string };
 }
 
 async function createInvite(app: App, token: string, famId: string, email: string, role = 'parent') {
-  const r = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const r = await app.call('POST', `/v2/families/${famId}/invites`, {
     token,
     body: { email, role },
   });
@@ -67,13 +68,13 @@ test('idempotent invite retry returns a fresh onboarding_url', async () => {
   const app = makeApp();
   const { famId, token } = await bootstrapOwner(app, 'Page Fam 2', 'owner2@t.dev');
   const key = 'invite-page-idem-1';
-  const first = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const first = await app.call('POST', `/v2/families/${famId}/invites`, {
     token,
     body: { email: 'invitee2@t.dev', role: 'parent' },
     headers: { 'idempotency-key': key },
   });
   assert.equal(first.status, 201);
-  const second = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const second = await app.call('POST', `/v2/families/${famId}/invites`, {
     token,
     body: { email: 'invitee2@t.dev', role: 'parent' },
     headers: { 'idempotency-key': key },
@@ -96,12 +97,12 @@ test('non-owner/parent creating invite -> 403', async () => {
   const kidInv = await createInvite(app, token, famId, 'kid3@t.dev', 'kid');
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(kidInv.invite_code)}/accept`,
-    { body: { display_name: 'Kid', agent_label: 'kid-agent' } },
+    `/v2/invites/${encodeURIComponent(kidInv.invite_code)}/accept`,
+    { body: { display_name: 'Kid', agent_label: 'kid-agent' , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   const kidToken = acc.body.token as string;
-  const denied = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const denied = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: kidToken,
     body: { email: 'someone@t.dev', role: 'kid' },
   });
@@ -134,14 +135,14 @@ test('GET page as JSON returns the agent page shape without secrets', async () =
     assert.equal(b.email_hint, 'i***@t.dev', label);
     assert.ok(typeof b.expires_at === 'string', label);
     assert.equal(b.client.version, manifest.version, label);
-    assert.equal(b.client.download_url, 'https://hub.test/v1/client/download/hub', label);
-    assert.equal(b.client.skill.download_url, 'https://hub.test/v1/client/download/skill.tar.gz', label);
+    assert.equal(b.client.download_url, 'https://hub.test/v2/client/download/hub', label);
+    assert.equal(b.client.skill.download_url, 'https://hub.test/v2/client/download/skill.tar.gz', label);
     assert.equal(b.client.skill.sha256, manifest.skill_sha256, label);
     assert.equal(b.client.skill.version, manifest.skill_version, label);
     // Install steps start with the skill bundle from this server — no
     // GitHub release URLs remain in the user-facing flow.
     const stepsText = (b.install.steps as string[]).join('\n');
-    assert.ok(stepsText.includes('https://hub.test/v1/client/download/skill.tar.gz'), label);
+    assert.ok(stepsText.includes('https://hub.test/v2/client/download/skill.tar.gz'), label);
     assert.ok(!stepsText.includes('github.com/maddy13182/museFamilyconnector/releases'), label);
     assert.ok(typeof b.client.sha256 === 'string' && b.client.sha256.length > 0, label);
     assert.ok(
@@ -191,7 +192,7 @@ test('GET page as HTML renders install steps and the masked hint', async () => {
   assert.ok(html.includes('sigstore'), 'install steps present');
   assert.ok(html.includes('skill.tar.gz'), 'install steps start with the skill bundle');
   assert.ok(
-    html.includes('https://hub.test/v1/client/download/skill.tar.gz'),
+    html.includes('https://hub.test/v2/client/download/skill.tar.gz'),
     'install steps use this server download endpoints',
   );
   assert.ok(
@@ -231,8 +232,8 @@ test('unknown / used / expired pages all 404 identically', async () => {
   assert.equal(verified.status, 200);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(verified.body.invite_code)}/accept`,
-    { body: { display_name: 'Used', agent_label: 'used-agent' } },
+    `/v2/invites/${encodeURIComponent(verified.body.invite_code)}/accept`,
+    { body: { display_name: 'Used', agent_label: 'used-agent' , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   const used = await app.call('GET', `/i/${usedToken}`, ip(63));
@@ -346,8 +347,8 @@ test('page self-destructs on invite accept', async () => {
   assert.equal(verified.status, 200);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(verified.body.invite_code)}/accept`,
-    { body: { display_name: 'Nine', agent_label: 'nine-agent' } },
+    `/v2/invites/${encodeURIComponent(verified.body.invite_code)}/accept`,
+    { body: { display_name: 'Nine', agent_label: 'nine-agent' , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
 
@@ -385,8 +386,8 @@ test('accepting one code consumes sibling codes for the same email', async () =>
   // Accept with the ORIGINAL code -> 201.
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.invite_code)}/accept`,
-    { body: { display_name: 'NineB', agent_label: 'nineb-agent' } },
+    `/v2/invites/${encodeURIComponent(inv.invite_code)}/accept`,
+    { body: { display_name: 'NineB', agent_label: 'nineb-agent' , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
 
@@ -398,8 +399,8 @@ test('accepting one code consumes sibling codes for the same email', async () =>
   assert.equal(members.length, 1);
   const second = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(freshCode)}/accept`,
-    { body: { display_name: 'NineB Two', agent_label: 'nineb-agent-2' } },
+    `/v2/invites/${encodeURIComponent(freshCode)}/accept`,
+    { body: { display_name: 'NineB Two', agent_label: 'nineb-agent-2' , agent_public_key: b64(32) } },
   );
   assert.equal(second.status, 409);
   const membersAfter = await app.db.queryAll(
@@ -415,8 +416,8 @@ test('redactPath redacts invite page paths', () => {
   assert.equal(redactPath('/i/fhip_secret'), '/i/[redacted]');
   assert.equal(redactPath('/i/fhip_secret.json'), '/i/[redacted]');
   // Existing behavior untouched.
-  assert.equal(redactPath('/v1/invites/abc123/accept'), '/v1/invites/[redacted]');
-  assert.equal(redactPath('/v1/health'), '/v1/health');
+  assert.equal(redactPath('/v2/invites/abc123/accept'), '/v2/invites/[redacted]');
+  assert.equal(redactPath('/v2/health'), '/v2/health');
 });
 
 // 11. The invite_page IP bucket: 11 rapid GETs -> 429 on the 11th.

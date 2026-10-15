@@ -148,24 +148,6 @@ export function reqAgentPublicKey(v: unknown, name: string): string {
   return s;
 }
 
-/** Optional variant: undefined/null = absent (no E2EE identity). */
-export function optAgentPublicKey(v: unknown, name: string): string | null {
-  if (v === undefined || v === null) return null;
-  return reqAgentPublicKey(v, name);
-}
-
-// E2EE (Phase 2): the per-topic encryption flag. Optional in the request
-// body; absent/null = 0 (plaintext, today's behavior). When present it must
-// be the integer 0 or 1 — booleans and strings are rejected so the flag
-// can never arrive in two textual forms.
-export function reqE2eeFlag(v: unknown, name: string): number {
-  if (v === undefined || v === null) return 0;
-  if (v !== 0 && v !== 1) {
-    throw new HttpError(400, 'bad_request', `${name} must be 0 or 1`);
-  }
-  return v;
-}
-
 // E2EE (Phase 2): a topic-key id — the random 128-bit value the CLI
 // generates at topic creation, hex-encoded (32 hex chars). Normalized to
 // lowercase for canonical storage/lookup.

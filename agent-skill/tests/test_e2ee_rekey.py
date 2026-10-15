@@ -60,7 +60,7 @@ class RekeyFakeHub:
     """Stateful fake hub mirroring the server's sync-v2 access rules.
 
     - Participants gate every topic-scoped call (403 otherwise).
-    - POST /v1/topics with e2ee=1 creates the topic at epoch 0
+    - POST /v2/topics with e2ee=1 creates the topic at epoch 0
       (current_epoch=0, current_key_id=None): writes blocked until commit.
     - Envelopes POST is STAGED: stored, never flips current_key_id (the N04
       defect is gone). Target must be a current participant with a
@@ -117,6 +117,7 @@ class RekeyFakeHub:
         return out
 
     def _commit(self, tid, topic, body, mid):
+        topic["subject"] = body.get("subject", topic.get("subject"))
         if self.members[mid]["role"] not in ("owner", "parent"):
             return 403, json.dumps({"error": {
                 "code": "forbidden", "message": "owner/parent only"}})
@@ -195,7 +196,7 @@ class RekeyFakeHub:
         # The fake models a current (1.0.0) server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
-        if method == "GET" and path == "/v1/health":
+        if method == "GET" and path == "/v2/health":
             self.health_calls.append(
                 {
                     "method": method,
@@ -205,20 +206,20 @@ class RekeyFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
             )
 
         self._record(method, url, headers, body_bytes)
         body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
         mid, _label = self.caller
 
-        if method == "GET" and path == "/v1/me":
+        if method == "GET" and path == "/v2/me":
             m = self.members[mid]
             return 200, json.dumps(
                 {"id": mid, "name": m["name"], "role": m["role"],
                  "agent_label": self.caller[1], "family_id": "f1"}
             )
-        if method == "GET" and path == "/v1/agent-keys":
+        if method == "GET" and path == "/v2/agent-keys":
             qmid = (query.get("member_id") or [""])[0]
             keys = [
                 {"member_id": qmid, "agent_label": label, "public_key": pub,
@@ -230,13 +231,14 @@ class RekeyFakeHub:
         m = urlparse.urlparse(path)
         segs = path.strip("/").split("/")
 
-        # POST /v1/topics (create)
-        if method == "POST" and path == "/v1/topics":
+        # POST /v2/topics (create)
+        if method == "POST" and path == "/v2/topics":
             pids = list(dict.fromkeys(body.get("participant_member_ids") or []))
             # v2: E2EE topics are created at epoch 0 (writes blocked);
             # activation happens only via keys/commit. No initial_key_id.
             self.topics[TOPIC_ID] = {
-                "e2ee": body.get("e2ee") or 0,
+                "e2ee": 1,
+                "subject": body.get("subject"),
                 "participants": pids,
                 "current_epoch": 0,
                 "current_key_id": None,
@@ -244,11 +246,12 @@ class RekeyFakeHub:
                 "history_from": {p: "full" for p in pids},
             }
             return 201, json.dumps({"topic": {
-                "id": TOPIC_ID, "e2ee": body.get("e2ee") or 0,
+                "id": TOPIC_ID, "e2ee": 1,
+                "subject": body.get("subject"),
                 "current_epoch": 0, "current_key_id": None}})
 
-        # /v1/topics/<tid>/...
-        if len(segs) >= 3 and segs[0] == "v1" and segs[1] == "topics":
+        # /v2/topics/<tid>/...
+        if len(segs) >= 3 and segs[0] == "v2" and segs[1] == "topics":
             tid = urlparse.unquote(segs[2])
             topic = self.topics.get(tid)
             if topic is None:
@@ -259,12 +262,12 @@ class RekeyFakeHub:
 
             if method == "GET" and sub is None:
                 return 200, json.dumps(
-                    {"topic": {"id": tid, "e2ee": topic["e2ee"],
+                    {"topic": {"id": tid, "e2ee": topic["e2ee"], "subject": topic.get("subject"),
                                "current_epoch": topic.get("current_epoch", 0),
                                "current_key_id": topic.get("current_key_id")},
                      "participants": [
                          {"member_id": p, "name": self.members[p]["name"],
-                          "history_from": topic.get("history_from", {}).get(p, "full")}
+                          "history_from": topic.get("history_from", {}).get(p, "full").replace("_", "-")}
                          for p in topic["participants"]
                      ]})
             if method == "PATCH" and sub == "subject":
@@ -273,7 +276,7 @@ class RekeyFakeHub:
                     return 400, json.dumps({"error": {"code": "bad_request",
                                                       "message": "bad subject"}})
                 return 200, json.dumps(
-                    {"topic": {"id": tid, "e2ee": topic["e2ee"],
+                    {"topic": {"id": tid, "e2ee": topic["e2ee"], "subject": topic.get("subject"),
                                "current_epoch": topic.get("current_epoch", 0),
                                "current_key_id": topic.get("current_key_id")}})
             if method == "GET" and sub == "history":
@@ -380,6 +383,9 @@ FAKE_TOKEN = "<redacted>"
 
 class E2eeRekeyTestBase(unittest.TestCase):
     def setUp(self):
+        self.topic_id_patch = mock.patch.object(hub, "_new_topic_id", return_value=TOPIC_ID)
+        self.topic_id_patch.start()
+        self.addCleanup(self.topic_id_patch.stop)
         self._saved_env = dict(os.environ)
         self.tmp = tempfile.mkdtemp(prefix="hubtest-rekey-")
         os.environ["FAMILY_HUB_CONFIG_HOME"] = self.tmp
@@ -452,12 +458,12 @@ class E2eeRekeyTestBase(unittest.TestCase):
 
     def create_e2ee_topic(self, with_members):
         rc, out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "rekey test",
+            ["new-topic", "--subject", "rekey test",
              "--with", ",".join(with_members)]
         )
         self.assertEqual(rc, 0, "stderr: %s" % err)
         result = json.loads(out)
-        key_id = result["e2ee"]["key_id"]
+        key_id = result["topic"]["current_key_id"]
         keys = hub._load_topic_keys("default", TOPIC_ID)
         return key_id, keys[key_id]
 
@@ -587,9 +593,8 @@ class TestTopicAddMember(E2eeRekeyTestBase):
         notices = self.fake.entry_posts("pending_key_distribution")
         self.assertEqual(len(notices), 1)
         entry_body = json.loads(notices[0]["body"])
-        self.assertIn("m4", entry_body["body"])
-        self.assertIn("Dee", entry_body["body"])
-        self.assertNotIn("fh1.", entry_body["body"])  # plaintext, not ciphertext
+        self.assertEqual(entry_body["data"]["member_id"], "m4")
+        self.assertNotIn("body", entry_body)
         self.assertIn("pending", err)  # stderr warning too
 
         # topic-key-status shows pending...
@@ -626,42 +631,17 @@ class TestRemoveAndRekey(E2eeRekeyTestBase):
         self.assertEqual(rc, 0, "stderr: %s" % err)
         return key_id, key
 
-    def test_remove_warns_rekey_and_rekey_rotates(self):
+    def test_remove_rotates_before_reporting_success(self):
         old_id, old_key = self._setup_two_member_topic()
-        rc, out, err = self.run_cli(
-            ["topic-remove-member", "--topic", TOPIC_ID, "--member", "m2"])
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        self.assertIn("topic-rekey", err)  # loud: old key still live until rotation
-        left = [e for e in self.fake.entries if e["kind"] == "member_left"]
-        self.assertEqual(len(left), 1)
-        self.assertIn("Bee", left[0]["body"])
-
-        rc, out, err = self.run_cli(["topic-rekey", "--topic", TOPIC_ID])
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        result = json.loads(out)
-        new_id = result["key_id"]
+        rc, out, err = self.run_cli(["topic-remove-member", "--topic", TOPIC_ID, "--member", "m2"])
+        self.assertEqual(rc, 0, err)
+        new_id = json.loads(out)["key_id"]
         self.assertNotEqual(new_id, old_id)
-        self.assertEqual(result["previous_key_id"], old_id)
-
-        # Old key retained locally for history.
-        keys = self.keystore("default")
-        self.assertEqual(keys[old_id], old_key)
-        self.assertIn(new_id, keys)
-
-        # Plaintext rotation announcement readable by everyone.
-        rots = self.fake.entry_posts("key_rotated")
-        self.assertEqual(len(rots), 1)
-        rot_body = json.loads(rots[0]["body"])
-        self.assertNotIn("fh1.", rot_body["body"])
-        self.assertIn(new_id[-8:], rot_body["body"])
-        self.assertEqual(rot_body["data"]["key_id"], new_id)
-
-        # No new-key envelope was sealed for the removed member.
-        new_posts = [c for c in self.fake.envelope_posts()
-                     if json.loads(c["body"])["key_id"] == new_id]
-        targets = {json.loads(c["body"])["member_id"] for c in new_posts}
-        self.assertNotIn("m2", targets)
-        self.assertIn("m1", targets)
+        self.assertEqual(self.fake.topics[TOPIC_ID]["current_key_id"], new_id)
+        self.assertEqual(self.keystore("default")[old_id], old_key)
+        targets = {json.loads(c["body"])["member_id"] for c in self.fake.envelope_posts() if json.loads(c["body"])["key_id"] == new_id}
+        self.assertEqual(targets, {"m1"})
+        self.assertEqual(self.fake.entry_posts("key_rotated"), [], "server records rotation atomically")
 
     def test_post_uses_new_key_and_old_key_fails_on_new_content(self):
         old_id, old_key = self._setup_two_member_topic()
@@ -699,18 +679,14 @@ class TestRemoveAndRekey(E2eeRekeyTestBase):
         self.assertNotEqual(rc, 0)
         self.assertIn("not end-to-end encrypted", err)
 
-    def test_rekey_without_old_key_succeeds(self):
-        # Rotation does NOT require holding the current key (spec §2): an
-        # owner who lost their keystore can still rotate. The commit only
-        # needs the NEW key's envelopes.
+    def test_rekey_without_old_key_requires_recovery(self):
         self._setup_two_member_topic()
-        shutil.rmtree(os.path.join(hub.topic_keys_dir("default")), ignore_errors=True)
+        shutil.rmtree(hub.topic_keys_dir("default"), ignore_errors=True)
+        before = len(self.fake.envelope_posts())
         rc, out, err = self.run_cli(["topic-rekey", "--topic", TOPIC_ID])
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        new_id = json.loads(out)["key_id"]
-        # The new key is stored; there was no old key to retain.
-        self.assertEqual(list(self.keystore("default")), [new_id])
-        self.assertEqual(self.fake.topics[TOPIC_ID]["current_key_id"], new_id)
+        self.assertEqual(rc, 1)
+        self.assertIn("recover", err)
+        self.assertEqual(len(self.fake.envelope_posts()), before)
 
     def test_rekey_as_kid_fails_loudly(self):
         # secfix F1: rotation is an owner/parent privilege. The CLI fails
@@ -785,53 +761,24 @@ class TestRekeyCommitHandling(E2eeRekeyTestBase):
         rc, out, err = self.run_cli(["topic-rekey", "--topic", TOPIC_ID])
         self.assertNotEqual(rc, 0)
         self.assertIn("key-init", err)
-        self.assertIn("--force", err)
+        self.assertIn("cannot be bypassed", err)
         # Nothing committed: the old key is still current.
         self.assertEqual(self.fake.topics[TOPIC_ID]["current_epoch"], 1)
 
-    def test_incomplete_distribution_force_commits_when_confirmed(self):
+    def test_force_flag_is_rejected(self):
         self.create_e2ee_topic(["m1", "m2"])
-        state = {"rejected": False}
-        commit_bodies = []
+        before = len(self.fake.calls)
+        with self.assertRaises(SystemExit) as exc:
+            self.run_cli(["topic-rekey", "--topic", TOPIC_ID, "--force"])
+        self.assertEqual(exc.exception.code, 2)
+        self.assertEqual(len(self.fake.calls), before)
 
-        def hook(tid, topic, body, mid):
-            commit_bodies.append(dict(body))
-            if not state["rejected"] and not body.get("force"):
-                state["rejected"] = True
-                return 409, json.dumps({"error": {
-                    "code": "incomplete_distribution",
-                    "message": "m4 has no registered identity key",
-                    "missing": ["m4/dee-agent"]}})
-            return self.fake._commit(tid, topic, body, mid)
-
-        self.fake.commit_hook = hook
-        with mock.patch("builtins.input", return_value="yes"):
-            rc, out, err = self.run_cli(
-                ["topic-rekey", "--topic", TOPIC_ID, "--force"])
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        result = json.loads(out)
-        self.assertTrue(result["forced_commit"])
-        # Same key material recommitted with force=true (no regeneration).
-        self.assertEqual(len(commit_bodies), 2)
-        self.assertFalse(commit_bodies[0]["force"])
-        self.assertTrue(commit_bodies[1]["force"])
-        self.assertEqual(commit_bodies[0]["key_id"], commit_bodies[1]["key_id"])
-
-    def test_force_declined_aborts_without_committing(self):
+    def test_keyless_recipient_prevents_any_commit(self):
         self.create_e2ee_topic(["m1", "m2"])
-
-        def hook(tid, topic, body, mid):
-            return 409, json.dumps({"error": {
-                "code": "incomplete_distribution",
-                "message": "m4 has no registered identity key",
-                "missing": ["m4/dee-agent"]}})
-
-        self.fake.commit_hook = hook
-        with mock.patch("builtins.input", return_value="no"):
-            rc, out, err = self.run_cli(
-                ["topic-rekey", "--topic", TOPIC_ID, "--force"])
+        self.fake.keys_by_member["m2"] = []
+        rc, out, err = self.run_cli(["topic-rekey", "--topic", TOPIC_ID])
         self.assertNotEqual(rc, 0)
-        self.assertIn("declined", err)
+        self.assertIn("key-init", err)
         self.assertEqual(self.fake.topics[TOPIC_ID]["current_epoch"], 1)
 
 
@@ -847,9 +794,8 @@ class TestKeyRequestGrant(E2eeRekeyTestBase):
         reqs = self.fake.entry_posts("key_request")
         self.assertEqual(len(reqs), 1)
         body = json.loads(reqs[0]["body"])
-        self.assertIn("[key request]", body["body"])
-        self.assertIn("m5", body["body"])
-        self.assertNotIn("fh1.", body["body"])  # plaintext, visible
+        self.assertEqual(body["data"], {"member_id":"m5", "agent_label":"eee-agent"})
+        self.assertNotIn("body", body)
         # Nothing was granted automatically.
         self.assertEqual(len(self.fake.envelope_posts()), 2)  # only creation's
 
@@ -958,16 +904,11 @@ class TestKeyFetchAndSyncRefresh(E2eeRekeyTestBase):
 
 
 class TestSystemKindRouting(E2eeRekeyTestBase):
-    def test_post_system_kind_stays_plaintext_on_e2ee_topic(self):
-        self.create_e2ee_topic(["m1", "m2"])
-        rc, out, err = self.run_cli(
-            ["post", "--topic", TOPIC_ID, "--kind", "key_request",
-             "--message", "[key request] manual"])
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        entry = json.loads(out)["entry"]["entry"]
-        self.assertEqual(entry["kind"], "key_request")
-        self.assertIn("[key request] manual", entry["body"])
-        self.assertIn("PLAINTEXT", err)
+    def test_post_cannot_smuggle_free_text_as_system_notice(self):
+        with self.assertRaises(SystemExit) as exc:
+            self.run_cli(["post", "--topic", TOPIC_ID, "--kind", "key_request", "--message", "private note"])
+        self.assertEqual(exc.exception.code, 2)
+        self.assertEqual(self.fake.calls, [])
 
     def test_post_message_still_encrypts(self):
         self.create_e2ee_topic(["m1", "m2"])

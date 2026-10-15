@@ -72,7 +72,7 @@ async function twoEpochs(app: TestApp, name: string): Promise<Ctx> {
 }
 
 async function keyStatus(app: TestApp, token: string, tid: string): Promise<string | undefined> {
-  const s = await app.call('GET', '/v1/sync/topics?limit=200', { token });
+  const s = await app.call('GET', '/v2/sync/topics?limit=200', { token });
   assert.equal(s.status, 200);
   return (s.body.topics as any[]).find((t: any) => t.topic_id === tid)?.key_status;
 }
@@ -104,7 +104,7 @@ test('full_history accept: no rotation gate; joiner sealed all committed epoch k
   // The joiner now holds every committed epoch: granted history is
   // actually readable. Envelopes are ordered by epoch ASC, each carrying
   // its commitment for N07 verification.
-  const envs = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: cee.token });
+  const envs = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: cee.token });
   assert.equal(envs.status, 200);
   const rows = envs.body.envelopes as any[];
   assert.equal(rows.length, 2);
@@ -160,7 +160,7 @@ test('keyless full_history joiner: envelopes cannot be staged; stays pending', a
   assert.equal(await keyStatus(app, elle.token, tid), 'pending');
 
   // Once they register a key, the owner can seal every committed epoch.
-  const rot = await app.call('POST', '/v1/agent-keys/rotate', {
+  const rot = await app.call('POST', '/v2/agent-keys/rotate', {
     token: elle.token,
     body: { agent_public_key: b64(32) },
   });

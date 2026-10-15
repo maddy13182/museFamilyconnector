@@ -54,7 +54,7 @@ NEW_SKILL_VERSION = _next_minor(hub.SKILL_VERSION)
 def make_manifest(version=NEW_CLI_VERSION, sha256="0" * 64,
                   server="https://hub.example.test",
                   skill_version="0.11.0", skill_sha256="1" * 64):
-    """The new /v1/client/latest shape (spec §3.5 + §3.6): assets served by
+    """The new /v2/client/latest shape (spec §3.5 + §3.6): assets served by
     the server itself, plus min_cli_version and the skill bundle block.
     The default skill version is older than the installed skill, so the
     skill-docs refresh phase no-ops unless a test asks for newer."""
@@ -62,16 +62,16 @@ def make_manifest(version=NEW_CLI_VERSION, sha256="0" * 64,
         "version": version,
         "min_cli_version": "0.10.0",
         "server_version": "1.0.0",
-        "download_url": server + "/v1/client/download/hub",
+        "download_url": server + "/v2/client/download/hub",
         "sha256": sha256,
         "released_at": "2026-10-11T22:00:00Z",
         "assets": {
-            "hub": server + "/v1/client/download/hub",
-            "sigstore": server + "/v1/client/download/hub.sigstore",
-            "manifest": server + "/v1/client/download/manifest.json",
+            "hub": server + "/v2/client/download/hub",
+            "sigstore": server + "/v2/client/download/hub.sigstore",
+            "manifest": server + "/v2/client/download/manifest.json",
         },
         "skill": {
-            "url": server + "/v1/client/download/skill.tar.gz",
+            "url": server + "/v2/client/download/skill.tar.gz",
             "sha256": skill_sha256,
             "version": skill_version,
         },
@@ -79,13 +79,13 @@ def make_manifest(version=NEW_CLI_VERSION, sha256="0" * 64,
 
 
 class FakeTransport:
-    """Serve GET /v1/client/latest; nothing else is needed for upgrade."""
+    """Serve GET /v2/client/latest; nothing else is needed for upgrade."""
 
     def __init__(self, manifest):
         self.manifest = manifest
 
     def __call__(self, method, url, headers, body_bytes):
-        if not url.endswith("/v1/client/latest"):
+        if not url.endswith("/v2/client/latest"):
             raise AssertionError("unexpected URL: %s" % url)
         if "Authorization" in headers:
             raise AssertionError("latest must be unauthenticated")
@@ -297,9 +297,9 @@ class ManifestSchemaTest(unittest.TestCase):
         server = "https://hub.example.test"
         # Same origin passes (default and explicit https port agree).
         hub._validate_download_url(
-            server + "/v1/client/download/hub", server)
+            server + "/v2/client/download/hub", server)
         hub._validate_download_url(
-            "https://hub.example.test:443/v1/client/download/hub", server)
+            "https://hub.example.test:443/v2/client/download/hub", server)
         # Plain http is refused for non-loopback hosts…
         with self.assertRaises(hub.HubError):
             hub._validate_download_url(
@@ -320,17 +320,17 @@ class ManifestSchemaTest(unittest.TestCase):
     def test_download_url_loopback_http_allowed(self):
         # Dev-only exception, mirroring F03 for the server URL itself.
         hub._validate_download_url(
-            "http://127.0.0.1:8080/v1/client/download/hub",
+            "http://127.0.0.1:8080/v2/client/download/hub",
             "http://127.0.0.1:8080")
         with self.assertRaises(hub.HubError):
             hub._validate_download_url(
-                "http://127.0.0.1:8080/v1/client/download/hub",
+                "http://127.0.0.1:8080/v2/client/download/hub",
                 "https://hub.example.test")
 
     def test_download_url_rejects_embedded_credentials(self):
         with self.assertRaises(hub.HubError):
             hub._validate_download_url(
-                "https://user:pass@hub.example.test/v1/client/download/hub",
+                "https://user:pass@hub.example.test/v2/client/download/hub",
                 "https://hub.example.test")
 
     def test_download_url_rejects_malformed(self):
@@ -414,7 +414,7 @@ class UpgradeTest(unittest.TestCase):
         for url in requested:
             self.assertNotIn("github.com", url)
             self.assertTrue(
-                url.startswith("https://hub.example.test/v1/client/download/"))
+                url.startswith("https://hub.example.test/v2/client/download/"))
 
     def test_upgrade_surfaces_min_cli_version(self):
         fx = UpgradeFixture(self)

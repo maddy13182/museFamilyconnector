@@ -6,7 +6,7 @@
 // circle), so the dashboard keeps a per-circle token map ('fh_circle_tokens',
 // circle id -> token) alongside the default token ('fh_token'). Data calls
 // for a circle use that circle's token; the default token is only a fallback
-// and always backs the /v1/families listing (the server scopes it by caller).
+// and always backs the /v2/families listing (the server scopes it by caller).
 
 import { CIRCLE_LOGIC_SRC } from './circle-logic.js';
 
@@ -46,20 +46,13 @@ export const UI_HTML = `<!DOCTYPE html>
   <div id="circleError" class="meta" style="color: #a00;"></div>
   <h2>Topics</h2>
   <div id="topics"></div>
-  <h3>New topic</h3>
-  <input id="newSubject" placeholder="Subject" size="40">
-  <button id="createTopic">Create group topic with me</button>
-  <div class="meta">Topics created here are plaintext. Encrypted (E2EE) topics are created with the agent CLI (<code>hub new-topic --e2ee</code>).</div>
+  <p>All conversations are encrypted. Create topics and send messages through your Muse.</p>
   <h2 id="topicTitle"></h2>
   <div id="entries"></div>
-  <h3>Post</h3>
-  <textarea id="postBody" placeholder="Write a message…"></textarea><br>
-  <button id="post">Post message</button>
 </div>
 <script>
 ${CIRCLE_LOGIC_SRC}
 const $ = (id) => document.getElementById(id);
-let currentTopic = null;
 let activeCircleId = localStorage.getItem('fh_circle_id') || null;
 let lastFamilies = [];
 
@@ -78,7 +71,7 @@ function tokenForCircle(circleId) {
 // The server binds each bearer token to exactly one (member, circle), so a
 // data call for a circle must carry that circle's token. opts.circleId
 // overrides the active circle; null selects the default token (used for the
-// /v1/families listing, which the server scopes by caller email).
+// /v2/families listing, which the server scopes by caller email).
 async function api(path, opts = {}) {
   const { base } = cfg();
   const { circleId, ...fetchOpts } = opts;
@@ -97,7 +90,7 @@ async function loadCircles() {
   const errBox = $('circleError');
   let families = [];
   try {
-    const data = await api('/v1/families', { circleId: null });
+    const data = await api('/v2/families', { circleId: null });
     families = Array.isArray(data.families) ? data.families : [];
   } catch (e) {
     if (/HTTP 404/.test(e.message)) {
@@ -197,12 +190,12 @@ async function saveCircleToken() {
   const active = lastFamilies.filter(function (f) { return f.id === activeCircleId; })[0];
   const name = active ? active.name : activeCircleId;
   // Verify the token before storing it: fail fast on typos, expired, or
-  // revoked tokens instead of 403ing every later call. GET /v1/me also
+  // revoked tokens instead of 403ing every later call. GET /v2/me also
   // proves the token is bound to THIS circle, so a token pasted for the
   // wrong circle is rejected instead of mislabeling its data as ours.
   let me;
   try {
-    const res = await fetch(cfg().base + '/v1/me', {
+    const res = await fetch(cfg().base + '/v2/me', {
       headers: { 'authorization': 'Bearer ' + t }
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -239,7 +232,6 @@ function canLoadCircleData() {
 async function switchCircle(id) {
   activeCircleId = id;
   localStorage.setItem('fh_circle_id', id);
-  currentTopic = null;
   $('topicTitle').textContent = '';
   $('entries').innerHTML = '';
   $('topics').innerHTML = '';
@@ -251,25 +243,16 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&l
 async function loadTopics() {
   if (!canLoadCircleData()) return; // token notice showing; never fetch with the wrong token
   try {
-    const { topics } = await api('/v1/topics');
+    const { topics } = await api('/v2/topics');
     $('circleError').textContent = '';
     $('topics').innerHTML = '';
     topics.forEach(t => {
       const b = document.createElement('button');
-      const e2ee = t.e2ee === 1;
-      // E2EE subjects are ciphertext opaque to the server — never render the
-      // blob. Metadata-only label instead.
-      if (e2ee) {
-        b.innerHTML = '';
-        const badge = document.createElement('span');
-        badge.className = 'lockBadge';
-        badge.textContent = '🔒 encrypted';
-        b.appendChild(badge);
-        b.appendChild(document.createTextNode(' [encrypted]'));
-      } else {
-        b.textContent = t.subject + (t.parent_topic_id ? ' (linked)' : '');
-      }
-      b.onclick = () => loadTopic(t.id, t.subject, e2ee);
+      const badge = document.createElement('span');
+      badge.className = 'lockBadge';
+      badge.textContent = '🔒 [encrypted]';
+      b.appendChild(badge);
+      b.onclick = () => loadTopic(t.id);
       $('topics').appendChild(b);
     });
   } catch (e) {
@@ -277,7 +260,6 @@ async function loadTopics() {
     // keep existing content
   }
 }
-let currentTopicE2ee = false;
 // Shared renderer: a retired topic's pointer entry is a "retired →
 // continues at <id>" banner, never a normal message — in E2EE and plaintext
 // views alike.
@@ -305,9 +287,7 @@ function renderE2eeEntry(e) {
   if (typeof e.body === 'string' && e.body.indexOf('fh1.') === 0) {
     return head + '<span class="meta">(encrypted content — the dashboard holds no keys, so the body is not shown)</span></div>';
   }
-  // Plaintext by accident or design on an E2EE topic: it IS readable, so
-  // render it honestly rather than hiding it.
-  return head + esc(e.body) + '</div>';
+  return head + '<span class="meta">(system event)</span></div>';
 }
 // The dashboard has no E2EE keys by design: subjects and message bodies
 // stay opaque. This view is metadata only — participants, counts, plaintext
@@ -318,8 +298,8 @@ async function loadE2eeTopic(id) {
   const box = $('entries');
   try {
     const [detail, hist] = await Promise.all([
-      api('/v1/topics/' + encodeURIComponent(id)),
-      api('/v1/topics/' + encodeURIComponent(id) + '/history?limit=100')
+      api('/v2/topics/' + encodeURIComponent(id)),
+      api('/v2/topics/' + encodeURIComponent(id) + '/history?limit=100')
     ]);
     const participants = (detail.participants || [])
       .map(p => esc(p.name) + ' (' + esc(p.role) + ')').join(', ') || '—';
@@ -339,51 +319,9 @@ async function loadE2eeTopic(id) {
     $('circleError').textContent = 'Could not load topic metadata: ' + e.message;
   }
 }
-async function loadPlainTopic(id) {
-  try {
-    const { entries } = await api('/v1/topics/' + encodeURIComponent(id) + '/history?limit=100');
-    $('entries').innerHTML = entries.map(e =>
-      e.kind === 'topic_archived' ? renderArchivedBanner(e) :
-      '<div class="entry"><span class="kind">' + esc(e.kind) + '</span> ' +
-      '<span class="meta">#' + esc(e.seq) + ' · ' + esc(e.ts) + ' · ' + esc(e.agent_label) + '</span><br>' +
-      esc(e.body) + '</div>'
-    ).join('');
-  } catch (e) {
-    $('circleError').textContent = 'Could not load messages: ' + e.message;
-  }
-}
-async function loadTopic(id, subject, isE2ee) {
-  currentTopic = id;
-  currentTopicE2ee = !!isE2ee;
-  if (currentTopicE2ee) {
-    $('topicTitle').innerHTML = '';
-    const badge = document.createElement('span');
-    badge.className = 'lockBadge';
-    badge.textContent = '🔒 encrypted topic';
-    $('topicTitle').appendChild(badge);
-    await loadE2eeTopic(id);
-  } else {
-    $('topicTitle').textContent = subject;
-    await loadPlainTopic(id);
-  }
-  updatePostUi();
-}
-// Posting needs the plaintext-encrypting CLI: the dashboard holds no keys,
-// so its Post box is disabled on encrypted topics rather than posting
-// something unreadable (or failing server-side).
-function updatePostUi() {
-  $('post').disabled = currentTopicE2ee;
-  $('postBody').disabled = currentTopicE2ee;
-  let note = $('postNote');
-  if (!note) {
-    note = document.createElement('div');
-    note.id = 'postNote';
-    note.className = 'meta';
-    $('post').insertAdjacentElement('afterend', note);
-  }
-  note.textContent = currentTopicE2ee
-    ? 'Posting to an encrypted topic is not available in the dashboard (it holds no keys). Use the agent CLI: hub post --topic <id> --message "…".'
-    : '';
+async function loadTopic(id) {
+  $('topicTitle').textContent = '🔒 encrypted topic';
+  await loadE2eeTopic(id);
 }
 $('save').onclick = () => {
   localStorage.setItem('fh_base', $('base').value.trim() || location.origin);
@@ -397,31 +335,6 @@ $('forget').onclick = () => {
   localStorage.removeItem('fh_circle_id');
   $('token').value = '';
   $('app').style.display = 'none';
-};
-$('post').onclick = async () => {
-  if (!currentTopic) return alert('Pick a topic first');
-  try {
-    await api('/v1/topics/' + encodeURIComponent(currentTopic) + '/entries',
-      { method: 'POST', body: JSON.stringify({ body: $('postBody').value }) });
-    $('postBody').value = '';
-    loadTopic(currentTopic, $('topicTitle').textContent);
-  } catch (e) { alert('Post failed: ' + e.message); }
-};
-$('createTopic').onclick = async () => {
-  const subject = $('newSubject').value.trim();
-  if (!subject) return alert('Subject required');
-  try {
-    // Identity comes from GET /v1/me — the member bound to THIS token. Never
-    // /v1/members[0]: the server orders members by creation time, so [0] is
-    // typically the owner, and a kid clicking this would otherwise create a
-    // topic that discloses to the owner.
-    const me = await api('/v1/me');
-    const { topic } = await api('/v1/topics', { method: 'POST',
-      body: JSON.stringify({ subject, kind: 'group', participant_member_ids: [me.id] }) });
-    $('newSubject').value = '';
-    await loadTopics();
-    loadTopic(topic.id, topic.subject);
-  } catch (e) { alert('Create failed: ' + e.message); }
 };
 if (localStorage.getItem('fh_token')) {
   $('base').value = localStorage.getItem('fh_base') || '';

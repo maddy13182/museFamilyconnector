@@ -1,3 +1,4 @@
+import { b64 } from './syncv2_helpers.js';
 // Phase D (audit F02): identity principals.
 //
 // Cross-circle negative tests: a member in circle A whose email COLLIDES
@@ -13,18 +14,19 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { makeApp, TestApp } from './app.js';
+import { makeClientApp as makeApp } from './fixture-client.js';
+import type { TestClientApp as TestApp } from './fixture-client.js';
 import { sqliteClient } from './sqlite.js';
 
 async function bootstrap(app: TestApp, name: string, ownerName: string, email: string) {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: ownerName, owner_email: email },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
   return { famId: fam.body.family.id as string, token: red.body.token as string };
@@ -38,15 +40,15 @@ async function inviteAccept(
   role: string,
   displayName: string,
 ) {
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: inviterToken,
     body: { email, role },
   });
   assert.equal(inv.status, 201);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` } },
+    `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
@@ -82,7 +84,7 @@ test('colliding email in circle A grants no hub-owner power over circle B', asyn
   // The attack (pre-F02): the owner of A invites B's owner email into A as a
   // kid and an accomplice accepts. The email-string join in isHubOwner then
   // treated the accomplice as a hub owner: circle B's metadata leaked via
-  // GET /v1/families and circles could be created while setup was locked.
+  // GET /v2/families and circles could be created while setup was locked.
   const attacker = await inviteAccept(app, famA, ownerToken, 's@b.dev', 'kid', 'Impostor');
 
   // 1. The new row gets a FRESH principal even though the email collides.
@@ -99,7 +101,7 @@ test('colliding email in circle A grants no hub-owner power over circle B', asyn
   );
 
   // 2. Circle listing: sees only A, never B's metadata.
-  const list = await app.call('GET', '/v1/families', { token: attacker.token });
+  const list = await app.call('GET', '/v2/families', { token: attacker.token });
   assert.equal(list.status, 200);
   assert.deepEqual(
     list.body.families.map((f: any) => f.id),
@@ -107,7 +109,7 @@ test('colliding email in circle A grants no hub-owner power over circle B', asyn
   );
 
   // 3. Hub-owner circle creation while locked: denied.
-  const create = await app.call('POST', '/v1/families', {
+  const create = await app.call('POST', '/v2/families', {
     token: attacker.token,
     body: { name: 'Evil Circle' },
   });
@@ -116,11 +118,11 @@ test('colliding email in circle A grants no hub-owner power over circle B', asyn
 
   // 4. Minting a provisioning code for B's owner member: the member is not
   // in the attacker's circle — 404 with no existence leak.
-  const bMembers = await app.call('GET', '/v1/members', { token: strangerToken });
+  const bMembers = await app.call('GET', '/v2/members', { token: strangerToken });
   assert.equal(bMembers.status, 200);
   const bOwner = bMembers.body.members.find((m: any) => m.role === 'owner');
   assert.ok(bOwner);
-  const mint = await app.call('POST', '/v1/provisioning-codes', {
+  const mint = await app.call('POST', '/v2/provisioning-codes', {
     token: attacker.token,
     body: { member_id: bOwner.id, agent_label: 'evil-agent' },
   });
@@ -128,13 +130,13 @@ test('colliding email in circle A grants no hub-owner power over circle B', asyn
 
   // Sanity: the real owners are unaffected — B's owner still lists B and can
   // still create circles while locked.
-  const bList = await app.call('GET', '/v1/families', { token: strangerToken });
+  const bList = await app.call('GET', '/v2/families', { token: strangerToken });
   assert.equal(bList.status, 200);
   assert.deepEqual(
     bList.body.families.map((f: any) => f.id),
     [famB],
   );
-  const okCreate = await app.call('POST', '/v1/families', {
+  const okCreate = await app.call('POST', '/v2/families', {
     token: strangerToken,
     body: { name: 'Legit Circle' },
   });
@@ -143,7 +145,7 @@ test('colliding email in circle A grants no hub-owner power over circle B', asyn
 
 test('verified owner keeps cross-circle visibility via locked creation', async () => {
   const { app, ownerToken, kidToken, famA, famB } = await lockedSetup();
-  const created = await app.call('POST', '/v1/families', {
+  const created = await app.call('POST', '/v2/families', {
     token: ownerToken,
     body: { name: 'Gym Circle' },
   });
@@ -157,7 +159,7 @@ test('verified owner keeps cross-circle visibility via locked creation', async (
   assert.equal(linked.length, 2);
   assert.equal(linked[0]['principal_id'], linked[1]['principal_id']);
 
-  const list = await app.call('GET', '/v1/families', { token: ownerToken });
+  const list = await app.call('GET', '/v2/families', { token: ownerToken });
   assert.equal(list.status, 200);
   const ids = list.body.families.map((f: any) => f.id);
   assert.ok(ids.includes(famA), 'still sees Fam A');
@@ -167,12 +169,12 @@ test('verified owner keeps cross-circle visibility via locked creation', async (
   assert.equal(gym.my_role, 'owner');
 
   // A non-owner in A sees only A and cannot create circles while locked.
-  const kidList = await app.call('GET', '/v1/families', { token: kidToken });
+  const kidList = await app.call('GET', '/v2/families', { token: kidToken });
   assert.deepEqual(
     kidList.body.families.map((f: any) => f.id),
     [famA],
   );
-  const kidCreate = await app.call('POST', '/v1/families', {
+  const kidCreate = await app.call('POST', '/v2/families', {
     token: kidToken,
     body: { name: 'Nope' },
   });
@@ -261,21 +263,21 @@ test('migration 0005 backfill: one principal per distinct email', async () => {
   assert.ok(!pid.includes('mahesh'), 'principal id must not embed the email');
 });
 
-test('GET /v1/me exposes is_hub_owner for agent discovery', async () => {
+test('GET /v2/me exposes is_hub_owner for agent discovery', async () => {
   const { app, ownerToken, kidToken, strangerToken } = await lockedSetup();
 
-  const ownerMe = await app.call('GET', '/v1/me', { token: ownerToken });
+  const ownerMe = await app.call('GET', '/v2/me', { token: ownerToken });
   assert.equal(ownerMe.status, 200);
   assert.equal(ownerMe.body.is_hub_owner, true);
   assert.equal(ownerMe.body.role, 'owner');
 
-  const kidMe = await app.call('GET', '/v1/me', { token: kidToken });
+  const kidMe = await app.call('GET', '/v2/me', { token: kidToken });
   assert.equal(kidMe.status, 200);
   assert.equal(kidMe.body.is_hub_owner, false);
   assert.equal(kidMe.body.role, 'kid');
 
   // Owner of a different circle is still a hub owner (any-circle rule).
-  const strangerMe = await app.call('GET', '/v1/me', { token: strangerToken });
+  const strangerMe = await app.call('GET', '/v2/me', { token: strangerToken });
   assert.equal(strangerMe.status, 200);
   assert.equal(strangerMe.body.is_hub_owner, true);
 });

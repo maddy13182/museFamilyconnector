@@ -1,3 +1,8 @@
+> Historical design notes. Protocol 2 supersedes optional encryption, v1 routes,
+> legacy subject formats and force commits described below. Use [INSTALL.md](INSTALL.md),
+> [SECURITY.md](SECURITY.md) and [the encryption guide](../agent-skill/references/e2ee.md)
+> for the implemented contract.
+
 # API Versioning & Client Distribution Spec — v1.0
 
 Status: accepted design (owner, 2026-10-11). This is the build contract for
@@ -38,7 +43,7 @@ dual-path code for the 0.11.0/0.9.0 pair.
 
 ## 2. Sources of truth (unchanged)
 
-- Server version: `server/package.json` → reported by `GET /v1/health`.
+- Server version: `server/package.json` → reported by `GET /v2/health`.
 - CLI version: `agent-skill/pyproject.toml` (contract C6); release stamp
   derived at build time; skill version from the `SKILL.md` header.
 - **Pairing record:** `server/client-manifest.json` declares which CLI
@@ -49,7 +54,7 @@ dual-path code for the 0.11.0/0.9.0 pair.
 
 ## 3. Server changes (`feat/api-versioning-server`)
 
-### 3.1 `GET /v1/health` — advertise the contract
+### 3.1 `GET /v2/health` — advertise the contract
 
 Response: `{ok: true, version: SERVER_VERSION, api_versions: ["v1"]}`.
 `api_versions` is the machine-readable contract; it becomes `["v1","v2"]`
@@ -59,31 +64,31 @@ if a breaking change ever lands. Unauthenticated (unchanged).
 
 `gateClientVersion` rejection becomes **HTTP 426 (Upgrade Required)** with
 code `client_too_old` (was 400). Keep the plain-language message naming the
-upgrade path. Exemptions unchanged: `/v1/health` and `/v1/client/latest`
+upgrade path. Exemptions unchanged: `/v2/health` and `/v2/client/latest`
 must stay reachable by outdated clients (self-heal path) — the four
 download endpoints (§3.4) are likewise exempt: an outdated client must be
 able to fetch its replacement.
 
 ### 3.3 Router: prefix dispatch ready for v2
 
-Structure the `/v1/...` dispatch so `/v2/...` handlers can live alongside
+Structure the `/v2/...` dispatch so `/v2/...` handlers can live alongside
 later (e.g. dispatch on API-major prefix). No v2 endpoints now. v1 response
 shapes are frozen from here on.
 
 ### 3.4 New download endpoints (public, unauthenticated)
 
-The CLI binary is a public artifact (same precedent as `/v1/health` and
-`/v1/client/latest`).
+The CLI binary is a public artifact (same precedent as `/v2/health` and
+`/v2/client/latest`).
 
 | Method | Path | Content-Type | Notes |
 |---|---|---|---|
-| GET | `/v1/client/download/hub` | `application/octet-stream` | `Content-Disposition: attachment; filename="hub"` |
-| GET | `/v1/client/download/hub.sigstore` | `application/json` | `attachment; filename="hub.sigstore"` |
-| GET | `/v1/client/download/manifest.json` | `application/json` | `attachment; filename="manifest.json"` |
-| GET | `/v1/client/download/skill.tar.gz` | `application/gzip` | `attachment; filename="skill.tar.gz"` — the versioned skill bundle (`SKILL.md`, `references/`, `INSTALL.md`, `requirements.txt`, plus the `hub` artifact, its sigstore bundle, and the release manifest) |
+| GET | `/v2/client/download/hub` | `application/octet-stream` | `Content-Disposition: attachment; filename="hub"` |
+| GET | `/v2/client/download/hub.sigstore` | `application/json` | `attachment; filename="hub.sigstore"` |
+| GET | `/v2/client/download/manifest.json` | `application/json` | `attachment; filename="manifest.json"` |
+| GET | `/v2/client/download/skill.tar.gz` | `application/gzip` | `attachment; filename="skill.tar.gz"` — the versioned skill bundle (`SKILL.md`, `references/`, `INSTALL.md`, `requirements.txt`, plus the `hub` artifact, its sigstore bundle, and the release manifest) |
 
 - **Fixed asset map only — no path parameters.** No traversal surface by
-  construction. Any other path under `/v1/client/download/` → 404.
+  construction. Any other path under `/v2/client/download/` → 404.
 - `Content-Length` set; `Cache-Control: public, max-age=300` (bytes change
   when the manifest pin updates + server redeploys — must NOT be immutable).
 - Apply the existing in-worker rate limiter (generous bucket); 429 uses the
@@ -91,7 +96,7 @@ The CLI binary is a public artifact (same precedent as `/v1/health` and
 - Serve the artifacts bundled at build time (§3.6). The build fails closed,
   so these endpoints never serve placeholders.
 
-### 3.5 `GET /v1/client/latest` — new shape, self-referential URLs
+### 3.5 `GET /v2/client/latest` — new shape, self-referential URLs
 
 ```json
 {
@@ -100,14 +105,14 @@ The CLI binary is a public artifact (same precedent as `/v1/health` and
   "server_version": "<this build's SERVER_VERSION>",
   "sha256": "<pin sha256>",
   "released_at": "<pin released_at>",
-  "download_url": "https://<this-server>/v1/client/download/hub",
+  "download_url": "https://<this-server>/v2/client/download/hub",
   "assets": {
-    "hub": "https://<this-server>/v1/client/download/hub",
-    "sigstore": "https://<this-server>/v1/client/download/hub.sigstore",
-    "manifest": "https://<this-server>/v1/client/download/manifest.json"
+    "hub": "https://<this-server>/v2/client/download/hub",
+    "sigstore": "https://<this-server>/v2/client/download/hub.sigstore",
+    "manifest": "https://<this-server>/v2/client/download/manifest.json"
   },
   "skill": {
-    "url": "https://<this-server>/v1/client/download/skill.tar.gz",
+    "url": "https://<this-server>/v2/client/download/skill.tar.gz",
     "sha256": "<pin skill_sha256>",
     "version": "<pin skill_version>"
   }
@@ -146,7 +151,7 @@ machine-readable.
 
 ### 3.7 `docs/openapi.yaml`
 
-- Document the three download endpoints, the new `/v1/client/latest`
+- Document the three download endpoints, the new `/v2/client/latest`
   shape, `api_versions` in health, and 426 + `client_too_old` in the
   `ErrorCode` enum.
 - Fix the stale 429 prose (in-worker rate limiting has existed since
@@ -177,7 +182,7 @@ gate (see `docs/VERSIONING.md`).
 
 `server/src/index.ts` (~line 1489) and the invite onboarding pages surface
 install/download instructions — repoint them at this server's download
-endpoints / `/v1/client/latest`. Grep the repo for
+endpoints / `/v2/client/latest`. Grep the repo for
 `github.com/maddy13182/museFamilyconnector/releases` and update every
 user-facing reference: `docs/AGENT_JOIN.md`, `docs/DEPLOY.md`,
 `docs/INSTALL.md`, `docs/MAINTAINERS.md`, `docs/CLIENT_HARDENING_SPEC.md`,
@@ -202,7 +207,7 @@ Bumped deliberately, covered by a CLI test. No backcompat with 0.11.0.
 
 ### 4.2 Per-invocation server check
 
-Once per process invocation, `GET /v1/health` (unauthenticated, cheap;
+Once per process invocation, `GET /v2/health` (unauthenticated, cheap;
 result cached for the process — not per sub-request). Then:
 
 - `server_version < _MIN_SERVER_VERSION` → fail **before any command**:
@@ -232,7 +237,7 @@ plain-language upgrade-path message.
 
 ### 4.6 `hub upgrade` — from the server, not GitHub
 
-- Read `min_cli_version` from `/v1/client/latest` and surface it
+- Read `min_cli_version` from `/v2/client/latest` and surface it
   (e.g. "this server requires CLI ≥ x").
 - Download all three assets from `assets.{hub,sigstore,manifest}` (this
   server), plus the skill bundle from the `skill` block (`skill.url`,
@@ -251,7 +256,7 @@ plain-language upgrade-path message.
 ### 4.7 Docs
 
 `agent-skill/INSTALL.md`: first-time install downloads from the server
-(URLs from the invite page / `/v1/client/latest`); verification steps
+(URLs from the invite page / `/v2/client/latest`); verification steps
 unchanged. `agent-skill/SKILL.md`: update any references to the GitHub
 download flow.
 
@@ -282,13 +287,13 @@ no links) — a tampered bundle fails the hash, never the extractor.
 
 | Change | Method | Path | Auth | Success | Errors |
 |---|---|---|---|---|---|
-| new | GET | `/v1/client/download/hub` | no | 200 binary | 429 |
-| new | GET | `/v1/client/download/hub.sigstore` | no | 200 JSON | 429 |
-| new | GET | `/v1/client/download/manifest.json` | no | 200 JSON | 429 |
-| new | GET | `/v1/client/download/skill.tar.gz` | no | 200 gzip tar | 429 |
-| changed | GET | `/v1/client/latest` | no | 200 new shape (§3.5) | — |
-| changed | GET | `/v1/health` | no | 200 + `api_versions` | — |
-| changed | gate | all `/v1/*` (except health, client/latest, client/download/*) | — | — | **426** `client_too_old` (was 400) |
+| new | GET | `/v2/client/download/hub` | no | 200 binary | 429 |
+| new | GET | `/v2/client/download/hub.sigstore` | no | 200 JSON | 429 |
+| new | GET | `/v2/client/download/manifest.json` | no | 200 JSON | 429 |
+| new | GET | `/v2/client/download/skill.tar.gz` | no | 200 gzip tar | 429 |
+| changed | GET | `/v2/client/latest` | no | 200 new shape (§3.5) | — |
+| changed | GET | `/v2/health` | no | 200 + `api_versions` | — |
+| changed | gate | all `/v2/*` (except health, client/latest, client/download/*) | — | — | **426** `client_too_old` (was 400) |
 
 ## 7. Testing requirements
 
@@ -296,7 +301,7 @@ no links) — a tampered bundle fails the hash, never the extractor.
   `api_versions`; 426 gate (update `client_gate.test.ts` expectations —
   intentional behavior change, not a weakening); download endpoints
   (content types, bytes equal the pinned artifacts, fixed-path 404s, rate
-  limit — including `skill.tar.gz` and its shared bucket); `/v1/client/latest`
+  limit — including `skill.tar.gz` and its shared bucket); `/v2/client/latest`
   shape (absolute server URLs, `server_version`, `skill` block); invite
   pages install steps (bundle-first flow — intentional behavior change,
   not a weakening: still assert no GitHub URLs, sigstore mention, hash

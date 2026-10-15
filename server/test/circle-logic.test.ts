@@ -120,7 +120,7 @@ test('served page embeds the token logic and wiring, not query-param scoping', (
   assert.ok(UI_HTML.includes('fh_circle_id'), 'selection persisted to localStorage');
   assert.ok(UI_HTML.includes('dashboard-token'), 'onboarding hint wired');
   assert.ok(UI_HTML.includes('id="circleBox"'), 'switcher container present');
-  assert.ok(UI_HTML.includes("api('/v1/families'"), 'families endpoint wired');
+  assert.ok(UI_HTML.includes("api('/v2/families'"), 'families endpoint wired');
   assert.ok(!UI_HTML.includes('circleScopedPath'), 'query-param scoping removed');
   assert.ok(!UI_HTML.includes('family_id='), 'no family_id query params emitted');
 });
@@ -142,5 +142,6 @@ test('dashboard E2EE view is metadata-only with honest labeling', () => {
     UI_HTML.includes('Discussion continues at'),
     'archive banner names the successor',
   );
-  assert.ok(UI_HTML.includes('updatePostUi'), 'post-box gating embedded');
+  assert.ok(!UI_HTML.includes('postBody'), 'plaintext posting removed');
+  assert.ok(!UI_HTML.includes('createTopic'), 'plaintext creation removed');
 });

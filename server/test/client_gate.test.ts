@@ -1,9 +1,9 @@
-// WS-B — client version gate (B1), GET /v1/client/latest (B2), and key
+// WS-B — client version gate (B1), GET /v2/client/latest (B2), and key
 // lineage in the audit log (B3).
 //
 // Covers: below-minimum 426 with the guidance message, the legacy
 // `family-hub-agent/1.0` sentinel, non-CLI user-agent passthrough, gate-off
-// default, /v1/client/latest shape + gate exemption, and key-fingerprint
+// default, /v2/client/latest shape + gate exemption, and key-fingerprint
 // audit entries on registration / rotation (old fp → new fp) / revocation.
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -68,14 +68,14 @@ async function setupOwner(app: TestApp): Promise<{
   memberId: string;
   famId: string;
 }> {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name: `gate-${Date.now()}-${Math.random()}`, owner_name: 'Ow', owner_email: 'o@gate.dev' },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
   const memberId = red.body.member.id as string;
@@ -98,7 +98,7 @@ function gateOn(app: TestApp, min = '0.7.0'): void {
 test('gate is off by default: outdated CLI UA passes', async () => {
   const app = makeApp();
   const { token } = await setupOwner(app);
-  const res = await app.call('GET', '/v1/me', {
+  const res = await app.call('GET', '/v2/me', {
     token,
     headers: { 'user-agent': 'family-hub-agent/0.0.1' },
   });
@@ -108,7 +108,7 @@ test('gate is off by default: outdated CLI UA passes', async () => {
 test('below-minimum CLI is rejected with 426 and the guidance message', async () => {
   const app = makeApp();
   gateOn(app);
-  const res = await app.call('GET', '/v1/me', {
+  const res = await app.call('GET', '/v2/me', {
     headers: { 'user-agent': 'family-hub-agent/0.5.0' },
   });
   assert.equal(res.status, 426);
@@ -123,7 +123,7 @@ test('below-minimum CLI is rejected with 426 and the guidance message', async ()
 test('legacy family-hub-agent/1.0 sentinel is treated as 0.0.0', async () => {
   const app = makeApp();
   gateOn(app);
-  const res = await app.call('GET', '/v1/me', {
+  const res = await app.call('GET', '/v2/me', {
     headers: { 'user-agent': 'family-hub-agent/1.0' },
   });
   assert.equal(res.status, 426);
@@ -136,7 +136,7 @@ test('client at or above the minimum passes the gate', async () => {
   gateOn(app);
   const { token } = await setupOwner(app);
   for (const v of ['0.7.0', '0.7.1', '1.2.3']) {
-    const res = await app.call('GET', '/v1/me', {
+    const res = await app.call('GET', '/v2/me', {
       token,
       headers: { 'user-agent': `family-hub-agent/${v}` },
     });
@@ -149,7 +149,7 @@ test('non-CLI user agents are never gated', async () => {
   gateOn(app);
   const { token } = await setupOwner(app);
   // Browser dashboard UA.
-  const browser = await app.call('GET', '/v1/me', {
+  const browser = await app.call('GET', '/v2/me', {
     token,
     headers: {
       'user-agent':
@@ -158,41 +158,41 @@ test('non-CLI user agents are never gated', async () => {
   });
   assert.equal(browser.status, 200);
   // curl.
-  const curl = await app.call('GET', '/v1/me', {
+  const curl = await app.call('GET', '/v2/me', {
     token,
     headers: { 'user-agent': 'curl/8.5.0' },
   });
   assert.equal(curl.status, 200);
   // No User-Agent header at all.
-  const none = await app.call('GET', '/v1/me', { token });
+  const none = await app.call('GET', '/v2/me', { token });
   assert.equal(none.status, 200);
 });
 
 test('gate fires before auth (426, not 401) for old clients', async () => {
   const app = makeApp();
   gateOn(app);
-  const res = await app.call('GET', '/v1/me', {
+  const res = await app.call('GET', '/v2/me', {
     headers: { 'user-agent': 'family-hub-agent/0.1.0' },
   });
   assert.equal(res.status, 426);
   assert.equal(res.body.error.code, 'client_too_old');
 });
 
-test('/v1/client/latest, /v1/health, and /v1/client/download/* are exempt from the gate', async () => {
+test('/v2/client/latest, /v2/health, and /v2/client/download/* are exempt from the gate', async () => {
   const app = makeApp();
   gateOn(app);
   const oldUA = { headers: { 'user-agent': 'family-hub-agent/0.0.1' } };
-  const latest = await app.call('GET', '/v1/client/latest', oldUA);
+  const latest = await app.call('GET', '/v2/client/latest', oldUA);
   assert.equal(latest.status, 200);
-  const health = await app.call('GET', '/v1/health', {
+  const health = await app.call('GET', '/v2/health', {
     headers: { 'user-agent': 'family-hub-agent/1.0' },
   });
   assert.equal(health.status, 200);
   for (const p of [
-    '/v1/client/download/hub',
-    '/v1/client/download/hub.sigstore',
-    '/v1/client/download/manifest.json',
-    '/v1/client/download/skill.tar.gz',
+    '/v2/client/download/hub',
+    '/v2/client/download/hub.sigstore',
+    '/v2/client/download/manifest.json',
+    '/v2/client/download/skill.tar.gz',
   ]) {
     const r = await app.call('GET', p, oldUA);
     assert.equal(r.status, 200, `${p} must stay reachable by outdated clients`);
@@ -200,12 +200,12 @@ test('/v1/client/latest, /v1/health, and /v1/client/download/* are exempt from t
 });
 
 // ---------------------------------------------------------------------------
-// B2: GET /v1/client/latest.
+// B2: GET /v2/client/latest.
 // ---------------------------------------------------------------------------
 
-test('/v1/client/latest serves the manifest shape, publicly', async () => {
+test('/v2/client/latest serves the manifest shape, publicly', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/client/latest');
+  const res = await app.call('GET', '/v2/client/latest');
   assert.equal(res.status, 200);
   assert.deepEqual(Object.keys(res.body).sort(), [
     'assets',
@@ -224,16 +224,16 @@ test('/v1/client/latest serves the manifest shape, publicly', async () => {
   assert.equal(res.body.released_at, manifest.released_at);
   // Self-referential: URLs point at THIS server's download endpoints,
   // derived from the request origin.
-  assert.equal(res.body.download_url, 'https://hub.test/v1/client/download/hub');
+  assert.equal(res.body.download_url, 'https://hub.test/v2/client/download/hub');
   assert.deepEqual(res.body.assets, {
-    hub: 'https://hub.test/v1/client/download/hub',
-    sigstore: 'https://hub.test/v1/client/download/hub.sigstore',
-    manifest: 'https://hub.test/v1/client/download/manifest.json',
+    hub: 'https://hub.test/v2/client/download/hub',
+    sigstore: 'https://hub.test/v2/client/download/hub.sigstore',
+    manifest: 'https://hub.test/v2/client/download/manifest.json',
   });
   // The skill block names the bundle URL, its build-verified sha256, and
   // the skill version (from the SKILL VERSION header, independent of CLI).
   assert.deepEqual(res.body.skill, {
-    url: 'https://hub.test/v1/client/download/skill.tar.gz',
+    url: 'https://hub.test/v2/client/download/skill.tar.gz',
     sha256: manifest.skill_sha256,
     version: manifest.skill_version,
   });
@@ -247,7 +247,7 @@ test('/v1/client/latest serves the manifest shape, publicly', async () => {
 
 test('key registration via redeem logs key_fp → agent_label → member_id → circle_id', async () => {
   const app = makeApp();
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name: `reg-${Date.now()}`, owner_name: 'Ow', owner_email: 'o@reg.dev' },
   });
   assert.equal(fam.status, 201);
@@ -257,7 +257,7 @@ test('key registration via redeem logs key_fp → agent_label → member_id → 
   try {
     red = await app.call(
       'POST',
-      `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+      `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
       { body: { agent_public_key: pubkey } },
     );
   } finally {
@@ -271,14 +271,14 @@ test('key registration via redeem logs key_fp → agent_label → member_id → 
   assert.equal(line['family_id'], red.body.member.family_id);
 });
 
-test('initial registration via /v1/agent-keys/rotate logs key_fp', async () => {
+test('rotation of an enrolled identity logs key_fp', async () => {
   const app = makeApp();
   const { token, memberId, famId } = await setupOwner(app);
   const pubkey = b64(32);
   const cap = captureLogs();
   let res;
   try {
-    res = await app.call('POST', '/v1/agent-keys/rotate', {
+    res = await app.call('POST', '/v2/agent-keys/rotate', {
       token,
       body: { agent_public_key: pubkey },
     });
@@ -286,7 +286,7 @@ test('initial registration via /v1/agent-keys/rotate logs key_fp', async () => {
     cap.restore();
   }
   assert.equal(res.status, 200);
-  const line = findLine(parsed(cap.lines), 'agent_key_registered');
+  const line = findLine(parsed(cap.lines), 'agent_key_rotated');
   assert.equal(line['key_fp'], await fpOf(pubkey));
   assert.equal(line['agent_label'], 'owner-agent');
   assert.equal(line['member_id'], memberId);
@@ -298,7 +298,7 @@ test('rotation logs old fp → new fp with the full chain', async () => {
   const { token, memberId, famId } = await setupOwner(app);
   const first = b64(32);
   const second = b64(32);
-  const r1 = await app.call('POST', '/v1/agent-keys/rotate', {
+  const r1 = await app.call('POST', '/v2/agent-keys/rotate', {
     token,
     body: { agent_public_key: first },
   });
@@ -306,7 +306,7 @@ test('rotation logs old fp → new fp with the full chain', async () => {
   const cap = captureLogs();
   let r2;
   try {
-    r2 = await app.call('POST', '/v1/agent-keys/rotate', {
+    r2 = await app.call('POST', '/v2/agent-keys/rotate', {
       token,
       body: { agent_public_key: second },
     });
@@ -326,7 +326,7 @@ test('token revocation logs the active key fingerprint with the full chain', asy
   const app = makeApp();
   const { token, memberId, famId } = await setupOwner(app);
   const pubkey = b64(32);
-  const reg = await app.call('POST', '/v1/agent-keys/rotate', {
+  const reg = await app.call('POST', '/v2/agent-keys/rotate', {
     token,
     body: { agent_public_key: pubkey },
   });
@@ -337,7 +337,7 @@ test('token revocation logs the active key fingerprint with the full chain', asy
   const cap = captureLogs();
   let res;
   try {
-    res = await app.call('POST', '/v1/auth/revoke', {
+    res = await app.call('POST', '/v2/auth/revoke', {
       token,
       body: { token_id: tokenRow!['token_id'] },
     });

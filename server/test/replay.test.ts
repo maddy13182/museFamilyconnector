@@ -17,7 +17,7 @@ import {
   hex,
   setupKeyedFamily,
   createE2eeTopic,
-  createPlainTopic,
+  createActiveTopic,
   postEntry,
   postEnvelope,
   commitKey,
@@ -81,7 +81,7 @@ test('same msg_id, different payload -> 409 msg_id_conflict', async () => {
 test('msg_id is scoped per topic: same id in another topic is fine', async () => {
   const app = makeApp();
   const { owner, tid, keyId } = await committedTopic(app, 'Replay3');
-  const other = await createPlainTopic(app, owner.token, 'other');
+  const other = await createActiveTopic(app, owner.token, 'other');
   const msgId = hex(16);
 
   const r1 = await postEntry(app, owner.token, tid, wireBody(keyId, msgId));
@@ -102,15 +102,16 @@ test('msg_id is scoped per topic: same id in another topic is fine', async () =>
   void other;
 });
 
-test('plaintext bodies carry no msg_id: duplicates are separate entries', async () => {
+test('distinct encrypted message IDs produce separate entries', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'Replay4');
-  const tid = await createPlainTopic(app, owner.token, 'plain replay');
+  const tid = await createActiveTopic(app, owner.token, 'plain replay');
 
-  const r1 = await postEntry(app, owner.token, tid, 'same words');
-  const r2 = await postEntry(app, owner.token, tid, 'same words');
+  const key=(await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?',[tid]))!.current_key_id as string;
+  const r1 = await postEntry(app, owner.token, tid, wireBody(key));
+  const r2 = await postEntry(app, owner.token, tid, wireBody(key));
   assert.equal(r1.status, 201);
-  assert.equal(r2.status, 201, 'no msg_id -> no replay dedupe');
+  assert.equal(r2.status, 201, 'different msg_id -> different entries');
   assert.notEqual(r1.body.entry.seq, r2.body.entry.seq);
 });
 

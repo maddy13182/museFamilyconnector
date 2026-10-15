@@ -27,6 +27,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import urllib.parse as urlparse
 from importlib.machinery import SourceFileLoader
 
@@ -49,7 +50,7 @@ TOPIC_ID = "t-e2ee-1"
 class E2eeFakeHub:
     """Stateful fake hub for the E2EE new-topic flow (sync-v2 semantics).
 
-    - POST /v1/topics with e2ee=1 creates the topic at epoch 0
+    - POST /v2/topics with e2ee=1 creates the topic at epoch 0
       (current_epoch=0, current_key_id=None): writes blocked until commit.
       There is no initial_key_id anymore.
     - POST .../envelopes is STAGED: stored, never flips current_key_id (the
@@ -98,6 +99,7 @@ class E2eeFakeHub:
         return out
 
     def _commit(self, body):
+        self.subject = body.get("subject", self.subject)
         expected = body.get("expected_epoch")
         if expected != self.current_epoch + 1:
             return 409, json.dumps({"error": {
@@ -170,7 +172,7 @@ class E2eeFakeHub:
         # The fake models a current (1.0.0) server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
-        if method == "GET" and path == "/v1/health":
+        if method == "GET" and path == "/v2/health":
             self.health_calls.append(
                 {
                     "method": method,
@@ -180,12 +182,12 @@ class E2eeFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
             )
 
         self._record(method, url, headers, body_bytes)
 
-        if method == "POST" and path == "/v1/topics":
+        if method == "POST" and path == "/v2/topics":
             body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
             # v2: E2EE topics are created at epoch 0 (writes blocked);
             # activation happens only via keys/commit. No initial_key_id.
@@ -197,14 +199,14 @@ class E2eeFakeHub:
                 {"topic": {"id": TOPIC_ID, "subject": self.subject, "e2ee": 1,
                            "current_epoch": 0, "current_key_id": None}}
             )
-        if method == "GET" and path == "/v1/me":
+        if method == "GET" and path == "/v2/me":
             return 200, json.dumps(
                 {"id": "m1", "family_id": "f1", "agent_label": "owner-agent", "role": "owner"}
             )
-        if method == "GET" and path == "/v1/topics/%s" % TOPIC_ID:
+        if method == "GET" and path == "/v2/topics/%s" % TOPIC_ID:
             return 200, json.dumps(
                 {
-                    "topic": {"id": TOPIC_ID, "e2ee": 1,
+                    "topic": {"id": TOPIC_ID, "subject": self.subject, "e2ee": 1,
                               "current_epoch": self.current_epoch,
                               "current_key_id": self.current_key_id},
                     "participants": [{"member_id": m, "history_from": "full"}
@@ -213,7 +215,7 @@ class E2eeFakeHub:
             )
         # Subject re-encryption PATCH (topic-bound AAD): topic metadata, not
         # a content write — allowed at epoch 0.
-        if method == "PATCH" and path == "/v1/topics/%s/subject" % TOPIC_ID:
+        if method == "PATCH" and path == "/v2/topics/%s/subject" % TOPIC_ID:
             body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
             subject = body.get("subject")
             if not isinstance(subject, str) or not (1 <= len(subject) <= 1024):
@@ -225,7 +227,7 @@ class E2eeFakeHub:
                            "current_epoch": self.current_epoch,
                            "current_key_id": self.current_key_id}}
             )
-        if method == "GET" and path == "/v1/agent-keys":
+        if method == "GET" and path == "/v2/agent-keys":
             mid = (query.get("member_id") or [""])[0]
             keys = [
                 {"member_id": mid, "agent_label": label, "public_key": pub,
@@ -233,7 +235,7 @@ class E2eeFakeHub:
                 for label, pub in self.keys_by_member.get(mid, [])
             ]
             return 200, json.dumps({"keys": keys})
-        if path == "/v1/topics/%s/envelopes" % TOPIC_ID:
+        if path == "/v2/topics/%s/envelopes" % TOPIC_ID:
             if method == "POST":
                 env = json.loads(body_bytes.decode("utf-8"))
                 tmid, tlabel = env.get("member_id"), env.get("agent_label")
@@ -263,7 +265,7 @@ class E2eeFakeHub:
                 and e["key_id"] in committed
             ]
             return 200, json.dumps({"envelopes": mine})
-        if method == "POST" and path == "/v1/topics/%s/keys/commit" % TOPIC_ID:
+        if method == "POST" and path == "/v2/topics/%s/keys/commit" % TOPIC_ID:
             if self.fail_commit_with is not None:
                 status, payload = self.fail_commit_with
                 return status, json.dumps(payload)
@@ -284,6 +286,9 @@ FAKE_TOKEN = "<redacted>"
 
 class E2eeTopicTestBase(unittest.TestCase):
     def setUp(self):
+        self.topic_id_patch = mock.patch.object(hub, "_new_topic_id", return_value=TOPIC_ID)
+        self.topic_id_patch.start()
+        self.addCleanup(self.topic_id_patch.stop)
         self._saved_env = dict(os.environ)
         self.tmp = tempfile.mkdtemp(prefix="hubtest-e2ee-")
         os.environ["FAMILY_HUB_CONFIG_HOME"] = self.tmp
@@ -345,160 +350,57 @@ class E2eeTopicTestBase(unittest.TestCase):
 
 
 class TestNewTopicE2eeArgs(unittest.TestCase):
-    def parse(self, argv):
-        return hub.build_parser().parse_args(argv)
-
-    def test_e2ee_flag_parses(self):
-        a = self.parse(["new-topic", "--e2ee", "--subject", "s", "--with", "m1"])
-        self.assertTrue(a.e2ee)
-
-    def test_e2ee_defaults_off(self):
-        a = self.parse(["new-topic", "--subject", "s", "--with", "m1"])
-        self.assertFalse(a.e2ee)
+    def test_encryption_has_no_opt_in_switch(self):
+        args = hub.build_parser().parse_args(["new-topic", "--subject", "s", "--with", "m1"])
+        self.assertFalse(hasattr(args, "e2ee"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            hub.build_parser().parse_args(["new-topic", "--subject", "s", "--e2ee"])
 
 
 class TestNewTopicE2eeFlow(E2eeTopicTestBase):
     def test_full_flow(self):
         self.write_identity_key()
-        rc, out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "Surprise party for Mahesh", "--with", "m1,m2"]
-        )
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        result = json.loads(out)
-        self.assertEqual(result["topic"]["id"], TOPIC_ID)
+        rc,out,err=self.run_cli(["new-topic","--subject","Surprise party for Mahesh","--with","m1,m2"])
+        self.assertEqual(rc,0,err)
+        result=json.loads(out)
+        self.assertTrue(result["encrypted"])
+        kid=result["topic"]["current_key_id"]
+        key=hub._load_topic_keys("default",TOPIC_ID)[kid]
+        create=next(json.loads(c["body"]) for c in self.fake.calls if c["method"]=="POST" and c["url"].endswith("/v2/topics"))
+        self.assertNotIn("e2ee",create)
+        self.assertNotIn("initial_key_id",create)
+        self.assertEqual(create["topic_id"],TOPIC_ID)
+        self.assertTrue(create["subject"].startswith("fh1."))
+        wrapped={"topic_id":TOPIC_ID,"body":create["subject"]}
+        hub._decrypt_entry_in_place(wrapped,{kid:key})
+        self.assertEqual(wrapped["body"],"Surprise party for Mahesh")
+        self.assertFalse(any(c["method"]=="PATCH" for c in self.fake.calls))
+        posts=self.envelope_posts()
+        self.assertEqual(len(posts),3)
+        for call in posts:
+            payload=json.loads(call["body"])
+            sk=self.privs[(payload["member_id"],payload["agent_label"])]
+            opened=bindings.crypto_box_seal_open(base64.b64decode(payload["envelope"]),bytes(sk.public_key),bytes(sk))
+            self.assertEqual(opened,TOPIC_ID.encode()+b"\0"+bytes.fromhex(kid)+key)
+        self.assertEqual(self.fake.current_epoch,1)
+        self.assertEqual(os.stat(os.path.join(hub.topic_keys_dir("default"),TOPIC_ID+".json")).st_mode & 0o777,0o600)
 
-        # 1. Topic POST carried e2ee=1 and an encrypted (non-plaintext) subject.
-        creates = [
-            c for c in self.fake.calls
-            if c["method"] == "POST" and c["url"].endswith("/v1/topics")
-        ]
-        self.assertEqual(len(creates), 1)
-        create_body = json.loads(creates[0]["body"])
-        self.assertEqual(create_body["e2ee"], 1)
-        self.assertNotIn("Surprise party", create_body["subject"])
-        # v2: no initial_key_id — the server leaves the topic at epoch 0
-        # (writes blocked) and activation happens only via keys/commit.
-        self.assertNotIn("initial_key_id", create_body)
-        key_id_hex = result["e2ee"]["key_id"]
 
-        # 2. Local key file: 0600, mapping key_id -> base64 topic key.
-        self.assertRegex(key_id_hex, r"^[0-9a-f]{32}$")
-        key_path = os.path.join(hub.topic_keys_dir("default"), TOPIC_ID + ".json")
-        self.assertEqual(
-            stat.S_IMODE(os.stat(key_path).st_mode), 0o600, "topic key file must be 0600"
-        )
-        with open(key_path) as fh:
-            stored = json.load(fh)
-        topic_key = base64.b64decode(stored[key_id_hex])
-        self.assertEqual(len(topic_key), 32)
-        self.assertEqual(stored, {key_id_hex: base64.b64encode(topic_key).decode("ascii")})
-
-        # 3. secfix F4: immediately after creation the CLI PATCHes the
-        # subject re-encrypted with the topic-bound AAD (topic ids are
-        # server-generated, so it cannot be bound at create time).
-        patches = [
-            c for c in self.fake.calls
-            if c["method"] == "PATCH" and c["url"].endswith("/subject")
-        ]
-        self.assertEqual(len(patches), 1)
-        patched_subject = json.loads(patches[0]["body"])["subject"]
-        self.assertNotIn("Surprise party", patched_subject)
-        raw = base64.b64decode(patched_subject)
-        nonce, ct = raw[:24], raw[24:]
-        pt = bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
-            ct, SUBJECT_AAD + b"\x00" + TOPIC_ID.encode("utf-8"), nonce, topic_key
-        )
-        self.assertEqual(pt.decode("utf-8"), "Surprise party for Mahesh")
-        # ...and it does NOT verify under a different topic's AAD.
-        with self.assertRaises(Exception):
-            bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
-                ct, SUBJECT_AAD + b"\x00" + b"some-other-topic", nonce, topic_key
-            )
-
-        # 4. One envelope per participant agent (3): each opens to key_id || topic_key.
-        posts = self.envelope_posts()
-        self.assertEqual(len(posts), 3)
-        targets = set()
-        for c in posts:
-            b = json.loads(c["body"])
-            targets.add((b["member_id"], b["agent_label"]))
-            self.assertEqual(b["key_id"], key_id_hex)
-            sk = self.privs[(b["member_id"], b["agent_label"])]
-            opened = bindings.crypto_box_seal_open(
-                base64.b64decode(b["envelope"]), bytes(sk.public_key), bytes(sk)
-            )
-            # secfix F2: sealed plaintext binds the topic id.
-            self.assertEqual(
-                opened,
-                TOPIC_ID.encode("utf-8") + b"\x00" + bytes.fromhex(key_id_hex) + topic_key,
-            )
-        self.assertEqual(
-            targets, {("m1", "owner-agent"), ("m2", "bee-agent"), ("m2", "bee2-agent")}
-        )
-        self.assertEqual(result["e2ee"]["envelopes_posted"], 3)
-
-        # 5. The staged commit ran: POST keys/commit with expected_epoch=1,
-        #    the key_id, and a 64-hex SHA256 commitment. Staged envelopes are
-        #    invisible via GET until commit, so there is no round-trip
-        #    envelope fetch — the commit response is the confirmation.
-        commits = [
-            c for c in self.fake.calls
-            if c["method"] == "POST" and c["url"].endswith("/keys/commit")
-        ]
-        self.assertEqual(len(commits), 1)
-        commit_body = json.loads(commits[0]["body"])
-        self.assertEqual(commit_body["expected_epoch"], 1)
-        self.assertEqual(commit_body["key_id"], key_id_hex)
-        self.assertRegex(commit_body["commitment"], r"^[0-9a-f]{64}$")
-        self.assertEqual(
-            commit_body["commitment"], hashlib.sha256(topic_key).hexdigest()
-        )
-        self.assertFalse(commit_body["force"])
-        self.assertEqual(result["e2ee"]["epoch"], 1)
-        gets = [
-            c for c in self.fake.calls
-            if c["method"] == "GET" and c["url"].endswith("/envelopes")
-        ]
-        self.assertEqual(
-            gets, [],
-            "no envelope round-trip: staged envelopes are invisible pre-commit",
-        )
-
-        # 6. No key material and no plaintext subject on stdout.
-        self.assertNotIn(base64.b64encode(topic_key).decode("ascii"), out)
-        self.assertNotIn(topic_key.hex(), out)
-        self.assertNotIn("Surprise party", out)
-
-    def test_keyless_participant_warns_but_does_not_abort(self):
+    def test_keyless_participant_blocks_activation(self):
         self.write_identity_key()
         # m3 participates but has no registered agent keys.
         self.fake.participants = ["m1", "m2", "m3"]
         rc, out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "Quiet planning", "--with", "m1,m2,m3"]
+            ["new-topic", "--subject", "Quiet planning", "--with", "m1,m2,m3"]
         )
-        self.assertEqual(rc, 0, "stderr: %s" % err)
+        self.assertEqual(rc, 1, "stderr: %s" % err)
         self.assertIn("key-init", err)
         self.assertIn("m3", err)
         # Envelopes still went out to the keyed agents.
         self.assertEqual(len(self.envelope_posts()), 3)
-        result = json.loads(out)
-        self.assertEqual(result["e2ee"]["keyless_participants"], ["m3"])
+        self.assertEqual(out, "", "failed activation must not report success")
+        self.assertFalse(any(c["url"].endswith("/keys/commit") for c in self.fake.calls))
 
-    def test_plaintext_new_topic_sends_no_e2ee_field(self):
-        # The --e2ee flag must not change the plaintext request shape at all.
-        self.write_identity_key()
-        rc, out, err = self.run_cli(
-            ["new-topic", "--subject", "plain subject", "--with", "m1"]
-        )
-        self.assertEqual(rc, 0, "stderr: %s" % err)
-        creates = [
-            c for c in self.fake.calls
-            if c["method"] == "POST" and c["url"].endswith("/v1/topics")
-        ]
-        self.assertEqual(len(creates), 1)
-        body = json.loads(creates[0]["body"])
-        self.assertNotIn("e2ee", body)
-        self.assertEqual(body["subject"], "plain subject")
 
     def test_commit_failure_keeps_key_anchor_and_names_rekey(self):
         # If the commit fails, the topic sits at epoch 0 (writes blocked)
@@ -508,7 +410,7 @@ class TestNewTopicE2eeFlow(E2eeTopicTestBase):
         self.fake.fail_commit_with = (
             400, {"error": {"code": "bad_request", "message": "boom"}})
         rc, out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "Surprise", "--with", "m1"]
+            ["new-topic", "--subject", "Surprise", "--with", "m1"]
         )
         self.assertNotEqual(rc, 0)
         self.assertIn("topic-rekey", err)
@@ -521,7 +423,7 @@ class TestNewTopicE2eeFlow(E2eeTopicTestBase):
     def test_subject_over_200_chars_rejected(self):
         self.write_identity_key()
         rc, _out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "x" * 201, "--with", "m1"]
+            ["new-topic", "--subject", "x" * 201, "--with", "m1"]
         )
         self.assertEqual(rc, 1)
         self.assertIn("200", err)
@@ -533,7 +435,7 @@ class TestNewTopicE2eeMissingKey(E2eeTopicTestBase):
     def test_missing_keypair_fails_with_key_init_guidance(self):
         # No agent.key on disk: fail loudly, never auto-generate, no network.
         rc, _out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "Secret", "--with", "m1"]
+            ["new-topic", "--subject", "Secret", "--with", "m1"]
         )
         self.assertEqual(rc, 1)
         self.assertIn("hub key-init", err)
@@ -549,7 +451,7 @@ class TestNewTopicE2eeMissingKey(E2eeTopicTestBase):
         class RejectingHub(E2eeFakeHub):
             def __call__(self, method, url, headers, body_bytes):
                 parts = urlparse.urlparse(url)
-                if method == "POST" and parts.path == "/v1/topics":
+                if method == "POST" and parts.path == "/v2/topics":
                     self._record(method, url, headers, body_bytes)
                     return 400, json.dumps(
                         {
@@ -564,7 +466,7 @@ class TestNewTopicE2eeMissingKey(E2eeTopicTestBase):
 
         self.fake = RejectingHub(self.fake.keys_by_member, ["m1"])
         rc, _out, err = self.run_cli(
-            ["new-topic", "--e2ee", "--subject", "Secret", "--with", "m1"]
+            ["new-topic", "--subject", "Secret", "--with", "m1"]
         )
         self.assertEqual(rc, 1)
         self.assertIn("key-init", err)

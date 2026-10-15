@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "family-hub-cli"
-version = "1.3.0"
+version = "2.0.0"
 description = "Family Hub agent CLI (the `hub` single-file script)"
 requires-python = ">=3.9"
 dependencies = [

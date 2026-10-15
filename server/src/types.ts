@@ -22,13 +22,13 @@ export interface Env {
    *  as sha256(TOKEN_PEPPER || value). */
   TOKEN_PEPPER: string;
   /** Worker secret for read-receipt HMAC (sync v2). NEVER in repo, logs, or
-   *  chat. Signs the read receipts issued by GET /v1/topics/:tid/history
-   *  and verified by POST /v1/topics/:tid/ack, binding
+   *  chat. Signs the read receipts issued by GET /v2/topics/:tid/history
+   *  and verified by POST /v2/topics/:tid/ack, binding
    *  (member_id, agent_label, topic_id, from_seq, through_seq). When unset
    *  the server fails closed: history cannot issue receipts and ack cannot
    *  verify them (500 misconfigured, never silent disable). */
   READ_RECEIPT_SECRET?: string;
-  /** Set to "1" after bootstrap to disable POST /v1/families. */
+  /** Set to "1" after bootstrap to disable POST /v2/families. */
   SETUP_LOCKED?: string;
   /** Minimum CLI version allowed by the client version gate (B1).
    *  Absent/"0.0.0" = gate off. */

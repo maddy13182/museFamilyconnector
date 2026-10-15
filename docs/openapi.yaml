@@ -1,109 +1,56 @@
 openapi: 3.1.0
 info:
   title: Family Hub API
-  version: 0.1.0
+  version: 2.0.0
   license:
-    name: Proprietary — family use only
-  description: |
-    Family Hub v0.1 — family-owned agent coordination service.
-    Machine-readable contract for SPEC.md §13. One deployment per family.
-
-    The human dashboard (not part of this API contract) is served at `/`:
-    a single self-contained HTML page — paste a per-circle token, read and
-    post. It uses GET /v1/me to resolve the caller's identity.
-
-    Conventions (all from SPEC.md):
-    - All paths are under `/v1`. JSON in/out. Timestamps are ISO-8601 UTC strings.
-    - Auth: `Authorization: Bearer <token>` on every request except the ones
-      marked "Public" below. The token is per-agent (`fh_` + 256-bit random).
-    - Error shape is always `{ "error": { "code": "<string>", "message": "<string>" } }`
-      with HTTP semantics: 400 bad_request, 401 bad/unknown/revoked token,
-      403 not-a-participant or wrong role, 404 unknown id/code, 409 state
-      conflict (subtasks_open, already_member, invite_used, code_used),
-      410 expired code (invite_expired, code_expired), 422 PII detected,
-      426 client too old (client_too_old — the client version gate, see below),
-      429 rate limited. NOTE on 429: the worker itself enforces in-worker
-      rate limits on unauthenticated endpoints (fixed-window counters in D1,
-      since v0.11.0) — a 429 means the in-worker bucket OR a Cloudflare edge
-      rate-limiting rule fired. Edge rules are configured by the OPERATOR
-      (docs/INSTALL.md §5); they are not part of the worker and not
-      guaranteed to exist on any given deployment.
-    - Client version gate: requests carrying `User-Agent:
-      family-hub-agent/<semver>` below the server's `MIN_CLI_VERSION`
-      (default "0.0.0" = gate off) are rejected with 426 `client_too_old`
-      and an upgrade guidance message. The exact legacy string
-      `family-hub-agent/1.0` is treated as version `0.0.0`. Requests without
-      a `family-hub-agent` UA (browser dashboard, curl) are never gated, and
-      neither are `GET /v1/health`, `GET /v1/client/latest`, nor anything
-      under `GET /v1/client/download/*` (an outdated client must always reach
-      the upgrade metadata and the replacement artifacts it needs to update).
-    - `seq` is per-topic ordering; `gseq` is global family ordering (for /sync).
-    - Entries are append-only. The writer's actor_member_id / agent_label /
-      token_id are stamped server-side from the token, never from the client.
-    - Endpoints tagged `x-spec-note: PROPOSED` are NOT in SPEC §13 but are
-      required to implement SPEC §6 (provisioning) and the incident runbook.
-      They are proposed contracts pending owner confirmation.
-    - Canonical list shapes (pinned per WS-2): every list endpoint returns a
-      JSON *object envelope*, never a bare array — `{"members": [...]}`,
-      `{"topics": [...]}`, `{"tokens": [...]}`, `{"tasks": [...]}`,
-      `{"entries": [...]}`. History and sync wrap the array with cursor
-      fields. Clients MUST NOT rely on bare arrays; servers MUST NOT emit them.
-    - Client notes: clients SHOULD send `Idempotency-Key` (a UUID,
-      auto-generated when the caller has none; the server treats it as opaque)
-      on entry POSTs. All path parameters (invite/provisioning codes, ids)
-      MUST be URL-encoded by the client before interpolation.
-
+    name: MIT
+    url: https://opensource.org/license/mit
+  description: Family Hub protocol 2. Every conversation is end-to-end encrypted. The client encrypts
+    content; the server validates envelopes and lifecycle state and stores ciphertext. This development
+    release deliberately has no API v1 or plaintext compatibility. The browser dashboard shows metadata
+    only.
 servers:
-  - url: https://REPLACE-WITH-YOUR-WORKER.workers.dev
-    description: Your family's deployment (set after `wrangler deploy`).
-
+- url: https://REPLACE-WITH-YOUR-WORKER.workers.dev
+  description: Your family's deployment (set after `wrangler deploy`).
 security:
-  - bearerAuth: []
-
+- bearerAuth: []
 tags:
-  - name: families
-    description: One-time family bootstrap.
-  - name: invites
-    description: Member invitations (single-use codes).
-  - name: auth
-    description: Token rotate / revoke / provision (agent credentials).
-  - name: members
-    description: Family roster.
-  - name: topics
-    description: Conversations — create, invite, spawn linked children, read, export.
-  - name: entries
-    description: Append-only log writes (messages).
-  - name: tasks
-    description: Task lifecycle and delegation.
-  - name: sync
-    description: Poll loop — new entries across all visible topics.
-  - name: ops
-    description: Health and privileged redaction.
-
+- name: families
+  description: One-time family bootstrap.
+- name: invites
+  description: Member invitations (single-use codes).
+- name: auth
+  description: Token rotate / revoke / provision (agent credentials).
+- name: members
+  description: Family roster.
+- name: topics
+  description: Conversations — create, invite, spawn linked children, read, export.
+- name: entries
+  description: Append-only log writes (messages).
+- name: tasks
+  description: Task lifecycle and delegation.
+- name: sync
+  description: Poll loop — new entries across all visible topics.
+- name: ops
+  description: Health and privileged redaction.
 paths:
-  # ---------------------------------------------------------------- families
-  /v1/families:
+  /v2/families:
     post:
-      tags: [families]
+      tags:
+      - families
       operationId: bootstrapFamily
       summary: Bootstrap a family (one-time)
-      description: |
-        Two modes, selected by env `SETUP_LOCKED`:
-        - **Open** (`SETUP_LOCKED` unset — first deploy only): public
-          bootstrap. Creates the family, the owner member, and returns a
-          one-time provisioning code for the owner's first agent.
-        - **Locked** (`SETUP_LOCKED=1` — the normal running state): server-owner
-          circle creation. Requires a bearer token (401 without one); the
-          caller must be a **server owner** (an explicit row in `server_owners`,
-          matched by principal id — *not* merely an owner of some circle) or
-          the call is 403 `forbidden`. The creator becomes an `owner` member
-          of the new circle and gets a single-use provisioning code for their
-          agent in that circle — the existing token stays bound to the old
-          circle. There is no `setup_locked` error code; unauthenticated
-          calls are 401 `unauthorized`.
-        A second *deployment* is only needed for a truly separate family that
-        must not share an operator or database; additional circles for people
-        you trust are created in locked mode above.
+      description: "Two modes, selected by env `SETUP_LOCKED`:\n- **Open** (`SETUP_LOCKED` unset — first\
+        \ deploy only): public\n  bootstrap. Creates the family, the owner member, and returns a\n  one-time\
+        \ provisioning code for the owner's first agent.\n- **Locked** (`SETUP_LOCKED=1` — the normal\
+        \ running state): server-owner\n  circle creation. Requires a bearer token (401 without one);\
+        \ the\n  caller must be a **server owner** (an explicit row in `server_owners`,\n  matched by\
+        \ principal id — *not* merely an owner of some circle) or\n  the call is 403 `forbidden`. The\
+        \ creator becomes an `owner` member\n  of the new circle and gets a single-use provisioning code\
+        \ for their\n  agent in that circle — the existing token stays bound to the old\n  circle. There\
+        \ is no `setup_locked` error code; unauthenticated\n  calls are 401 `unauthorized`.\nA second\
+        \ *deployment* is only needed for a truly separate family that\nmust not share an operator or\
+        \ database; additional circles for people\nyou trust are created in locked mode above.\n"
       security: []
       requestBody:
         required: true
@@ -111,61 +58,126 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name, owner_name, owner_email]
+              required:
+              - name
+              - owner_name
+              - owner_email
               properties:
-                name: { type: string, minLength: 1, maxLength: 100, example: "Ramamurthy family" }
-                owner_name: { type: string, minLength: 1, maxLength: 100, example: "Mahesh Ramamurthy" }
-                owner_email: { type: string, format: email, maxLength: 254 }
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  example: Ramamurthy family
+                owner_name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  example: Mahesh Ramamurthy
+                owner_email:
+                  type: string
+                  format: email
+                  maxLength: 254
       responses:
         '201':
-          description: |
-            Family/circle created. Two shapes: open (bootstrap) mode returns
+          description: 'Family/circle created. Two shapes: open (bootstrap) mode returns
+
             `{family, member, provisioning_code, provisioning_expires_at}`;
+
             locked (hub-owner) mode returns the flat
+
             `{id, name, kind, created_at, provisioning_code, provisioning_expires_at}`.
+
+            '
           content:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    required: [family, member, provisioning_code, provisioning_expires_at]
-                    properties:
-                      family: { $ref: '#/components/schemas/Family' }
-                      member: { $ref: '#/components/schemas/Member' }
-                      provisioning_code:
-                        type: string
-                        description: 128-bit random, single-use. Redeem at POST /v1/provision/{code}/accept. Shown once.
-                      provisioning_expires_at: { type: string, format: date-time }
-                  - type: object
-                    description: Locked (hub-owner) circle-creation shape.
-                    required: [id, name, kind, created_at, provisioning_code, provisioning_expires_at]
-                    properties:
-                      id: { type: string }
-                      name: { type: string }
-                      kind: { type: string }
-                      created_at: { type: string, format: date-time }
-                      provisioning_code: { type: string, description: 'Single-use, 24h TTL. Shown once.' }
-                      provisioning_expires_at: { type: string, format: date-time }
+                - type: object
+                  required:
+                  - family
+                  - member
+                  - provisioning_code
+                  - provisioning_expires_at
+                  properties:
+                    family:
+                      $ref: '#/components/schemas/Family'
+                    member:
+                      $ref: '#/components/schemas/Member'
+                    provisioning_code:
+                      type: string
+                      description: 128-bit random, single-use. Redeem at POST /v2/provision/{code}/accept.
+                        Shown once.
+                    provisioning_expires_at:
+                      type: string
+                      format: date-time
+                - type: object
+                  description: Locked (hub-owner) circle-creation shape.
+                  required:
+                  - id
+                  - name
+                  - kind
+                  - created_at
+                  - provisioning_code
+                  - provisioning_expires_at
+                  properties:
+                    id:
+                      type: string
+                    name:
+                      type: string
+                    kind:
+                      type: string
+                    created_at:
+                      type: string
+                      format: date-time
+                    provisioning_code:
+                      type: string
+                      description: Single-use, 24h TTL. Shown once.
+                    provisioning_expires_at:
+                      type: string
+                      format: date-time
         '200':
-          description: |
-            Locked mode, idempotent retry with a repeated Idempotency-Key —
+          description: 'Locked mode, idempotent retry with a repeated Idempotency-Key —
+
             the circle already existed, so a FRESH provisioning code is issued
+
             and the orphaned token from the first attempt is revoked.
+
+            '
           content:
             application/json:
               schema:
                 type: object
-                required: [id, name, kind, created_at, provisioning_code, provisioning_expires_at, deduped]
+                required:
+                - id
+                - name
+                - kind
+                - created_at
+                - provisioning_code
+                - provisioning_expires_at
+                - deduped
                 properties:
-                  id: { type: string }
-                  name: { type: string }
-                  kind: { type: string }
-                  created_at: { type: string, format: date-time }
-                  provisioning_code: { type: string, description: 'Single-use, 24h TTL. Shown once.' }
-                  provisioning_expires_at: { type: string, format: date-time }
-                  deduped: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  kind:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+                  provisioning_code:
+                    type: string
+                    description: Single-use, 24h TTL. Shown once.
+                  provisioning_expires_at:
+                    type: string
+                    format: date-time
+                  deduped:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           description: Locked mode and the caller is not a hub owner
           content:
@@ -173,7 +185,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
               example:
-                error: { code: forbidden, message: "Only hub owners can create a family while setup is locked" }
+                error:
+                  code: forbidden
+                  message: Only hub owners can create a family while setup is locked
         '409':
           description: Circle name already taken (case-insensitive)
           content:
@@ -181,17 +195,23 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
               example:
-                error: { code: circle_name_taken, message: 'A circle named "X" already exists' }
-
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
+                error:
+                  code: circle_name_taken
+                  message: A circle named "X" already exists
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
     get:
-      tags: [families]
+      tags:
+      - families
       operationId: listFamilies
       summary: List circles I am a member of
-      description: |
-        Membership is matched by email (one human, one member row per circle).
-        Each entry carries `my_role` — the caller's role in that circle.
+      description: 'Membership is matched by email (one human, one member row per circle).
+
+        Each entry carries `my_role` — the caller''s role in that circle.
+
+        '
       responses:
         '200':
           description: Circle list
@@ -199,48 +219,78 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [families]
+                required:
+                - families
                 properties:
                   families:
                     type: array
                     items:
                       type: object
-                      required: [id, name, kind, my_role, created_at]
+                      required:
+                      - id
+                      - name
+                      - kind
+                      - my_role
+                      - created_at
                       properties:
-                        id: { type: string }
-                        name: { type: string }
-                        kind: { type: string }
-                        my_role: { $ref: '#/components/schemas/Role' }
-                        created_at: { type: string, format: date-time }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-  /v1/families/{fid}/invites:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        kind:
+                          type: string
+                        my_role:
+                          $ref: '#/components/schemas/Role'
+                        created_at:
+                          type: string
+                          format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/families/{fid}/invites:
     post:
-      tags: [invites]
+      tags:
+      - invites
       operationId: createInvite
       summary: Invite a family member
-      description: |
-        Caller must have role `owner` or `parent`. Owners may invite any role;
+      description: 'Caller must have role `owner` or `parent`. Owners may invite any role;
+
         parents may invite `parent`/`kid` only (a parent inviting `owner` → 403).
+
         An email already in the family → 409 `already_member`. Returns a 128-bit
+
         random invite code (single-use, 7-day expiry) plus a one-time
+
         `onboarding_url` (`https://<server>/i/<token>`). Only hashes are stored.
+
         The inviter shares the onboarding URL with the invitee (not the raw
+
         code): the page asks for the invited email and reveals a fresh
+
         single-use code plus the exact `hub setup` command. The raw code in
+
         this response remains valid as a fallback for direct
-        `POST /v1/invites/{code}/accept`.
+
+        `POST /v2/invites/{code}/accept`.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/FamilyId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [email, role]
+              required:
+              - email
+              - role
               properties:
-                email: { type: string, format: email, maxLength: 254 }
-                role: { $ref: '#/components/schemas/Role' }
+                email:
+                  type: string
+                  format: email
+                  maxLength: 254
+                role:
+                  $ref: '#/components/schemas/Role'
       responses:
         '201':
           description: Invite created
@@ -248,72 +298,110 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [invite_code, expires_at, onboarding_url]
+                required:
+                - invite_code
+                - expires_at
+                - onboarding_url
                 properties:
                   invite_code:
                     type: string
-                    description: Single-use code. The invitee's agent redeems it at POST /v1/invites/{code}/accept.
-                  expires_at: { type: string, format: date-time }
+                    description: Single-use code. The invitee's agent redeems it at POST /v2/invites/{code}/accept.
+                  expires_at:
+                    type: string
+                    format: date-time
                   onboarding_url:
                     type: string
                     format: uri
-                    description: |
-                      One-time onboarding page URL to send the invitee
+                    description: 'One-time onboarding page URL to send the invitee
+
                       (never post publicly). The page reveals a fresh
+
                       single-use code after the invitee proves the invited
+
                       email. Shown once — only the hash is stored.
+
+                      '
         '200':
-          description: |
-            Idempotent retry with a repeated Idempotency-Key — a FRESH invite
-            code is minted for the same (email, role) (the original code's
+          description: 'Idempotent retry with a repeated Idempotency-Key — a FRESH invite
+
+            code is minted for the same (email, role) (the original code''s
+
             plaintext is unrecoverable) instead of duplicating the invite.
+
+            '
           content:
             application/json:
               schema:
                 type: object
-                required: [invite_code, expires_at, onboarding_url, deduped]
+                required:
+                - invite_code
+                - expires_at
+                - onboarding_url
+                - deduped
                 properties:
-                  invite_code: { type: string }
-                  expires_at: { type: string, format: date-time }
+                  invite_code:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
                   onboarding_url:
                     type: string
                     format: uri
                     description: One-time onboarding page URL (fresh token per retry).
-                  deduped: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-
-  /v1/invites/{code}/accept:
+                  deduped:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v2/invites/{code}/accept:
     post:
-      tags: [invites]
+      tags:
+      - invites
       operationId: acceptInvite
       summary: Accept an invite (new member enrollment)
-      description: |
-        Public — the invite code is the credential. Creates the member record
-        and issues a per-agent bearer token, RETURNED ONCE and never again.
-        The agent must store it in its Secure Vault immediately. Unknown codes
-        return 404; reuse returns 409 `invite_used`; expired codes (7-day TTL)
-        return 410 `invite_expired`.
+      description: Redeem a single-use code and atomically issue credentials with a mandatory X25519 encryption
+        identity. Invalid or missing public keys do not consume the code. Re-enrollment of the same label
+        cannot replace its identity key.
       security: []
       parameters:
-        - name: code
-          in: path
-          required: true
-          schema: { type: string, minLength: 16 }
-          description: The invite code from POST /v1/families/{fid}/invites.
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 16
+        description: The invite code from POST /v2/families/{fid}/invites.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [display_name, agent_label]
+              required:
+              - display_name
+              - agent_label
+              - agent_public_key
               properties:
-                display_name: { type: string, minLength: 1, maxLength: 100 }
-                agent_label: { type: string, minLength: 1, maxLength: 100, example: "lakshmi-phone-agent" }
+                display_name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                agent_label:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  example: lakshmi-phone-agent
+                agent_public_key:
+                  type: string
+                  description: Canonical standard base64, exactly 32 decoded bytes.
       responses:
         '201':
           description: Member created, token issued (once)
@@ -321,63 +409,100 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [member, token, token_id]
+                required:
+                - member
+                - token
+                - token_id
                 properties:
-                  member: { $ref: '#/components/schemas/Member' }
+                  member:
+                    $ref: '#/components/schemas/Member'
                   token:
                     type: string
-                    description: "Bearer token, format fh_<256-bit random base62>. Shown once — never returned again."
+                    description: Bearer token, format fh_<256-bit random base62>. Shown once — never returned
+                      again.
                   token_id:
                     type: string
                     description: Stable id for this credential (used for revoke/rotate and audit).
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
-          description: Invite already used — also returns the member and a flag so the client can tell the user they are already enrolled but hold no token
+          description: Invite already used — also returns the member and a flag so the client can tell
+            the user they are already enrolled but hold no token
           content:
             application/json:
               schema:
                 type: object
-                required: [error, member, token_already_issued]
+                required:
+                - error
+                - member
+                - token_already_issued
                 properties:
-                  error: { $ref: '#/components/schemas/Error' }
+                  error:
+                    $ref: '#/components/schemas/Error'
                   member:
                     $ref: '#/components/schemas/Member'
                     description: The already-enrolled member (may be null).
-                  token_already_issued: { type: boolean, example: true }
+                  token_already_issued:
+                    type: boolean
+                    example: true
           example:
-            error: { code: invite_used, message: "Invite already used" }
-            member: { id: "m_…", name: "…", email: "…", role: "kid", created_at: "…" }
+            error:
+              code: invite_used
+              message: Invite already used
+            member:
+              id: m_…
+              name: …
+              email: …
+              role: kid
+              created_at: …
             token_already_issued: true
-        '410': { $ref: '#/components/responses/Gone' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-
-  # ------------------------------------------------- invite onboarding pages
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
   /i/{token}:
     get:
-      tags: [invites]
+      tags:
+      - invites
       operationId: getInvitePage
       summary: Open an invite onboarding page
-      description: |
-        Public — the page token is the credential (256-bit random,
+      description: 'Public — the page token is the credential (256-bit random,
+
         `fhip_`-prefixed, hash-stored). The inviter shares the `onboarding_url`
-        from POST /v1/families/{fid}/invites; the invitee (human or their
+
+        from POST /v2/families/{fid}/invites; the invitee (human or their
+
         agent) opens it here. Content negotiation: `Accept: application/json`
+
         or the `/i/{token}.json` form returns the agent JSON page (install
-        steps pinned to the server's recommended CLI release — artifacts
-        download from this server's `/v1/client/download/*` endpoints,
+
+        steps pinned to the server''s recommended CLI release — artifacts
+
+        download from this server''s `/v2/client/download/*` endpoints,
+
         masked email hint, verify instructions); otherwise an HTML page with
+
         an email form is returned. Never reveals the invite code. Unknown,
+
         used, or expired pages return identical 404s. Rate-limited per IP.
-        Not under /v1/, so the client version gate does not apply.
+
+        Not under /v2/, so the client version gate does not apply.
+
+        '
       security: []
       parameters:
-        - name: token
-          in: path
-          required: true
-          schema: { type: string, minLength: 1, maxLength: 128 }
-          description: The page token from the invite's onboarding_url.
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description: The page token from the invite's onboarding_url.
       responses:
         '200':
           description: The onboarding page (JSON for agents, HTML for humans)
@@ -385,80 +510,133 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [page, family_name, role, email_hint, expires_at, client, install, verify]
+                required:
+                - page
+                - family_name
+                - role
+                - email_hint
+                - expires_at
+                - client
+                - install
+                - verify
                 properties:
-                  page: { type: string, example: "invite" }
-                  family_name: { type: string }
-                  role: { $ref: '#/components/schemas/Role' }
+                  page:
+                    type: string
+                    example: invite
+                  family_name:
+                    type: string
+                  role:
+                    $ref: '#/components/schemas/Role'
                   email_hint:
                     type: string
-                    example: "s***@gmail.com"
+                    example: s***@gmail.com
                     description: First char of the invited email's local part, masked.
-                  expires_at: { type: string, format: date-time }
+                  expires_at:
+                    type: string
+                    format: date-time
                   client:
                     type: object
-                    required: [version, download_url, sha256]
+                    required:
+                    - version
+                    - download_url
+                    - sha256
                     properties:
-                      version: { type: string }
-                      download_url: { type: string, format: uri }
-                      sha256: { type: string }
+                      version:
+                        type: string
+                      download_url:
+                        type: string
+                        format: uri
+                      sha256:
+                        type: string
                   install:
                     type: object
                     properties:
-                      summary: { type: string }
-                      steps: { type: array, items: { type: string } }
-                      verify_note: { type: string }
+                      summary:
+                        type: string
+                      steps:
+                        type: array
+                        items:
+                          type: string
+                      verify_note:
+                        type: string
                   verify:
                     type: object
                     properties:
-                      method: { type: string, example: "POST" }
+                      method:
+                        type: string
+                        example: POST
                       path:
                         type: string
-                        example: "/i/{token}/verify"
-                        description: Absolute path with the page token echoed back to its holder (the party that presented it in the request URL). A relative ./verify would resolve to /i/verify and 404.
+                        example: /i/{token}/verify
+                        description: Absolute path with the page token echoed back to its holder (the
+                          party that presented it in the request URL). A relative ./verify would resolve
+                          to /i/verify and 404.
                       body:
                         type: object
                         properties:
-                          email: { type: string }
+                          email:
+                            type: string
             text/html:
-              schema: { type: string }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
   /i/{token}/verify:
     post:
-      tags: [invites]
+      tags:
+      - invites
       operationId: verifyInvitePageEmail
       summary: Prove the invited email, receive the invite code
-      description: |
-        Public — the page token is the credential. Body `{"email": "..."}`;
+      description: 'Public — the page token is the credential. Body `{"email": "..."}`;
+
         the candidate is normalized (trim + lowercase) and compared in
-        constant time against the invite's stored email. On a match, returns a
+
+        constant time against the invite''s stored email. On a match, returns a
+
         FRESH single-use invite code for the same (family, email, role) — the
-        stored code's plaintext is unrecoverable, so verification rotates it —
+
+        stored code''s plaintext is unrecoverable, so verification rotates it —
+
         plus the exact `hub setup` command (server origin derived
+
         server-side). Normalization is trim + lowercase only (no `+`-tag
+
         stripping, no Unicode confusable folding); the inviter must use the
+
         canonical address. On a mismatch: 403. Email guesses are budgeted per page
+
         (10+ rapid guesses → 429 with `Retry-After`; the budget decays after
+
         an hour and never hard-locks). The page self-destructs when the invite
+
         is accepted.
+
+        '
       security: []
       parameters:
-        - name: token
-          in: path
-          required: true
-          schema: { type: string, minLength: 1, maxLength: 128 }
-          description: The page token from the invite's onboarding_url.
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description: The page token from the invite's onboarding_url.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [email]
+              required:
+              - email
               properties:
-                email: { type: string, minLength: 3, maxLength: 254 }
+                email:
+                  type: string
+                  minLength: 3
+                  maxLength: 254
       responses:
         '200':
           description: Email confirmed — invite code issued
@@ -466,49 +644,69 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [invite_code, setup_command, expires_at]
+                required:
+                - invite_code
+                - setup_command
+                - expires_at
                 properties:
                   invite_code:
                     type: string
-                    description: Fresh single-use invite code for POST /v1/invites/{code}/accept.
+                    description: Fresh single-use invite code for POST /v2/invites/{code}/accept.
                   setup_command:
                     type: string
-                    example: "hub setup --server https://<server> --invite fhi_…"
-                  expires_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/BadRequest' }
+                    example: hub setup --server https://<server> --invite fhi_…
+                  expires_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '403':
           description: The email does not match the invitation
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-              example: { error: { code: "forbidden", message: "This email does not match the invitation." } }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
-  # ------------------------------------------------- ownership transfer
-  /v1/families/{fid}/transfer:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: forbidden
+                  message: This email does not match the invitation.
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v2/families/{fid}/transfer:
     post:
-      tags: [families]
+      tags:
+      - families
       operationId: offerOwnershipTransfer
       summary: Offer circle ownership to another member
-      description: |
-        Two-phase ownership transfer (offer → accept). The caller must be a
+      description: 'Two-phase ownership transfer (offer → accept). The caller must be a
+
         circle `owner`. The target must be an existing member of the SAME
+
         circle and not already an owner (→ 422 `already_owner`). Ownership is
+
         never forced: nothing changes until the recipient explicitly accepts
+
         at POST …/transfer/accept. Exactly one pending offer per circle
+
         (→ 409 `transfer_pending`); offers expire after 7 days. Supports
+
         `Idempotency-Key` like the other create endpoints — a repeated key
+
         returns the original offer with `deduped: true` instead of a second one.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/FamilyId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [to_member_id]
+              required:
+              - to_member_id
               properties:
                 to_member_id:
                   type: string
@@ -526,40 +724,58 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [transfer]
+                required:
+                - transfer
                 properties:
-                  transfer: { $ref: '#/components/schemas/Transfer' }
+                  transfer:
+                    $ref: '#/components/schemas/Transfer'
         '200':
-          description: |
-            Idempotent retry with a repeated Idempotency-Key — the original
+          description: 'Idempotent retry with a repeated Idempotency-Key — the original
+
             pending offer is returned with `deduped: true`.
+
+            '
           content:
             application/json:
               schema:
                 type: object
-                required: [transfer, deduped]
+                required:
+                - transfer
+                - deduped
                 properties:
-                  transfer: { $ref: '#/components/schemas/Transfer' }
-                  deduped: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+                  transfer:
+                    $ref: '#/components/schemas/Transfer'
+                  deduped:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '422':
           description: Target is already a circle owner
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema:
+                $ref: '#/components/schemas/Error'
     get:
-      tags: [families]
+      tags:
+      - families
       operationId: getOwnershipTransfer
       summary: Read the pending ownership transfer
-      description: |
-        Any circle member may read the pending offer. Returns
+      description: 'Any circle member may read the pending offer. Returns
+
         `{ "transfer": null }` when there is none.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/FamilyId'
       responses:
         '200':
           description: The pending transfer, or null
@@ -567,31 +783,42 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [transfer]
+                required:
+                - transfer
                 properties:
                   transfer:
                     oneOf:
-                      - $ref: '#/components/schemas/Transfer'
-                      - type: 'null'
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v1/families/{fid}/transfer/accept:
+                    - $ref: '#/components/schemas/Transfer'
+                    - type: 'null'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/families/{fid}/transfer/accept:
     post:
-      tags: [families]
+      tags:
+      - families
       operationId: acceptOwnershipTransfer
       summary: Accept an ownership transfer offer
-      description: |
-        Only the named recipient (`to_member_id`) may accept — 403 otherwise.
+      description: 'Only the named recipient (`to_member_id`) may accept — 403 otherwise.
+
         The offer must be pending and unexpired (expired → 410
+
         `transfer_expired`, and the offer is marked cancelled). The role swap
+
         is applied in ONE atomic batch — the recipient is promoted to `owner`
+
         and the offering owner is demoted or access-revoked per `on_complete`
+
         — so the circle never sits with zero owners. `remove` revokes every
+
         agent token the previous owner held for this circle; their member row
+
         is retained for audit history.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/FamilyId'
       responses:
         '200':
           description: Ownership transferred
@@ -599,41 +826,63 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [transfer, new_owner, previous_owner]
+                required:
+                - transfer
+                - new_owner
+                - previous_owner
                 properties:
-                  transfer: { $ref: '#/components/schemas/Transfer' }
+                  transfer:
+                    $ref: '#/components/schemas/Transfer'
                   new_owner:
                     type: object
-                    required: [id, role]
+                    required:
+                    - id
+                    - role
                     properties:
-                      id: { type: string }
-                      role: { type: string, example: owner }
-                  previous_owner:
-                    type: object
-                    required: [id, role]
-                    properties:
-                      id: { type: string }
+                      id:
+                        type: string
                       role:
                         type: string
-                        enum: [parent, removed]
-                        description: "`parent` for on_complete=demote, `removed` for on_complete=remove."
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '410': { $ref: '#/components/responses/Gone' }
-
-  /v1/families/{fid}/transfer/cancel:
+                        example: owner
+                  previous_owner:
+                    type: object
+                    required:
+                    - id
+                    - role
+                    properties:
+                      id:
+                        type: string
+                      role:
+                        type: string
+                        enum:
+                        - parent
+                        - removed
+                        description: '`parent` for on_complete=demote, `removed` for on_complete=remove.'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+  /v2/families/{fid}/transfer/cancel:
     post:
-      tags: [families]
+      tags:
+      - families
       operationId: cancelOwnershipTransfer
       summary: Cancel a pending ownership transfer offer
-      description: |
-        The current circle owner may withdraw a pending offer. The recipient
+      description: 'The current circle owner may withdraw a pending offer. The recipient
+
         cannot cancel (→ 403); only the owner can. An already-expired offer
+
         returns 410 `transfer_expired`.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/FamilyId'
       responses:
         '200':
           description: Offer cancelled
@@ -641,32 +890,47 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [transfer]
+                required:
+                - transfer
                 properties:
-                  transfer: { $ref: '#/components/schemas/Transfer' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '410': { $ref: '#/components/responses/Gone' }
-
-  /v1/families/{fid}/members/{mid}:
+                  transfer:
+                    $ref: '#/components/schemas/Transfer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+  /v2/families/{fid}/members/{mid}:
     delete:
-      tags: [families]
+      tags:
+      - families
       operationId: removeCircleMember
       summary: Soft-remove a member from the circle (owner only)
-      description: |
-        Only the circle owner may remove members. Removal is soft: the
+      description: 'Only the circle owner may remove members. Removal is soft: the
+
         member row is retained (history references it) with `removed_at`
+
         set, every agent token of the member is revoked effective now,
+
         their topic participation is dropped (E2EE topics they were in
+
         get `rotation_required` — rekey next), and pending ownership
+
         transfers involving them are cancelled. The freed email becomes
+
         re-invitable. You cannot remove yourself (→ 400; use the
+
         ownership transfer to step off) and the last owner cannot be
+
         removed (→ 400).
+
+        '
       parameters:
-        - $ref: '#/components/parameters/FamilyId'
-        - $ref: '#/components/parameters/MemberId'
+      - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/MemberId'
       responses:
         '200':
           description: Member removed
@@ -674,33 +938,45 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [removed]
+                required:
+                - removed
                 properties:
-                  removed: { type: string, description: Member id removed }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  # -------------------------------------------------------------------- auth
-  /v1/auth/revoke:
+                  removed:
+                    type: string
+                    description: Member id removed
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/auth/revoke:
     post:
-      tags: [auth]
+      tags:
+      - auth
       operationId: revokeToken
       summary: Revoke an agent token
-      description: |
-        Revokes `token_id` immediately. A member may revoke their own agents'
+      description: 'Revokes `token_id` immediately. A member may revoke their own agents''
+
         tokens; `owner`/`parent` may revoke any token in the family.
+
         Revoking the token used for this call is allowed; subsequent calls 401.
+
+        '
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [token_id]
+              required:
+              - token_id
               properties:
-                token_id: { type: string, minLength: 1 }
+                token_id:
+                  type: string
+                  minLength: 1
       responses:
         '200':
           description: Token revoked
@@ -708,36 +984,54 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [ok]
+                required:
+                - ok
                 properties:
-                  ok: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-  /v1/provisioning-codes:
+                  ok:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
+  /v2/provisioning-codes:
     post:
-      tags: [auth]
+      tags:
+      - auth
       operationId: mintProvisioningCode
       summary: Mint a provisioning code for an additional agent
       x-spec-note: Gap-fill implemented by WS-1 — not in SPEC §13. Required by SPEC §6.4.
-      description: |
-        Mints a single-use provisioning code (24h TTL) for the given member.
+      description: 'Mints a single-use provisioning code (24h TTL) for the given member.
+
         member_id is required: callers mint for their own member, or
+
         (`owner`/`parent` only) for another member of the family.
+
+        '
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [member_id, agent_label]
+              required:
+              - member_id
+              - agent_label
               properties:
-                member_id: { type: string }
-                agent_label: { type: string, minLength: 1, maxLength: 80 }
+                member_id:
+                  type: string
+                agent_label:
+                  type: string
+                  minLength: 1
+                  maxLength: 80
       responses:
         '201':
           description: Provisioning code minted
@@ -745,39 +1039,46 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [provisioning_code, expires_at]
+                required:
+                - provisioning_code
+                - expires_at
                 properties:
-                  provisioning_code: { type: string, description: 'Single-use, 24h TTL. Shown once.' }
-                  expires_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-
-  /v1/provisioning-codes/{code}/redeem:
+                  provisioning_code:
+                    type: string
+                    description: Single-use, 24h TTL. Shown once.
+                  expires_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
+  /v2/provisioning-codes/{code}/redeem:
     post:
-      tags: [auth]
+      tags:
+      - auth
       operationId: redeemProvisioningCode
       summary: Redeem a provisioning code for an agent token
       x-spec-note: Gap-fill implemented by WS-1 — not in SPEC §13. Required by SPEC §6.1/§6.4.
-      description: |
-        Public — the provisioning code is the credential. Issues the per-agent
-        bearer token for the member the code was minted for (the agent_label
-        comes from the minted code). Token RETURNED ONCE. Reuse returns 409
-        `code_used`; expired codes return 410 `code_expired`.
-        E2EE (Phase 1): the optional `agent_public_key` binds the agent's
-        X25519 identity key to the same (member_id, agent_label) in the same
-        atomic batch as the token issuance. It must be standard base64
-        decoding to exactly 32 bytes (400 otherwise); absent means the agent
-        has no E2EE identity (plaintext topics still work).
+      description: Redeem a single-use code and atomically issue credentials with a mandatory X25519 encryption
+        identity. Invalid or missing public keys do not consume the code. Re-enrollment of the same label
+        cannot replace its identity key.
       security: []
       parameters:
-        - name: code
-          in: path
-          required: true
-          schema: { type: string, minLength: 16 }
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 16
       requestBody:
         required: false
         content:
@@ -787,10 +1088,9 @@ paths:
               properties:
                 agent_public_key:
                   type: string
-                  description: >
-                    Optional X25519 public key (standard base64, 32 bytes
-                    when decoded). Stored bound to (member_id, agent_label)
-                    atomically with the token.
+                  description: Canonical standard base64, exactly 32 decoded bytes.
+              required:
+              - agent_public_key
       responses:
         '201':
           description: Token issued (once)
@@ -798,50 +1098,79 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [member, token, token_id]
+                required:
+                - member
+                - token
+                - token_id
                 properties:
-                  member: { $ref: '#/components/schemas/Member' }
-                  token: { type: string, description: 'Bearer token, shown once.' }
-                  token_id: { type: string }
-        '404': { $ref: '#/components/responses/NotFound' }
+                  member:
+                    $ref: '#/components/schemas/Member'
+                  token:
+                    type: string
+                    description: Bearer token, shown once.
+                  token_id:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
-          description: Code already used — also returns the member and a flag so the client can tell the user they are already enrolled but hold no token
+          description: Code already used — also returns the member and a flag so the client can tell the
+            user they are already enrolled but hold no token
           content:
             application/json:
               schema:
                 type: object
-                required: [error, member, token_already_issued]
+                required:
+                - error
+                - member
+                - token_already_issued
                 properties:
-                  error: { $ref: '#/components/schemas/Error' }
+                  error:
+                    $ref: '#/components/schemas/Error'
                   member:
                     $ref: '#/components/schemas/Member'
                     description: The member the code was minted for (may be null).
-                  token_already_issued: { type: boolean, example: true }
+                  token_already_issued:
+                    type: boolean
+                    example: true
           example:
-            error: { code: code_used, message: "Provisioning code already used" }
-            member: { id: "m_…", name: "…", email: "…", role: "owner", created_at: "…" }
+            error:
+              code: code_used
+              message: Provisioning code already used
+            member:
+              id: m_…
+              name: …
+              email: …
+              role: owner
+              created_at: …
             token_already_issued: true
-        '410': { $ref: '#/components/responses/Gone' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-
-  # ------------------------------------------------- E2EE keys (Phase 1)
-  /v1/agent-keys:
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
+  /v2/agent-keys:
     get:
-      tags: [e2ee]
+      tags:
+      - e2ee
       operationId: listAgentKeys
       summary: List agent public keys (the key directory)
-      description: |
-        Authenticated. Returns the ACTIVE X25519 public keys of members the
+      description: 'Authenticated. Returns the ACTIVE X25519 public keys of members the
+
         caller shares a circle with — never cross-circle. Public keys are
+
         public; the only access rule is circle membership. Used by agents to
+
         fetch recipient keys when creating key envelopes (Phase 2+).
+
+        '
       parameters:
-        - name: member_id
-          in: query
-          required: false
-          schema: { type: string }
-          description: Restrict to one member's keys; omit to list every visible key.
+      - name: member_id
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Restrict to one member's keys; omit to list every visible key.
       responses:
         '200':
           description: Key directory
@@ -849,42 +1178,60 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [keys]
+                required:
+                - keys
                 properties:
                   keys:
                     type: array
                     items:
                       type: object
-                      required: [member_id, agent_label, public_key, created_at]
+                      required:
+                      - member_id
+                      - agent_label
+                      - public_key
+                      - created_at
                       properties:
-                        member_id: { type: string }
-                        agent_label: { type: string }
+                        member_id:
+                          type: string
+                        agent_label:
+                          type: string
                         public_key:
                           type: string
                           description: Standard base64, decodes to 32 bytes (X25519).
-                        created_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
-  /v1/agent-keys/rotate:
+                        created_at:
+                          type: string
+                          format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/agent-keys/rotate:
     post:
-      tags: [e2ee]
+      tags:
+      - e2ee
       operationId: rotateAgentKey
       summary: Register or rotate my agent identity key
-      description: |
-        Authenticated by the caller's bearer token, which is the bootstrap:
+      description: 'Authenticated by the caller''s bearer token, which is the bootstrap:
+
         the token proves WHO the agent is, the keypair becomes WHAT it can
-        decrypt. Marks the caller's current key superseded (kept, never
+
+        decrypt. Marks the caller''s current key superseded (kept, never
+
         deleted) and stores the new one as the single active key for
+
         (member_id, agent_label). With no prior key this is the initial
+
         registration path (used by `hub key-init`).
+
+        '
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [agent_public_key]
+              required:
+              - agent_public_key
               properties:
                 agent_public_key:
                   type: string
@@ -896,18 +1243,29 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [member_id, agent_label, public_key, created_at]
+                required:
+                - member_id
+                - agent_label
+                - public_key
+                - created_at
                 properties:
-                  member_id: { type: string }
-                  agent_label: { type: string }
-                  public_key: { type: string }
-                  created_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-  # ------------------------------------------------------------------ members
-  /v1/members:
+                  member_id:
+                    type: string
+                  agent_label:
+                    type: string
+                  public_key:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/members:
     get:
-      tags: [members]
+      tags:
+      - members
       operationId: listMembers
       summary: List members of my family
       responses:
@@ -917,23 +1275,30 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [members]
+                required:
+                - members
                 properties:
                   members:
                     type: array
-                    items: { $ref: '#/components/schemas/Member' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
-  /v1/me:
+                    items:
+                      $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/me:
     get:
-      tags: [members]
+      tags:
+      - members
       operationId: getSelf
       summary: My own identity (the member bound to this token)
-      description: |
-        Returns the member record the calling bearer token is bound to,
-        plus the token's `agent_label`. Clients MUST use this — not
-        `/v1/members[0]` — to learn who "I" am: members are ordered by
+      description: 'Returns the member record the calling bearer token is bound to,
+
+        plus the token''s `agent_label`. Clients MUST use this — not
+
+        `/v2/members[0]` — to learn who "I" am: members are ordered by
+
         creation time, so `[0]` is typically the owner, not the caller.
+
+        '
       responses:
         '200':
           description: Caller identity
@@ -941,87 +1306,84 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [id, family_id, name, email, role, created_at, agent_label, is_hub_owner]
+                required:
+                - id
+                - family_id
+                - name
+                - email
+                - role
+                - created_at
+                - agent_label
+                - is_hub_owner
                 properties:
-                  id: { type: string }
-                  family_id: { type: string }
-                  name: { type: string }
-                  email: { type: string, format: email }
-                  role: { $ref: '#/components/schemas/Role' }
-                  created_at: { type: string, format: date-time }
+                  id:
+                    type: string
+                  family_id:
+                    type: string
+                  name:
+                    type: string
+                  email:
+                    type: string
+                    format: email
+                  role:
+                    $ref: '#/components/schemas/Role'
+                  created_at:
+                    type: string
+                    format: date-time
                   agent_label:
                     type: string
                     description: The agent label recorded when this token was issued.
                   is_hub_owner:
                     type: boolean
-                    description: >
-                      True when the caller's principal holds the owner role in
-                      at least one circle — i.e. this agent may create circles
-                      (POST /v1/families while setup is locked). Lets the agent
-                      learn this from `hub me` instead of via a 403.
-        '401': { $ref: '#/components/responses/Unauthorized' }
+                    description: 'True when the caller''s principal holds the owner role in at least one
+                      circle — i.e. this agent may create circles (POST /v2/families while setup is locked).
+                      Lets the agent learn this from `hub me` instead of via a 403.
 
-  # ------------------------------------------------------------------- topics
-  /v1/topics:
+                      '
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/topics:
     post:
-      tags: [topics]
+      tags:
+      - topics
       operationId: createTopic
       summary: Create a topic
-      description: |
-        `kind: direct` requires exactly 2 participant_member_ids, and the caller
-        must be one of them (400 otherwise). For `group`, the caller is
-        auto-added as a participant if not listed.
-        `parents_only: true` auto-includes all parent-role members (and the
-        owner) and rejects any kid-role member id; participant_member_ids may
-        be omitted in that case. All participants must be family members.
-        E2EE (Phase 2): `e2ee: 1` creates an end-to-end-encrypted topic. The
-        subject may then arrive already encrypted (opaque to the server —
-        stored as-is; up to 1024 chars of base64 ciphertext vs the usual
-        200). Requires the creator's agent to have a registered identity
-        key in `agent_keys` (400 with `hub key-init` guidance otherwise),
-        and requires `initial_key_id` (the creator's client-generated topic
-        key id, 32 hex chars) — the server records it as
-        `topics.current_key_id`, the single source of truth clients use to
-        elect the encryption key (secfix F1). `initial_key_id` is rejected
-        on plaintext topics. After creation, distribute the topic key with
-        POST /v1/topics/{tid}/envelopes — one sealed envelope per participant
-        agent — then PATCH /v1/topics/{tid}/subject with the subject
-        re-encrypted under the topic-bound AAD (secfix F4). Absent/null
-        `e2ee` (or 0) is a plaintext topic, unchanged.
+      description: Create an encrypted topic at epoch zero. The caller must have a registered encryption
+        identity and owner/parent role. The subject is already encrypted using the client-chosen topic
+        ID as authenticated context. Writes remain blocked until a complete recipient set and the encrypted
+        subject are committed as epoch one. No encryption flag or initial_key_id is accepted.
       requestBody:
         required: true
         content:
           application/json:
-            schema:
+            schema: &id001
               type: object
-              required: [subject, kind, participant_member_ids]
+              required:
+              - topic_id
+              - subject
+              - kind
+              - participant_member_ids
+              additionalProperties: false
               properties:
-                subject: { type: string, minLength: 1, maxLength: 200 }
-                kind: { $ref: '#/components/schemas/TopicKind' }
+                topic_id:
+                  type: string
+                  pattern: ^[0-9a-f]{32}$
+                  description: Client-generated operation/topic ID chosen before encryption; retry the
+                    identical payload with this ID.
+                subject: &id002
+                  $ref: '#/components/schemas/EncryptedContent'
+                kind:
+                  $ref: '#/components/schemas/TopicKind'
                 participant_member_ids:
                   type: array
-                  minItems: 0
                   maxItems: 20
-                  items: { type: string }
-                  description: >
-                    Required (may be empty). When parents_only is true the
-                    owner+parent roles are auto-included regardless of this list
-                    (kid-role ids are rejected with 403).
-                parents_only: { type: boolean, default: false }
-                e2ee:
-                  type: integer
-                  enum: [0, 1]
-                  default: 0
-                  description: >
-                    1 = end-to-end-encrypted topic (subject is opaque
-                    ciphertext; creator must have a registered agent identity
-                    key). 0 / absent = plaintext topic.
-                initial_key_id:
-                  type: string
-                  description: >
-                    Required when e2ee=1 (rejected otherwise): the creator's
-                    client-generated 128-bit topic-key id, 32 hex chars.
-                    Recorded as topics.current_key_id.
+                  items:
+                    type: string
+                parents_only:
+                  type: boolean
+                  default: false
+                link_visibility:
+                  $ref: '#/components/schemas/LinkVisibility'
       responses:
         '201':
           description: Topic created (caller is added as participant if not listed)
@@ -1029,33 +1391,43 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic]
+                required:
+                - topic
                 properties:
-                  topic: { $ref: '#/components/schemas/Topic' }
+                  topic:
+                    $ref: '#/components/schemas/Topic'
         '200':
-          description: Idempotent retry with a repeated Idempotency-Key — the already-created topic is returned, nothing is duplicated
+          description: Idempotent retry with a repeated Idempotency-Key — the already-created topic is
+            returned, nothing is duplicated
           content:
             application/json:
               schema:
                 type: object
-                required: [topic, deduped]
+                required:
+                - topic
+                - deduped
                 properties:
-                  topic: { $ref: '#/components/schemas/Topic' }
-                  deduped: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
+                  topic:
+                    $ref: '#/components/schemas/Topic'
+                  deduped:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
     get:
-      tags: [topics]
+      tags:
+      - topics
       operationId: listTopics
       summary: Search / list visible topics
-      description: Returns only topics the caller participates in, optionally filtered by subject substring (case-insensitive).
-      parameters:
-        - name: q
-          in: query
-          required: false
-          schema: { type: string, maxLength: 200 }
+      description: List visible encrypted topics. Subjects are ciphertext; clients decrypt and search
+        locally. A server-side q parameter is rejected.
+      parameters: []
       responses:
         '200':
           description: Visible topics
@@ -1063,21 +1435,24 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topics]
+                required:
+                - topics
                 properties:
                   topics:
                     type: array
-                    items: { $ref: '#/components/schemas/Topic' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
-  /v1/topics/{tid}:
+                    items:
+                      $ref: '#/components/schemas/Topic'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/topics/{tid}:
     get:
-      tags: [topics]
+      tags:
+      - topics
       operationId: getTopic
       summary: Get topic metadata + participants
       description: 403 unless the caller is a participant.
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       responses:
         '200':
           description: Topic detail
@@ -1085,87 +1460,70 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic, participants]
+                required:
+                - topic
+                - participants
                 properties:
-                  topic: { $ref: '#/components/schemas/Topic' }
+                  topic:
+                    $ref: '#/components/schemas/Topic'
                   participants:
                     type: array
-                    items: { $ref: '#/components/schemas/TopicParticipantView' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v1/topics/{tid}/subject:
-    patch:
-      tags: [e2ee]
-      operationId: patchTopicSubject
-      summary: Replace the topic subject (E2EE re-encryption step)
-      description: |
-        E2EE (secfix F4). Replaces the topic subject. Participant-only
-        (403 otherwise; 404 when the topic doesn't exist in the caller's
-        family); E2EE topics only (400 otherwise). Exists so
-        `hub new-topic --e2ee` can re-encrypt the subject with the
-        topic-bound AAD (b"fh-topic-subject-v1" + 0x00 + topic_id)
-        immediately after creation — topic ids are server-generated, so the
-        CLI cannot bind topic_id at create time. The subject is opaque to
-        the server: validated like a created E2EE subject (1..1024 chars),
-        stored as-is, never inspected or PII-scanned.
-      parameters:
-        - $ref: '#/components/parameters/TopicId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [subject]
-              properties:
-                subject: { type: string, minLength: 1, maxLength: 1024 }
-      responses:
-        '200':
-          description: Subject replaced
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [topic]
-                properties:
-                  topic: { $ref: '#/components/schemas/Topic' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v1/sync/topics:
+                    items:
+                      $ref: '#/components/schemas/TopicParticipantView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/sync/topics:
     get:
-      tags: [sync]
+      tags:
+      - sync
       operationId: syncTopics
       summary: Changed-topic discovery (sync v2)
-      description: |
-        Changed-topic discovery, per circle token — one call per circle, never
+      description: 'Changed-topic discovery, per circle token — one call per circle, never
+
         crossing family boundaries (cross-family topic ids 404 by
+
         construction). Returns per changed topic: topic_id, circle_id,
+
         circle_name, subject, kind, e2ee, acked_seq, latest_seq, new_count,
+
         last_activity_ts, last_actor, key_status (ok|pending|not_e2ee),
+
         assigned_to_me. Changed = visible entry with
+
         seq > max(acked_seq, history_from_seq - 1). Bootstrap: the first call
+
         sends no cursor — a deliberate full re-read; every visible entry is
-        reported as unread once, duplicates handled by the skill's dedupe
+
+        reported as unread once, duplicates handled by the skill''s dedupe
+
         rule. The CLI deletes legacy cursor files without reading them.
+
+        '
       parameters:
-        - name: bootstrap_gseq
-          in: query
-          required: false
-          schema: { type: integer, minimum: 0 }
-          description: First call only; legacy cursor, ignored after bootstrap.
-        - name: limit
-          in: query
-          required: false
-          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
-        - name: page_token
-          in: query
-          required: false
-          schema: { type: string }
+      - name: bootstrap_gseq
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+        description: First call only; legacy cursor, ignored after bootstrap.
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+      - name: page_token
+        in: query
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Changed topics
@@ -1173,78 +1531,139 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topics]
+                required:
+                - topics
                 properties:
                   topics:
                     type: array
                     items:
                       type: object
-                      required: [topic_id, circle_id, circle_name, subject, kind, e2ee, acked_seq, latest_seq, new_count, last_activity_ts, last_actor, key_status, assigned_to_me]
+                      required:
+                      - topic_id
+                      - circle_id
+                      - circle_name
+                      - subject
+                      - kind
+                      - e2ee
+                      - acked_seq
+                      - latest_seq
+                      - new_count
+                      - last_activity_ts
+                      - last_actor
+                      - key_status
+                      - assigned_to_me
                       properties:
-                        topic_id: { type: string }
-                        circle_id: { type: string }
-                        circle_name: { type: string }
-                        subject: { type: string }
-                        kind: { type: string }
-                        e2ee: { type: boolean }
-                        acked_seq: { type: integer }
-                        latest_seq: { type: integer }
-                        new_count: { type: integer }
-                        last_activity_ts: { type: string, format: date-time }
-                        last_actor: { type: string }
-                        key_status: { type: string, enum: [ok, pending, not_e2ee] }
-                        assigned_to_me: { type: boolean }
+                        topic_id:
+                          type: string
+                        circle_id:
+                          type: string
+                        circle_name:
+                          type: string
+                        subject:
+                          type: string
+                        kind:
+                          type: string
+                        e2ee:
+                          type: boolean
+                        acked_seq:
+                          type: integer
+                        latest_seq:
+                          type: integer
+                        new_count:
+                          type: integer
+                        last_activity_ts:
+                          type: string
+                          format: date-time
+                        last_actor:
+                          type: string
+                        key_status:
+                          type: string
+                          enum:
+                          - ok
+                          - pending
+                          - not_e2ee
+                        assigned_to_me:
+                          type: boolean
                   versions:
                     type: object
-                    description: >
-                      Update advertisement (decoupled releases): the newest
-                      released server / CLI / skill versions known to this
-                      server. `hub sync` compares these against the installed
-                      versions and nudges the agent to run `hub upgrade` when
-                      either is newer.
-                    required: [server, cli, skill]
-                    properties:
-                      server: { type: string }
-                      cli: { type: string }
-                      skill: { type: string }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+                    description: 'Update advertisement (decoupled releases): the newest released server
+                      / CLI / skill versions known to this server. `hub sync` compares these against the
+                      installed versions and nudges the agent to run `hub upgrade` when either is newer.
 
-  /v1/topics/{tid}/history:
+                      '
+                    required:
+                    - server
+                    - cli
+                    - skill
+                    properties:
+                      server:
+                        type: string
+                      cli:
+                        type: string
+                      skill:
+                        type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/topics/{tid}/history:
     get:
-      tags: [topics]
+      tags:
+      - topics
       operationId: getTopicHistory
       summary: Read topic history
-      description: |
-        Entries in per-topic `seq` order. Only entries with
-        `seq >=` the caller's `history_from_seq` are returned (invite-time
-        visibility). 403 unless the caller is a participant. Page with
-        `after_seq`; more entries exist while the last returned seq < max_seq.
-        `context` (default 10, max 50) prepends up to that many entries
-        immediately before `after_seq` (bounded below by history_from_seq),
-        flagged `is_context: true` — re-reads for orientation; page entries
-        carry `is_context: false`. Every response includes `read_through_seq`
-        (highest newly-read seq in this page; context rows excluded) and a
-        `read_receipt` HMAC binding
-        (member_id, agent_label, topic_id, from_seq, through_seq) with
-        from_seq = max(after_seq, history_from_seq - 1) + 1 — POST it to
-        /v1/topics/{tid}/ack to advance read state.
-      parameters:
-        - $ref: '#/components/parameters/TopicId'
-        - name: after_seq
-          in: query
-          required: false
-          schema: { type: integer, minimum: 0, default: 0 }
-          description: Return entries with seq > after_seq.
-        - name: limit
-          in: query
-          required: false
-          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
-        - name: context
-          in: query
-          required: false
-          schema: { type: integer, minimum: 0, maximum: 50, default: 10 }
-          description: Sync v2 — also return up to N entries before after_seq (flagged is_context).
+      description: 'Entries in per-topic `seq` order. Only entries with
 
+        `seq >=` the caller''s `history_from_seq` are returned (invite-time
+
+        visibility). 403 unless the caller is a participant. Page with
+
+        `after_seq`; more entries exist while the last returned seq < max_seq.
+
+        `context` (default 10, max 50) prepends up to that many entries
+
+        immediately before `after_seq` (bounded below by history_from_seq),
+
+        flagged `is_context: true` — re-reads for orientation; page entries
+
+        carry `is_context: false`. Every response includes `read_through_seq`
+
+        (highest newly-read seq in this page; context rows excluded) and a
+
+        `read_receipt` HMAC binding
+
+        (member_id, agent_label, topic_id, from_seq, through_seq) with
+
+        from_seq = max(after_seq, history_from_seq - 1) + 1 — POST it to
+
+        /v2/topics/{tid}/ack to advance read state.
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/TopicId'
+      - name: after_seq
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+        description: Return entries with seq > after_seq.
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 100
+      - name: context
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          maximum: 50
+          default: 10
+        description: Sync v2 — also return up to N entries before after_seq (flagged is_context).
       responses:
         '200':
           description: History page
@@ -1252,16 +1671,21 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entries, max_seq, read_through_seq, read_receipt]
+                required:
+                - entries
+                - max_seq
+                - read_through_seq
+                - read_receipt
                 properties:
                   entries:
                     type: array
                     items:
                       allOf:
-                        - { $ref: '#/components/schemas/Entry' }
-                        - type: object
-                          properties:
-                            is_context: { type: boolean }
+                      - $ref: '#/components/schemas/Entry'
+                      - type: object
+                        properties:
+                          is_context:
+                            type: boolean
                   max_seq:
                     type: integer
                     description: Highest seq in the topic (visible range).
@@ -1270,39 +1694,56 @@ paths:
                     description: Highest newly-read seq in this page (context rows excluded).
                   read_receipt:
                     type: string
-                    description: >
-                      HMAC-bound receipt for this (member, agent, topic,
-                      from_seq, through_seq); present to POST .../ack.
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+                    description: 'HMAC-bound receipt for this (member, agent, topic, from_seq, through_seq);
+                      present to POST .../ack.
 
-  /v1/topics/{tid}/ack:
+                      '
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/topics/{tid}/ack:
     post:
-      tags: [topics]
+      tags:
+      - topics
       operationId: ackTopic
       summary: Advance per-agent read state (sync v2)
-      description: |
-        Receipt-bound, contiguous ack. Body { seq, read_receipt }, both
+      description: 'Receipt-bound, contiguous ack. Body { seq, read_receipt }, both
+
         required. The server HMAC-verifies the receipt — it must bind THIS
+
         (member_id, agent_label, topic_id); cross-agent replay fails with
+
         403 invalid_read_receipt. effective = max(acked_seq,
+
         history_from_seq - 1). seq <= effective is a no-op success
+
         (idempotent). Otherwise the ack must be contiguous: from_seq <=
+
         effective + 1 and seq <= through_seq, else 409 noncontiguous_ack
+
         (read and ack pages in order). Read state advances atomically via
+
         max(). 403 unless the caller is a participant; 404 when the topic
-        is not in the caller's family.
+
+        is not in the caller''s family.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [seq, read_receipt]
+              required:
+              - seq
+              - read_receipt
               properties:
                 seq:
                   type: integer
@@ -1318,46 +1759,68 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic_id, acked_seq]
+                required:
+                - topic_id
+                - acked_seq
                 properties:
-                  topic_id: { type: string }
-                  acked_seq: { type: integer }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-
-  /v1/topics/{tid}/invite:
+                  topic_id:
+                    type: string
+                  acked_seq:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v2/topics/{tid}/invite:
     post:
-      tags: [topics]
+      tags:
+      - topics
       operationId: inviteToTopic
       summary: Invite members into a topic
-      description: |
-        Caller must be a participant AND have role owner/parent. The join is
+      description: 'Caller must be a participant AND have role owner/parent. The join is
+
         logged as a `member_joined` entry (visible to existing readers).
-        `history_from: from_join` sets the new participant's history_from_seq to
+
+        `history_from: from_join` sets the new participant''s history_from_seq to
+
         current_max_seq + 1 (they see only what comes after joining).
+
         Sync v2 (spec §1.4): on E2EE topics a `from_join` accept sets
+
         `topics.rotation_required = 1` in the same transaction — the new
+
         member is never given the current epoch key; encrypted writes pause
+
         with 409 `rotation_required` until the owner rekeys and commits, at
+
         which point the joiner receives only the new epoch key.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [member_ids, history_from]
+              required:
+              - member_ids
+              - history_from
               properties:
                 member_ids:
                   type: array
                   minItems: 1
-                  items: { type: string }
-                history_from: { $ref: '#/components/schemas/HistoryFrom' }
+                  items:
+                    type: string
+                history_from:
+                  $ref: '#/components/schemas/HistoryFrom'
       responses:
         '200':
           description: Members invited
@@ -1365,37 +1828,51 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [added]
+                required:
+                - added
                 properties:
                   added:
                     type: array
-                    items: { type: string }
+                    items:
+                      type: string
                     description: Member ids added to the topic.
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v1/topics/{tid}/participants/{mid}:
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/topics/{tid}/participants/{mid}:
     delete:
-      tags: [topics]
+      tags:
+      - topics
       operationId: removeTopicParticipant
       summary: Remove a member from a topic
-      description: |
-        Caller must be a participant AND have role owner/parent (same 403 rule
+      description: 'Caller must be a participant AND have role owner/parent (same 403 rule
+
         as the topic invite endpoint). The removal is logged as a `member_left`
+
         entry naming the member. Cannot remove the last participant.
-        E2EE note: the removed member's sealed envelopes are kept (they
+
+        E2EE note: the removed member''s sealed envelopes are kept (they
+
         already held the old key), but no NEW envelopes can be posted for
+
         them — run a key rotation (`hub topic-rekey`) immediately after to
+
         lock them out of new content.
+
+        '
       parameters:
-        - $ref: '#/components/parameters/TopicId'
-        - name: mid
-          in: path
-          required: true
-          schema: { type: string }
-          description: Member id to remove.
+      - $ref: '#/components/parameters/TopicId'
+      - name: mid
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Member id to remove.
       responses:
         '200':
           description: Member removed
@@ -1403,50 +1880,37 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [removed]
+                required:
+                - removed
                 properties:
                   removed:
                     type: string
                     description: Member id removed from the topic.
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v1/topics/{tid}/spawn:
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/topics/{tid}/spawn:
     post:
-      tags: [topics]
+      tags:
+      - topics
       operationId: spawnTopic
       summary: Spawn a linked child topic
-      description: |
-        Caller must be a participant of the parent. Creates a new topic with
-        `parent_topic_id` set; its first entry is the `briefing` (curated
-        context — the ONLY thing carried over). A `topic_spawned` entry is
-        appended to the parent. The briefing becomes entry seq 1 of the child —
-        read it back via history. Child participants who cannot read the parent
-        get 403 on the parent; the child shows a "linked private parent
-        discussion" placeholder unless link_visibility is "hidden".
+      description: Initialize an independently encrypted child through the same lifecycle as ordinary
+        topic creation. The caller must participate in the parent. No parent key or history is shared.
+        After activation the client posts the approved briefing as a child-key-encrypted briefing entry.
+        Inline briefing content is rejected.
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [subject, participant_member_ids, briefing]
-              properties:
-                subject: { type: string, minLength: 1, maxLength: 200 }
-                participant_member_ids:
-                  type: array
-                  minItems: 1
-                  items: { type: string }
-                briefing:
-                  type: string
-                  minLength: 1
-                  maxLength: 20000
-                  description: Curated context for the new participants; becomes entry seq 1 (kind=briefing). Sync v2: must be well-formed fh1 when the parent topic is E2EE (400 plaintext_in_e2ee_topic otherwise).
-                link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
+            schema: *id001
       responses:
         '201':
           description: Child topic created
@@ -1454,73 +1918,84 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic, parent_topic_id]
+                required:
+                - topic
+                - parent_topic_id
                 properties:
-                  topic: { $ref: '#/components/schemas/Topic' }
-                  parent_topic_id: { type: string }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '422': { $ref: '#/components/responses/PiiError' }
-
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-  /v1/topics/{tid}/entries:
+                  topic:
+                    $ref: '#/components/schemas/Topic'
+                  parent_topic_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/PiiError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
+  /v2/topics/{tid}/entries:
     post:
-      tags: [entries]
+      tags:
+      - entries
       operationId: postEntry
       summary: Post an entry (message)
-      description: |
-        Caller must be a participant. Client-settable kinds: `message` plus
-        the E2EE plaintext system kinds `key_rotated`, `key_request`,
-        `pending_key_distribution` (Phase 4), and `topic_archived`
-        (Phase 5) — these MUST stay plaintext (even on E2EE topics) so
-        agents without the topic key can read them; all other kinds are
-        server-generated. Supports
-        `Idempotency-Key` header: retries with the same key return the
-        original entry (`deduped: true`) instead of creating a duplicate.
-        Body is PII-scanned before insert (well-formed fh1 ciphertext skips
-        the scan — the CLI scans plaintext before encrypting).
-        Sync v2 (spec §1.5): on E2EE topics, `message` content must be
-        sealed — `body` and `data` (when present, a JSON string holding the
-        fh1 wire body) must be well-formed fh1, else 400
-        `plaintext_in_e2ee_topic`. Protocol kinds skip this check
-        (plaintext by design). Encrypted writes are gated server-side on the
-        fh1 header's key_id: 409 `key_not_active` at epoch 0 (writes blocked
-        until the first key commits), 409 `stale_key` when the key_id
-        differs from the topic's current key, 409 `rotation_required` while
-        a removal/from-join rekey is pending. R1 replay: the fh1 `msg_id` is
-        stored under a partial unique index — a retried POST with the same
-        body returns the existing entry (`deduped: true`); the same msg_id
-        with different content is 409 `msg_id_conflict`.
+      description: Append encrypted message or briefing content. Metadata-only system events use fixed
+        server-generated labels, strict per-kind data and no body. Content is accepted only for the active
+        key and outside a rotation gate.
       parameters:
-        - $ref: '#/components/parameters/TopicId'
-        - name: Idempotency-Key
-          in: header
-          required: false
-          schema: { type: string, maxLength: 128 }
-          description: Opaque client key; same key + same topic returns the original entry.
+      - $ref: '#/components/parameters/TopicId'
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          maxLength: 128
+        description: Opaque client key; same key + same topic returns the original entry.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [body]
-              properties:
-                kind:
-                  type: string
-                  enum: [message, key_rotated, key_request, pending_key_distribution, topic_archived]
-                  default: message
-                body: { type: string, minLength: 1, maxLength: 20000 }
-                reply_to_seq:
-                  type: integer
-                  minimum: 1
-                  description: Must reference an existing seq in this topic.
-                data:
-                  type: object
-                  description: Free-form JSON machine payload.
+              oneOf:
+              - type: object
+                required:
+                - body
+                properties:
+                  kind:
+                    type: string
+                    enum:
+                    - message
+                    - briefing
+                    default: message
+                  body: *id002
+                  data: *id002
+                  reply_to_seq:
+                    type: integer
+                    minimum: 1
+                additionalProperties: false
+              - type: object
+                required:
+                - kind
+                - data
+                properties:
+                  kind:
+                    type: string
+                    enum:
+                    - key_request
+                    - pending_key_distribution
+                    - topic_archived
+                  data:
+                    type: object
+                    description: 'Strict per-kind metadata: key IDs, real member/agent identifiers, successor
+                      topic ID and booleans only. No free text, notes, reasons or content.'
+                additionalProperties: false
       responses:
         '201':
           description: Entry created
@@ -1528,58 +2003,73 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entry]
+                required:
+                - entry
                 properties:
-                  entry: { $ref: '#/components/schemas/Entry' }
+                  entry:
+                    $ref: '#/components/schemas/Entry'
         '200':
           description: Idempotent replay — original entry returned, no duplicate created
           content:
             application/json:
               schema:
                 type: object
-                required: [entry, deduped]
+                required:
+                - entry
+                - deduped
                 properties:
-                  entry: { $ref: '#/components/schemas/Entry' }
-                  deduped: { type: boolean, example: true }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '422': { $ref: '#/components/responses/PiiError' }
+                  entry:
+                    $ref: '#/components/schemas/Entry'
+                  deduped:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/PiiError'
         '409':
           description: key_not_active | stale_key | rotation_required | msg_id_conflict
-        '429': { $ref: '#/components/responses/RateLimited' }
-        '426': { $ref: '#/components/responses/ClientTooOld' }
-  /v1/topics/{tid}/tasks:
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '426':
+          $ref: '#/components/responses/ClientTooOld'
+  /v2/topics/{tid}/tasks:
     post:
-      tags: [tasks]
+      tags:
+      - tasks
       operationId: createTask
       summary: Create a task in a topic
-      description: |
-        Caller must be a participant. The assignee (if set) must already be a
-        participant of the topic (400 otherwise). Appends a `task_created` entry.
-        Sync v2 (spec §1.5): on E2EE topics `title` and `description` must be
-        well-formed fh1 (400 `plaintext_in_e2ee_topic` otherwise); the
-        `task_created` entry body is the sealed title and its data collapses
-        to `{"task_id": "…", "sealed": "fh1…"}` with `task_id` plaintext so
-        the task-visibility predicate keeps working.
+      description: Participant-only content write. All supplied content fields must be encrypted under
+        the active topic key. Initialization and pending rotation block writes. Task ownership, history
+        floors, and subtask completion rules remain enforced. PII scanning happens on the client before
+        encryption.
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [title]
+              required:
+              - title
               properties:
-                title: { type: string, minLength: 1, maxLength: 200 }
-                description: { type: string, maxLength: 20000 }
-                assignee_member_id: { type: string }
+                title: *id002
+                description: *id002
+                assignee_member_id:
+                  type: string
                 parent_task_id:
                   type: string
                   description: Must belong to the same topic.
-                due_at: { type: string, format: date-time }
+                due_at:
+                  type: string
+                  format: date-time
       responses:
         '201':
           description: Task created
@@ -1587,22 +2077,29 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [task]
+                required:
+                - task
                 properties:
-                  task: { $ref: '#/components/schemas/Task' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
+                  task:
+                    $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
     get:
-      tags: [tasks]
+      tags:
+      - tasks
       operationId: listTopicTasks
       summary: List tasks in a topic
-      x-spec-note: Added at WS-1/WS-2 request — not in SPEC §13. Needed by the agent CLI to list a topic's tasks.
+      x-spec-note: Added at WS-1/WS-2 request — not in SPEC §13. Needed by the agent CLI to list a topic's
+        tasks.
       description: Caller must be a participant of the topic. Returns tasks in creation order.
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       responses:
         '200':
           description: Topic tasks
@@ -1610,63 +2107,92 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [tasks]
+                required:
+                - tasks
                 properties:
                   tasks:
                     type: array
-                    items: { $ref: '#/components/schemas/Task' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
-  /v1/topics/{tid}/envelopes:
+                    items:
+                      $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/topics/{tid}/envelopes:
     post:
-      tags: [e2ee]
+      tags:
+      - e2ee
       operationId: postTopicEnvelope
       summary: Store a sealed topic-key envelope for a recipient agent
-      description: |
-        E2EE (sync v2). STAGED distribution: stores one sealed topic-key
+      description: 'E2EE (sync v2). STAGED distribution: stores one sealed topic-key
+
         envelope for the target (member_id, agent_label). The envelope blob
+
         is opaque to the server: format-validated (standard base64) and
+
         stored, never inspected. N04: a new key_id is STORED, never flipped —
+
         only POST .../keys/commit activates a key and advances
+
         topics.current_key_id. The caller must be a current participant of
+
         the topic (403 otherwise); introducing a key_id different from the
-        topic's current_key_id is allowed only for owner/parent callers (403
+
+        topic''s current_key_id is allowed only for owner/parent callers (403
+
         otherwise). The target must be a current participant AND hold an
+
         ACTIVE (non-superseded) registered public key (400 otherwise —
+
         sealing to an agent with no key on file is meaningless; they must
-        run `hub key-init` first). The server records the target's active
-        identity-key id on the row (identity_key_id) for the commit's
+
+        run `hub key-init` first). The server records the target''s active
+
+        identity-key id on the row (identity_key_id) for the commit''s
+
         superseded-key check. Re-POSTing the same
+
         (topic_id, member_id, agent_label, key_id) replaces the stored
+
         envelope — idempotent distribution — and preserves the original
+
         created_at (secfix F3).
+
+        '
       parameters:
-        - name: tid
-          in: path
-          required: true
-          schema: { type: string }
+      - name: tid
+        in: path
+        required: true
+        schema:
+          type: string
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [member_id, agent_label, key_id, envelope]
+              required:
+              - member_id
+              - agent_label
+              - key_id
+              - envelope
               properties:
-                member_id: { type: string }
-                agent_label: { type: string }
+                member_id:
+                  type: string
+                agent_label:
+                  type: string
                 key_id:
                   type: string
                   description: Random 128-bit topic-key id, 32 hex chars.
                 envelope:
                   type: string
-                  description: >
-                    Standard base64 crypto_box_seal of (topic_id_bytes ||
-                    0x00 || key_id_bytes || topic_key) to the target agent's
-                    X25519 public key (secfix F2: the topic_id binding stops
-                    cross-topic envelope transplants). Opaque to the server.
+                  description: 'Standard base64 crypto_box_seal of (topic_id_bytes || 0x00 || key_id_bytes
+                    || topic_key) to the target agent''s X25519 public key (secfix F2: the topic_id binding
+                    stops cross-topic envelope transplants). Opaque to the server.
+
+                    '
       responses:
         '201':
           description: Envelope stored
@@ -1674,37 +2200,64 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic_id, member_id, agent_label, key_id, created_at]
+                required:
+                - topic_id
+                - member_id
+                - agent_label
+                - key_id
+                - created_at
                 properties:
-                  topic_id: { type: string }
-                  member_id: { type: string }
-                  agent_label: { type: string }
-                  key_id: { type: string }
-                  created_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+                  topic_id:
+                    type: string
+                  member_id:
+                    type: string
+                  agent_label:
+                    type: string
+                  key_id:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
     get:
-      tags: [e2ee]
+      tags:
+      - e2ee
       operationId: listTopicEnvelopes
       summary: Fetch my own key envelopes for a topic
-      description: |
-        E2EE (sync v2). Returns ONLY the caller's own envelopes for COMMITTED
-        epochs — rows are matched on the caller's (member_id, agent_label)
+      description: 'E2EE (sync v2). Returns ONLY the caller''s own envelopes for COMMITTED
+
+        epochs — rows are matched on the caller''s (member_id, agent_label)
+
         from the Bearer <redacted> never on caller-supplied input, and joined
-        against the topic's epoch log. Staged (uncommitted) keys stay
+
+        against the topic''s epoch log. Staged (uncommitted) keys stay
+
         invisible until POST .../keys/commit activates them: an uncommitted
+
         key must never be treated as usable. Each envelope carries its
-        epoch's `commitment` (hex SHA256 of the topic key; null for
-        grandfathered pre-migration epochs) for the CLI's verify-on-open
-        (N07). One agent can never fetch another agent's envelopes. 403 when
+
+        epoch''s `commitment` (hex SHA256 of the topic key; null for
+
+        grandfathered pre-migration epochs) for the CLI''s verify-on-open
+
+        (N07). One agent can never fetch another agent''s envelopes. 403 when
+
         the caller is not a participant of the topic.
+
+        '
       parameters:
-        - name: tid
-          in: path
-          required: true
-          schema: { type: string }
+      - name: tid
+        in: path
+        required: true
+        schema:
+          type: string
       responses:
         '200':
           description: The caller's envelopes for this topic
@@ -1712,66 +2265,74 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [envelopes]
+                required:
+                - envelopes
                 properties:
                   envelopes:
                     type: array
                     items:
                       type: object
-                      required: [topic_id, member_id, agent_label, key_id, envelope, created_at, epoch]
+                      required:
+                      - topic_id
+                      - member_id
+                      - agent_label
+                      - key_id
+                      - envelope
+                      - created_at
+                      - epoch
                       properties:
-                        topic_id: { type: string }
-                        member_id: { type: string }
-                        agent_label: { type: string }
-                        key_id: { type: string }
-                        envelope: { type: string }
-                        created_at: { type: string, format: date-time }
-                        epoch: { type: integer, description: Committed epoch this envelope belongs to. }
+                        topic_id:
+                          type: string
+                        member_id:
+                          type: string
+                        agent_label:
+                          type: string
+                        key_id:
+                          type: string
+                        envelope:
+                          type: string
+                        created_at:
+                          type: string
+                          format: date-time
+                        epoch:
+                          type: integer
+                          description: Committed epoch this envelope belongs to.
                         commitment:
                           type: string
                           nullable: true
-                          description: >
-                            Hex SHA256 of the topic key for verify-on-open;
-                            null for grandfathered pre-migration epochs.
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
+                          description: 'Hex SHA256 of the topic key for verify-on-open; null for grandfathered
+                            pre-migration epochs.
 
-  /v1/topics/{tid}/keys/commit:
+                            '
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/topics/{tid}/keys/commit:
     post:
-      tags: [e2ee]
+      tags:
+      - e2ee
       operationId: commitTopicKey
       summary: Staged atomic key activation (sync v2)
-      description: |
-        Handles GENESIS (expected_epoch 1, topic at epoch 0) and ROTATION
-        (expected_epoch = current_epoch + 1). Body
-        { expected_epoch, key_id, commitment, force }. Owner/parent only;
-        force is owner-only. Single transaction: expected_epoch must equal
-        current_epoch + 1 (409 stale_epoch); key_id must never have been used
-        for this topic (409 key_reuse); commitment must be 64 hex chars and
-        never used (409 key_material_reuse). Then the set-equality of STAGED
-        vs CURRENT agents (staged = envelope rows for key_id sealed to each
-        agent's currently-active identity key; current = live agents of
-        current participants): staged envelopes for non-participants BURN the
-        key — 409 recipients_removed_key_burned, staged rows deleted, client
-        must generate fresh key material (force cannot override); agents with
-        an active identity key but no staged envelope for it → 409
-        superseded_identity_key (not force-overridable — re-seal to the
-        active key); agents with no active identity key at all → 409
-        incomplete_distribution, or commit with force:true recording
-        forced=1 + forced_missing (the ONLY case force covers). On success
-        the epoch row is inserted and topics.current_key_id/current_epoch
-        advance atomically (rotation_required cleared). Response
-        { topic_id, epoch, key_id }.
+      description: Commit the complete staged recipient set for current_epoch + 1. The subject must be
+        encrypted with this candidate key. The epoch, encrypted subject and write-unblocking transition
+        commit atomically against the membership snapshot. Removed recipients burn the key; missing identities
+        or envelopes block activation. There is no force bypass.
       parameters:
-        - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/TopicId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [expected_epoch, key_id, commitment]
+              required:
+              - expected_epoch
+              - key_id
+              - commitment
+              - subject
               properties:
                 expected_epoch:
                   type: integer
@@ -1783,10 +2344,8 @@ paths:
                 commitment:
                   type: string
                   description: Hex SHA256 of the topic key, 64 hex chars; never reused.
-                force:
-                  type: boolean
-                  default: false
-                  description: Owner-only; covers ONLY agents with no active identity key.
+                subject: *id002
+              additionalProperties: false
       responses:
         '200':
           description: Epoch committed
@@ -1794,37 +2353,49 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [topic_id, epoch, key_id]
+                required:
+                - topic_id
+                - epoch
+                - key_id
                 properties:
-                  topic_id: { type: string }
-                  epoch: { type: integer }
-                  key_id: { type: string }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-
-  /v1/tasks/{tid}/notes:
+                  topic_id:
+                    type: string
+                  epoch:
+                    type: integer
+                  key_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v2/tasks/{tid}/notes:
     post:
-      tags: [tasks]
+      tags:
+      - tasks
       operationId: addTaskNote
       summary: Add a progress note to a task
-      description: |
-        Appends a `task_note` entry to the task's topic. Body is PII-scanned.
-        Sync v2 (spec §1.5): when the task's topic is E2EE the note body must
-        be well-formed fh1 (400 `plaintext_in_e2ee_topic` otherwise).
+      description: Participant-only content write. All supplied content fields must be encrypted under
+        the active topic key. Initialization and pending rotation block writes. Task ownership, history
+        floors, and subtask completion rules remain enforced. PII scanning happens on the client before
+        encryption.
       parameters:
-        - $ref: '#/components/parameters/TaskId'
+      - $ref: '#/components/parameters/TaskId'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [body]
+              required:
+              - body
               properties:
-                body: { type: string, minLength: 1, maxLength: 20000 }
+                body: *id002
       responses:
         '201':
           description: Note appended
@@ -1832,29 +2403,33 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entry]
+                required:
+                - entry
                 properties:
-                  entry: { $ref: '#/components/schemas/Entry' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '422': { $ref: '#/components/responses/PiiError' }
-
-  /v1/tasks/{tid}/done:
+                  entry:
+                    $ref: '#/components/schemas/Entry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/PiiError'
+  /v2/tasks/{tid}/done:
     post:
-      tags: [tasks]
+      tags:
+      - tasks
       operationId: completeTask
       summary: Complete a task with a structured result
-      description: |
-        Sets status to done, stores the `result` JSON, appends `task_done`.
-        Rejected with 409 while any subtask is not in done/cancelled.
-        N05 (E2EE topics): `result` must be an fh1 sealed body (400
-        `plaintext_in_e2ee_topic` otherwise); the `task_done` entry data
-        carries it as `{"task_id": "…", "sealed": "fh1…"}` with `task_id`
-        plaintext for the F06 visibility predicate.
+      description: Participant-only content write. All supplied content fields must be encrypted under
+        the active topic key. Initialization and pending rotation block writes. Task ownership, history
+        floors, and subtask completion rules remain enforced. PII scanning happens on the client before
+        encryption.
       parameters:
-        - $ref: '#/components/parameters/TaskId'
+      - $ref: '#/components/parameters/TaskId'
       requestBody:
         required: false
         content:
@@ -1862,9 +2437,7 @@ paths:
             schema:
               type: object
               properties:
-                result:
-                  type: object
-                  description: 'Machine-readable handoff payload, e.g. {"conflicts": [...]}.'
+                result: *id002
       responses:
         '200':
           description: Task completed
@@ -1872,24 +2445,32 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [task]
+                required:
+                - task
                 properties:
-                  task: { $ref: '#/components/schemas/Task' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-
-
-  /v1/health:
+                  task:
+                    $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v2/health:
     get:
-      tags: [ops]
+      tags:
+      - ops
       operationId: healthCheck
       summary: Liveness check
-      description: |
-        Public. Returns ok, the server version, and the API majors this
+      description: 'Public. Returns ok, the server version, and the API majors this
+
         server speaks. The client version gate never blocks this endpoint.
+
+        '
       security: []
       responses:
         '200':
@@ -1898,34 +2479,55 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [ok, version, api_versions]
+                required:
+                - ok
+                - version
+                - api_versions
                 properties:
-                  ok: { type: boolean, example: true }
-                  version: { type: string, example: "0.12.0" }
+                  ok:
+                    type: boolean
+                    example: true
+                  version:
+                    type: string
+                    example: 0.12.0
                   api_versions:
                     type: array
-                    items: { type: string }
-                    example: ["v1"]
-                    description: |
-                      The API majors this server implements. Clients pick the
+                    items:
+                      type: string
+                    example:
+                    - v1
+                    description: 'The API majors this server implements. Clients pick the
+
                       highest major they implement (v1 today). Becomes
+
                       ["v1","v2"] if a breaking change ever lands.
 
-  /v1/client/latest:
+                      '
+  /v2/client/latest:
     get:
-      tags: [ops]
+      tags:
+      - ops
       operationId: getClientLatest
       summary: Current CLI release known to this server
-      description: |
-        Public. Returns the CLI release metadata the deployed server knows
+      description: 'Public. Returns the CLI release metadata the deployed server knows
+
         about, sourced from the repo-controlled `server/client-manifest.json`
+
         (bundled at build time — no database read; the release workflow is
+
         the only writer). Used by `hub upgrade` to compare the installed
+
         version, fetch the new artifacts, and verify their sha256. The client
+
         version gate never blocks this endpoint, so an outdated client can
+
         always reach the metadata it needs in order to update. All URLs are
+
         absolute and self-referential: this server serves its own bundled
-        artifacts (see /v1/client/download/*).
+
+        artifacts (see /v2/client/download/*).
+
+        '
       security: []
       responses:
         '200':
@@ -1934,167 +2536,266 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [version, min_cli_version, server_version, sha256, released_at, download_url, assets, skill]
+                required:
+                - version
+                - min_cli_version
+                - server_version
+                - sha256
+                - released_at
+                - download_url
+                - assets
+                - skill
                 properties:
-                  version: { type: string, example: "0.9.0" }
-                  min_cli_version: { type: string, example: "0.9.0" }
+                  version:
+                    type: string
+                    example: 0.9.0
+                  min_cli_version:
+                    type: string
+                    example: 0.9.0
                   server_version:
                     type: string
-                    example: "0.12.0"
+                    example: 0.12.0
                     description: The version of THIS server build (makes the server↔CLI pairing machine-readable).
-                  sha256: { type: string, example: "b7873c4e…" }
-                  released_at: { type: string, format: date-time }
+                  sha256:
+                    type: string
+                    example: b7873c4e…
+                  released_at:
+                    type: string
+                    format: date-time
                   download_url:
                     type: string
                     format: uri
-                    example: "https://<server>/v1/client/download/hub"
-                    description: Kept for field continuity; repointed at this server. The explicit contract the CLI uses is `assets`.
+                    example: https://<server>/v2/client/download/hub
+                    description: Kept for field continuity; repointed at this server. The explicit contract
+                      the CLI uses is `assets`.
                   assets:
                     type: object
-                    required: [hub, sigstore, manifest]
+                    required:
+                    - hub
+                    - sigstore
+                    - manifest
                     properties:
-                      hub: { type: string, format: uri, example: "https://<server>/v1/client/download/hub" }
-                      sigstore: { type: string, format: uri, example: "https://<server>/v1/client/download/hub.sigstore" }
-                      manifest: { type: string, format: uri, example: "https://<server>/v1/client/download/manifest.json" }
+                      hub:
+                        type: string
+                        format: uri
+                        example: https://<server>/v2/client/download/hub
+                      sigstore:
+                        type: string
+                        format: uri
+                        example: https://<server>/v2/client/download/hub.sigstore
+                      manifest:
+                        type: string
+                        format: uri
+                        example: https://<server>/v2/client/download/manifest.json
                   skill:
                     type: object
-                    required: [url, sha256, version]
-                    description: The versioned skill bundle (SKILL.md, references/, INSTALL.md, requirements.txt plus the hub artifact, its sigstore bundle, and the release manifest), hash-verified at build time. `hub upgrade`'s skill-refresh reads this block.
+                    required:
+                    - url
+                    - sha256
+                    - version
+                    description: The versioned skill bundle (SKILL.md, references/, INSTALL.md, requirements.txt
+                      plus the hub artifact, its sigstore bundle, and the release manifest), hash-verified
+                      at build time. `hub upgrade`'s skill-refresh reads this block.
                     properties:
-                      url: { type: string, format: uri, example: "https://<server>/v1/client/download/skill.tar.gz" }
-                      sha256: { type: string, example: "9f2c…", description: "sha256 of skill.tar.gz (pin skill_sha256, cross-checked against the release manifest at build time)" }
-                      version: { type: string, example: "0.11.0", description: "Skill version, from the SKILL VERSION header of agent-skill/SKILL.md (versions independently from the CLI)" }
-
-  /v1/client/download/hub:
+                      url:
+                        type: string
+                        format: uri
+                        example: https://<server>/v2/client/download/skill.tar.gz
+                      sha256:
+                        type: string
+                        example: 9f2c…
+                        description: sha256 of skill.tar.gz (pin skill_sha256, cross-checked against the
+                          release manifest at build time)
+                      version:
+                        type: string
+                        example: 0.11.0
+                        description: Skill version, from the SKILL VERSION header of agent-skill/SKILL.md
+                          (versions independently from the CLI)
+  /v2/client/download/hub:
     get:
-      tags: [ops]
+      tags:
+      - ops
       operationId: downloadClientHub
       summary: Download the bundled CLI artifact
-      description: |
-        Public. Serves the `hub` CLI artifact bundled into this server build
+      description: 'Public. Serves the `hub` CLI artifact bundled into this server build
+
         (hash-verified at build time against the pinned release). Exact path
+
         only — no path parameters, so no traversal surface by construction;
-        anything else under /v1/client/download/ 404s. The client version
+
+        anything else under /v2/client/download/ 404s. The client version
+
         gate never blocks this endpoint (an outdated client must be able to
+
         fetch its replacement). Rate-limited per IP with a generous bucket;
+
         `Content-Length` is set and `Cache-Control: public, max-age=300`
+
         (bytes change when the manifest pin updates + the server redeploys —
+
         NOT immutable).
+
+        '
       security: []
       responses:
         '200':
           description: The CLI artifact bytes
           headers:
             Content-Disposition:
-              schema: { type: string }
-              description: 'attachment; filename="hub"'
+              schema:
+                type: string
+              description: attachment; filename="hub"
             Cache-Control:
-              schema: { type: string }
-              description: 'public, max-age=300'
+              schema:
+                type: string
+              description: public, max-age=300
           content:
             application/octet-stream:
-              schema: { type: string, format: binary }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
-  /v1/client/download/hub.sigstore:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v2/client/download/hub.sigstore:
     get:
-      tags: [ops]
+      tags:
+      - ops
       operationId: downloadClientSigstore
       summary: Download the bundled sigstore signature bundle
-      description: |
-        Public. Serves the `hub.sigstore` keyless-OIDC signature bundle for
+      description: 'Public. Serves the `hub.sigstore` keyless-OIDC signature bundle for
+
         the pinned CLI release (same build-bundling, rate limit, and cache
-        rules as /v1/client/download/hub). The CLI verifies this seal
+
+        rules as /v2/client/download/hub). The CLI verifies this seal
+
         client-side before installing — the trust anchor, unchanged by the
+
         server-hosted transport.
+
+        '
       security: []
       responses:
         '200':
           description: The sigstore bundle (JSON)
           headers:
             Content-Disposition:
-              schema: { type: string }
-              description: 'attachment; filename="hub.sigstore"'
+              schema:
+                type: string
+              description: attachment; filename="hub.sigstore"
             Cache-Control:
-              schema: { type: string }
-              description: 'public, max-age=300'
+              schema:
+                type: string
+              description: public, max-age=300
           content:
             application/json:
-              schema: { type: object }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
-  /v1/client/download/manifest.json:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v2/client/download/manifest.json:
     get:
-      tags: [ops]
+      tags:
+      - ops
       operationId: downloadClientManifest
       summary: Download the release manifest for the bundled CLI
-      description: |
-        Public. Serves the release `manifest.json` ({version, sha256, files,
+      description: 'Public. Serves the release `manifest.json` ({version, sha256, files,
+
         signature, identity, released_at}) for the pinned CLI release (same
+
         build-bundling, rate limit, and cache rules as
-        /v1/client/download/hub). The CLI verifies sha256(hub) against this
+
+        /v2/client/download/hub). The CLI verifies sha256(hub) against this
+
         manifest client-side before installing.
+
+        '
       security: []
       responses:
         '200':
           description: The release manifest (JSON)
           headers:
             Content-Disposition:
-              schema: { type: string }
-              description: 'attachment; filename="manifest.json"'
+              schema:
+                type: string
+              description: attachment; filename="manifest.json"
             Cache-Control:
-              schema: { type: string }
-              description: 'public, max-age=300'
+              schema:
+                type: string
+              description: public, max-age=300
           content:
             application/json:
-              schema: { type: object }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
-  /v1/client/download/skill.tar.gz:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v2/client/download/skill.tar.gz:
     get:
-      tags: [ops]
+      tags:
+      - ops
       operationId: downloadSkillBundle
       summary: Download the versioned skill bundle
-      description: |
-        Public. Serves the `skill.tar.gz` bundle for the pinned CLI release:
+      description: 'Public. Serves the `skill.tar.gz` bundle for the pinned CLI release:
+
         `SKILL.md`, `references/`, `INSTALL.md`, `requirements.txt`, plus
+
         the `hub` artifact, its `hub.sigstore` bundle, and the release
+
         `manifest.json` (same build-bundling, rate limit, and cache rules as
-        /v1/client/download/hub). The bundler verifies sha256(skill.tar.gz)
-        against BOTH the pin's `skill_sha256` and the release manifest's
+
+        /v2/client/download/hub). The bundler verifies sha256(skill.tar.gz)
+
+        against BOTH the pin''s `skill_sha256` and the release manifest''s
+
         `skill_sha256` at build time, and structurally validates the tarball
-        (relative paths only, no links). `hub upgrade`'s skill-refresh
+
+        (relative paths only, no links). `hub upgrade`''s skill-refresh
+
         verifies the sha256 client-side before extracting.
+
+        '
       security: []
       responses:
         '200':
           description: The skill bundle (gzipped tar)
           headers:
             Content-Disposition:
-              schema: { type: string }
-              description: 'attachment; filename="skill.tar.gz"'
+              schema:
+                type: string
+              description: attachment; filename="skill.tar.gz"
             Cache-Control:
-              schema: { type: string }
-              description: 'public, max-age=300'
+              schema:
+                type: string
+              description: public, max-age=300
           content:
             application/gzip:
-              schema: { type: string, format: binary }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
-  /v1/server/owners:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v2/server/owners:
     get:
-      tags: [server]
+      tags:
+      - server
       operationId: listServerOwners
       summary: List server owners
-      description: |
-        Server ownership control plane — **server owners only** (403 otherwise).
+      description: 'Server ownership control plane — **server owners only** (403 otherwise).
+
         Server ownership is explicit (rows in `server_owners`) and is what
+
         grants circle-creation power. Circle owners manage only their own
+
         circle and cannot use this endpoint.
+
+        '
       responses:
         '200':
           description: The server owners, oldest first
@@ -2102,31 +2803,50 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [owners]
+                required:
+                - owners
                 properties:
                   owners:
                     type: array
                     items:
                       type: object
-                      required: [principal_id, created_at]
+                      required:
+                      - principal_id
+                      - created_at
                       properties:
-                        principal_id: { type: string }
-                        name: { type: string, nullable: true }
-                        email: { type: string, nullable: true }
-                        created_at: { type: string, format: date-time }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '429': { $ref: '#/components/responses/RateLimited' }
+                        principal_id:
+                          type: string
+                        name:
+                          type: string
+                          nullable: true
+                        email:
+                          type: string
+                          nullable: true
+                        created_at:
+                          type: string
+                          format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
     post:
-      tags: [server]
+      tags:
+      - server
       operationId: promoteServerOwner
       summary: Promote a principal to server owner
-      description: |
-        Server ownership control plane — **server owners only** (403 otherwise).
+      description: 'Server ownership control plane — **server owners only** (403 otherwise).
+
         Promotes one principal to server owner, granting them circle-creation
+
         power. Identify the principal directly (`principal_id`) or pass one of
+
         their member ids (`member_id`) and the server resolves it. Idempotent:
+
         promoting an existing server owner returns the row.
+
+        '
       requestBody:
         required: true
         content:
@@ -2147,36 +2867,52 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [owner]
+                required:
+                - owner
                 properties:
                   owner:
                     type: object
-                    required: [principal_id, created_at]
+                    required:
+                    - principal_id
+                    - created_at
                     properties:
-                      principal_id: { type: string }
-                      created_at: { type: string, format: date-time }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
-  /v1/server/owners/{principal}:
+                      principal_id:
+                        type: string
+                      created_at:
+                        type: string
+                        format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v2/server/owners/{principal}:
     delete:
-      tags: [server]
+      tags:
+      - server
       operationId: demoteServerOwner
       summary: Demote a server owner
-      description: |
-        Server ownership control plane — **server owners only** (403 otherwise).
+      description: 'Server ownership control plane — **server owners only** (403 otherwise).
+
         Removes one principal from the server owners. Refuses to demote the
+
         last server owner (400): an empty table would lock everyone out of
+
         circle creation and promotion alike.
+
+        '
       parameters:
-        - name: principal
-          in: path
-          required: true
-          schema: { type: string }
-          description: Principal id to demote
+      - name: principal
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Principal id to demote
       responses:
         '200':
           description: The demoted principal
@@ -2184,313 +2920,565 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [removed]
+                required:
+                - removed
                 properties:
-                  removed: { type: string }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/RateLimited' }
-
+                  removed:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: "fh_<token>"
-      description: 'Per-agent bearer token issued at invite/provision accept. Sent as `Authorization: Bearer <token>`.'
-
+      bearerFormat: fh_<token>
+      description: 'Per-agent bearer token issued at invite/provision accept. Sent as `Authorization:
+        Bearer <token>`.'
   parameters:
     FamilyId:
       name: fid
       in: path
       required: true
-      schema: { type: string, minLength: 1 }
+      schema:
+        type: string
+        minLength: 1
     MemberId:
       name: mid
       in: path
       required: true
-      schema: { type: string, minLength: 1 }
+      schema:
+        type: string
+        minLength: 1
     TopicId:
       name: tid
       in: path
       required: true
-      schema: { type: string, minLength: 1 }
+      schema:
+        type: string
+        minLength: 1
     TaskId:
       name: tid
       in: path
       required: true
-      schema: { type: string, minLength: 1 }
-
+      schema:
+        type: string
+        minLength: 1
   schemas:
     Role:
       type: string
-      enum: [owner, parent, kid]
+      enum:
+      - owner
+      - parent
+      - kid
     TopicKind:
       type: string
-      enum: [direct, group]
+      enum:
+      - direct
+      - group
     LinkVisibility:
       type: string
-      enum: [placeholder, hidden]
+      enum:
+      - placeholder
+      - hidden
       default: placeholder
     HistoryFrom:
       type: string
-      enum: [full, from_join]
+      enum:
+      - full
+      - from_join
     EntryKind:
       type: string
-      enum: [message, briefing, member_joined, member_left, topic_spawned, task_created, task_assigned, task_status, task_note, task_done, redaction, key_rotated, key_request, pending_key_distribution, topic_archived]
+      enum:
+      - message
+      - briefing
+      - member_joined
+      - member_left
+      - topic_spawned
+      - task_created
+      - task_assigned
+      - task_status
+      - task_note
+      - task_done
+      - redaction
+      - key_rotated
+      - key_request
+      - pending_key_distribution
+      - topic_archived
     TaskStatus:
       type: string
-      enum: [open, in_progress, blocked, done, cancelled]
+      enum:
+      - open
+      - in_progress
+      - blocked
+      - done
+      - cancelled
     ErrorCode:
       type: string
-      enum: [bad_request, unauthorized, forbidden, setup_locked, not_found, subtasks_open, already_member, invite_used, invite_expired, code_used, code_expired, pii_detected, rate_limited, client_too_old, internal, already_owner, transfer_pending, transfer_expired, transfer_recipient_gone, transfer_offer_lapsed, noncontiguous_ack, invalid_read_receipt, stale_epoch, key_reuse, key_material_reuse, recipients_removed_key_burned, superseded_identity_key, incomplete_distribution, misconfigured, plaintext_in_e2ee_topic, msg_id_conflict, key_not_active, stale_key, rotation_required]
-
+      enum:
+      - bad_request
+      - unauthorized
+      - forbidden
+      - setup_locked
+      - not_found
+      - subtasks_open
+      - already_member
+      - invite_used
+      - invite_expired
+      - code_used
+      - code_expired
+      - pii_detected
+      - rate_limited
+      - client_too_old
+      - schema_required
+      - internal
+      - already_owner
+      - transfer_pending
+      - transfer_expired
+      - transfer_recipient_gone
+      - transfer_offer_lapsed
+      - noncontiguous_ack
+      - invalid_read_receipt
+      - stale_epoch
+      - key_reuse
+      - key_material_reuse
+      - recipients_removed_key_burned
+      - superseded_identity_key
+      - incomplete_distribution
+      - misconfigured
+      - plaintext_in_e2ee_topic
+      - msg_id_conflict
+      - key_not_active
+      - stale_key
+      - rotation_required
+      - operation_conflict
+      - history_not_granted
     Error:
       type: object
-      required: [error]
+      required:
+      - error
       properties:
         error:
           type: object
-          required: [code, message]
+          required:
+          - code
+          - message
           properties:
-            code: { $ref: '#/components/schemas/ErrorCode' }
-            message: { type: string }
-
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
     Family:
       type: object
-      required: [id, name, created_at]
+      required:
+      - id
+      - name
+      - created_at
       properties:
-        id: { type: string }
-        name: { type: string }
-        created_at: { type: string, format: date-time }
-
+        id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
     Member:
       type: object
-      description: >
-        family_id is present on roster endpoints (GET /v1/members, GET /v1/me)
-        and absent from enrollment responses (invite accept, bootstrap), which
-        return a narrower shape.
-      required: [id, name, email, role, created_at]
+      description: 'family_id is present on roster endpoints (GET /v2/members, GET /v2/me) and absent
+        from enrollment responses (invite accept, bootstrap), which return a narrower shape.
+
+        '
+      required:
+      - id
+      - name
+      - email
+      - role
+      - created_at
       properties:
-        id: { type: string }
+        id:
+          type: string
         family_id:
           type: string
           description: Present on roster/self endpoints; absent on enrollment responses.
-        name: { type: string }
-        email: { type: string, format: email }
-        role: { $ref: '#/components/schemas/Role' }
-        created_at: { type: string, format: date-time }
-
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+        created_at:
+          type: string
+          format: date-time
     TransferCompletionMode:
       type: string
-      enum: [demote, remove]
-      description: |
-        What happens to the offering owner once the recipient accepts:
+      enum:
+      - demote
+      - remove
+      description: 'What happens to the offering owner once the recipient accepts:
+
         `demote` drops them to parent (their tokens keep working); `remove`
+
         strips the owner role AND revokes all of their agent tokens for the
+
         circle, ending their access entirely. The member row itself is
+
         retained for audit history.
 
+        '
     Transfer:
       type: object
-      required: [id, family_id, from_member_id, to_member_id, on_complete, status, created_at, expires_at]
+      required:
+      - id
+      - family_id
+      - from_member_id
+      - to_member_id
+      - on_complete
+      - status
+      - created_at
+      - expires_at
       properties:
-        id: { type: string }
-        family_id: { type: string }
+        id:
+          type: string
+        family_id:
+          type: string
         from_member_id:
           type: string
           description: The offering owner.
         to_member_id:
           type: string
           description: The named recipient — only they may accept.
-        on_complete: { $ref: '#/components/schemas/TransferCompletionMode' }
+        on_complete:
+          $ref: '#/components/schemas/TransferCompletionMode'
         status:
           type: string
-          enum: [pending, completed, cancelled]
-        created_at: { type: string, format: date-time }
+          enum:
+          - pending
+          - completed
+          - cancelled
+        created_at:
+          type: string
+          format: date-time
         expires_at:
           type: string
           format: date-time
           description: Offers expire 7 days after creation; expired offers cannot be accepted (410).
         decided_at:
-          type: ["string", "null"]
+          type:
+          - string
+          - 'null'
           format: date-time
           description: Set when the transfer completes, is cancelled, or is noticed expired.
-
     TokenInfo:
       type: object
-      required: [token_id, member_id, agent_label, created_at]
+      required:
+      - token_id
+      - member_id
+      - agent_label
+      - created_at
       properties:
-        token_id: { type: string }
-        member_id: { type: string }
-        agent_label: { type: string }
-        created_at: { type: string, format: date-time }
-        revoked_at: { type: ["string", "null"], format: date-time }
-        last_used_at: { type: ["string", "null"], format: date-time }
+        token_id:
+          type: string
+        member_id:
+          type: string
+        agent_label:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        last_used_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
       description: Token metadata. The token VALUE is never returned by any endpoint after issuance.
-
     TopicParticipantView:
       type: object
-      description: >
-        Participant as returned by the topic detail and export endpoints — a
-        separate top-level array, not nested in the topic. history_from_seq is
-        present on export; the detail endpoint omits it.
-      required: [member_id, name, role, joined_at]
-      properties:
-        member_id: { type: string }
-        name: { type: string }
-        role: { $ref: '#/components/schemas/Role' }
-        joined_at: { type: string, format: date-time }
-        history_from_seq: { type: integer, minimum: 1 }
+      description: 'Participant as returned by the topic detail and export endpoints — a separate top-level
+        array, not nested in the topic. history_from_seq is present on export; the detail endpoint omits
+        it.
 
+        '
+      required:
+      - member_id
+      - name
+      - role
+      - joined_at
+      properties:
+        member_id:
+          type: string
+        name:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        joined_at:
+          type: string
+          format: date-time
+        history_from_seq:
+          type: integer
+          minimum: 1
     Topic:
       type: object
-      description: >
-        Note: the SQLite-backed server encodes booleans as integers, so
-        parents_only may arrive as true/false or 1/0 — clients MUST accept
-        both. (Server-side coercion to true booleans is a recommended cleanup.)
-      required: [id, family_id, subject, kind, parents_only, created_by, created_at]
+      description: 'Note: the SQLite-backed server encodes booleans as integers, so parents_only may arrive
+        as true/false or 1/0 — clients MUST accept both. (Server-side coercion to true booleans is a recommended
+        cleanup.)
+
+        '
+      required:
+      - id
+      - family_id
+      - subject
+      - kind
+      - parents_only
+      - created_by
+      - created_at
       properties:
-        id: { type: string }
-        family_id: { type: string }
-        subject: { type: string }
-        kind: { $ref: '#/components/schemas/TopicKind' }
-        parents_only: { type: boolean }
-        parent_topic_id: { type: ["string", "null"] }
-        link_visibility: { $ref: '#/components/schemas/LinkVisibility' }
-        created_by: { type: string }
-        created_at: { type: string, format: date-time }
+        id:
+          type: string
+        family_id:
+          type: string
+        subject: *id002
+        kind:
+          $ref: '#/components/schemas/TopicKind'
+        parents_only:
+          type: boolean
+        parent_topic_id:
+          type:
+          - string
+          - 'null'
+        link_visibility:
+          $ref: '#/components/schemas/LinkVisibility'
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
         e2ee:
           type: integer
-          enum: [0, 1]
-          description: >
-            1 = end-to-end-encrypted topic (subject is opaque ciphertext;
-            entries are ciphertext — see Phase 3). 0 = plaintext topic.
+          const: 1
+          description: 'Invariant: all topics are encrypted.'
         current_key_id:
-          type: ["string", "null"]
-          description: >
-            E2EE key election (secfix F1): the key_id of the CURRENT topic
-            key. Set at E2EE creation from initial_key_id; afterwards only an
-            owner/parent may introduce a new key_id (rotation). Null for
-            plaintext topics. Clients elect the encryption key from this
-            field, never from envelope recency.
-
+          type:
+          - string
+          - 'null'
+          description: NULL until genesis commits; then the active committed key ID.
     Entry:
       type: object
-      required: [gseq, topic_id, seq, ts, actor_member_id, agent_label, kind, body]
+      required:
+      - gseq
+      - topic_id
+      - seq
+      - ts
+      - actor_member_id
+      - agent_label
+      - kind
+      - body
       properties:
         gseq:
           type: integer
           description: Global family ordering (drives /sync cursors). Equals the entry id.
-        topic_id: { type: string }
+        topic_id:
+          type: string
         seq:
           type: integer
           description: Per-topic ordering (drives history/threads).
-        ts: { type: string, format: date-time }
-        actor_member_id: { type: string, description: Stamped server-side from the token. }
-        agent_label: { type: string }
+        ts:
+          type: string
+          format: date-time
+        actor_member_id:
+          type: string
+          description: Stamped server-side from the token.
+        agent_label:
+          type: string
         token_id:
           type: string
-          description: >
-            Credential attribution. Required by SPEC section 3 but currently
-            omitted by the server — clients MUST NOT require it. (Recommended
-            server cleanup: include it in the serialized entry.)
-        kind: { $ref: '#/components/schemas/EntryKind' }
-        body: { type: string }
+          description: 'Credential attribution. Required by SPEC section 3 but currently omitted by the
+            server — clients MUST NOT require it. (Recommended server cleanup: include it in the serialized
+            entry.)
+
+            '
+        kind:
+          $ref: '#/components/schemas/EntryKind'
+        body:
+          type: string
         data:
-          type: ["object", "null"]
+          type:
+          - object
+          - 'null'
           description: Free-form JSON machine payload.
         reply_to_seq:
-          type: ["integer", "null"]
-
+          type:
+          - integer
+          - 'null'
     Task:
       type: object
-      required: [id, topic_id, title, status, owner_member_id, created_by, created_at, updated_at]
+      required:
+      - id
+      - topic_id
+      - title
+      - status
+      - owner_member_id
+      - created_by
+      - created_at
+      - updated_at
       properties:
-        id: { type: string }
-        topic_id: { type: string }
-        title: { type: string }
-        description: { type: ["string", "null"] }
-        status: { $ref: '#/components/schemas/TaskStatus' }
-        owner_member_id: { type: string }
-        assignee_member_id: { type: ["string", "null"] }
-        parent_task_id: { type: ["string", "null"] }
-        due_at: { type: ["string", "null"], format: date-time }
+        id:
+          type: string
+        topic_id:
+          type: string
+        title:
+          type: string
+        description:
+          type:
+          - string
+          - 'null'
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+        owner_member_id:
+          type: string
+        assignee_member_id:
+          type:
+          - string
+          - 'null'
+        parent_task_id:
+          type:
+          - string
+          - 'null'
+        due_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         result:
-          type: ["object", "null"]
+          type:
+          - object
+          - 'null'
           description: Structured handoff payload, set on done.
-        created_by: { type: string }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    EncryptedContent:
+      type: string
+      pattern: ^fh1\.[0-9a-f]{32}\.[0-9a-f]{32}\.[A-Za-z0-9+/]+={0,2}$
+      description: XChaCha20-Poly1305 encrypted field, bound to topic ID, key ID and message ID. Canonical
+        padded base64 contains a 24-byte nonce and at least a 16-byte tag.
   responses:
     BadRequest:
       description: Bad request — input failed validation (400)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: bad_request, message: "subject: must be 1..200 characters" }
+            error:
+              code: bad_request
+              message: 'subject: must be 1..200 characters'
     Unauthorized:
       description: Missing, unknown, or revoked token (401)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: unauthorized, message: "Invalid or revoked token." }
+            error:
+              code: unauthorized
+              message: Invalid or revoked token.
     Forbidden:
       description: Valid token, but not a participant / wrong role (403)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: forbidden, message: "You are not a participant of this topic." }
+            error:
+              code: forbidden
+              message: You are not a participant of this topic.
     NotFound:
       description: Unknown id / code (404)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: not_found, message: "Topic not found." }
+            error:
+              code: not_found
+              message: Topic not found.
     Conflict:
       description: State conflict — subtasks_open, already_member, invite_used, code_used (409)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: subtasks_open, message: "Task has open subtasks." }
+            error:
+              code: subtasks_open
+              message: Task has open subtasks.
     Gone:
       description: Expired single-use code — invite_expired, code_expired (410)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: invite_expired, message: "Invite expired." }
+            error:
+              code: invite_expired
+              message: Invite expired.
     PiiError:
       description: Possible PII detected — rejected, nothing stored (422)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: pii_detected, message: "Possible card number detected in body; rephrase without the number and retry." }
+            error:
+              code: pii_detected
+              message: Possible card number detected in body; rephrase without the number and retry.
     RateLimited:
       description: Too many requests (429)
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: rate_limited, message: "Slow down." }
+            error:
+              code: rate_limited
+              message: Slow down.
     ClientTooOld:
-      description: |
-        Client version below the server's MIN_CLI_VERSION (426). Fired by
-        the client version gate on /v1/* requests carrying a
-        `family-hub-agent/<semver>` User-Agent — except /v1/health,
-        /v1/client/latest, and /v1/client/download/*, which an outdated
+      description: 'Client version below the server''s MIN_CLI_VERSION (426). Fired by
+
+        the client version gate on /v2/* requests carrying a
+
+        `family-hub-agent/<semver>` User-Agent — except /v2/health,
+
+        /v2/client/latest, and /v2/client/download/*, which an outdated
+
         client must always reach in order to update.
+
+        '
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema:
+            $ref: '#/components/schemas/Error'
           example:
-            error: { code: client_too_old, message: "Client version 0.5.0 is below the required minimum 0.9.0. Update your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry." }
+            error:
+              code: client_too_old
+              message: 'Client version 0.5.0 is below the required minimum 0.9.0. Update your CLI: see
+                agent-skill/INSTALL.md (hub upgrade), then retry.'

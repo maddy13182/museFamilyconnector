@@ -77,7 +77,7 @@ No credential material is ever posted on Hub topics: no invite codes, no
 provisioning codes, no bearer tokens. The skill's PII rule (§6) forbids it,
 `hub` scans locally before sending, and the server scans again (422 on a
 hit). Posting a code on the Hub is a protocol violation even in a
-"private" topic — the server operator can read plaintext topics.
+"private" topic — all topics are encrypted; the server operator sees metadata, not topic content.
 
 The invite code travels **out-of-band only**: Eve emails or DMs it to the
 requester directly, and the requester's agent helps them redeem it
@@ -128,10 +128,10 @@ contains the code itself.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/families/:id/transfer` | Offer ownership to a member (two-phase step 1). |
-| `POST /v1/families/:id/transfer/accept` | Target member accepts — owner swap happens here, atomically. |
-| `POST /v1/families/:id/transfer/cancel` | Current owner cancels a pending offer. |
-| `GET /v1/families/:id/transfer` | Status of the pending transfer. |
+| `POST /v2/families/:id/transfer` | Offer ownership to a member (two-phase step 1). |
+| `POST /v2/families/:id/transfer/accept` | Target member accepts — owner swap happens here, atomically. |
+| `POST /v2/families/:id/transfer/cancel` | Current owner cancels a pending offer. |
+| `GET /v2/families/:id/transfer` | Status of the pending transfer. |
 
 CLI mirrors them under `hub circle`: `transfer`, `transfer-accept`,
 `transfer-cancel`, `transfer-status`.
