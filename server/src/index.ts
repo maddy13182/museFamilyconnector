@@ -615,7 +615,7 @@ async function requireFamilyMembers(
   const rows: Row[] = [];
   for (const id of ids) {
     const m = await db.queryOne(
-      `SELECT * FROM members WHERE id = ? AND family_id = ?`,
+      `SELECT * FROM members WHERE id = ? AND family_id = ? AND removed_at IS NULL`,
       [id, auth.family_id],
     );
     if (!m) throw new HttpError(400, 'bad_request', `Unknown member id: ${id}`);
@@ -1215,7 +1215,7 @@ async function isHubOwner(db: DbClient, auth: AuthContext): Promise<boolean> {
   const pid = auth.principal_id;
   if (!pid) return false;
   const row = await db.queryOne(
-    `SELECT 1 FROM members WHERE principal_id = ? AND role = 'owner' LIMIT 1`,
+    `SELECT 1 FROM members WHERE principal_id = ? AND role = 'owner' AND removed_at IS NULL LIMIT 1`,
     [pid],
   );
   return row !== null;
@@ -1480,8 +1480,9 @@ async function handleCreateInvite(
     const prior = await findCreateIdem(db, 'invite', auth.member_id, idemKey);
     if (prior) {
       // Mirror the normal path: if the email joined since, report it.
+      // Removed members don't block: their email is free for re-invite.
       const already = await db.queryOne(
-        `SELECT id FROM members WHERE family_id = ? AND email = ?`,
+        `SELECT id FROM members WHERE family_id = ? AND email = ? AND removed_at IS NULL`,
         [auth.family_id, email],
       );
       if (already) throw new HttpError(409, 'already_member', 'This email is already a family member');
@@ -1510,8 +1511,9 @@ async function handleCreateInvite(
       return json({ invite_code: code, expires_at: expiresAt, onboarding_url: page.onboardingUrl, deduped: true });
     }
   }
+  // Removed members don't block re-invite: their email is free again.
   const existing = await db.queryOne(
-    `SELECT id FROM members WHERE family_id = ? AND email = ?`,
+    `SELECT id FROM members WHERE family_id = ? AND email = ? AND removed_at IS NULL`,
     [auth.family_id, email],
   );
   if (existing) throw new HttpError(409, 'already_member', 'This email is already a family member');
@@ -1575,8 +1577,9 @@ async function handleAcceptInvite(
   const email = invite['email'] as string;
   const inviteFamilyId = invite['family_id'] as string;
   const inviteRole = invite['role'] as string;
+  // Removed members don't block: the invite provisions a fresh identity.
   const dup = await db.queryOne(
-    `SELECT id FROM members WHERE family_id = ? AND email = ?`,
+    `SELECT id FROM members WHERE family_id = ? AND email = ? AND removed_at IS NULL`,
     [inviteFamilyId, email],
   );
   if (dup) throw new HttpError(409, 'already_member', 'This email is already a family member');
@@ -2129,7 +2132,7 @@ async function handleOfferOwnership(
   // caller-supplied identity claims beyond the member id — and must not
   // already be an owner (a caller who is an owner cannot offer to themselves).
   const target = await db.queryOne(
-    `SELECT * FROM members WHERE id = ? AND family_id = ?`,
+    `SELECT * FROM members WHERE id = ? AND family_id = ? AND removed_at IS NULL`,
     [toMemberId, auth.family_id],
   );
   if (!target) throw new HttpError(404, 'not_found', 'Target member is not in this circle');
@@ -2345,6 +2348,86 @@ async function handleGetOwnershipTransfer(
   if (fid !== auth.family_id) throw new HttpError(404, 'not_found', 'Family not found');
   const transfer = await findPendingTransfer(db, auth.family_id);
   return json({ transfer: transfer ? publicTransfer(transfer) : null });
+}
+
+// DELETE /v1/families/:fid/members/:mid — circle owner only.
+// Soft-removes a member from the circle: sets removed_at, revokes every
+// agent token of the member, drops their topic participation (E2EE topics
+// they were in get rotation_required, mirroring topic participant
+// removal), and cancels any pending ownership transfer involving them.
+//
+// Member rows are never physically deleted: invites, topics, entries,
+// tasks and the audit trail reference members(id) with NOT NULL FKs, so a
+// physical DELETE would fail or destroy circle history. "Revocation plus
+// removal IS the removal" — the ownership-transfer doctrine (migration
+// 0008) extended to full membership. The freed email becomes re-invitable,
+// which is the recovery path for orphan members created by a setup run
+// whose credential was never persisted.
+//
+// Guards: the caller must be the circle's owner; the target must be an
+// active member of this circle; you cannot remove yourself (use the
+// ownership transfer to step off); the last owner cannot be removed —
+// a circle must always retain at least one owner.
+async function handleRemoveCircleMember(
+  db: DbClient,
+  _env: Env,
+  _req: Request,
+  auth: AuthContext,
+  fid: string,
+  mid: string,
+): Promise<Response> {
+  if (fid !== auth.family_id) throw new HttpError(404, 'not_found', 'Family not found');
+  if (auth.role !== 'owner') {
+    throw new HttpError(403, 'forbidden', 'Only the circle owner can remove members');
+  }
+  const target = await db.queryOne(
+    `SELECT * FROM members WHERE id = ? AND family_id = ? AND removed_at IS NULL`,
+    [mid, auth.family_id],
+  );
+  if (!target) throw new HttpError(404, 'not_found', 'Member is not in this circle');
+  if (mid === auth.member_id) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      'Cannot remove yourself — use the ownership transfer to step off',
+    );
+  }
+  if (target['role'] === 'owner') {
+    const owners = await db.queryOne(
+      `SELECT COUNT(*) AS c FROM members WHERE family_id = ? AND role = 'owner' AND removed_at IS NULL`,
+      [auth.family_id],
+    );
+    if (((owners?.['c'] as number) ?? 0) <= 1) {
+      throw new HttpError(400, 'bad_request', 'Cannot remove the last owner of a circle');
+    }
+  }
+  const ts = nowIso();
+  // E2EE topics the member participates in must rotate next: the removed
+  // member already held the old key, and forward secrecy comes from the
+  // rekey the owner runs next (same rule as topic participant removal).
+  const e2eeTopics = await db.queryAll(
+    `SELECT t.id FROM topics t JOIN topic_participants p ON p.topic_id = t.id
+      WHERE t.family_id = ? AND p.member_id = ? AND t.e2ee = 1`,
+    [auth.family_id, mid],
+  );
+  await db.execAtomically([
+    { sql: `UPDATE members SET removed_at = ? WHERE id = ?`, params: [ts, mid] },
+    // Revoke every credential of the removed member, effective now.
+    { sql: `UPDATE agent_tokens SET revoked_at = ? WHERE member_id = ?`, params: [ts, mid] },
+    { sql: `DELETE FROM topic_participants WHERE member_id = ?`, params: [mid] },
+    // A removed member can neither offer nor accept: cancel pending transfers.
+    {
+      sql: `UPDATE ownership_transfers SET status = 'cancelled', decided_at = ?
+            WHERE family_id = ? AND status = 'pending' AND (from_member_id = ? OR to_member_id = ?)`,
+      params: [ts, auth.family_id, mid, mid],
+    },
+    ...e2eeTopics.map((t) => ({
+      sql: `UPDATE topics SET rotation_required = 1 WHERE id = ?`,
+      params: [t['id']] as (string | number | null)[],
+    })),
+  ]);
+  logEvent('info', 'circle_member_removed', {});
+  return json({ removed: mid });
 }
 
 // POST /v1/provisioning-codes — mint a single-use code for an extra agent.
@@ -2817,7 +2900,7 @@ async function handleRevoke(
 // GET /v1/members
 async function handleListMembers(db: DbClient, auth: AuthContext): Promise<Response> {
   const rows = await db.queryAll(
-    `SELECT * FROM members WHERE family_id = ? ORDER BY created_at ASC`,
+    `SELECT * FROM members WHERE family_id = ? AND removed_at IS NULL ORDER BY created_at ASC`,
     [auth.family_id],
   );
   return json({ members: rows.map(publicMember) });
@@ -2936,7 +3019,7 @@ async function handleCreateTopic(
     }
     // Auto-include every owner/parent in the family.
     const grownups = await db.queryAll(
-      `SELECT id FROM members WHERE family_id = ? AND role IN ('owner','parent')`,
+      `SELECT id FROM members WHERE family_id = ? AND role IN ('owner','parent') AND removed_at IS NULL`,
       [auth.family_id],
     );
     for (const g of grownups) {
@@ -4554,6 +4637,20 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       if (action === '/cancel' && method === 'POST') {
         return await handleCancelOwnershipTransfer(db, auth, fid);
       }
+    }
+
+    // Circle member removal (soft): DELETE /v1/families/:id/members/:mid —
+    // owner only. See handleRemoveCircleMember.
+    const famMembers = /^\/v1\/families\/([^/]+)\/members\/([^/]+)$/.exec(path);
+    if (famMembers && method === 'DELETE') {
+      return await handleRemoveCircleMember(
+        db,
+        env,
+        req,
+        auth,
+        decodeURIComponent(famMembers[1]),
+        decodeURIComponent(famMembers[2]),
+      );
     }
 
     const topicSub = /^\/v1\/topics\/([^/]+)\/(history|invite|spawn|entries|tasks|envelopes|subject|ack)$/.exec(path);
