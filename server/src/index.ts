@@ -1180,6 +1180,13 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
               VALUES (?,?,?,?,?,?,NULL)`,
         params: [codeHash, familyId, memberId, 'owner-agent', memberId, provisionExpiresAt],
       },
+      // 0012: the bootstrap operator becomes a server owner in the same
+      // atomic batch — no gap between "server exists" and "server has an
+      // owner". OR IGNORE keeps a retried bootstrap idempotent.
+      {
+        sql: `INSERT OR IGNORE INTO server_owners(principal_id, created_at) VALUES (?,?)`,
+        params: [principalId, ts],
+      },
     ]);
   } catch (e) {
     if (isUniqueViolation(e)) {
@@ -1204,18 +1211,20 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
 }
 
 /**
- * True when the caller is a hub owner: the principal behind the verified
- * calling token holds the 'owner' role in at least one circle (F02).
- * Identity is matched by principal_id — never by the email string — so a
- * member row that merely shares an email with another circle's owner gains
- * no hub-owner powers. Fail closed: no principal, no power.
+ * True when the caller is a server owner: the principal behind the verified
+ * calling token has an explicit row in server_owners (migration 0012).
+ *
+ * Deliberately NOT derived from circle roles: a circle owner manages only
+ * their own circle. Creating circles on the server is a server-operator
+ * power, granted only via the server control-plane API (or the bootstrap
+ * seed). Identity is matched by principal_id — never by the email string.
+ * Fail closed: no principal, no power.
  */
 async function isHubOwner(db: DbClient, auth: AuthContext): Promise<boolean> {
-  if (auth.role === 'owner') return true;
   const pid = auth.principal_id;
   if (!pid) return false;
   const row = await db.queryOne(
-    `SELECT 1 FROM members WHERE principal_id = ? AND role = 'owner' AND removed_at IS NULL LIMIT 1`,
+    `SELECT 1 FROM server_owners WHERE principal_id = ? LIMIT 1`,
     [pid],
   );
   return row !== null;
@@ -2428,6 +2437,115 @@ async function handleRemoveCircleMember(
   ]);
   logEvent('info', 'circle_member_removed', {});
   return json({ removed: mid });
+}
+
+// ---------------------------------------------------------------------------
+// Server ownership control plane (migration 0012).
+//
+// Server owners are explicit rows in server_owners — never derived from
+// circle roles. Only server owners may create circles (POST /v1/families
+// while locked) and only server owners may use these endpoints. Circle
+// owners keep their circle-scoped powers (invite, remove, transfer) but
+// cannot create circles and cannot touch this control plane.
+// ---------------------------------------------------------------------------
+
+// GET /v1/server/owners — list server owners (server-owner only).
+async function handleListServerOwners(db: DbClient, auth: AuthContext): Promise<Response> {
+  if (!(await isHubOwner(db, auth))) {
+    throw new HttpError(403, 'forbidden', 'Only server owners can list server owners');
+  }
+  const rows = await db.queryAll(
+    `SELECT so.principal_id, so.created_at,
+            (SELECT m.name FROM members m
+              WHERE m.principal_id = so.principal_id ORDER BY m.created_at LIMIT 1) AS name,
+            (SELECT m.email FROM members m
+              WHERE m.principal_id = so.principal_id ORDER BY m.created_at LIMIT 1) AS email
+       FROM server_owners so ORDER BY so.created_at ASC`,
+  );
+  return json({
+    owners: rows.map((r) => ({
+      principal_id: r['principal_id'],
+      name: r['name'] ?? null,
+      email: r['email'] ?? null,
+      created_at: r['created_at'],
+    })),
+  });
+}
+
+// POST /v1/server/owners — promote a principal to server owner
+// (server-owner only). Body takes either {principal_id} or {member_id}
+// (resolved to its principal). Idempotent: promoting an existing server
+// owner returns the row.
+async function handlePromoteServerOwner(
+  db: DbClient,
+  req: Request,
+  auth: AuthContext,
+): Promise<Response> {
+  if (!(await isHubOwner(db, auth))) {
+    throw new HttpError(403, 'forbidden', 'Only server owners can promote server owners');
+  }
+  const body = await readJson(req);
+  let principalId: string | null = null;
+  const byPrincipal = body['principal_id'];
+  const byMember = body['member_id'];
+  if (typeof byPrincipal === 'string') {
+    principalId = reqString(byPrincipal, 'principal_id', 1, 128);
+    const exists = await db.queryOne(`SELECT 1 FROM principals WHERE id = ?`, [principalId]);
+    if (!exists) throw new HttpError(404, 'not_found', 'Principal not found');
+  } else if (typeof byMember === 'string') {
+    const memberId = reqString(byMember, 'member_id', 1, 128);
+    const member = await db.queryOne(`SELECT principal_id FROM members WHERE id = ?`, [memberId]);
+    if (!member || !member['principal_id']) {
+      throw new HttpError(404, 'not_found', 'Member not found');
+    }
+    principalId = member['principal_id'] as string;
+  } else {
+    throw new HttpError(400, 'bad_request', 'Provide principal_id or member_id');
+  }
+  const ts = nowIso();
+  await db.execAtomically([
+    {
+      sql: `INSERT OR IGNORE INTO server_owners(principal_id, created_at, created_by) VALUES (?,?,?)`,
+      params: [principalId, ts, auth.principal_id],
+    },
+  ]);
+  const row = await db.queryOne(`SELECT * FROM server_owners WHERE principal_id = ?`, [principalId]);
+  if (!row) throw new HttpError(500, 'internal', 'Server owner row missing after promote');
+  logEvent('info', 'server_owner_promoted', {});
+  return json(
+    {
+      owner: {
+        principal_id: row['principal_id'],
+        created_at: row['created_at'],
+      },
+    },
+    201,
+  );
+}
+
+// DELETE /v1/server/owners/:principal — demote a server owner
+// (server-owner only). Refuses to remove the last server owner: an empty
+// table would lock everyone out of circle creation and promotion alike
+// (recovery would need direct DB access).
+async function handleDemoteServerOwner(
+  db: DbClient,
+  auth: AuthContext,
+  principalId: string,
+): Promise<Response> {
+  if (!(await isHubOwner(db, auth))) {
+    throw new HttpError(403, 'forbidden', 'Only server owners can demote server owners');
+  }
+  const target = await db.queryOne(`SELECT * FROM server_owners WHERE principal_id = ?`, [principalId]);
+  if (!target) throw new HttpError(404, 'not_found', 'Not a server owner');
+  const count = await db.queryOne(`SELECT COUNT(*) AS c FROM server_owners`);
+  if (((count?.['c'] as number) ?? 0) <= 1) {
+    throw new HttpError(400, 'bad_request', 'Cannot demote the last server owner');
+  }
+  await db.execAtomically([
+    { sql: `DELETE FROM server_owners WHERE principal_id = ?`, params: [principalId] },
+  ]);
+  logEvent('info', 'server_owner_demoted', {});
+  return json({ removed: principalId });
 }
 
 // POST /v1/provisioning-codes — mint a single-use code for an extra agent.
@@ -4651,6 +4769,20 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
         decodeURIComponent(famMembers[1]),
         decodeURIComponent(famMembers[2]),
       );
+    }
+
+    // Server ownership control plane (migration 0012): GET/POST
+    // /v1/server/owners, DELETE /v1/server/owners/:principal — server
+    // owners only. See the handlers above handleMintProvisioning.
+    if (path === '/v1/server/owners' && method === 'GET') {
+      return await handleListServerOwners(db, auth);
+    }
+    if (path === '/v1/server/owners' && method === 'POST') {
+      return await handlePromoteServerOwner(db, req, auth);
+    }
+    const serverOwnerDel = /^\/v1\/server\/owners\/([^/]+)$/.exec(path);
+    if (serverOwnerDel && method === 'DELETE') {
+      return await handleDemoteServerOwner(db, auth, decodeURIComponent(serverOwnerDel[1]));
     }
 
     const topicSub = /^\/v1\/topics\/([^/]+)\/(history|invite|spawn|entries|tasks|envelopes|subject|ack)$/.exec(path);

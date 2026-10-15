@@ -1014,6 +1014,90 @@ class TestCircleRemoveMember(HubTestBase):
         self.assertEqual(self.call_paths(),
                          [("GET", "/v1/families"),
                           ("DELETE", "/v1/families/c222/members/m9")])
+# Server ownership control plane: hub server owners/promote/demote
+# ---------------------------------------------------------------------------
+
+
+class TestServerOwners(HubTestBase):
+    def parse(self, argv):
+        return hub.build_parser().parse_args(argv)
+
+    def call_paths(self):
+        return [(c["method"], urlparse.urlparse(c["url"]).path)
+                for c in self.fake.calls]
+
+    def test_server_owners_parses(self):
+        a = self.parse(["server", "owners"])
+        self.assertEqual(a.server_action, "owners")
+
+    def test_server_promote_parses(self):
+        a = self.parse(["server", "promote", "--principal", "pr_abc"])
+        self.assertEqual(a.server_action, "promote")
+        self.assertEqual(a.principal_id, "pr_abc")
+        self.assertIsNone(a.member_id)
+        b = self.parse(["server", "promote", "--member", "m123"])
+        self.assertEqual(b.member_id, "m123")
+        self.assertIsNone(b.principal_id)
+
+    def test_server_demote_parses(self):
+        a = self.parse(["server", "demote", "--principal", "pr_abc"])
+        self.assertEqual(a.server_action, "demote")
+        self.assertEqual(a.principal_id, "pr_abc")
+        with self.assertRaises(SystemExit):
+            self.parse(["server", "demote"])
+
+    def test_server_owners_get(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("GET", "/v1/server/owners", 200,
+                      {"owners": [{"principal_id": "pr_1",
+                                   "name": "Mahesh",
+                                   "email": "m@x.dev",
+                                   "created_at": "2026-10-14T00:00:00Z"}]})
+        rc, out, _ = self.run_cli(["server", "owners"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(), [("GET", "/v1/server/owners")])
+        self.assertIn("pr_1", out)
+        self.assertTokenAbsent(out)
+
+    def test_server_promote_by_member_posts(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/server/owners", 201,
+                      {"owner": {"principal_id": "pr_2",
+                                 "created_at": "2026-10-14T00:00:00Z"}})
+        rc, out, _ = self.run_cli(["server", "promote", "--member", "m123"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(), [("POST", "/v1/server/owners")])
+        self.assertEqual(json.loads(self.fake.calls[0]["body"]), {"member_id": "m123"})
+        self.assertIn("pr_2", out)
+        self.assertTokenAbsent(out)
+
+    def test_server_promote_by_principal_posts(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("POST", "/v1/server/owners", 201,
+                      {"owner": {"principal_id": "pr_9",
+                                 "created_at": "2026-10-14T00:00:00Z"}})
+        rc, _out, _ = self.run_cli(["server", "promote",
+                                    "--principal", "pr_9"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.fake.calls[0]["body"]), {"principal_id": "pr_9"})
+
+    def test_server_promote_needs_an_id(self):
+        self.seed_config(family_id="c111")
+        rc, _out, err = self.run_cli(["server", "promote"])
+        self.assertEqual(rc, 1)
+        self.assertIn("--principal", err)
+
+    def test_server_demote_deletes(self):
+        self.seed_config(family_id="c111")
+        self.fake.add("DELETE", "/v1/server/owners/pr_2", 200,
+                      {"removed": "pr_2"})
+        rc, out, _ = self.run_cli(["server", "demote",
+                                   "--principal", "pr_2"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.call_paths(),
+                         [("DELETE", "/v1/server/owners/pr_2")])
+        self.assertIn("pr_2", out)
+        self.assertTokenAbsent(out)
 
 
 # ---------------------------------------------------------------------------

@@ -92,14 +92,15 @@ paths:
         - **Open** (`SETUP_LOCKED` unset — first deploy only): public
           bootstrap. Creates the family, the owner member, and returns a
           one-time provisioning code for the owner's first agent.
-        - **Locked** (`SETUP_LOCKED=1` — the normal running state): hub-owner
+        - **Locked** (`SETUP_LOCKED=1` — the normal running state): server-owner
           circle creation. Requires a bearer token (401 without one); the
-          caller must be a hub owner (an `owner` in at least one circle,
-          matched by email) or the call is 403 `forbidden`. The creator
-          becomes an `owner` member of the new circle and gets a single-use
-          provisioning code for their agent in that circle — the existing
-          token stays bound to the old circle. There is no `setup_locked`
-          error code; unauthenticated calls are 401 `unauthorized`.
+          caller must be a **server owner** (an explicit row in `server_owners`,
+          matched by principal id — *not* merely an owner of some circle) or
+          the call is 403 `forbidden`. The creator becomes an `owner` member
+          of the new circle and gets a single-use provisioning code for their
+          agent in that circle — the existing token stays bound to the old
+          circle. There is no `setup_locked` error code; unauthenticated
+          calls are 401 `unauthorized`.
         A second *deployment* is only needed for a truly separate family that
         must not share an operator or database; additional circles for people
         you trust are created in locked mode above.
@@ -2081,6 +2082,114 @@ paths:
           content:
             application/gzip:
               schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/server/owners:
+    get:
+      tags: [server]
+      operationId: listServerOwners
+      summary: List server owners
+      description: |
+        Server ownership control plane — **server owners only** (403 otherwise).
+        Server ownership is explicit (rows in `server_owners`) and is what
+        grants circle-creation power. Circle owners manage only their own
+        circle and cannot use this endpoint.
+      responses:
+        '200':
+          description: The server owners, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [owners]
+                properties:
+                  owners:
+                    type: array
+                    items:
+                      type: object
+                      required: [principal_id, created_at]
+                      properties:
+                        principal_id: { type: string }
+                        name: { type: string, nullable: true }
+                        email: { type: string, nullable: true }
+                        created_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    post:
+      tags: [server]
+      operationId: promoteServerOwner
+      summary: Promote a principal to server owner
+      description: |
+        Server ownership control plane — **server owners only** (403 otherwise).
+        Promotes one principal to server owner, granting them circle-creation
+        power. Identify the principal directly (`principal_id`) or pass one of
+        their member ids (`member_id`) and the server resolves it. Idempotent:
+        promoting an existing server owner returns the row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                principal_id:
+                  type: string
+                  description: Principal id to promote
+                member_id:
+                  type: string
+                  description: Member id whose principal gets promoted
+      responses:
+        '201':
+          description: The promoted server owner
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [owner]
+                properties:
+                  owner:
+                    type: object
+                    required: [principal_id, created_at]
+                    properties:
+                      principal_id: { type: string }
+                      created_at: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/server/owners/{principal}:
+    delete:
+      tags: [server]
+      operationId: demoteServerOwner
+      summary: Demote a server owner
+      description: |
+        Server ownership control plane — **server owners only** (403 otherwise).
+        Removes one principal from the server owners. Refuses to demote the
+        last server owner (400): an empty table would lock everyone out of
+        circle creation and promotion alike.
+      parameters:
+        - name: principal
+          in: path
+          required: true
+          schema: { type: string }
+          description: Principal id to demote
+      responses:
+        '200':
+          description: The demoted principal
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
