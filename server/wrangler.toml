@@ -13,7 +13,7 @@ compatibility_date = "2026-10-01"
 binding = "DB"
 database_name = "family-hub"
 # Created 2026-10-09 via `wrangler d1 create family-hub` (not a secret).
-database_id = "38625921-e60b-41de-af8e-da90ba8b41a8"
+database_id = "6ce68eee-8c99-4daa-ad28-6e9fdaf77f9f"
 
 # Workers Logs: structured request/error logs (with the server version on
 # every line) are delivered to Cloudflare. View with `wrangler tail` or the
@@ -29,4 +29,4 @@ SETUP_LOCKED = "1"
 # "0.0.0" = gate off. Raise deliberately per the deploy runbook only AFTER
 # the installed fleet reports >= the new version — never ship a deploy that
 # bricks the currently-installed fleet.
-MIN_CLI_VERSION = "0.0.0"
+MIN_CLI_VERSION = "2.0.0"
