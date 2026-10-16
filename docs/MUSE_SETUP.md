@@ -57,6 +57,20 @@ npm ci
 
 `wrangler login` opens a browser for Cloudflare sign-in. For an environment without a browser, the [deployment guide](DEPLOY.md) explains the API-token alternative. Keep credentials in secure storage rather than pasting them into chat.
 
+### Agent-driven deploy (no browser)
+
+If a Muse agent is doing the deploy, it cannot use `wrangler login`. Instead:
+
+1. Ask the user for a **temporary** Cloudflare API token:
+   - Dashboard → Profile → My Profile → API Tokens → Create Token
+   - Use the **Edit Cloudflare Workers** template
+   - The agent uses it via `CLOUDFLARE_API_TOKEN` env var and discards it after
+2. The agent still needs the user to set Worker **secrets** via dashboard
+   (`TOKEN_PEPPER`, `READ_RECEIPT_SECRET`) — these cannot be set via API token
+   by the agent for security reasons
+3. Order is critical: **secrets → deploy → migrate → bootstrap → lock**.
+   See [E2EE_FRESH_DEPLOY.md](E2EE_FRESH_DEPLOY.md) for the full sequence.
+
 ## 2. Create your database and configure the server
 
 From `family-hub/server`:
