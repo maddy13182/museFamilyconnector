@@ -1,3 +1,8 @@
+> Historical design notes. Protocol 2 supersedes optional encryption, v1 routes,
+> legacy subject formats and force commits described below. Use [INSTALL.md](INSTALL.md),
+> [SECURITY.md](SECURITY.md) and [the encryption guide](../agent-skill/references/e2ee.md)
+> for the implemented contract.
+
 # E2EE Build Spec — per-topic end-to-end encryption
 
 **Source design:** `research/e2ee-design.md` (branch `design/agent-circles`, commit `a24b488`).
@@ -15,14 +20,14 @@ per-message ratcheting, server-side key escrow (all rejected in the design).
 **Server:**
 - Migration `0008`: `agent_keys(member_id, agent_label, public_key, created_at)`.
   Public keys are public; no secrecy needed.
-- `POST /v1/provisioning-codes/:code/redeem` gains optional `agent_public_key`
+- `POST /v2/provisioning-codes/:code/redeem` gains optional `agent_public_key`
   (32-byte X25519, base64). Stored bound to `(member_id, agent_label)` in the
   same atomic batch as the token. Absent = agent has no E2EE identity (can
   still use plaintext topics).
-- `GET /v1/agent-keys?member_id=…` — key directory. Authenticated; returns
+- `GET /v2/agent-keys?member_id=…` — key directory. Authenticated; returns
   public keys for members the caller shares a circle with. (Needed for
   envelope creation.)
-- Key rotation: `POST /v1/agent-keys/rotate` with new public key, authenticated
+- Key rotation: `POST /v2/agent-keys/rotate` with new public key, authenticated
   by Bearer <redacted> Old key marked superseded, not deleted (existing envelopes
   still reference it).
 
@@ -46,12 +51,12 @@ rotation marks superseded, directory access control.
 - Base schema (folded into `0001_init.sql`; clean slate, no 0008/0009):
   `topics.e2ee INTEGER DEFAULT 0`, `topics.current_key_id TEXT NULL`, and
   `topic_key_envelopes(topic_id, member_id, agent_label, key_id, envelope TEXT, created_at)`.
-- `POST /v1/topics` gains `e2ee: 0|1`. `e2ee=1` requires the creator's agent
+- `POST /v2/topics` gains `e2ee: 0|1`. `e2ee=1` requires the creator's agent
   to have a registered public key (else 400 with guidance) AND
   `initial_key_id` (the creator's 32-hex topic key id) — recorded as
   `topics.current_key_id`, the single source of truth clients use to elect
   the encryption key (secfix F1).
-- `POST /v1/topics/:id/envelopes` — accepts `{member_id, agent_label, key_id,
+- `POST /v2/topics/:id/envelopes` — accepts `{member_id, agent_label, key_id,
   envelope}`. Server enforces: caller is a current participant; target is a
   current participant with a registered key; a `key_id` different from
   `current_key_id` introduces a new key (rotation) — owner/parent only (403
@@ -59,9 +64,9 @@ rotation marks superseded, directory access control.
   envelope blob is opaque — stored, never inspected. Re-POST preserves the
   original `created_at` (secfix F3: `ON CONFLICT DO UPDATE SET
   envelope=excluded.envelope`).
-- `GET /v1/topics/:id/envelopes` — returns the *caller's own* envelopes only
+- `GET /v2/topics/:id/envelopes` — returns the *caller's own* envelopes only
   (one agent can't fetch another's).
-- `PATCH /v1/topics/:id/subject` — participant-only, E2EE-only subject
+- `PATCH /v2/topics/:id/subject` — participant-only, E2EE-only subject
   replacement so the CLI can re-encrypt the subject with the topic-bound
   AAD immediately after creation (secfix F4).
 - Plaintext topics behave byte-identically to today (design §9).

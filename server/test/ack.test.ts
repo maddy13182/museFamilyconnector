@@ -1,4 +1,4 @@
-// POST /v1/topics/:tid/ack — receipt-bound, contiguous ack (spec §1.4).
+// POST /v2/topics/:tid/ack — receipt-bound, contiguous ack (spec §1.4).
 //
 // Covers: the happy path (history -> receipt -> ack advances); receipt HMAC
 // verification (forgery -> 403 invalid_read_receipt); cross-agent receipt
@@ -15,10 +15,16 @@ import {
   setupKeyedFamily,
   addMember,
   addAgent,
-  createPlainTopic,
-  postEntry,
+  createActiveTopic,
+  wireBody,
+  postEntry as rawPostEntry,
   readState,
 } from './syncv2_helpers.js';
+
+async function postEntry(app: TestApp, token: string, tid: string, text: string, extra: Record<string,unknown> = {}) {
+  const row = await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?', [tid]);
+  return rawPostEntry(app, token, tid, text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string), extra);
+}
 
 async function postN(app: TestApp, token: string, tid: string, n: number) {
   for (let i = 1; i <= n; i++) await postEntry(app, token, tid, `msg ${i}`);
@@ -26,13 +32,13 @@ async function postN(app: TestApp, token: string, tid: string, n: number) {
 
 /** history -> { read_through_seq, read_receipt } */
 async function readPage(app: TestApp, token: string, tid: string, qs = '') {
-  const h = await app.call('GET', `/v1/topics/${tid}/history${qs}`, { token });
+  const h = await app.call('GET', `/v2/topics/${tid}/history${qs}`, { token });
   assert.equal(h.status, 200);
   return { through: h.body.read_through_seq as number, receipt: h.body.read_receipt as string };
 }
 
 async function ack(app: TestApp, token: string, tid: string, seq: number, receipt: string) {
-  return app.call('POST', `/v1/topics/${tid}/ack`, {
+  return app.call('POST', `/v2/topics/${tid}/ack`, {
     token,
     body: { seq, read_receipt: receipt },
   });
@@ -45,7 +51,7 @@ async function ack(app: TestApp, token: string, tid: string, seq: number, receip
 test('ack advances read state; replay at/below effective is a no-op success', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckFam1');
-  const tid = await createPlainTopic(app, owner.token, 'ack topic');
+  const tid = await createActiveTopic(app, owner.token, 'ack topic');
   await postN(app, owner.token, tid, 5);
 
   const { through, receipt } = await readPage(app, owner.token, tid);
@@ -70,7 +76,7 @@ test('ack advances read state; replay at/below effective is a no-op success', as
 test('acks advance in order: partial then full', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckFam2');
-  const tid = await createPlainTopic(app, owner.token, 'ack topic 2');
+  const tid = await createActiveTopic(app, owner.token, 'ack topic 2');
   await postN(app, owner.token, tid, 6);
 
   const p1 = await readPage(app, owner.token, tid, '?after_seq=0&limit=3');
@@ -93,7 +99,7 @@ test('acks advance in order: partial then full', async () => {
 test('forged receipt -> 403 invalid_read_receipt', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckForge');
-  const tid = await createPlainTopic(app, owner.token, 'forge topic');
+  const tid = await createActiveTopic(app, owner.token, 'forge topic');
   await postN(app, owner.token, tid, 3);
   const { receipt } = await readPage(app, owner.token, tid);
 
@@ -106,13 +112,13 @@ test('forged receipt -> 403 invalid_read_receipt', async () => {
 
   // Garbage receipts are 403, never 500; an empty receipt is 400
   // (the field is required).
-  const empty = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const empty = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: owner.token,
     body: { seq: 3, read_receipt: '' },
   });
   assert.equal(empty.status, 400);
   for (const bad of ['fhrr1.1.3', 'fhrr1.1.3.' + 'zz'.repeat(32), 'not-a-receipt']) {
-    const rb = await app.call('POST', `/v1/topics/${tid}/ack`, {
+    const rb = await app.call('POST', `/v2/topics/${tid}/ack`, {
       token: owner.token,
       body: { seq: 3, read_receipt: bad },
     });
@@ -122,8 +128,8 @@ test('forged receipt -> 403 invalid_read_receipt', async () => {
 
 test('cross-agent receipt replay -> 403 (binding is inside the HMAC)', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'AckXAgent');
-  const tid = await createPlainTopic(app, owner.token, 'xagent topic');
+  const { owner } = await setupKeyedFamily(app, 'AckXAgent');
+  const tid = await createActiveTopic(app, owner.token, 'xagent topic');
   await postN(app, owner.token, tid, 4);
 
   // Second agent for the SAME member (participants are per-member, so both
@@ -144,8 +150,8 @@ test('cross-agent receipt replay -> 403 (binding is inside the HMAC)', async () 
 test('cross-topic receipt replay -> 403', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckXTopic');
-  const t1 = await createPlainTopic(app, owner.token, 'topic one');
-  const t2 = await createPlainTopic(app, owner.token, 'topic two');
+  const t1 = await createActiveTopic(app, owner.token, 'topic one');
+  const t2 = await createActiveTopic(app, owner.token, 'topic two');
   await postN(app, owner.token, t1, 2);
   await postN(app, owner.token, t2, 2);
 
@@ -162,7 +168,7 @@ test('cross-topic receipt replay -> 403', async () => {
 test('ack beyond the receipt through_seq -> 409 noncontiguous_ack', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckContig1');
-  const tid = await createPlainTopic(app, owner.token, 'contig topic');
+  const tid = await createActiveTopic(app, owner.token, 'contig topic');
   await postN(app, owner.token, tid, 6);
 
   // Receipt covers only seqs 1..3; acking 6 overruns it.
@@ -176,7 +182,7 @@ test('ack beyond the receipt through_seq -> 409 noncontiguous_ack', async () => 
 test('ack with a from_seq gap -> 409 noncontiguous_ack', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckContig2');
-  const tid = await createPlainTopic(app, owner.token, 'contig topic 2');
+  const tid = await createActiveTopic(app, owner.token, 'contig topic 2');
   await postN(app, owner.token, tid, 9);
 
   // Read starting AFTER seq 5: the receipt's from_seq is 6, but the
@@ -195,7 +201,7 @@ test('ack with a from_seq gap -> 409 noncontiguous_ack', async () => {
 test('two agents of one member keep independent acked_seq', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckIso');
-  const tid = await createPlainTopic(app, owner.token, 'iso topic');
+  const tid = await createActiveTopic(app, owner.token, 'iso topic');
   await postN(app, owner.token, tid, 8);
   const agent2 = await addAgent(app, owner.token, owner.memberId, 'owner-second', false);
 
@@ -203,7 +209,7 @@ test('two agents of one member keep independent acked_seq', async () => {
   await ack(app, owner.token, tid, 8, r1.receipt);
 
   // Agent 2 is unaffected by agent 1's ack: everything still unread.
-  const s = await app.call('GET', '/v1/sync/topics', { token: agent2.token });
+  const s = await app.call('GET', '/v2/sync/topics', { token: agent2.token });
   const t = (s.body.topics as any[]).find((x: any) => x.topic_id === tid);
   assert.ok(t, 'topic still changed for the second agent');
   assert.equal(t.new_count, 8);
@@ -223,7 +229,7 @@ test('two agents of one member keep independent acked_seq', async () => {
 test('ack requires seq and read_receipt (400 otherwise)', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckValid');
-  const tid = await createPlainTopic(app, owner.token, 'valid topic');
+  const tid = await createActiveTopic(app, owner.token, 'valid topic');
 
   for (const body of [
     {},
@@ -235,7 +241,7 @@ test('ack requires seq and read_receipt (400 otherwise)', async () => {
     { seq: 1, read_receipt: '' },
     { seq: 1, read_receipt: 42 },
   ]) {
-    const r = await app.call('POST', `/v1/topics/${tid}/ack`, { token: owner.token, body });
+    const r = await app.call('POST', `/v2/topics/${tid}/ack`, { token: owner.token, body });
     assert.equal(r.status, 400, `body ${JSON.stringify(body)} must be 400`);
   }
 });
@@ -244,8 +250,8 @@ test('ack on a cross-family topic id -> 404 (no existence leak)', async () => {
   const app = makeApp();
   const a = await setupKeyedFamily(app, 'AckFamA');
   const b = await setupKeyedFamily(app, 'AckFamB');
-  const tidA = await createPlainTopic(app, a.owner.token, 'A topic');
-  const r = await app.call('POST', `/v1/topics/${tidA}/ack`, {
+  const tidA = await createActiveTopic(app, a.owner.token, 'A topic');
+  const r = await app.call('POST', `/v2/topics/${tidA}/ack`, {
     token: b.owner.token,
     body: { seq: 1, read_receipt: 'fhrr1.1.1.' + '0'.repeat(64) },
   });
@@ -255,9 +261,9 @@ test('ack on a cross-family topic id -> 404 (no existence leak)', async () => {
 test('non-participant ack -> 403', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'AckNonPart');
-  const tid = await createPlainTopic(app, owner.token, 'nonpart topic');
+  const tid = await createActiveTopic(app, owner.token, 'nonpart topic');
   const outsider = await addMember(app, famId, owner.token, 'out@a.dev', 'parent', 'Outsider');
-  const r = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const r = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: outsider.token,
     body: { seq: 1, read_receipt: 'fhrr1.1.1.' + '0'.repeat(64) },
   });

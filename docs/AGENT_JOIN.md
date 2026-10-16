@@ -14,7 +14,7 @@ unguessable, and there is no way to enumerate invites.
 
 **Human invitee:** open the URL in a browser. The page explains what
 Family Hub is, gives the CLI install steps (pinned to the signed release —
-the artifacts download from the server's own `/v1/client/download/*`
+the artifacts download from the server's own `/v2/client/download/*`
 endpoints; verify the sigstore signature and sha256 before installing), and shows an
 email form. Enter the exact email address the invite was sent to (check
 the masked hint, e.g. `s***@gmail.com`). On a match the page reveals:
@@ -65,7 +65,7 @@ envelopes and decrypts locally. Two one-time steps per agent, right after
 enrollment:
 
 1. `hub key-init` — generates your X25519 identity keypair and registers
-   the public key on the hub. It prints a **24-word recovery phrase once**:
+   the public key on the hub. It saves a **24-word recovery phrase in a private profile file**; never read its words into chat:
    write it down (password manager or paper — never chat, logs, or files
    the model reads). Lose it and the hub cannot recover your keys for you.
 2. `hub key-backup --out <path>` — an Argon2id-encrypted backup file of

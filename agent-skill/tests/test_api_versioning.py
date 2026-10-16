@@ -47,7 +47,7 @@ UNREACHABLE = object()
 
 
 class FakeHub:
-    """Canned transport; /v1/health is served from the `health` kwarg."""
+    """Canned transport; /v2/health is served from the `health` kwarg."""
 
     def __init__(self, health=None):
         self.health = health
@@ -67,7 +67,7 @@ class FakeHub:
             }
         )
         path = urlparse.urlparse(url).path
-        if path == "/v1/health":
+        if path == "/v2/health":
             if self.health is UNREACHABLE:
                 # Mirror HubClient._urllib_transport's URLError handling.
                 raise hub.HubError(
@@ -87,7 +87,7 @@ class FakeHub:
     def health_calls(self):
         return [
             c for c in self.calls
-            if urlparse.urlparse(c["url"]).path == "/v1/health"
+            if urlparse.urlparse(c["url"]).path == "/v2/health"
         ]
 
 
@@ -98,7 +98,7 @@ def captured():
         yield out, err
 
 
-HEALTH_OK = {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
+HEALTH_OK = {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
 # The 0.11.0 shape: health exists but carries no api_versions.
 HEALTH_OLD = {"ok": True, "version": "0.11.0"}
 
@@ -148,11 +148,11 @@ class VersionCheckBase(unittest.TestCase):
 class MinServerVersionTest(unittest.TestCase):
     def test_floor_is_0_14_0(self):
         # 1.0.0 is the first server with the sync-v2 flows
-        # (/v1/sync/topics, receipt-bound ack, /v1/keys/commit) and the
+        # (/v2/sync/topics, receipt-bound ack, /v2/keys/commit) and the
         # enforced E2EE lifecycle (staged key envelopes, N05 plaintext
         # rejection, write-time key gates), which this CLI requires.
         # Clean break, no backcompat.
-        self.assertEqual(hub._MIN_SERVER_VERSION, "1.0.0")
+        self.assertEqual(hub._MIN_SERVER_VERSION, "2.0.0")
 
     def test_floor_is_valid_semver(self):
         hub._parse_version(hub._MIN_SERVER_VERSION)
@@ -174,18 +174,18 @@ class ServerCheckTest(VersionCheckBase):
         self.assertEqual(len(self.fake.health_calls()), 1)
 
     def test_too_old_version_with_api_versions_still_fails(self):
-        health = {"ok": True, "version": "0.11.9", "api_versions": ["v1"]}
+        health = {"ok": True, "version": "0.11.9", "api_versions": ["v2"]}
         self.seed_config()
         rc, _out, err = self.run_cli(["topics"], health=health)
         self.assertEqual(rc, 1)
         self.assertIn(self.exact_too_old("0.11.9"), err)
 
     def test_health_missing_api_versions_is_too_old(self):
-        health = {"ok": True, "version": "1.0.0"}  # version ok, contract missing
+        health = {"ok": True, "version": "2.0.0"}  # version ok, contract missing
         self.seed_config()
         rc, _out, err = self.run_cli(["topics"], health=health)
         self.assertEqual(rc, 1)
-        self.assertIn(self.exact_too_old("1.0.0"), err)
+        self.assertIn(self.exact_too_old("2.0.0"), err)
 
     def test_health_missing_version_is_too_old(self):
         self.seed_config()
@@ -193,12 +193,12 @@ class ServerCheckTest(VersionCheckBase):
         self.assertEqual(rc, 1)
         self.assertIn(self.exact_too_old("unknown"), err)
 
-    def test_api_versions_without_v1_is_too_old(self):
-        health = {"ok": True, "version": "1.0.0", "api_versions": ["v2"]}
+    def test_api_versions_without_v2_is_too_old(self):
+        health = {"ok": True, "version": "2.0.0", "api_versions": ["v3"]}
         self.seed_config()
         rc, _out, err = self.run_cli(["topics"], health=health)
         self.assertEqual(rc, 1)
-        self.assertIn(self.exact_too_old("1.0.0"), err)
+        self.assertIn(self.exact_too_old("2.0.0"), err)
 
     def test_unreachable_server_is_connection_error_not_version_error(self):
         self.seed_config()
@@ -210,7 +210,7 @@ class ServerCheckTest(VersionCheckBase):
     def test_current_server_passes_and_command_runs(self):
         self.seed_config()
         self.fake = FakeHub(health=HEALTH_OK)
-        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        self.fake.add("GET", "/v2/topics", 200, {"topics": []})
         with captured() as (out, err):
             rc = hub.main(["topics"], transport=self.fake)
         self.assertEqual(rc, 0, err)
@@ -225,7 +225,7 @@ class ServerCheckTest(VersionCheckBase):
     def test_check_cached_one_call_per_process(self):
         self.seed_config()
         self.fake = FakeHub(health=HEALTH_OK)
-        self.fake.add("GET", "/v1/topics", 200, {"topics": []})
+        self.fake.add("GET", "/v2/topics", 200, {"topics": []})
         with captured():
             hub.main(["topics"], transport=self.fake)
         with captured():
@@ -347,21 +347,21 @@ class VersionCompareUnitsTest(unittest.TestCase):
         self.assertFalse(hub._version_at_least(123, "0.12.0"))
 
     def test_select_api_major(self):
-        self.assertEqual(hub._select_api_major(["v1"]), "v1")
-        self.assertEqual(hub._select_api_major(["v2", "v1"]), "v1")
-        self.assertIsNone(hub._select_api_major(["v2"]))
+        self.assertEqual(hub._select_api_major(["v2"]), "v2")
+        self.assertEqual(hub._select_api_major(["v2", "v1"]), "v2")
+        self.assertIsNone(hub._select_api_major(["v1"]))
         self.assertIsNone(hub._select_api_major([]))
         self.assertIsNone(hub._select_api_major(None))
         self.assertIsNone(hub._select_api_major("v1"))
 
     def test_apply_api_major_defaults_to_v1(self):
-        self.assertEqual(hub._apply_api_major("/v1/topics"), "/v1/topics")
+        self.assertEqual(hub._apply_api_major("/v2/topics"), "/v2/topics")
 
     def test_apply_api_major_rewrites_when_selected(self):
         saved = hub._api_major
         try:
             hub._api_major = "v2"
-            self.assertEqual(hub._apply_api_major("/v1/topics"), "/v2/topics")
+            self.assertEqual(hub._apply_api_major("/v2/topics"), "/v2/topics")
             # Non-API paths are untouched.
             self.assertEqual(hub._apply_api_major("/health"), "/health")
         finally:
@@ -401,7 +401,7 @@ class NoBypassTest(unittest.TestCase):
             ):
                 rc, _out, err = base.run_cli(["topics"], health=HEALTH_OLD)
             self.assertEqual(rc, 1)
-            self.assertIn("needs server 1.0.0+", err)
+            self.assertIn("needs server 2.0.0+", err)
         finally:
             base.tearDown()
 
@@ -441,18 +441,18 @@ class UpgradeThroughMainTest(VersionCheckBase):
             "version": new_version,
             "min_cli_version": "0.10.0",
             "server_version": "1.0.0",
-            "download_url": server + "/v1/client/download/hub",
+            "download_url": server + "/v2/client/download/hub",
             "sha256": digest,
             "released_at": "2026-10-11T22:00:00Z",
             "assets": {
-                "hub": server + "/v1/client/download/hub",
-                "sigstore": server + "/v1/client/download/hub.sigstore",
-                "manifest": server + "/v1/client/download/manifest.json",
+                "hub": server + "/v2/client/download/hub",
+                "sigstore": server + "/v2/client/download/hub.sigstore",
+                "manifest": server + "/v2/client/download/manifest.json",
             },
             # Older than the installed skill: the refresh phase no-ops,
             # so the asserted download sequence is the three binary assets.
             "skill": {
-                "url": server + "/v1/client/download/skill.tar.gz",
+                "url": server + "/v2/client/download/skill.tar.gz",
                 "sha256": "1" * 64,
                 "version": "0.11.0",
             },
@@ -470,7 +470,7 @@ class UpgradeThroughMainTest(VersionCheckBase):
             return downloads[url]
 
         self.fake = FakeHub(health=HEALTH_OK)
-        self.fake.add("GET", "/v1/client/latest", 200, manifest)
+        self.fake.add("GET", "/v2/client/latest", 200, manifest)
         with mock.patch.object(hub, "_script_path", return_value=target), \
              mock.patch.object(hub, "_download_bytes",
                                side_effect=fake_download), \
@@ -499,11 +499,11 @@ class UpgradeThroughMainTest(VersionCheckBase):
         with captured() as (out, err):
             rc = hub.main(["upgrade"], transport=self.fake)
         self.assertEqual(rc, 1)
-        self.assertIn("needs server 1.0.0+", err.getvalue())
-        # The command never reached /v1/client/latest.
+        self.assertIn("needs server 2.0.0+", err.getvalue())
+        # The command never reached /v2/client/latest.
         self.assertEqual(
             [c for c in self.fake.calls
-             if urlparse.urlparse(c["url"]).path == "/v1/client/latest"],
+             if urlparse.urlparse(c["url"]).path == "/v2/client/latest"],
             [],
         )
 

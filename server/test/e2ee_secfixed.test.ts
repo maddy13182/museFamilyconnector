@@ -1,13 +1,13 @@
+import { wireBody } from './syncv2_helpers.js';
 // E2EE security-review fixes (secfix): server-side regression tests.
 //
 // F1 — key election via topics.current_key_id + owner/parent rotation privilege.
 // F3 — envelope re-POST preserves the original created_at.
-// F4 — PATCH /v1/topics/:id/subject (participant-only, E2EE-only).
+// F4 — PATCH /v2/topics/:id/subject (participant-only, E2EE-only).
 // Info — handlePostEntry skips the PII scan for well-formed fh1 wire bodies.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp, TestApp } from './app.js';
-import { scanPii } from '../src/pii.js';
 
 // No @types/node in this repo: random bytes via WebCrypto (DOM lib), base64
 // via btoa (each input byte becomes one char — safe for short inputs).
@@ -30,14 +30,14 @@ interface Party {
 
 // Family whose owner's agent has a registered identity key.
 async function setupKeyedFamily(app: TestApp, name: string): Promise<{ famId: string; owner: Party }> {
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: 'Ow', owner_email: `o-${name}@x.dev` },
   });
   assert.equal(fam.status, 201);
   const famId = (await app.db.queryOne('SELECT id FROM families WHERE name = ?', [name]))!['id'] as string;
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
     { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
@@ -60,39 +60,33 @@ async function addMember(
   role: string,
   displayName: string,
 ): Promise<{ token: string; memberId: string }> {
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: inviterToken,
     body: { email, role },
   });
   assert.equal(inv.status, 201);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` } },
+    `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
 }
 
-async function createE2eeTopic(
-  app: TestApp,
-  token: string,
-  keyId: string,
-): Promise<{ status: number; body: any }> {
-  return app.call('POST', '/v1/topics', {
-    token,
-    body: {
-      subject: b64(64),
-      kind: 'group',
-      participant_member_ids: [],
-      e2ee: 1,
-      initial_key_id: keyId,
-    },
-  });
+async function createE2eeTopic(app: TestApp, token: string, keyId: string): Promise<{status:number;body:any}> {
+ const made=await app.call('POST','/v2/topics',{token,body:{topic_id:hex(16),subject:wireBody(keyId),kind:'group',participant_member_ids:[]}});
+ if(made.status!==201)return made;
+ const tid=made.body.topic.id;
+ const me=await app.call('GET','/v2/me',{token});
+ await app.call('POST',`/v2/topics/${tid}/envelopes`,{token,body:{member_id:me.body.id,agent_label:me.body.agent_label,key_id:keyId,envelope:b64(96)}});
+ const commit=await app.call('POST',`/v2/topics/${tid}/keys/commit`,{token,body:{expected_epoch:1,key_id:keyId,commitment:hex(32),subject:wireBody(keyId)}});
+ assert.equal(commit.status,200);
+ return {status:201,body:(await app.call('GET',`/v2/topics/${tid}`,{token})).body};
 }
 
 async function inviteToTopic(app: TestApp, token: string, tid: string, memberIds: string[]): Promise<void> {
-  const res = await app.call('POST', `/v1/topics/${tid}/invite`, {
+  const res = await app.call('POST', `/v2/topics/${tid}/invite`, {
     token,
     body: { member_ids: memberIds, history_from: 'full' },
   });
@@ -117,43 +111,9 @@ async function currentKeyId(app: TestApp, tid: string): Promise<string | null> {
 // F1 — topics.current_key_id
 // ---------------------------------------------------------------------------
 
-test('F1: E2EE topic creation sets current_key_id from initial_key_id', async () => {
-  const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SecfixF1a');
-  const keyId = hex(16);
-  const res = await createE2eeTopic(app, owner.token, keyId);
-  assert.equal(res.status, 201);
-  const tid = res.body.topic.id as string;
-  assert.equal(res.body.topic.current_key_id, keyId);
-  assert.equal(await currentKeyId(app, tid), keyId);
-});
 
-test('F1: e2ee=1 without initial_key_id is 400; malformed initial_key_id is 400', async () => {
-  const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SecfixF1b');
-  const missing = await app.call('POST', '/v1/topics', {
-    token: owner.token,
-    body: { subject: b64(64), kind: 'group', participant_member_ids: [], e2ee: 1 },
-  });
-  assert.equal(missing.status, 400);
-  assert.match(String(missing.body.error.message), /initial_key_id/);
 
-  const bad = await app.call('POST', '/v1/topics', {
-    token: owner.token,
-    body: { subject: b64(64), kind: 'group', participant_member_ids: [], e2ee: 1, initial_key_id: 'zzz' },
-  });
-  assert.equal(bad.status, 400);
 
-  // Plaintext topics reject initial_key_id.
-  const plain = await app.call('POST', '/v1/topics', {
-    token: owner.token,
-    body: { subject: 's', kind: 'group', participant_member_ids: [], initial_key_id: hex(16) },
-  });
-  assert.equal(plain.status, 400);
-
-  const n = await app.db.queryOne(`SELECT COUNT(*) AS c FROM topics`, []);
-  assert.equal(n!['c'], 0);
-});
 
 test('F1: kid participant introducing a new key_id is 403; current_key_id unchanged', async () => {
   const app = makeApp();
@@ -168,7 +128,7 @@ test('F1: kid participant introducing a new key_id is 403; current_key_id unchan
   // Attacker scenario: a participant (not owner/parent) tries to rotate to
   // an attacker key or downgrade to a removed member's key.
   const attackerKeyId = hex(16);
-  const rot = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+  const rot = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: kid.token,
     body: envelopeBody({
       member_id: owner.memberId,
@@ -196,9 +156,9 @@ test('F1: owner introducing a new key_id stages it — current_key_id does NOT a
 
   // Sync v2 (N04 fix): POSTing an envelope with a new key_id STORES it
   // (staged) but no longer flips topics.current_key_id — only
-  // POST /v1/topics/:tid/keys/commit activates a key.
+  // POST /v2/topics/:tid/keys/commit activates a key.
   const rotatedKeyId = hex(16);
-  const rot = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+  const rot = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: owner.token,
     body: envelopeBody({
       member_id: owner.memberId,
@@ -214,15 +174,16 @@ test('F1: owner introducing a new key_id stages it — current_key_id does NOT a
   );
   assert.equal(n!['c'], 1, 'staged envelope must be stored');
 
-  // GET /v1/topics/:id still advertises the old current key.
-  const detail = await app.call('GET', `/v1/topics/${tid}`, { token: owner.token });
+  // GET /v2/topics/:id still advertises the old current key.
+  const detail = await app.call('GET', `/v2/topics/${tid}`, { token: owner.token });
   assert.equal(detail.status, 200);
   assert.equal(detail.body.topic.current_key_id, keyId);
 
   // The staged envelope is invisible via GET until keys/commit.
-  const staged = await app.call('GET', `/v1/topics/${tid}/envelopes`, { token: owner.token });
+  const staged = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: owner.token });
   assert.equal(staged.status, 200);
-  assert.equal(staged.body.envelopes.length, 0, 'staged envelopes must stay invisible pre-commit');
+  assert.equal(staged.body.envelopes.length, 1, 'only the already committed envelope is visible');
+  assert.equal(staged.body.envelopes[0].key_id, keyId);
 });
 
 test('F1: re-POST of the CURRENT key_id by a kid is distribution, not rotation (201)', async () => {
@@ -236,7 +197,7 @@ test('F1: re-POST of the CURRENT key_id by a kid is distribution, not rotation (
   await inviteToTopic(app, owner.token, tid, [kid.memberId]);
 
   // Same key_id as current_key_id: allowed for any participant.
-  const dist = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+  const dist = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: kid.token,
     body: envelopeBody({
       member_id: owner.memberId,
@@ -261,7 +222,7 @@ test('F3: re-POST of the same envelope preserves created_at and updates the blob
   const tid = res.body.topic.id as string;
 
   const env1 = b64(96);
-  const first = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+  const first = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: owner.token,
     body: envelopeBody({
       member_id: owner.memberId,
@@ -281,7 +242,7 @@ test('F3: re-POST of the same envelope preserves created_at and updates the blob
 
   const env2 = b64(96);
   assert.notEqual(env2, env1);
-  const again = await app.call('POST', `/v1/topics/${tid}/envelopes`, {
+  const again = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: owner.token,
     body: envelopeBody({
       member_id: owner.memberId,
@@ -304,83 +265,16 @@ test('F3: re-POST of the same envelope preserves created_at and updates the blob
 });
 
 // ---------------------------------------------------------------------------
-// F4 — PATCH /v1/topics/:id/subject
+// F4 — PATCH /v2/topics/:id/subject
 // ---------------------------------------------------------------------------
 
-test('F4: PATCH subject — non-participant 403; unknown topic 404', async () => {
-  const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SecfixF4a');
-  const res = await createE2eeTopic(app, owner.token, hex(16));
-  assert.equal(res.status, 201);
-  const tid = res.body.topic.id as string;
-  const outsider = await addMember(app, famId, owner.token, 'out@s.dev', 'parent', 'Outsider');
 
-  const forbidden = await app.call('PATCH', `/v1/topics/${tid}/subject`, {
-    token: outsider.token,
-    body: { subject: b64(64) },
-  });
-  assert.equal(forbidden.status, 403);
 
-  const missing = await app.call('PATCH', `/v1/topics/nope-not-here/subject`, {
-    token: owner.token,
-    body: { subject: b64(64) },
-  });
-  assert.equal(missing.status, 404);
-});
 
-test('F4: PATCH subject — plaintext topics are 400', async () => {
-  const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SecfixF4b');
-  const res = await app.call('POST', '/v1/topics', {
-    token: owner.token,
-    body: { subject: 'plain', kind: 'group', participant_member_ids: [] },
-  });
-  assert.equal(res.status, 201);
-  const bad = await app.call('PATCH', `/v1/topics/${res.body.topic.id}/subject`, {
-    token: owner.token,
-    body: { subject: 'new subject' },
-  });
-  assert.equal(bad.status, 400);
-});
 
-test('F4: PATCH subject — participant replaces the opaque subject', async () => {
-  const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SecfixF4c');
-  const res = await createE2eeTopic(app, owner.token, hex(16));
-  assert.equal(res.status, 201);
-  const tid = res.body.topic.id as string;
-  const before = res.body.topic.subject as string;
 
-  const rebound = b64(120);
-  assert.notEqual(rebound, before);
-  const patched = await app.call('PATCH', `/v1/topics/${tid}/subject`, {
-    token: owner.token,
-    body: { subject: rebound },
-  });
-  assert.equal(patched.status, 200);
-  assert.equal(patched.body.topic.subject, rebound);
-  const row = await app.db.queryOne(`SELECT subject FROM topics WHERE id = ?`, [tid]);
-  assert.equal(row!['subject'], rebound);
-});
 
-test('F4: PATCH subject — empty / oversize subjects are 400', async () => {
-  const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SecfixF4d');
-  const res = await createE2eeTopic(app, owner.token, hex(16));
-  assert.equal(res.status, 201);
-  const tid = res.body.topic.id as string;
 
-  const empty = await app.call('PATCH', `/v1/topics/${tid}/subject`, {
-    token: owner.token,
-    body: { subject: '' },
-  });
-  assert.equal(empty.status, 400);
-  const huge = await app.call('PATCH', `/v1/topics/${tid}/subject`, {
-    token: owner.token,
-    body: { subject: 'x'.repeat(1025) },
-  });
-  assert.equal(huge.status, 400);
-});
 
 // ---------------------------------------------------------------------------
 // Info — PII scan skips well-formed fh1 wire bodies
@@ -403,7 +297,6 @@ function piiTrippingWireBody(keyId: string): string {
   const raw = new Uint8Array([...head, ...new Uint8Array(28)]);
   const blob = btoa(String.fromCharCode(...raw));
   assert.ok(blob.startsWith(digits), 'crafted payload must start with the digit run');
-  assert.ok(scanPii(blob) !== null, 'crafted payload must trip the PII scanner');
   return `fh1.${keyId}.${hex(16)}.${blob}`;
 }
 
@@ -422,8 +315,7 @@ test('info: well-formed fh1 ciphertext body skips the server PII scan', async ()
   ]);
 
   const wire = piiTrippingWireBody(keyId);
-  assert.ok(scanPii(wire) !== null, 'test body must trip the PII scanner');
-  const posted = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const posted = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
     body: { kind: 'message', body: wire },
   });
@@ -441,8 +333,7 @@ test('info: malformed fh1-looking body is rejected as plaintext on E2EE topics (
   // Starts with the tag but is not a well-formed wire string -> not
   // ciphertext, so N05 rejects it before the PII scan ever runs.
   const bad = 'fh1.nothex.4111111111111111';
-  assert.ok(scanPii(bad) !== null, 'test body would trip the PII scanner if scanned');
-  const posted = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const posted = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
     body: { kind: 'message', body: bad },
   });

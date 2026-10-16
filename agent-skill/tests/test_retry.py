@@ -73,14 +73,14 @@ class RetryTest(unittest.TestCase):
             ]
         )
         client = make_client(t)
-        self.assertEqual(client.call("GET", "/v1/health", auth=False), {"ok": True})
+        self.assertEqual(client.call("GET", "/v2/health", auth=False), {"ok": True})
         self.assertEqual(len(t.calls), 3)
 
     def test_no_retry_on_400(self):
         t = ScriptedTransport([(400, {"error": {"code": "bad_request", "message": "nope"}})])
         client = make_client(t)
         with self.assertRaises(hub.HubError):
-            client.call("GET", "/v1/topics")
+            client.call("GET", "/v2/topics")
         self.assertEqual(len(t.calls), 1)
 
     def test_retries_500_then_succeeds(self):
@@ -91,7 +91,7 @@ class RetryTest(unittest.TestCase):
             ]
         )
         client = make_client(t)
-        self.assertEqual(client.call("GET", "/v1/health", auth=False), {"ok": True})
+        self.assertEqual(client.call("GET", "/v2/health", auth=False), {"ok": True})
         self.assertEqual(len(t.calls), 2)
 
     def test_exhausted_retries_raise_connection(self):
@@ -100,7 +100,7 @@ class RetryTest(unittest.TestCase):
         )
         client = make_client(t)
         with self.assertRaises(hub.HubError) as cm:
-            client.call("GET", "/v1/health", auth=False, retries=2)
+            client.call("GET", "/v2/health", auth=False, retries=2)
         self.assertEqual(cm.exception.code, "connection")
         self.assertEqual(len(t.calls), 3)  # 1 initial + 2 retries
 
@@ -112,7 +112,7 @@ class RetryTest(unittest.TestCase):
             ]
         )
         client = make_client(t)
-        client.call("POST", "/v1/families", json_body={"name": "N"}, auth=False)
+        client.call("POST", "/v2/families", json_body={"name": "N"}, auth=False)
         keys = {c["headers"].get("Idempotency-Key") for c in t.calls}
         self.assertEqual(len(keys), 1)
         key = keys.pop()
@@ -127,18 +127,18 @@ class RetryTest(unittest.TestCase):
             return 200, json.dumps({"ok": True})
 
         client = make_client(transport)
-        client.call("POST", "/v1/families", json_body={}, auth=False)
-        client.call("POST", "/v1/topics", json_body={}, auth=False)
-        client.call("POST", "/v1/provisioning-codes", json_body={}, auth=False)
-        client.call("POST", "/v1/families/f1/invites", json_body={}, auth=False)
-        client.call("POST", "/v1/provisioning-codes/fhp_x/redeem", json_body={}, auth=False)
-        client.call("POST", "/v1/invites/fhi_x/accept", json_body={}, auth=False)
-        self.assertTrue(seen["/v1/families"])
-        self.assertTrue(seen["/v1/topics"])
-        self.assertTrue(seen["/v1/provisioning-codes"])
-        self.assertTrue(seen["/v1/families/f1/invites"])
-        self.assertIsNone(seen["/v1/provisioning-codes/fhp_x/redeem"])
-        self.assertIsNone(seen["/v1/invites/fhi_x/accept"])
+        client.call("POST", "/v2/families", json_body={}, auth=False)
+        client.call("POST", "/v2/topics", json_body={}, auth=False)
+        client.call("POST", "/v2/provisioning-codes", json_body={}, auth=False)
+        client.call("POST", "/v2/families/f1/invites", json_body={}, auth=False)
+        client.call("POST", "/v2/provisioning-codes/fhp_x/redeem", json_body={}, auth=False)
+        client.call("POST", "/v2/invites/fhi_x/accept", json_body={}, auth=False)
+        self.assertTrue(seen["/v2/families"])
+        self.assertTrue(seen["/v2/topics"])
+        self.assertTrue(seen["/v2/provisioning-codes"])
+        self.assertTrue(seen["/v2/families/f1/invites"])
+        self.assertIsNone(seen["/v2/provisioning-codes/fhp_x/redeem"])
+        self.assertIsNone(seen["/v2/invites/fhi_x/accept"])
 
     def test_server_code_preserved(self):
         t = ScriptedTransport(
@@ -146,7 +146,7 @@ class RetryTest(unittest.TestCase):
         )
         client = make_client(t)
         with self.assertRaises(hub.HubError) as cm:
-            client.call("POST", "/v1/x", json_body={}, auth=False)
+            client.call("POST", "/v2/x", json_body={}, auth=False)
         # Friendly code stays mapped; server code preserved verbatim.
         self.assertEqual(cm.exception.code, "conflict")
         self.assertEqual(cm.exception.server_code, "code_used")
@@ -161,7 +161,7 @@ class RetryTest(unittest.TestCase):
         )
         client = make_client(t)
         resp = client.call(
-            "POST", "/v1/provisioning-codes/fhp_abc/redeem", json_body={}, auth=False
+            "POST", "/v2/provisioning-codes/fhp_abc/redeem", json_body={}, auth=False
         )
         self.assertEqual(resp["token"], "t")
         self.assertEqual(len(t.calls), 2)
@@ -174,7 +174,7 @@ class RetryTest(unittest.TestCase):
         )
         client = make_client(t)
         with self.assertRaises(hub.HubError) as cm:
-            client.call("POST", "/v1/topics/t1/tasks", json_body={}, auth=False)
+            client.call("POST", "/v2/topics/t1/tasks", json_body={}, auth=False)
         self.assertEqual(cm.exception.code, "connection")
         self.assertEqual(len(t.calls), 1)
 
@@ -218,11 +218,11 @@ class CircleCreateRecoveryTest(unittest.TestCase):
         def router(method, url, headers, body_bytes):
             path = urlparse.urlparse(url).path
             calls.append({"method": method, "url": url, "headers": dict(headers)})
-            if path == "/v1/health" and method == "GET":
+            if path == "/v2/health" and method == "GET":
                 return 200, json.dumps(
-                    {"ok": True, "version": "1.0.0", "api_versions": ["v1"]})
-            if path == "/v1/families" and method == "POST":
-                n = len([c for c in calls if c["url"].endswith("/v1/families")])
+                    {"ok": True, "version": "2.0.0", "api_versions": ["v2"]})
+            if path == "/v2/families" and method == "POST":
+                n = len([c for c in calls if c["url"].endswith("/v2/families")])
                 if n == 1:
                     return 201, json.dumps({"id": "c1", "name": "Gym", "kind": "general",
                                             "provisioning_code": "fhp_code1"})
@@ -249,7 +249,7 @@ class CircleCreateRecoveryTest(unittest.TestCase):
         )
         self.assertEqual(rc, 0, err)
         self.assertIn("now active", out)
-        creates = [c for c in calls if c["url"].endswith("/v1/families")]
+        creates = [c for c in calls if c["url"].endswith("/v2/families")]
         self.assertEqual(len(creates), 2)
         self.assertEqual(
             creates[0]["headers"].get("Idempotency-Key"),
@@ -260,9 +260,9 @@ class CircleCreateRecoveryTest(unittest.TestCase):
     def test_create_duplicate_name_is_clear_error(self):
         def transport(method, url, headers, body_bytes):
             path = urlparse.urlparse(url).path
-            if path == "/v1/health" and method == "GET":
+            if path == "/v2/health" and method == "GET":
                 return 200, json.dumps(
-                    {"ok": True, "version": "1.0.0", "api_versions": ["v1"]})
+                    {"ok": True, "version": "2.0.0", "api_versions": ["v2"]})
             return 409, json.dumps(
                 {"error": {"code": "circle_name_taken", "message": "exists"}}
             )

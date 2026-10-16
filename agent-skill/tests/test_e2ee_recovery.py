@@ -18,6 +18,7 @@ Run from the repo root:
 """
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -54,12 +55,12 @@ class RecoveryFakeHub:
     """Stateful fake hub mirroring the server's access rules for recovery.
 
     - Participants gate topic-scoped calls (403 otherwise).
-    - GET /v1/agent-keys?member_id=: registered keys per member.
-    - POST /v1/agent-keys/rotate: registers the caller's new public key.
+    - GET /v2/agent-keys?member_id=: registered keys per member.
+    - POST /v2/agent-keys/rotate: registers the caller's new public key.
     - Envelopes POST: target must be a current participant with a registered
       key; GET returns only the caller's own envelopes.
     - entries POST: only known kinds; stored with seq/gseq.
-    - grant_on_poll: when set, the Nth GET /v1/.../envelopes seals the topic
+    - grant_on_poll: when set, the Nth GET /v2/.../envelopes seals the topic
       key for the caller's current registered key (simulates a member-agent
       running `hub key-grant` after human approval).
     """
@@ -105,6 +106,7 @@ class RecoveryFakeHub:
                 "agent_label": agent_label,
                 "key_id": self.topic_keys[tid][0],
                 "envelope": self.seal_for(tid, pub_b64),
+                "commitment": hashlib.sha256(self.topic_keys[tid][1]).hexdigest(),
             }
         )
 
@@ -117,7 +119,7 @@ class RecoveryFakeHub:
         # The fake models a current (1.0.0) server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
-        if method == "GET" and path == "/v1/health":
+        if method == "GET" and path == "/v2/health":
             self.health_calls.append(
                 {
                     "method": method,
@@ -127,20 +129,20 @@ class RecoveryFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
             )
 
         self._record(method, url, headers, body_bytes)
         body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
         mid, label = self.caller
 
-        if method == "GET" and path == "/v1/me":
+        if method == "GET" and path == "/v2/me":
             m = self.members[mid]
             return 200, json.dumps(
                 {"id": mid, "name": m["name"], "role": m["role"],
                  "agent_label": label, "family_id": "f1"}
             )
-        if method == "GET" and path == "/v1/agent-keys":
+        if method == "GET" and path == "/v2/agent-keys":
             qmid = (query.get("member_id") or [""])[0]
             keys = [
                 {"member_id": qmid, "agent_label": lab, "public_key": pub,
@@ -148,7 +150,7 @@ class RecoveryFakeHub:
                 for lab, pub in self.keys_by_member.get(qmid, [])
             ]
             return 200, json.dumps({"keys": keys})
-        if method == "POST" and path == "/v1/agent-keys/rotate":
+        if method == "POST" and path == "/v2/agent-keys/rotate":
             pub = body.get("agent_public_key")
             if not pub:
                 return 400, json.dumps(
@@ -163,7 +165,7 @@ class RecoveryFakeHub:
             )
 
         segs = path.strip("/").split("/")
-        if len(segs) >= 3 and segs[0] == "v1" and segs[1] == "topics":
+        if len(segs) >= 3 and segs[0] == "v2" and segs[1] == "topics":
             tid = urlparse.unquote(segs[2])
             topic = self.topics.get(tid)
             if topic is None:
@@ -460,7 +462,7 @@ class TestRecoverRung2(E2eeRecoveryTestBase):
         # A visible key-request was posted; nothing was auto-granted.
         reqs = self.fake.entry_posts("key_request")
         self.assertEqual(len(reqs), 1)
-        self.assertIn("NO automatic fulfillment", json.loads(reqs[0]["body"])["body"])
+        self.assertEqual(json.loads(reqs[0]["body"])["data"], {"member_id":"m1", "agent_label":"owner-agent"})
         self.assertIn("waiting", err)
         self.assertIn("[rung 1/3] FAILED", err)
         self.assertIn("[rung 2/3]", err)
@@ -503,7 +505,7 @@ class TestRecoverRung3(E2eeRecoveryTestBase):
         self.assertIn("[rung 3/3]", err)
         self.assertIn("provisioning code", err)
         self.assertIn("hub setup", err)
-        self.assertIn("POST https://hub.example/v1/provisioning-codes", err)
+        self.assertIn("POST https://hub.example/v2/provisioning-codes", err)
         self.assertIn("[rung 2/3] SKIPPED", err)
 
     def test_rung3_identity_only_without_topic(self):
@@ -519,18 +521,15 @@ class TestRecoverRung3(E2eeRecoveryTestBase):
 class TestTopicArchive(E2eeRecoveryTestBase):
     def test_archive_posts_entry_with_successor(self):
         rc, out, err = self.run_cli(
-            ["topic-archive", "--topic", TOPIC_ID, "--successor", SUCCESSOR_ID,
-             "--reason", "every member-agent lost its keys", "--yes"])
+            ["topic-archive", "--topic", TOPIC_ID, "--successor", SUCCESSOR_ID, "--yes"])
         self.assertEqual(rc, 0, "stderr: %s" % err)
         posts = self.fake.entry_posts("topic_archived")
         self.assertEqual(len(posts), 1)
         payload = json.loads(posts[0]["body"])
-        self.assertIn("every member-agent lost its keys", payload["body"])
-        self.assertIn("Owner", payload["body"])  # who authorized
-        self.assertIn(SUCCESSOR_ID, payload["body"])  # where discussion continues
+        self.assertNotIn("body", payload)
         data = payload["data"]
         self.assertEqual(data["successor_topic_id"], SUCCESSOR_ID)
-        self.assertEqual(data["reason"], "every member-agent lost its keys")
+        self.assertNotIn("reason", data)
         self.assertEqual(data["archived_by"], "m1")
         result = json.loads(out)
         self.assertEqual(result["topic_id"], TOPIC_ID)
@@ -539,8 +538,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
         with mock.patch.object(hub, "_prompt", return_value="no"):
             rc, out, err = self.run_cli(
                 ["topic-archive", "--topic", TOPIC_ID,
-                 "--successor", SUCCESSOR_ID,
-                 "--reason", "keys lost"])
+                 "--successor", SUCCESSOR_ID,])
         self.assertEqual(rc, 1, "stderr: %s" % err)
         self.assertEqual(self.fake.entry_posts("topic_archived"), [])
         self.assertIn("archive cancelled", err)
@@ -550,7 +548,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
             hub, "_prompt", side_effect=AssertionError("prompt must not run"))
         with prompter:
             rc, out, err = self.run_cli(
-                ["topic-archive", "--topic", TOPIC_ID, "--reason", "keys lost",
+                ["topic-archive", "--topic", TOPIC_ID,
                  "--yes"])
         self.assertEqual(rc, 0, "stderr: %s" % err)
         self.assertEqual(len(self.fake.entry_posts("topic_archived")), 1)
@@ -564,12 +562,11 @@ class TestTopicArchive(E2eeRecoveryTestBase):
         with mock.patch.object(hub, "_prompt", return_value="yes"):
             with captured() as (out, err):
                 rc = hub.main(
-                    ["--profile", "kidprof", "topic-archive", "--topic", TOPIC_ID,
-                     "--reason", "keys lost"],
+                    ["--profile", "kidprof", "topic-archive", "--topic", TOPIC_ID,],
                     transport=self.fake,
                 )
         self.assertEqual(rc, 1, "stderr: %s" % err.getvalue())
-        self.assertIn("Only the topic owner/parent or a remaining key-holder",
+        self.assertIn("Only an owner or parent",
                       err.getvalue())
         self.assertEqual(self.fake.entry_posts("topic_archived"), [])
 
@@ -581,8 +578,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
         self.fake.caller = ("m2", "bee-agent")
         with captured() as (out, err):
             rc = hub.main(
-                ["--profile", "beeprof", "topic-archive", "--topic", TOPIC_ID,
-                 "--reason", "keys lost", "--yes"],
+                ["--profile", "beeprof", "topic-archive", "--topic", TOPIC_ID, "--yes"],
                 transport=self.fake,
             )
         self.assertEqual(rc, 0, "stderr: %s" % err.getvalue())
@@ -590,8 +586,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
 
     def test_archive_unknown_successor_refused(self):
         rc, out, err = self.run_cli(
-            ["topic-archive", "--topic", TOPIC_ID, "--successor", "nope",
-             "--reason", "keys lost", "--yes"])
+            ["topic-archive", "--topic", TOPIC_ID, "--successor", "nope", "--yes"])
         self.assertEqual(rc, 1, "stderr: %s" % err)
         self.assertEqual(self.fake.entry_posts("topic_archived"), [])
 
@@ -603,8 +598,7 @@ class TestTopicArchive(E2eeRecoveryTestBase):
              "actor_member_id": "m1", "agent_label": "owner-agent",
              "kind": "message", "body": wire, "data": None})
         rc, out, err = self.run_cli(
-            ["topic-archive", "--topic", TOPIC_ID, "--successor", SUCCESSOR_ID,
-             "--reason", "keys lost", "--yes"])
+            ["topic-archive", "--topic", TOPIC_ID, "--successor", SUCCESSOR_ID, "--yes"])
         self.assertEqual(rc, 0, "stderr: %s" % err)
         rc, out, err = self.run_cli(["read", "--topic", TOPIC_ID])
         self.assertEqual(rc, 0, "stderr: %s" % err)

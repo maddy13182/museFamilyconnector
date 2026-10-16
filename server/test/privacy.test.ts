@@ -1,3 +1,4 @@
+import { b64 } from './syncv2_helpers.js';
 // Tests: Phase C privacy boundaries.
 // F06 — the from-join history floor must apply to the task list (not just
 // entry reads), and the cutoff must be computed inside the membership
@@ -8,7 +9,8 @@
 // task completion results.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { makeApp, TestApp } from './app.js';
+import { makeClientApp as makeApp } from './fixture-client.js';
+import type { TestClientApp as TestApp } from './fixture-client.js';
 
 async function bootstrap(): Promise<{
   app: TestApp;
@@ -17,14 +19,14 @@ async function bootstrap(): Promise<{
   ownerId: string;
 }> {
   const app = makeApp();
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name: 'F', owner_name: 'Mahesh', owner_email: 'm@t.dev' },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
   return {
@@ -42,22 +44,22 @@ async function inviteMember(
   email: string,
   name: string,
 ): Promise<{ token: string; id: string }> {
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: ownerToken,
     body: { email, role: 'kid' },
   });
   assert.equal(inv.status, 201);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: name, agent_label: `${name.toLowerCase()}-agent` } },
+    `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: name, agent_label: `${name.toLowerCase()}-agent` , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, id: acc.body.member.id as string };
 }
 
 async function makeTopic(app: TestApp, ownerToken: string, ownerId: string, ids: string[]): Promise<string> {
-  const t = await app.call('POST', '/v1/topics', {
+  const t = await app.call('POST', '/v2/topics', {
     token: ownerToken,
     body: { subject: 'Trip', kind: 'group', participant_member_ids: [ownerId, ...ids] },
   });
@@ -74,11 +76,11 @@ test('F06: from_join member cannot read pre-join tasks via list', async () => {
   const kid1 = await inviteMember(app, famId, ownerToken, 'k1@t.dev', 'Kid1');
   const tid = await makeTopic(app, ownerToken, ownerId, [kid1.id]);
 
-  await app.call('POST', `/v1/topics/${tid}/entries`, {
+  await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: ownerToken,
     body: { body: 'Old message before anyone else joined.' },
   });
-  const t1 = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t1 = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'Pre-join task' },
   });
@@ -87,14 +89,14 @@ test('F06: from_join member cannot read pre-join tasks via list', async () => {
 
   // Kid2 joins later with history_from=from_join.
   const kid2 = await inviteMember(app, famId, ownerToken, 'k2@t.dev', 'Kid2');
-  const inv = await app.call('POST', `/v1/topics/${tid}/invite`, {
+  const inv = await app.call('POST', `/v2/topics/${tid}/invite`, {
     token: ownerToken,
     body: { member_ids: [kid2.id], history_from: 'from_join' },
   });
   assert.equal(inv.status, 200);
 
   // 1. list hides the pre-join task.
-  const list = await app.call('GET', `/v1/topics/${tid}/tasks`, { token: kid2.token });
+  const list = await app.call('GET', `/v2/topics/${tid}/tasks`, { token: kid2.token });
   assert.equal(list.status, 200);
   assert.ok(
     !(list.body.tasks as any[]).some((t) => t.id === t1id),
@@ -102,18 +104,18 @@ test('F06: from_join member cannot read pre-join tasks via list', async () => {
   );
 
   // A task created AFTER the join is visible via list.
-  const t2 = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t2 = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'Post-join task' },
   });
   assert.equal(t2.status, 201);
   const t2id = t2.body.task.id as string;
 
-  const list2 = await app.call('GET', `/v1/topics/${tid}/tasks`, { token: kid2.token });
+  const list2 = await app.call('GET', `/v2/topics/${tid}/tasks`, { token: kid2.token });
   assert.ok((list2.body.tasks as any[]).some((t) => t.id === t2id), 'post-join task visible in list');
 
   // The original participant (floor=1) still sees the pre-join task everywhere.
-  const listK1 = await app.call('GET', `/v1/topics/${tid}/tasks`, { token: kid1.token });
+  const listK1 = await app.call('GET', `/v2/topics/${tid}/tasks`, { token: kid1.token });
   assert.ok((listK1.body.tasks as any[]).some((t) => t.id === t1id), 'original member still sees pre-join task in list');
 });
 
@@ -122,7 +124,7 @@ test('F06: from_join member cannot use write paths as a read oracle for pre-join
   const kid1 = await inviteMember(app, famId, ownerToken, 'k1@t.dev', 'Kid1');
   const tid = await makeTopic(app, ownerToken, ownerId, [kid1.id]);
 
-  const t1 = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t1 = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'Pre-join task' },
   });
@@ -130,19 +132,19 @@ test('F06: from_join member cannot use write paths as a read oracle for pre-join
   const t1id = t1.body.task.id as string;
 
   const kid2 = await inviteMember(app, famId, ownerToken, 'k2@t.dev', 'Kid2');
-  const inv = await app.call('POST', `/v1/topics/${tid}/invite`, {
+  const inv = await app.call('POST', `/v2/topics/${tid}/invite`, {
     token: ownerToken,
     body: { member_ids: [kid2.id], history_from: 'from_join' },
   });
   assert.equal(inv.status, 200);
 
   // done and note paths are gated.
-  const done = await app.call('POST', `/v1/tasks/${t1id}/done`, {
+  const done = await app.call('POST', `/v2/tasks/${t1id}/done`, {
     token: kid2.token,
     body: {},
   });
   assert.equal(done.status, 404);
-  const note = await app.call('POST', `/v1/tasks/${t1id}/notes`, {
+  const note = await app.call('POST', `/v2/tasks/${t1id}/notes`, {
     token: kid2.token,
     body: { body: 'hello' },
   });
@@ -152,20 +154,20 @@ test('F06: from_join member cannot use write paths as a read oracle for pre-join
 test('F06: history_from=full invite still sees pre-join tasks', async () => {  const { app, famId, ownerToken, ownerId } = await bootstrap();
   const kid1 = await inviteMember(app, famId, ownerToken, 'k1@t.dev', 'Kid1');
   const tid = await makeTopic(app, ownerToken, ownerId, [kid1.id]);
-  const t1 = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t1 = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'Pre-join task' },
   });
   const t1id = t1.body.task.id as string;
 
   const kid2 = await inviteMember(app, famId, ownerToken, 'k2@t.dev', 'Kid2');
-  const inv = await app.call('POST', `/v1/topics/${tid}/invite`, {
+  const inv = await app.call('POST', `/v2/topics/${tid}/invite`, {
     token: ownerToken,
     body: { member_ids: [kid2.id], history_from: 'full' },
   });
   assert.equal(inv.status, 200);
 
-  const list = await app.call('GET', `/v1/topics/${tid}/tasks`, { token: kid2.token });
+  const list = await app.call('GET', `/v2/topics/${tid}/tasks`, { token: kid2.token });
   assert.ok((list.body.tasks as any[]).some((t) => t.id === t1id), 'full-history invite sees pre-join task in list');
 });
 
@@ -173,66 +175,66 @@ test('F06: history_from=full invite still sees pre-join tasks', async () => {  c
 // F08
 // ---------------------------------------------------------------------------
 
-test('F08: PII-shaped values in entry.data are rejected (422)', async () => {
+test('F08: Plaintext PII-shaped values in entry.data are rejected before storage', async () => {
   const { app, ownerToken, ownerId } = await bootstrap();
   const tid = await makeTopic(app, ownerToken, ownerId, []);
 
-  const ssn = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const ssn = await app.rawCall('POST', `/v2/topics/${tid}/entries`, {
     token: ownerToken,
     body: { body: 'clean body', data: { note: 'member ssn 900-12-3456 on file' } },
   });
-  assert.equal(ssn.status, 422);
-  assert.equal(ssn.body.error.code, 'pii_detected');
+  assert.equal(ssn.status, 400);
+  assert.equal(ssn.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const nested = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const nested = await app.rawCall('POST', `/v2/topics/${tid}/entries`, {
     token: ownerToken,
     body: { body: 'clean', data: { deep: { list: ['ok', 'card 4111 1111 1111 1111'] } } },
   });
-  assert.equal(nested.status, 422);
-  assert.equal(nested.body.error.code, 'pii_detected');
+  assert.equal(nested.status, 400);
+  assert.equal(nested.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const clean = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const clean = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: ownerToken,
     body: { body: 'clean', data: { note: 'pick up milk', count: 3 } },
   });
   assert.equal(clean.status, 201);
 });
 
-test('F08: PII-shaped task titles are rejected on create', async () => {
+test('F08: Plaintext PII-shaped task titles are rejected on create', async () => {
   const { app, ownerToken, ownerId } = await bootstrap();
   const tid = await makeTopic(app, ownerToken, ownerId, []);
 
-  const badCreate = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const badCreate = await app.rawCall('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'File SSN 900-12-3456 today' },
   });
-  assert.equal(badCreate.status, 422);
-  assert.equal(badCreate.body.error.code, 'pii_detected');
+  assert.equal(badCreate.status, 400);
+  assert.equal(badCreate.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const ok = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const ok = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'File the paperwork today' },
   });
   assert.equal(ok.status, 201);
 });
 
-test('F08: PII-shaped completion results are rejected; clean results pass', async () => {
+test('F08: Plaintext PII-shaped completion results are rejected; clean results pass', async () => {
   const { app, ownerToken, ownerId } = await bootstrap();
   const tid = await makeTopic(app, ownerToken, ownerId, []);
-  const t = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const t = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'Do it' },
   });
   const taskId = t.body.task.id as string;
 
-  const bad = await app.call('POST', `/v1/tasks/${taskId}/done`, {
+  const bad = await app.rawCall('POST', `/v2/tasks/${taskId}/done`, {
     token: ownerToken,
     body: { result: { summary: 'paid, ssn 900-12-3456 verified' } },
   });
-  assert.equal(bad.status, 422);
-  assert.equal(bad.body.error.code, 'pii_detected');
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error.code, 'plaintext_in_e2ee_topic');
 
-  const good = await app.call('POST', `/v1/tasks/${taskId}/done`, {
+  const good = await app.call('POST', `/v2/tasks/${taskId}/done`, {
     token: ownerToken,
     body: { result: { summary: 'all done', items: 2 } },
   });
@@ -247,36 +249,36 @@ test('F08: PII-shaped completion results are rejected; clean results pass', asyn
 test('deleted endpoints stay deleted: redact, export, bare task GET/PATCH', async () => {
   const { app, ownerToken, ownerId } = await bootstrap();
   const tid = await makeTopic(app, ownerToken, ownerId, []);
-  const entry = await app.call('POST', `/v1/topics/${tid}/entries`, {
+  const entry = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: ownerToken,
     body: { body: 'some entry' },
   });
   assert.equal(entry.status, 201);
   const gseq = entry.body.entry.gseq as number;
-  const task = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const task = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: ownerToken,
     body: { title: 'some task' },
   });
   const taskId = task.body.task.id as string;
 
-  // POST /v1/entries/:eid/redact — deleted (no client).
+  // POST /v2/entries/:eid/redact — deleted (no client).
   for (const tok of [ownerToken]) {
-    const r = await app.call('POST', `/v1/entries/${gseq}/redact`, { token: tok, body: {} });
+    const r = await app.call('POST', `/v2/entries/${gseq}/redact`, { token: tok, body: {} });
     assert.equal(r.status, 404, 'redact must stay deleted');
   }
-  // GET /v1/topics/:tid/export — deleted (no client).
-  const exp = await app.call('GET', `/v1/topics/${tid}/export`, { token: ownerToken });
+  // GET /v2/topics/:tid/export — deleted (no client).
+  const exp = await app.call('GET', `/v2/topics/${tid}/export`, { token: ownerToken });
   assert.equal(exp.status, 404, 'export must stay deleted');
-  // GET / PATCH /v1/tasks/:tid — deleted (the CLI uses notes/done).
+  // GET / PATCH /v2/tasks/:tid — deleted (the CLI uses notes/done).
   for (const method of ['GET', 'PATCH'] as const) {
-    const r = await app.call(method, `/v1/tasks/${taskId}`, {
+    const r = await app.call(method, `/v2/tasks/${taskId}`, {
       token: ownerToken,
       body: method === 'PATCH' ? { title: 'x' } : undefined,
     });
-    assert.equal(r.status, 404, `${method} /v1/tasks/:id must stay deleted`);
+    assert.equal(r.status, 404, `${method} /v2/tasks/:id must stay deleted`);
   }
   // The task sub-paths that remain still work (notes/done are not bare-task).
-  const note = await app.call('POST', `/v1/tasks/${taskId}/notes`, {
+  const note = await app.call('POST', `/v2/tasks/${taskId}/notes`, {
     token: ownerToken,
     body: { body: 'still here' },
   });

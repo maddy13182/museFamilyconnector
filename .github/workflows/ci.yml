@@ -33,6 +33,18 @@ jobs:
       - name: Build + test
         run: npm test
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install integration dependencies
+        working-directory: .
+        run: pip install -r agent-skill/requirements.lock
+
+      - name: Production CLI and Worker encryption journeys
+        working-directory: .
+        run: python3 integration/test_encryption.py
+
       - name: npm audit (fail on high+)
         run: npm audit --audit-level=high
 

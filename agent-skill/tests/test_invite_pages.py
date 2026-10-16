@@ -34,7 +34,7 @@ class TestInviteOnboardingPages(HubTestBase):
             "onboarding_url": ONBOARDING_URL,
         }
         body.update(resp_over)
-        self.fake.add("POST", "/v1/families/fam1/invites", 201, body)
+        self.fake.add("POST", "/v2/families/fam1/invites", 201, body)
         return self.run_cli(
             ["invite-member", "--email", "lakshmi@example.com", "--role", "parent"]
         )
@@ -80,19 +80,19 @@ class TestInviteOnboardingPages(HubTestBase):
         # passthrough); everything below takes codes, never URLs.
         # topic-level invite
         self.seed_config(family_id="fam1")
-        self.fake.add("POST", "/v1/topics/t1/invite", 200, {"ok": True})
+        self.fake.add("POST", "/v2/topics/t1/invite", 200, {"ok": True})
         rc, out, err = self.run_cli(["invite", "--topic", "t1", "--member", "m1"])
         self.assertEqual(rc, 0)
         self.assertNotIn("/i/", out + err)
         # circle join: takes a code, never a page URL
         self.fake.add(
-            "POST", "/v1/invites/%s/accept" % INVITE_CODE, 200,
+            "POST", "/v2/invites/%s/accept" % INVITE_CODE, 200,
             {"member": {"id": "m2", "name": "New", "role": "parent",
                         "family_id": "fam1"},
              "token": "fh_fixturetoken"},
         )
         self.fake.add(
-            "GET", "/v1/me", 200,
+            "GET", "/v2/me", 200,
             {"id": "m2", "name": "New", "role": "parent", "family_id": "fam1"},
         )
         rc, out, err = self.run_cli(["circle", "join", "--code", INVITE_CODE])

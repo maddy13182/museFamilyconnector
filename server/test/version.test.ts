@@ -1,4 +1,4 @@
-// Version reporting + structured logging: /v1/health reports the
+// Version reporting + structured logging: /v2/health reports the
 // server/package.json version (single source of truth), every log line
 // carries it, and single-use codes never appear in log output.
 import { test } from 'node:test';
@@ -34,7 +34,7 @@ function parsed(lines: string[]): Record<string, unknown>[] {
 
 test('health reports the package.json version', async () => {
   const app = makeApp();
-  const res = await app.call('GET', '/v1/health');
+  const res = await app.call('GET', '/v2/health');
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, true);
   assert.equal(res.body.version, SERVER_VERSION);
@@ -42,29 +42,29 @@ test('health reports the package.json version', async () => {
 });
 
 test('redactPath hides invite and provisioning codes', () => {
-  assert.equal(redactPath('/v1/invites/abc123/accept'), '/v1/invites/[redacted]');
+  assert.equal(redactPath('/v2/invites/abc123/accept'), '/v2/invites/[redacted]');
   assert.equal(
-    redactPath('/v1/provisioning-codes/xyz789/redeem'),
-    '/v1/provisioning-codes/[redacted]',
+    redactPath('/v2/provisioning-codes/xyz789/redeem'),
+    '/v2/provisioning-codes/[redacted]',
   );
   // Near-miss shapes must not leak codes either (over-redaction is safe).
-  assert.equal(redactPath('/v1/invites/abc123/accept/'), '/v1/invites/[redacted]');
-  assert.equal(redactPath('/v1/invites/a/b/accept'), '/v1/invites/[redacted]');
+  assert.equal(redactPath('/v2/invites/abc123/accept/'), '/v2/invites/[redacted]');
+  assert.equal(redactPath('/v2/invites/a/b/accept'), '/v2/invites/[redacted]');
   assert.equal(
-    redactPath('/v1/provisioning-codes/xyz/redeem/'),
-    '/v1/provisioning-codes/[redacted]',
+    redactPath('/v2/provisioning-codes/xyz/redeem/'),
+    '/v2/provisioning-codes/[redacted]',
   );
   // Bare collection routes carry no code — left alone.
-  assert.equal(redactPath('/v1/invites'), '/v1/invites');
-  assert.equal(redactPath('/v1/provisioning-codes'), '/v1/provisioning-codes');
-  assert.equal(redactPath('/v1/topics'), '/v1/topics');
-  assert.equal(redactPath('/v1/health'), '/v1/health');
+  assert.equal(redactPath('/v2/invites'), '/v2/invites');
+  assert.equal(redactPath('/v2/provisioning-codes'), '/v2/provisioning-codes');
+  assert.equal(redactPath('/v2/topics'), '/v2/topics');
+  assert.equal(redactPath('/v2/health'), '/v2/health');
 });
 
 test('logEvent emits version, ts, level, event on every line', () => {
   const cap = captureLogs();
   try {
-    logEvent('info', 'request', { method: 'GET', path: '/v1/health', status: 200 });
+    logEvent('info', 'request', { method: 'GET', path: '/v2/health', status: 200 });
     logEvent('error', 'request_error', { status: 500 });
   } finally {
     cap.restore();
@@ -83,7 +83,7 @@ test('rejected token logs auth_rejected without leaking the token', async () => 
   const cap = captureLogs();
   let res;
   try {
-    res = await app.call('GET', '/v1/topics', { token: 'bad-token-xyz' });
+    res = await app.call('GET', '/v2/topics', { token: 'bad-token-xyz' });
   } finally {
     cap.restore();
   }
@@ -105,7 +105,7 @@ test('code-bearing paths are redacted in logs', async () => {
   const app = makeApp();
   const cap = captureLogs();
   try {
-    await app.call('POST', '/v1/invites/SECRETCODE123/accept', { body: {} });
+    await app.call('POST', '/v2/invites/SECRETCODE123/accept', { body: {} });
   } finally {
     cap.restore();
   }
@@ -125,7 +125,7 @@ test('successful request logs one access line with version', async () => {
   const app = makeApp();
   const cap = captureLogs();
   try {
-    await app.call('GET', '/v1/health');
+    await app.call('GET', '/v2/health');
   } finally {
     cap.restore();
   }
@@ -133,7 +133,7 @@ test('successful request logs one access line with version', async () => {
   assert.equal(access.length, 1);
   assert.equal(access[0]['v'], SERVER_VERSION);
   assert.equal(access[0]['method'], 'GET');
-  assert.equal(access[0]['path'], '/v1/health');
+  assert.equal(access[0]['path'], '/v2/health');
   assert.equal(access[0]['status'], 200);
   assert.ok(typeof access[0]['ms'] === 'number');
 });

@@ -88,7 +88,7 @@ export async function resolveToken(
     `SELECT t.token_id, t.member_id, t.agent_label, t.revoked_at,
             m.family_id, m.role, m.principal_id
        FROM agent_tokens t
-       JOIN members m ON m.id = t.member_id
+       JOIN members m ON m.id = t.member_id AND m.removed_at IS NULL
       WHERE t.token_hash = ?`,
     [hash],
   );

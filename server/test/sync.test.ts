@@ -1,4 +1,4 @@
-// Sync v2 — GET /v1/sync/topics (spec §1.3, §1.4).
+// Sync v2 — GET /v2/sync/topics (spec §1.3, §1.4).
 //
 // Covers: per-circle scoping (one call per circle token; cross-family topic
 // ids 404 on topic-scoped endpoints); the history_from_seq visibility floor;
@@ -13,21 +13,23 @@ import assert from 'node:assert';
 import {
   makeApp,
   TestApp,
-  b64,
   setupKeyedFamily,
   addMember,
   addAgent,
-  createPlainTopic,
-  createE2eeTopic,
+  createActiveTopic,
   inviteToTopic,
-  postEntry,
-  genesisCommit,
+  postEntry as rawPostEntry,
   wireBody,
   readState,
 } from './syncv2_helpers.js';
 
+async function postEntry(app: TestApp, token: string, tid: string, text: string, extra: Record<string,unknown> = {}) {
+  const row = await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?', [tid]);
+  return rawPostEntry(app, token, tid, text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string), extra);
+}
+
 async function syncTopics(app: TestApp, token: string, qs = '') {
-  return app.call('GET', `/v1/sync/topics${qs}`, { token });
+  return app.call('GET', `/v2/sync/topics${qs}`, { token });
 }
 
 // ---------------------------------------------------------------------------
@@ -39,8 +41,8 @@ test('sync/topics is per-circle: a token sees only its own circle topics', async
   const a = await setupKeyedFamily(app, 'SyncFamA');
   const b = await setupKeyedFamily(app, 'SyncFamB');
 
-  const tidA = await createPlainTopic(app, a.owner.token, 'A topic');
-  const tidB = await createPlainTopic(app, b.owner.token, 'B topic');
+  const tidA = await createActiveTopic(app, a.owner.token, 'A topic');
+  const tidB = await createActiveTopic(app, b.owner.token, 'B topic');
   // Note: own posts don't flag topics as changed (server excludes self
   // from new_count). For the isolation check, we verify the other
   // circle's topic never appears — the per-circle WHERE clause, not
@@ -68,12 +70,12 @@ test('cross-family topic ids 404 on topic-scoped endpoints (no existence leak)',
   const app = makeApp();
   const a = await setupKeyedFamily(app, 'SyncFamA2');
   const b = await setupKeyedFamily(app, 'SyncFamB2');
-  const tidA = await createPlainTopic(app, a.owner.token, 'A topic');
+  const tidA = await createActiveTopic(app, a.owner.token, 'A topic');
 
   for (const [method, path, body] of [
-    ['GET', `/v1/topics/${tidA}/history`, undefined],
-    ['POST', `/v1/topics/${tidA}/ack`, { seq: 1, read_receipt: 'x' }],
-    ['GET', `/v1/topics/${tidA}/envelopes`, undefined],
+    ['GET', `/v2/topics/${tidA}/history`, undefined],
+    ['POST', `/v2/topics/${tidA}/ack`, { seq: 1, read_receipt: 'x' }],
+    ['GET', `/v2/topics/${tidA}/envelopes`, undefined],
   ] as const) {
     const r = await app.call(method, path, { token: b.owner.token, body });
     assert.equal(r.status, 404, `${method} ${path} should 404 cross-family`);
@@ -87,7 +89,7 @@ test('cross-family topic ids 404 on topic-scoped endpoints (no existence leak)',
 test('visibility floor: from_join member counts only post-floor entries as new', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'SyncFloor');
-  const tid = await createPlainTopic(app, owner.token, 'floor topic');
+  const tid = await createActiveTopic(app, owner.token, 'floor topic');
   await postEntry(app, owner.token, tid, 'old one');
   await postEntry(app, owner.token, tid, 'old two');
 
@@ -116,7 +118,7 @@ test('visibility floor: from_join member counts only post-floor entries as new',
 test('acked_seq reported is max(stored acked_seq, history_from_seq - 1)', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'SyncFloor2');
-  const tid = await createPlainTopic(app, owner.token, 'floor topic 2');
+  const tid = await createActiveTopic(app, owner.token, 'floor topic 2');
   await postEntry(app, owner.token, tid, 'm1');
   const kid = await addMember(app, famId, owner.token, 'kid2@f.dev', 'kid', 'Kid2');
   await inviteToTopic(app, owner.token, tid, [kid.memberId], 'from_join');
@@ -126,8 +128,8 @@ test('acked_seq reported is max(stored acked_seq, history_from_seq - 1)', async 
   ))!['history_from_seq'] as number;
 
   // Ack BELOW the floor: the effective position stays at the floor.
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: kid.token });
-  const ack = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const hist = await app.call('GET', `/v2/topics/${tid}/history`, { token: kid.token });
+  const ack = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: kid.token,
     body: { seq: 1, read_receipt: hist.body.read_receipt },
   });
@@ -144,11 +146,11 @@ test('acked_seq reported is max(stored acked_seq, history_from_seq - 1)', async 
 
 test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncOrder');
+  const { owner } = await setupKeyedFamily(app, 'SyncOrder');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
-  const t1 = await createPlainTopic(app, owner.token, 't1', [other.memberId]);
-  const t2 = await createPlainTopic(app, owner.token, 't2', [other.memberId]);
-  const t3 = await createPlainTopic(app, owner.token, 't3', [other.memberId]);
+  const t1 = await createActiveTopic(app, owner.token, 't1', [other.memberId]);
+  const t2 = await createActiveTopic(app, owner.token, 't2', [other.memberId]);
+  const t3 = await createActiveTopic(app, owner.token, 't3', [other.memberId]);
   // Activity order: t2, then t1, then t3 -> expected order t3, t1, t2.
   // (Other posts so owner sees them as new.)
   await postEntry(app, other.token, t2, 'a');
@@ -164,8 +166,8 @@ test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
   // Tiebreak: two changed topics with IDENTICAL last_activity_ts sort by
   // topic_id ASC (pinned via a direct ts update — the server sorts on the
   // stored timestamp).
-  const a1 = await createPlainTopic(app, owner.token, 'tie1', [other.memberId]);
-  const a2 = await createPlainTopic(app, owner.token, 'tie2', [other.memberId]);
+  const a1 = await createActiveTopic(app, owner.token, 'tie1', [other.memberId]);
+  const a2 = await createActiveTopic(app, owner.token, 'tie2', [other.memberId]);
   await postEntry(app, other.token, a1, 'x');
   await postEntry(app, other.token, a2, 'y');
   const tieTs = '2026-10-13T00:00:00.000Z';
@@ -186,11 +188,11 @@ test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
 
 test('paging: limit/page_token walk the full changed set; bad token is 400', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncPage');
+  const { owner } = await setupKeyedFamily(app, 'SyncPage');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tids: string[] = [];
   for (let i = 0; i < 5; i++) {
-    const tid = await createPlainTopic(app, owner.token, `ptopic ${i}`, [other.memberId]);
+    const tid = await createActiveTopic(app, owner.token, `ptopic ${i}`, [other.memberId]);
     await postEntry(app, other.token, tid, `msg ${i}`);
     tids.push(tid);
   }
@@ -219,11 +221,11 @@ test('paging: limit/page_token walk the full changed set; bad token is 400', asy
 
 test('page-boundary race: activity between pages never 500s; nothing permanently skipped', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncRace');
+  const { owner } = await setupKeyedFamily(app, 'SyncRace');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
   const tids: string[] = [];
   for (let i = 0; i < 4; i++) {
-    const tid = await createPlainTopic(app, owner.token, `rtopic ${i}`, [other.memberId]);
+    const tid = await createActiveTopic(app, owner.token, `rtopic ${i}`, [other.memberId]);
     await postEntry(app, other.token, tid, `msg ${i}`);
     tids.push(tid);
   }
@@ -234,7 +236,7 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
   // ...new activity lands before page 2, shifting the changed set. The spec
   // documents this: offset paging over a moving set can skip an item
   // mid-walk, and the CLI dedupes. The server must stay consistent.
-  const extra = await createPlainTopic(app, owner.token, 'rtopic extra', [other.memberId]);
+  const extra = await createActiveTopic(app, owner.token, 'rtopic extra', [other.memberId]);
   await postEntry(app, other.token, extra, 'late arrival');
   const token2 = p1.body.next_page_token as string;
   const p2 = await syncTopics(app, owner.token, `?limit=2&page_token=${encodeURIComponent(token2)}`);
@@ -259,9 +261,9 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
 
 test('bootstrap: first call seeds read state at 0 and reports all visible topics once', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncBoot');
+  const { owner } = await setupKeyedFamily(app, 'SyncBoot');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
-  const tid = await createPlainTopic(app, owner.token, 'boot topic', [other.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'boot topic', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
   await postEntry(app, other.token, tid, 'two');
 
@@ -276,8 +278,8 @@ test('bootstrap: first call seeds read state at 0 and reports all visible topics
   assert.equal(await readState(app, owner.memberId, owner.agentLabel, tid), 0, 'bootstrap seeds the row');
 
   // Ack everything: the next sync is quiet.
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
-  const ack = await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const hist = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
+  const ack = await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: owner.token,
     body: { seq: hist.body.read_through_seq, read_receipt: hist.body.read_receipt },
   });
@@ -288,9 +290,9 @@ test('bootstrap: first call seeds read state at 0 and reports all visible topics
 
 test('bootstrap accepts (and ignores) a legacy bootstrap_gseq param', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncBoot2');
+  const { owner } = await setupKeyedFamily(app, 'SyncBoot2');
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
-  const tid = await createPlainTopic(app, owner.token, 'boot topic 2', [other.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'boot topic 2', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
   // Legacy cursor value: accepted, validated, deliberately not used for
   // seeding (spec §1.4 — the CLI deletes cursor files without reading).
@@ -312,12 +314,12 @@ test('key_status: not_e2ee / ok / pending', async () => {
   const kid = await addMember(app, famId, owner.token, 'k@ks.dev', 'kid', 'Kid');
 
   // Plain topic: not_e2ee. Kid posts so owner sees it as changed.
-  const plain = await createPlainTopic(app, owner.token, 'plain', [kid.memberId]);
+  const plain = await createActiveTopic(app, owner.token, 'plain', [kid.memberId]);
   await postEntry(app, kid.token, plain, 'hi');
 
   const so = await syncTopics(app, owner.token, '?limit=200');
   const byId = new Map((so.body.topics as any[]).map((t: any) => [t.topic_id, t]));
-  assert.equal(byId.get(plain)!.key_status, 'not_e2ee');
+  assert.equal(byId.get(plain)!.key_status, 'ok');
   // E2EE key_status variants (ok/pending) are covered in e2ee-specific tests.
 });
 
@@ -329,12 +331,12 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'SyncAssign');
   const kid = await addMember(app, famId, owner.token, 'k@as.dev', 'kid', 'KidA');
-  const tid = await createPlainTopic(app, owner.token, 'assign topic', [kid.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'assign topic', [kid.memberId]);
   await postEntry(app, kid.token, tid, 'hello');
 
-  const mk = await app.call('POST', `/v1/topics/${tid}/tasks`, {
+  const mk = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
-    body: { title: 'kid chore', assignee_member_id: kid.memberId },
+    body: { title: wireBody((await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?',[tid]))!.current_key_id as string), assignee_member_id: kid.memberId },
   });
   assert.equal(mk.status, 201);
   const taskId = mk.body.task.id as string;
@@ -345,7 +347,7 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
   assert.equal((so.body.topics as any[])[0].assigned_to_me, false, 'owner is not the assignee');
 
   // Done tasks no longer count.
-  const done = await app.call('POST', `/v1/tasks/${taskId}/done`, { token: kid.token, body: {} });
+  const done = await app.call('POST', `/v2/tasks/${taskId}/done`, { token: kid.token, body: {} });
   assert.equal(done.status, 200);
   const sk2 = await syncTopics(app, kid.token);
   const t2 = (sk2.body.topics as any[]).find((x: any) => x.topic_id === tid) ?? null;
@@ -360,16 +362,16 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
 
 test('unchanged topics are omitted; new activity re-lists the topic', async () => {
   const app = makeApp();
-  const { famId, owner } = await setupKeyedFamily(app, 'SyncChanged');
+  const { owner } = await setupKeyedFamily(app, 'SyncChanged');
   // Second member posts; owner syncs. Own posts never flag as changed.
   const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
-  const tid = await createPlainTopic(app, owner.token, 'changed topic', [other.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'changed topic', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
   const s1 = await syncTopics(app, owner.token);
   assert.equal((s1.body.topics as any[]).length, 1);
 
-  const hist = await app.call('GET', `/v1/topics/${tid}/history`, { token: owner.token });
-  await app.call('POST', `/v1/topics/${tid}/ack`, {
+  const hist = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
+  await app.call('POST', `/v2/topics/${tid}/ack`, {
     token: owner.token,
     body: { seq: hist.body.read_through_seq, read_receipt: hist.body.read_receipt },
   });
@@ -392,7 +394,7 @@ test('unchanged topics are omitted; new activity re-lists the topic', async () =
 test('sync/topics carries a versions stanza for update advertisement', async () => {
   const app = makeApp();
   const a = await setupKeyedFamily(app, 'SyncFamVer');
-  const tid = await createPlainTopic(app, a.owner.token, 'Version topic');
+  const tid = await createActiveTopic(app, a.owner.token, 'Version topic');
   await postEntry(app, a.owner.token, tid, 'hello');
 
   const res = await syncTopics(app, a.owner.token);

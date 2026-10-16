@@ -1,3 +1,8 @@
+> Historical design notes. Protocol 2 supersedes optional encryption, v1 routes,
+> legacy subject formats and force commits described below. Use [INSTALL.md](INSTALL.md),
+> [SECURITY.md](SECURITY.md) and [the encryption guide](../agent-skill/references/e2ee.md)
+> for the implemented contract.
+
 # Client Hardening — Build Spec
 
 ## 1. Goal
@@ -69,14 +74,14 @@ to existing behavior.
   `Client version 0.5.0 is below the required minimum 0.7.0. Update
   your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry.`
   (426 since server 0.12.0; was 400.)
-- The gate never blocks `GET /v1/health`, `GET /v1/client/latest`, or
-  `GET /v1/client/download/*` — an outdated client must always reach the
+- The gate never blocks `GET /v2/health`, `GET /v2/client/latest`, or
+  `GET /v2/client/download/*` — an outdated client must always reach the
   upgrade metadata and the replacement artifacts.
 - Rollout note: the default stays off until agents have upgraded; the
   deploy runbook raises it deliberately. Never ship a deploy that
   bricks the currently-installed fleet.
 
-**B2. `GET /v1/client/latest`.**
+**B2. `GET /v2/client/latest`.**
 - Returns the current CLI release the server knows about, sourced from
   a repo-controlled manifest at `server/client-manifest.json` (loaded
   at worker startup; no D1 read on the hot path):
@@ -87,18 +92,18 @@ to existing behavior.
     "server_version": "0.12.0",
     "sha256": "<hex of the released hub artifact>",
     "released_at": "2026-10-12T00:55:22Z",
-    "download_url": "https://<this-server>/v1/client/download/hub",
+    "download_url": "https://<this-server>/v2/client/download/hub",
     "assets": {
-      "hub": "https://<this-server>/v1/client/download/hub",
-      "sigstore": "https://<this-server>/v1/client/download/hub.sigstore",
-      "manifest": "https://<this-server>/v1/client/download/manifest.json"
+      "hub": "https://<this-server>/v2/client/download/hub",
+      "sigstore": "https://<this-server>/v2/client/download/hub.sigstore",
+      "manifest": "https://<this-server>/v2/client/download/manifest.json"
     }
   }
   ```
 - All URLs are absolute and self-referential: since server 0.12.0 the
   worker bundles the pinned CLI artifacts at build time
   (`npm run bundle:client`, fail-closed) and serves them from
-  `GET /v1/client/download/{hub,hub.sigstore,manifest.json}` (public,
+  `GET /v2/client/download/{hub,hub.sigstore,manifest.json}` (public,
   exact paths only). `download_url` in the pin file itself remains the
   GitHub Release provenance URL; responses always use this server's URLs.
 - This ties the CLI release to the deployed server: the manifest is
@@ -138,10 +143,10 @@ to existing behavior.
   (`contents: write`, `id-token: write`).
 - Update `agent-skill/INSTALL.md` with two flows:
   - **First-time install:** download the three artifacts from the server's
-    `/v1/client/download/*` endpoints (URLs from the invite onboarding page
-    or `GET /v1/client/latest`) → verify sigstore signature → verify sha256
+    `/v2/client/download/*` endpoints (URLs from the invite onboarding page
+    or `GET /v2/client/latest`) → verify sigstore signature → verify sha256
     against the release manifest → install → run `hub --version` self-check.
-  - **Upgrade:** `hub upgrade` checks `GET /v1/client/latest`, compares
+  - **Upgrade:** `hub upgrade` checks `GET /v2/client/latest`, compares
     versions, downloads the new artifacts from the server's `assets.*` URLs,
     verifies signature+hash,
     swaps it in **atomically**, keeps the previous binary for
@@ -149,7 +154,7 @@ to existing behavior.
     cutting over.
 - The server deploy runbook (`docs/DEPLOY.md`) gains a step: after
   deploying the worker, the manifest the server serves is whatever is
-  in the repo at that deploy — verify `/v1/client/latest` after
+  in the repo at that deploy — verify `/v2/client/latest` after
   deploy.
 
 ### WS-D — Key wrapping at rest (`agent-skill/hub`)
@@ -204,7 +209,7 @@ to existing behavior.
 
 ## 5. Versioning
 
-Per `docs/VERSIONING.md`: new API route (`GET /v1/client/latest`) and
+Per `docs/VERSIONING.md`: new API route (`GET /v2/client/latest`) and
 new CLI capabilities are backwards-compatible features → **MINOR**
 bumps, done as the **final commit** after all workstreams merge:
 

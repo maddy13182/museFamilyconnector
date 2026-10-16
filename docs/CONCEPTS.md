@@ -59,7 +59,7 @@ Consequences:
   auto-redeems it so the new circle works immediately.
 - Joining someone else's circle means redeeming an invite/provisioning code
   for *that* circle (`hub circle join --code`), which mints a token bound to
-  it. Listing circles (`GET /v1/families`) works with any of your tokens —
+  it. Listing circles (`GET /v2/families`) works with any of your tokens —
   the server scopes the list by your email.
 - Tokens are 256-bit from a CSPRNG. The server stores only
   `sha256(TOKEN_PEPPER || token)` — a database leak alone yields nothing
@@ -79,28 +79,18 @@ unlike tokens.
 
 ## Encryption — stated honestly
 
-- **In transit**: TLS everywhere (Cloudflare-managed).
-- **At rest**: tokens stored as peppered hashes; invite/provisioning codes as
-  hashes. Plaintext topic bodies are stored in D1 as written.
-- **End-to-end encryption is real, and opt-in per topic** (`hub new-topic
-  --e2ee`). An E2EE topic's subjects and message bodies are encrypted with a
-  topic key the server never sees (XChaCha20-Poly1305 via libsodium; identity
-  keys are X25519, `hub key-init`). Plaintext topics are unchanged — the
-  server operator (you, the family owner) can read those, as before.
-- **E2EE trust model, per topic**: an E2EE topic is private *from the server*
-  and from anyone not a participant. What the server still sees — the
-  **metadata** — is honest and unavoidable: topic existence, participant
-  roster, message counts and timestamps, key-rotation and archive events
-  (these system entries are plaintext by design so keyless agents can still
-  read them), and the ciphertext blobs themselves. If you need a conversation
-  to be invisible even as metadata, don't have it on the hub.
-- **The key is yours, and yours to lose.** The server never holds a topic
-  key and cannot recover one for you. Each agent's identity key lives in a
-  0600 file on its own machine; the 24-word recovery phrase shown at
-  `key-init` (and the Argon2id-encrypted `hub key-backup` file) is the way
-  back. Lose both and the topic's history is unreadable to that agent —
-  see the `hub recover` ladder (key-backup → key-request → re-enroll) in the
-  skill and the key-loss runbook in `docs/SECURITY.md`.
+- Every topic encrypts subjects, conversation content and task text locally.
+  The server stores ciphertext and sealed key envelopes, not topic keys.
+- The operator sees metadata: identities, membership, timestamps, task status,
+  due dates and assignment. Owning the server alone does not decrypt content.
+- A participant's Muse can read content it has keys for. Protect its environment
+  and backups; removal cannot erase copies already received.
+- A child topic receives independent keys and an approved briefing, never its
+  parent's keys. From-join access excludes older epochs.
+- First contact trusts the identity directory; later identity changes stop key
+  sharing pending independent verification. See [SECURITY.md](SECURITY.md).
+- Save the private recovery phrase off-machine or create an encrypted key backup.
+  The CLI saves recovery words privately and never prints them into chat.
 
 ## What to save, and where
 

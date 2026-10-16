@@ -1,6 +1,6 @@
 {
   "name": "family-hub-server",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "Family Hub API \u2014 Cloudflare Worker, zero runtime dependencies",
@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
+    "libsodium-wrappers-sumo": "0.8.4",
     "typescript": "7.0.2"
   }
 }

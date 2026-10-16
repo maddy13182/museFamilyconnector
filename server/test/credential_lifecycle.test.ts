@@ -1,3 +1,4 @@
+import { b64 } from './syncv2_helpers.js';
 // Phase B credential-lifecycle tests (audit findings F01, F04, F05, F17).
 //
 // Covers: the mint caller/target role matrix (F01) incl. the parent-can-never-
@@ -8,7 +9,8 @@
 // codes and one-level descendant tokens (F17).
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { makeApp, TestApp } from './app.js';
+import { makeClientApp as makeApp } from './fixture-client.js';
+import type { TestClientApp as TestApp } from './fixture-client.js';
 import { credentialHash } from '../src/auth.js';
 
 interface Party {
@@ -25,14 +27,14 @@ async function setupRoles(): Promise<{
   kid: Party;
 }> {
   const app = makeApp();
-  const fam = await app.call('POST', '/v1/families', {
+  const fam = await app.call('POST', '/v2/families', {
     body: { name: 'Cred Fam', owner_name: 'Ow', owner_email: 'o@x.dev' },
   });
   assert.equal(fam.status, 201);
   const red = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red.status, 201);
   const famId = (await app.db.queryOne('SELECT id FROM families', []))!['id'] as string;
@@ -43,15 +45,15 @@ async function setupRoles(): Promise<{
   };
 
   async function addMember(email: string, role: string, name: string): Promise<Party> {
-    const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+    const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
       token: owner.token,
       body: { email, role },
     });
     assert.equal(inv.status, 201);
     const acc = await app.call(
       'POST',
-      `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-      { body: { display_name: name, agent_label: `${role}-agent` } },
+      `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+      { body: { display_name: name, agent_label: `${role}-agent` , agent_public_key: b64(32) } },
     );
     assert.equal(acc.status, 201);
     return {
@@ -66,7 +68,7 @@ async function setupRoles(): Promise<{
 }
 
 async function meStatus(app: TestApp, token: string): Promise<number> {
-  return (await app.call('GET', '/v1/me', { token })).status;
+  return (await app.call('GET', '/v2/me', { token })).status;
 }
 
 test('F01: mint matrix — self-mint always allowed; minting for another member is owner-only', async () => {
@@ -80,7 +82,7 @@ test('F01: mint matrix — self-mint always allowed; minting for another member 
   for (const [callerRole, caller] of Object.entries(parties)) {
     for (const [targetRole, targetMemberId] of Object.entries(members)) {
       const self = targetMemberId === caller.memberId;
-      const res = await app.call('POST', '/v1/provisioning-codes', {
+      const res = await app.call('POST', '/v2/provisioning-codes', {
         token: caller.token,
         body: { member_id: targetMemberId, agent_label: 'matrix-agent' },
       });
@@ -99,7 +101,7 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
   const { app, famId, owner, parent, kid } = await setupRoles();
 
   // parent -> owner's token: denied, and the owner token keeps working
-  const denied = await app.call('POST', '/v1/auth/revoke', {
+  const denied = await app.call('POST', '/v2/auth/revoke', {
     token: parent.token,
     body: { token_id: owner.tokenId },
   });
@@ -108,26 +110,26 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
   assert.equal(await meStatus(app, owner.token), 200);
 
   // kid -> owner's token: denied (kids cannot revoke others at all)
-  const deniedKid = await app.call('POST', '/v1/auth/revoke', {
+  const deniedKid = await app.call('POST', '/v2/auth/revoke', {
     token: kid.token,
     body: { token_id: owner.tokenId },
   });
   assert.equal(deniedKid.status, 403);
 
   // owner -> second owner's token: allowed (documented: only parents are barred)
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: owner.token,
     body: { email: 'o2@x.dev', role: 'owner' },
   });
   assert.equal(inv.status, 201);
   const acc = await app.call(
     'POST',
-    `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: 'Ow2', agent_label: 'o2-agent' } },
+    `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
+    { body: { display_name: 'Ow2', agent_label: 'o2-agent' , agent_public_key: b64(32) } },
   );
   assert.equal(acc.status, 201);
   const owner2TokenId = acc.body.token_id as string;
-  const okCoOwner = await app.call('POST', '/v1/auth/revoke', {
+  const okCoOwner = await app.call('POST', '/v2/auth/revoke', {
     token: owner.token,
     body: { token_id: owner2TokenId },
   });
@@ -135,7 +137,7 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
   assert.equal(await meStatus(app, acc.body.token as string), 401);
 
   // owner -> parent's token: allowed
-  const ok = await app.call('POST', '/v1/auth/revoke', {
+  const ok = await app.call('POST', '/v2/auth/revoke', {
     token: owner.token,
     body: { token_id: parent.tokenId },
   });
@@ -143,7 +145,7 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
   assert.equal(await meStatus(app, parent.token), 401);
 
   // self-revoke as kid: always allowed
-  const selfOk = await app.call('POST', '/v1/auth/revoke', {
+  const selfOk = await app.call('POST', '/v2/auth/revoke', {
     token: kid.token,
     body: { token_id: kid.tokenId },
   });
@@ -153,19 +155,20 @@ test('F01: a parent can never revoke an owner token; owner and self-revoke still
 
 test('F05: concurrent redeem of one code mints exactly one token', async () => {
   const { app, owner } = await setupRoles();
-  const mint = await app.call('POST', '/v1/provisioning-codes', {
+  const mint = await app.call('POST', '/v2/provisioning-codes', {
     token: owner.token,
     body: { member_id: owner.memberId, agent_label: 'race-agent' },
   });
   assert.equal(mint.status, 201);
-  const path = `/v1/provisioning-codes/${encodeURIComponent(mint.body.provisioning_code)}/redeem`;
+  const path = `/v2/provisioning-codes/${encodeURIComponent(mint.body.provisioning_code)}/redeem`;
 
   const before = (
     await app.db.queryAll(`SELECT token_id FROM agent_tokens WHERE member_id = ?`, [owner.memberId])
   ).length;
+  const publicKey = b64(32);
   const [r1, r2] = await Promise.all([
-    app.call('POST', path, { body: {} }),
-    app.call('POST', path, { body: {} }),
+    app.call('POST', path, { body: { agent_public_key: publicKey } }),
+    app.call('POST', path, { body: { agent_public_key: publicKey } }),
   ]);
   const statuses = [r1.status, r2.status].sort();
   assert.deepEqual(statuses, [201, 409]);
@@ -191,16 +194,16 @@ test('F05: concurrent redeem of one code mints exactly one token', async () => {
 
 test('F05: concurrent accept of one invite creates exactly one member', async () => {
   const { app, famId, owner } = await setupRoles();
-  const inv = await app.call('POST', `/v1/families/${famId}/invites`, {
+  const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
     token: owner.token,
     body: { email: 'race@x.dev', role: 'kid' },
   });
   assert.equal(inv.status, 201);
-  const path = `/v1/invites/${encodeURIComponent(inv.body.invite_code)}/accept`;
+  const path = `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`;
 
   const [r1, r2] = await Promise.all([
-    app.call('POST', path, { body: { display_name: 'R1', agent_label: 'r1' } }),
-    app.call('POST', path, { body: { display_name: 'R2', agent_label: 'r2' } }),
+    app.call('POST', path, { body: { display_name: 'R1', agent_label: 'r1' , agent_public_key: b64(32) } }),
+    app.call('POST', path, { body: { display_name: 'R2', agent_label: 'r2' , agent_public_key: b64(32) } }),
   ]);
   const statuses = [r1.status, r2.status].sort();
   assert.deepEqual(statuses, [201, 409]);
@@ -223,7 +226,7 @@ test('F17: revoking a token expires its pending provisioning codes', async () =>
   const { app, owner, parent } = await setupRoles();
 
   // code minted under the owner's token, for the parent member
-  const mint = await app.call('POST', '/v1/provisioning-codes', {
+  const mint = await app.call('POST', '/v2/provisioning-codes', {
     token: owner.token,
     body: { member_id: parent.memberId, agent_label: 'doomed-agent' },
   });
@@ -236,14 +239,14 @@ test('F17: revoking a token expires its pending provisioning codes', async () =>
   assert.equal(pcRow!['issued_by_token_id'], owner.tokenId);
 
   // control: code minted under the parent's own (live) token
-  const control = await app.call('POST', '/v1/provisioning-codes', {
+  const control = await app.call('POST', '/v2/provisioning-codes', {
     token: parent.token,
     body: { member_id: parent.memberId, agent_label: 'control-agent' },
   });
   assert.equal(control.status, 201);
 
   // revoke the owner's token (self-revoke)
-  const rev = await app.call('POST', '/v1/auth/revoke', {
+  const rev = await app.call('POST', '/v2/auth/revoke', {
     token: owner.token,
     body: { token_id: owner.tokenId },
   });
@@ -252,8 +255,8 @@ test('F17: revoking a token expires its pending provisioning codes', async () =>
   // the pending code dies with the issuing token: redeem now reports expired
   const dead = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(mint.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(mint.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(dead.status, 410);
   assert.equal(dead.body.error.code, 'code_expired');
@@ -261,8 +264,8 @@ test('F17: revoking a token expires its pending provisioning codes', async () =>
   // the control code, issued under a live token, still redeems
   const live = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(control.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(control.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(live.status, 201);
 });
@@ -271,15 +274,15 @@ test('F17: revoking a token revokes the full transitive descendant closure', asy
   const { app, owner, parent } = await setupRoles();
 
   // A (owner token) mints a code; redeeming it yields B, a child of A
-  const c1 = await app.call('POST', '/v1/provisioning-codes', {
+  const c1 = await app.call('POST', '/v2/provisioning-codes', {
     token: owner.token,
     body: { member_id: parent.memberId, agent_label: 'child-agent' },
   });
   assert.equal(c1.status, 201);
   const b = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(c1.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(c1.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(b.status, 201);
   const bToken = b.body.token as string;
@@ -290,15 +293,15 @@ test('F17: revoking a token revokes the full transitive descendant closure', asy
   assert.equal(bRow!['issued_by_token_id'], owner.tokenId);
 
   // B self-mints a code (always allowed); redeeming it yields C, a grandchild of A
-  const c2 = await app.call('POST', '/v1/provisioning-codes', {
+  const c2 = await app.call('POST', '/v2/provisioning-codes', {
     token: bToken,
     body: { member_id: parent.memberId, agent_label: 'grandchild-agent' },
   });
   assert.equal(c2.status, 201);
   const c = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(c2.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(c2.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(c.status, 201);
   const cToken = c.body.token as string;
@@ -306,7 +309,7 @@ test('F17: revoking a token revokes the full transitive descendant closure', asy
   for (const t of [owner.token, bToken, cToken]) assert.equal(await meStatus(app, t), 200);
 
   // revoke A: the transitive closure (B and C) is revoked
-  const rev = await app.call('POST', '/v1/auth/revoke', {
+  const rev = await app.call('POST', '/v2/auth/revoke', {
     token: owner.token,
     body: { token_id: owner.tokenId },
   });
@@ -320,27 +323,27 @@ test('N01: transfer commit revokes every credential of the removed owner atomica
   const { app, famId, owner, parent } = await setupRoles();
 
   // The owner holds TWO agent tokens (two agents, e.g. phone + server).
-  const mint2 = await app.call('POST', '/v1/provisioning-codes', {
+  const mint2 = await app.call('POST', '/v2/provisioning-codes', {
     token: owner.token,
     body: { member_id: owner.memberId, agent_label: 'owner-second-agent' },
   });
   assert.equal(mint2.status, 201);
   const red2 = await app.call(
     'POST',
-    `/v1/provisioning-codes/${encodeURIComponent(mint2.body.provisioning_code)}/redeem`,
-    { body: {} },
+    `/v2/provisioning-codes/${encodeURIComponent(mint2.body.provisioning_code)}/redeem`,
+    { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red2.status, 201);
   const ownerToken2 = red2.body.token as string;
   assert.equal(await meStatus(app, ownerToken2), 200, 'second owner agent works pre-transfer');
 
   // Offer ownership to the parent; the recipient accepts (on_complete=remove).
-  const offer = await app.call('POST', `/v1/families/${famId}/transfer`, {
+  const offer = await app.call('POST', `/v2/families/${famId}/transfer`, {
     token: owner.token,
     body: { to_member_id: parent.memberId },
   });
   assert.equal(offer.status, 201);
-  const acc = await app.call('POST', `/v1/families/${famId}/transfer/accept`, {
+  const acc = await app.call('POST', `/v2/families/${famId}/transfer/accept`, {
     token: parent.token,
   });
   assert.equal(acc.status, 200);
@@ -366,9 +369,9 @@ test('N01: transfer commit revokes every credential of the removed owner atomica
   // The recipient's pre-existing credential keeps working and now carries
   // owner powers (can mint for others).
   assert.equal(await meStatus(app, parent.token), 200, 'recipient token survives the commit');
-  const me = await app.call('GET', '/v1/me', { token: parent.token });
+  const me = await app.call('GET', '/v2/me', { token: parent.token });
   assert.equal(me.body.role, 'owner');
-  const mint = await app.call('POST', '/v1/provisioning-codes', {
+  const mint = await app.call('POST', '/v2/provisioning-codes', {
     token: parent.token,
     body: { member_id: parent.memberId, agent_label: 'post-transfer-agent' },
   });

@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/hosting-your_Cloudflare_account-teal.svg)](#get-started)
-[![Optional E2EE](https://img.shields.io/badge/encryption-optional_per_conversation-amber.svg)](#privacy-you-can-understand)
+[![E2EE](https://img.shields.io/badge/encryption-mandatory_E2EE-green.svg)](#privacy-you-can-understand)
 
 **Connect the Muse assistants of your family or team, so plans, requests, and updates have one shared home.**
 

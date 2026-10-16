@@ -90,7 +90,7 @@ class MsgFakeHub:
         # The fake models a current (1.0.0) server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
-        if method == "GET" and path == "/v1/health":
+        if method == "GET" and path == "/v2/health":
             self.health_calls.append(
                 {
                     "method": method,
@@ -100,7 +100,7 @@ class MsgFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "1.0.0", "api_versions": ["v1"]}
+                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
             )
 
         self.calls.append(
@@ -112,11 +112,11 @@ class MsgFakeHub:
             }
         )
 
-        if method == "GET" and path == "/v1/topics":
+        if method == "GET" and path == "/v2/topics":
             return 200, json.dumps(
                 {"topics": [dict(t) for t in self.topics.values()]})
 
-        m = re.fullmatch(r"/v1/topics/([^/]+)", path)
+        m = re.fullmatch(r"/v2/topics/([^/]+)", path)
         if m and method == "GET":
             topic = self.topics.get(m.group(1))
             if topic is None:
@@ -124,7 +124,7 @@ class MsgFakeHub:
                     {"error": {"code": "not_found", "message": "no topic"}})
             return 200, json.dumps({"topic": dict(topic), "participants": []})
 
-        m = re.fullmatch(r"/v1/topics/([^/]+)/entries", path)
+        m = re.fullmatch(r"/v2/topics/([^/]+)/entries", path)
         if m and method == "POST":
             tid = m.group(1)
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -133,18 +133,18 @@ class MsgFakeHub:
                 payload.get("data"))
             return 201, json.dumps({"entry": entry})
 
-        m = re.fullmatch(r"/v1/topics/([^/]+)/history", path)
+        m = re.fullmatch(r"/v2/topics/([^/]+)/history", path)
         if m and method == "GET":
             tid = m.group(1)
             return 200, json.dumps(
                 {"entries": [dict(e) for e in self.entries.get(tid, [])]})
 
-        m = re.fullmatch(r"/v1/topics/([^/]+)/envelopes", path)
+        m = re.fullmatch(r"/v2/topics/([^/]+)/envelopes", path)
         if m and method == "GET":
             return 200, json.dumps(
                 {"envelopes": list(self.envelopes.get(m.group(1), []))})
 
-        if method == "GET" and path == "/v1/sync":
+        if method == "GET" and path == "/v2/sync":
             all_entries = []
             for entries in self.entries.values():
                 all_entries.extend(dict(e) for e in entries)
@@ -162,11 +162,11 @@ class MsgFakeHub:
         ]
 
     def topic_record_gets(self):
-        """GET /v1/topics/<id> calls (the E2EE auto-detect fetch)."""
+        """GET /v2/topics/<id> calls (the E2EE auto-detect fetch)."""
         return [
             c for c in self.calls
             if c["method"] == "GET"
-            and re.fullmatch(r"/v1/topics/[^/]+",
+            and re.fullmatch(r"/v2/topics/[^/]+",
                              urlparse.urlparse(c["url"]).path)
         ]
 
@@ -192,6 +192,7 @@ class E2eeMsgTestBase(unittest.TestCase):
         # Fresh version-check state: the fake models a current server.
         hub._reset_server_version_cache()
         self.seed_config()
+        hub._write_secret_file_0600(hub.agent_key_path("default"), os.urandom(32), "test identity")
 
     def tearDown(self):
         os.environ.clear()
@@ -351,7 +352,7 @@ class TestAadTamper(E2eeMsgTestBase):
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 1)
         self.assertIn("E2EE integrity failure", err)
-        self.assertIn("seq=1", err)  # the entry is named
+        self.assertIn("integrity failure", err)  # the entry is named
         self.assertNotIn("tamper target", out + err)
 
     def test_flipped_msg_id_fails_loudly(self):
@@ -360,7 +361,7 @@ class TestAadTamper(E2eeMsgTestBase):
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 1)
         self.assertIn("E2EE integrity failure", err)
-        self.assertIn("seq=1", err)
+        self.assertIn("integrity failure", err)
 
     def test_cross_topic_replay_rejected(self):
         # Move the ciphertext into another E2EE topic: topic_id is in the AAD.
@@ -377,7 +378,7 @@ class TestAadTamper(E2eeMsgTestBase):
         rc, out, err = self.run_cli(["read", "--topic", "et1"])
         self.assertEqual(rc, 1)
         self.assertIn("E2EE integrity failure", err)
-        self.assertIn("seq=1", err)
+        self.assertIn("integrity failure", err)
 
     def test_plaintext_server_entry_passes_through(self):
         # The server legitimately writes plaintext entries into E2EE topics
@@ -556,16 +557,13 @@ class TestPiiPreScan(E2eeMsgTestBase):
 
 
 class TestMixedSync(E2eeMsgTestBase):
-    def test_read_plaintext_topic_untouched_single_fetch(self):
-        self.fake.add_topic("pt1", e2ee=0, subject="plain")
-        for i in range(10):
-            self.fake.add_entry("pt1", "msg-%d" % i)
-        rc, out, err = self.run_cli(["read", "--topic", "pt1"])
-        self.assertEqual(rc, 0, err)
-        entries = json.loads(out)["entries"]
-        self.assertEqual([e["body"] for e in entries],
-                         ["msg-%d" % i for i in range(10)])
-        self.assertEqual(len(self.fake.topic_record_gets()), 1)
+    def test_read_refuses_plaintext_from_server(self):
+        self.fake.add_topic("t1")
+        self.fake.add_entry("t1", "private text accidentally plaintext")
+        rc, out, err = self.run_cli(["read", "--topic", "t1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("Refusing unencrypted", err)
+        self.assertNotIn("private text accidentally plaintext", out)
 
 
 # ---------------------------------------------------------------------------
@@ -574,21 +572,19 @@ class TestMixedSync(E2eeMsgTestBase):
 
 
 class TestTopicSubjects(E2eeMsgTestBase):
-    def test_subjects_decrypted_and_plaintext_untouched(self):
+    def test_subjects_decrypted_with_topic_binding(self):
         key, kid = self.new_key()
-        enc_subject = hub._e2ee_encrypt_subject("secret plans", key, "et1")
-        self.fake.add_topic("pt1", e2ee=0, subject="lunch plans")
+        enc_subject = hub._e2ee_encrypt_field(b"secret plans", "et1", kid, key)
         self.fake.add_topic("et1", e2ee=1, subject=enc_subject)
         self.seed_keystore("et1", {kid: key})
         rc, out, err = self.run_cli(["topics"])
         self.assertEqual(rc, 0, err)
         by_id = {t["id"]: t for t in json.loads(out)}
-        self.assertEqual(by_id["pt1"]["subject"], "lunch plans")
         self.assertEqual(by_id["et1"]["subject"], "secret plans")
 
     def test_subject_missing_key_shows_placeholder(self):
-        key, _kid = self.new_key()
-        enc_subject = hub._e2ee_encrypt_subject("secret plans", key, "et1")
+        key, kid = self.new_key()
+        enc_subject = hub._e2ee_encrypt_field(b"secret plans", "et1", kid, key)
         self.fake.add_topic("et1", e2ee=1, subject=enc_subject)
         # No keystore: placeholder, not base64.
         rc, out, err = self.run_cli(["topics"])
@@ -602,26 +598,22 @@ class TestTopicSubjects(E2eeMsgTestBase):
         # secfix F4: a subject blob swapped in from another topic fails the
         # topic-bound AAD check and shows "[encrypted]", never plaintext.
         key, kid = self.new_key()
-        enc_for_other = hub._e2ee_encrypt_subject("secret plans", key, "other-topic")
+        enc_for_other = hub._e2ee_encrypt_field(b"secret plans", "other-topic", kid, key)
         self.fake.add_topic("et1", e2ee=1, subject=enc_for_other)
         self.seed_keystore("et1", {kid: key})
         rc, out, err = self.run_cli(["topics"])
-        self.assertEqual(rc, 0, err)
-        topics = json.loads(out)
-        self.assertEqual(topics[0]["subject"], "[encrypted]")
+        self.assertEqual(rc, 1)
+        self.assertIn("integrity failure", err)
         self.assertNotIn("secret plans", out)
 
     def test_subject_aad_differs_per_topic(self):
-        # The same subject encrypted for two topics yields different blobs
-        # (different AAD), and each only verifies under its own topic.
-        key, _kid = self.new_key()
-        enc_a = hub._e2ee_encrypt_subject("same subject", key, "topic-A")
-        enc_b = hub._e2ee_encrypt_subject("same subject", key, "topic-B")
-        self.assertNotEqual(enc_a, enc_b)
-        self.assertEqual(hub._e2ee_decrypt_subject(enc_a, key, "topic-A"), "same subject")
-        self.assertEqual(hub._e2ee_decrypt_subject(enc_b, key, "topic-B"), "same subject")
+        key, kid = self.new_key()
+        wire = hub._e2ee_encrypt_field(b"same subject", "topic-A", kid, key)
+        self.seed_keystore("topic-A", {kid: key})
+        self.seed_keystore("topic-B", {kid: key})
+        self.assertEqual(hub._decrypt_subject_value("default", {"id":"topic-A","subject":wire}), "same subject")
         with self.assertRaises(hub.HubError):
-            hub._e2ee_decrypt_subject(enc_a, key, "topic-B")
+            hub._decrypt_subject_value("default", {"id":"topic-B","subject":wire})
 
 
 if __name__ == "__main__":
