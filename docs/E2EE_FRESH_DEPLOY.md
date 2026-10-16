@@ -15,6 +15,21 @@ adapter is supported. Existing plaintext must never be described as encrypted.
 4. Prepare a fresh Worker configuration and a **new, empty D1 database**. Use a new
    Worker name if an older installation must remain available during testing.
    Do not overwrite the checked-in database ID or deploy into somebody else's hub.
+
+   **CRITICAL — secrets before anything else.** Set these Cloudflare Worker
+   secrets *before* deploying the worker bundle or creating any credentials:
+   - `TOKEN_PEPPER` — random 256-bit hex; used to hash all tokens, provisioning
+     codes, and invite codes. If lost, all credentials become unverifiable and
+     the database must be wiped. Back it up in a password manager.
+   - `READ_RECEIPT_SECRET` — random 256-bit hex; signs read receipts.
+
+   A worker upload does NOT carry secrets with it. If you deploy before setting
+   them, `env.TOKEN_PEPPER` will be empty and every authenticated endpoint will
+   500. Worse: any credentials created during that window are hashed against an
+   empty pepper and become permanently invalid once the real secret is set —
+   you must wipe the database and start over. **Order is: secrets → deploy →
+   migrate → bootstrap. Never bootstrap before secrets exist.**
+
 5. Follow [INSTALL.md](INSTALL.md), applying every migration to that new database.
    Migration 0013 refuses a database containing topics. API v2 also verifies the
    installed encryption contract before serving data. Do not drop the guard.

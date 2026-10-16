@@ -63,6 +63,16 @@ environment variables only.
   one — in-flight receipts invalidate and agents simply re-read (stateless,
   nothing is lost).
 
+## CRITICAL: secrets before deploy, deploy before bootstrap
+
+**Order: set secrets → deploy worker → run migrations → bootstrap.**
+Never create credentials before secrets exist.
+
+A worker upload does NOT carry secrets. If `TOKEN_PEPPER` is empty at runtime,
+every authenticated endpoint 500s. Worse: credentials created during that window
+are hashed against an empty pepper and become permanently invalid once the real
+secret is set — you must wipe the database and start over.
+
 ## Rule: new required secrets must update this checklist
 
 The deploy workflow only pushes code — it never sets worker secrets. So any
