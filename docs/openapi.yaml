@@ -40,18 +40,21 @@ paths:
       - families
       operationId: bootstrapFamily
       summary: Bootstrap a family (one-time)
-      description: "Two modes, selected by env `SETUP_LOCKED`:\n- **Open** (`SETUP_LOCKED` unset — first\
-        \ deploy only): public\n  bootstrap. Creates the family, the owner member, and returns a\n  one-time\
-        \ provisioning code for the owner's first agent.\n- **Locked** (`SETUP_LOCKED=1` — the normal\
-        \ running state): server-owner\n  circle creation. Requires a bearer token (401 without one);\
-        \ the\n  caller must be a **server owner** (an explicit row in `server_owners`,\n  matched by\
-        \ principal id — *not* merely an owner of some circle) or\n  the call is 403 `forbidden`. The\
-        \ creator becomes an `owner` member\n  of the new circle and gets a single-use provisioning code\
-        \ for their\n  agent in that circle — the existing token stays bound to the old\n  circle. There\
-        \ is no `setup_locked` error code; unauthenticated\n  calls are 401 `unauthorized`.\nA second\
-        \ *deployment* is only needed for a truly separate family that\nmust not share an operator or\
-        \ database; additional circles for people\nyou trust are created in locked mode above.\n"
+      description: |
+        With SETUP_LOCKED=0, creates the first family and owner and returns a
+        single-use provisioning code. Automatically provisioned hubs require
+        the private X-Bootstrap-Secret capability during this setup window.
+        With SETUP_LOCKED=1, requires an authenticated server owner and creates
+        an additional circle with its own provisioning code. A circle owner
+        does not automatically have server-owner authority.
       security: []
+      parameters:
+      - in: header
+        name: X-Bootstrap-Secret
+        required: false
+        description: Required during unlocked bootstrap when BOOTSTRAP_SECRET is configured; never log this value. It does not bypass authentication in locked mode.
+        schema:
+          type: string
       requestBody:
         required: true
         content:

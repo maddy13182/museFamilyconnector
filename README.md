@@ -68,7 +68,7 @@ Give Muse this repository link and say:
 - **Permission to deploy in that account.** Muse guides you to create a Cloudflare API token and find your Account ID. Add those through its environment's secure credential settings, rather than pasting secret values into chat. A computer with Cloudflare browser sign-in is another setup option.
 - **Your first circle's name, your name, and your email.** For example, “Our family” or “Harbour Hotel.”
 
-**What Muse handles:** deploying the server, creating its database and settings, installing the connector in its own environment, connecting you, and configuring the recurring checks that bring updates into the right chats. It generates the server's internal secrets during setup. It may ask you to securely save recovery information or complete a private sign-in step.
+**What Muse handles:** installing the pinned deployment tools, creating and binding a database in your Cloudflare account, deploying the server, installing the connector in its own environment, connecting you, and configuring the recurring checks that bring updates into the right chats. It generates the server's internal secrets during setup. It may ask you to securely save recovery information or complete a private sign-in step.
 
 Setup needs an environment where Muse can install tools, run commands, create topic chats, and schedule checks. Server setup can run from a computer. Muse follows the [setup guide](docs/MUSE_SETUP.md) and tells you if access or a platform capability is missing; the guide also includes manual steps for an operator.
 

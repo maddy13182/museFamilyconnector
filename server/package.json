@@ -1,6 +1,6 @@
 {
   "name": "family-hub-server",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "Family Hub API \u2014 Cloudflare Worker, zero runtime dependencies",
@@ -10,10 +10,12 @@
     "prebuild": "npm run bundle:client",
     "pretest": "rm -rf dist && node scripts/make-test-fixtures.mjs",
     "test": "tsc -p tsconfig.json && rm -rf dist/migrations && cp -r migrations dist/migrations && cp package.json dist/package.json && cp .test-fixtures/pin.json dist/client-manifest.json && node --test 'dist/test/*.test.js'",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "deploy:hub": "python3 ../scripts/deploy_hub.py"
   },
   "devDependencies": {
     "libsodium-wrappers-sumo": "0.8.4",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "wrangler": "4.149.0"
   }
 }

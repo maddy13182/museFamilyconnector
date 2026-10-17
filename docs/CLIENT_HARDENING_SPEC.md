@@ -68,7 +68,7 @@ to existing behavior.
 - Requests **without** a `family-hub-agent` UA (browser dashboard,
   curl) are never gated.
 - If the parsed version is below the configured minimum
-  (`MIN_CLI_VERSION` in `server/wrangler.toml`, default `"0.0.0"` =
+  (`MIN_CLI_VERSION` in generated deployment settings; protocol-2 template default `"2.0.0"`; `"0.0.0"` =
   gate off), reject with **426** (`client_too_old`) and a guidance message
   following the existing pattern, e.g.:
   `Client version 0.5.0 is below the required minimum 0.7.0. Update

@@ -30,6 +30,8 @@ export interface Env {
   READ_RECEIPT_SECRET?: string;
   /** Set to "1" after bootstrap to disable POST /v2/families. */
   SETUP_LOCKED?: string;
+  /** Private bootstrap capability installed by the provisioner; never logged. */
+  BOOTSTRAP_SECRET?: string;
   /** Minimum CLI version allowed by the client version gate (B1).
    *  Absent/"0.0.0" = gate off. */
   MIN_CLI_VERSION?: string;

@@ -1095,6 +1095,9 @@ async function handleCreateFamily(db: DbClient, env: Env, req: Request): Promise
   if (env.SETUP_LOCKED === '1') {
     return await handleCreateFamilyLocked(db, env, req);
   }
+  if (env.BOOTSTRAP_SECRET && !(await constantTimeEqual(req.headers.get('X-Bootstrap-Secret') ?? '', env.BOOTSTRAP_SECRET))) {
+    throw new HttpError(403, 'forbidden', 'A private bootstrap capability is required');
+  }
   const body = await readJson(req);
   const name = reqString(body['name'], 'name', 1, 120);
   const ownerName = reqString(body['owner_name'], 'owner_name', 1, 120);
@@ -1520,6 +1523,10 @@ async function handleAcceptInvite(
       `SELECT * FROM members WHERE family_id = ? AND email = ?`,
       [invite['family_id'] as string, invite['email'] as string],
     );
+    logEvent('warn', 'enrollment_rejected', {
+      request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+      flow: 'invite', code: 'invite_used',
+    });
     return json(
       {
         error: { code: 'invite_used', message: 'Invite already used' },
@@ -1564,6 +1571,10 @@ async function handleAcceptInvite(
   // a member elsewhere. (If the conditional member INSERT below does not
   // fire, the principals row is an inert orphan: nothing references
   // principals outward.)
+  logEvent('info', 'enrollment_batch_started', {
+    request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+    flow: 'invite',
+  });
   await db.execAtomically([
     principalInsertOp(principalId, ts),
     {
@@ -1604,6 +1615,13 @@ async function handleAcceptInvite(
       params: [inviteFamilyId, email],
     },
   ]);
+  logEvent('info', 'enrollment_batch_completed', {
+    request_id: req.headers.get('X-Request-ID'),
+    operation_id: req.headers.get('X-Operation-ID'),
+    flow: 'invite',
+    member_id: memberId,
+    token_id: tokenId,
+  });
   const won = await db.queryOne(`SELECT id FROM members WHERE id = ?`, [memberId]);
   if (!won) {
     // Lost a concurrent-accept race: the winner's member row holds this email.
@@ -1611,6 +1629,10 @@ async function handleAcceptInvite(
       `SELECT * FROM members WHERE family_id = ? AND email = ?`,
       [inviteFamilyId, email],
     );
+    logEvent('warn', 'enrollment_rejected', {
+      request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+      flow: 'invite', code: 'invite_used',
+    });
     return json(
       {
         error: { code: 'invite_used', message: 'Invite already used' },
@@ -1620,6 +1642,10 @@ async function handleAcceptInvite(
       409,
     );
   }
+  logEvent('info', 'enrollment_issued', {
+    request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+    flow: 'invite', member_id: memberId, token_id: tokenId,
+  });
   // Token is returned ONCE here and never again.
   // The member object goes through publicMember(), the single canonical
   // member serializer — never hand-built. (A hand-built object once omitted
@@ -2553,6 +2579,10 @@ async function handleRedeemProvisioning(
     // user they are already a member but this device holds no token, and ask
     // an owner for a fresh code.
     const member = await db.queryOne(`SELECT * FROM members WHERE id = ?`, [pc['member_id'] as string]);
+    logEvent('warn', 'enrollment_rejected', {
+      request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+      flow: 'provisioning', code: 'code_used',
+    });
     return json(
       {
         error: { code: 'code_used', message: 'Provisioning code already used' },
@@ -2587,6 +2617,10 @@ async function handleRedeemProvisioning(
   // is the call whose token_id the code row records as redeemed_token_id.
   // F17: the new token inherits the code's issued_by_token_id, so revoking
   // the minter's token cascades to it.
+  logEvent('info', 'enrollment_batch_started', {
+    request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+    flow: 'provisioning',
+  });
   await db.execAtomically([
     {
       sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at, issued_by_token_id)
@@ -2614,12 +2648,23 @@ async function handleRedeemProvisioning(
           },
         ] : []),
   ]);
+  logEvent('info', 'enrollment_batch_completed', {
+    request_id: req.headers.get('X-Request-ID'),
+    operation_id: req.headers.get('X-Operation-ID'),
+    flow: 'provisioning',
+    member_id: pc['member_id'],
+    token_id: tokenId,
+  });
   const consumed = await db.queryOne(
     `SELECT redeemed_token_id FROM provisioning_codes WHERE code_hash = ?`,
     [codeHash],
   );
   if (!consumed || consumed['redeemed_token_id'] !== tokenId) {
     // Lost a concurrent-redeem race: another call consumed the code first.
+    logEvent('warn', 'enrollment_rejected', {
+      request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+      flow: 'provisioning', code: 'code_used',
+    });
     return json(
       {
         error: { code: 'code_used', message: 'Provisioning code already used' },
@@ -2640,6 +2685,10 @@ async function handleRedeemProvisioning(
       family_id: member['family_id'] as string,
     });
   }
+  logEvent('info', 'enrollment_issued', {
+    request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID'),
+    flow: 'provisioning', member_id: member['id'], token_id: tokenId,
+  });
   return json({ token, token_id: tokenId, member: publicMember(member) }, 201);
 }
 
@@ -4311,37 +4360,56 @@ async function handleTaskDone(
 // ---------------------------------------------------------------------------
 
 // Request entry point (what tests drive and what the worker's fetch calls).
-// Logs exactly one structured line per request — method, redacted path,
-// status, duration — with the server version on every line. Error detail
+// Logs arrival before routing and completion after routing — method,
+// redacted path, status, duration — with the server version on every line. Error detail
 // (code) is logged by routeRequest's catch below, so failures produce a
 // detail line plus this access line.
 export async function handleRequest(req: Request, db: DbClient, env: Env): Promise<Response> {
   const start = Date.now();
+  // Correlation IDs are opaque, bounded identifiers, never credentials.
+  const safeId = (value: string | null): string =>
+    value && /^[a-f0-9-]{32,36}$/i.test(value) ? value : crypto.randomUUID();
+  const requestId = safeId(req.headers.get('X-Request-ID'));
+  const operationId = safeId(req.headers.get('X-Operation-ID'));
+  const headers = new Headers(req.headers);
+  headers.set('X-Request-ID', requestId);
+  headers.set('X-Operation-ID', operationId);
+  req = new Request(req, { headers });
+  const correlation = { request_id: requestId, operation_id: operationId };
+  const finish = (res: Response): Response => {
+    const result = withSecurityHeaders(res);
+    result.headers.set('X-Request-ID', requestId);
+    result.headers.set('X-Operation-ID', operationId);
+    return result;
+  };
   let method = '?';
   let path = '?';
   try {
     const url = new URL(req.url);
     path = redactPath(url.pathname);
     method = req.method.toUpperCase();
+    logEvent('info', 'request_received', { ...correlation, method, path });
     const res = await routeRequest(req, db, env);
     logEvent(res.status >= 500 ? 'error' : res.status >= 400 ? 'warn' : 'info', 'request', {
+      ...correlation,
       method,
       path,
       status: res.status,
       ms: Date.now() - start,
     });
-    return withSecurityHeaders(res);
+    return finish(res);
   } catch (e) {
     // routeRequest converts all expected errors to responses; this is the
     // last resort so a request never goes unlogged.
     logEvent('error', 'request_error', {
+      ...correlation,
       method,
       path,
       status: 500,
       code: 'internal',
       ms: Date.now() - start,
     });
-    return withSecurityHeaders(
+    return finish(
       json({ error: { code: 'internal', message: 'Internal server error' } }, 500),
     );
   }
@@ -4585,6 +4653,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
     throw new HttpError(404, 'not_found', 'Unknown endpoint');
   } catch (e) {
     const logPath = redactPath(new URL(req.url).pathname);
+    const correlation = { request_id: req.headers.get('X-Request-ID'), operation_id: req.headers.get('X-Operation-ID') };
     if (e instanceof Error && e.message.includes('encrypted_write_conflict')) {
       return json({error:{code:'rotation_required',message:'Encryption state changed during this write; refresh the topic and retry'}},409);
     }
@@ -4592,6 +4661,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       // 401/403 get their own event so auth probing is visible in log streams.
       const event = e.status === 401 || e.status === 403 ? 'auth_rejected' : 'request_error';
       logEvent(e.status >= 500 ? 'error' : 'warn', event, {
+        ...correlation,
         path: logPath,
         status: e.status,
         code: e.code,
@@ -4599,7 +4669,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       return json({ error: { code: e.code, message: e.message } }, e.status);
     }
     // Never leak stack traces or SQL to clients.
-    logEvent('error', 'request_error', { path: logPath, status: 500, code: 'internal' });
+    logEvent('error', 'request_error', { ...correlation, path: logPath, status: 500, code: 'internal' });
     return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
   }
 }

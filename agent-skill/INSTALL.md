@@ -303,3 +303,36 @@ is not the layer that saves you there.
 | cron job hangs on a prompt | `agent.key` is wrapped and the job lacks `FAMILY_HUB_KEY_PASSPHRASE` — bind it from the Secure Vault (see Step 3) |
 | `installed CLI does not match the signed release` (exit 5) | The `hub` file differs from the signed release — run `hub verify-install` for details, then reinstall from the server |
 | `RESULT: FAIL` from `hub verify-install` | Reinstall from the server (artifact + `manifest.json` + `hub.sigstore` via `/v2/client/download/*`, or `hub upgrade`); don't keep using the failed copy |
+
+### Enrollment diagnostics (recorded automatically)
+
+The CLI records metadata for every HTTP attempt, retry, response, JSON parse,
+credential save, and enrollment verification, even without `--debug`. Its private
+`0600` log is `<profile directory>/diagnostics.jsonl` (normally
+`~/.config/family-hub/profiles/default/diagnostics.jsonl`). History is discarded
+when the file exceeds 1 MiB. Preserve it after a failure, before more commands.
+A warning means the log could not be written; missing events are then inconclusive.
+
+Each invocation has a `run_id`. Each HTTP call has an `operation_id` shared by
+its retries, and each attempt has a distinct `request_id`. The CLI sends these
+last two IDs to the server. Match them against Cloudflare Workers Logs:
+
+| Evidence | What it establishes |
+| --- | --- |
+| CLI `http_attempt_started` | The CLI was about to send an attempt; arrival is not proven. |
+| Server `request_received` | The handler received that attempt. |
+| Server `enrollment_batch_started` / `enrollment_batch_completed` | The database batch started / completed; a conditional race loser may complete without issuing a token. |
+| Server `enrollment_issued` | Post-batch checks confirmed this attempt issued the credential. |
+| Server `request` with status `201` | The handler prepared success; client receipt is not proven. |
+| CLI `http_response_received` / `http_json_parsed` | The CLI read the complete response / parsed its JSON. |
+| CLI `credential_file_saved` / `credential_config_saved` | The corresponding local persistence call completed. |
+| CLI `credential_verified` | The new credential successfully authenticated with `/v2/me`. |
+| CLI `command_finished` | The actual CLI exit code, independent of shell pipelines. |
+
+Persistent diagnostics exclude tokens, invite codes, bodies, names, email
+addresses, keys, recovery phrases, and exception messages. Do not share your
+configuration, credential files, or recovery phrase alongside the log. `--debug`
+is a separate, more detailed console trace and is unnecessary for this history.
+Absent events alone do not prove an event never happened: abrupt termination,
+local storage failure, or telemetry delivery can interrupt recording. These
+logs diagnose enrollment; they do not make single-use enrollment resumable.

@@ -1,16 +1,16 @@
 # CD (optional): on push to main (or manual dispatch) → build, test, migrate D1, deploy.
 #
 # Needs GitHub Actions secrets (repo Settings → Secrets and variables → Actions):
-#   CLOUDFLARE_API_TOKEN   — API token from the "Edit Cloudflare Workers" template
+#   CLOUDFLARE_API_TOKEN   — scoped API token with Workers Scripts and D1 Edit (docs/DEPLOY.md)
 #   CLOUDFLARE_ACCOUNT_ID  — from the Cloudflare dashboard overview page
 # The deploy job skips gracefully when they aren't set (forks, local-deploy
 # users). NOTE: secrets may not be referenced in `if:` conditions per GitHub
 # docs, so a small `check` job maps the secret to an output and the deploy
 # job gates on `needs.check` (an allowed context) instead.
 #
-# One-time manual setup first (see docs/DEPLOY.md):
-#   1. D1 database created, database_id filled into server/wrangler.toml
-#   2. TOKEN_PEPPER set as a worker secret (dashboard or `wrangler secret put`)
+# First provision with npm run deploy:hub (docs/DEPLOY.md).
+# Set Actions variable CLOUDFLARE_HUB_NAME to explicitly select the existing hub.
+# CI discovers its DB binding; no deployment-specific config is committed.
 name: Deploy
 
 on:
@@ -28,10 +28,12 @@ jobs:
         id: creds
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_HUB_NAME: ${{ vars.CLOUDFLARE_HUB_NAME }}
         run: |
-          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ] || [ -z "${CLOUDFLARE_HUB_NAME}" ]; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No CLOUDFLARE_API_TOKEN secret set — skipping Cloudflare deploy (local deploy is the primary path; see README)."
+            echo "::notice::Cloudflare credentials or CLOUDFLARE_HUB_NAME missing — skipping deploy (see docs/DEPLOY.md)."
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
@@ -46,6 +48,7 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_HUB_NAME: ${{ vars.CLOUDFLARE_HUB_NAME }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -61,8 +64,9 @@ jobs:
       - name: Build + test
         run: npm test
 
-      - name: Apply D1 migrations
-        run: npx -y wrangler@4.149.0 d1 migrations apply family-hub --remote
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
 
-      - name: Deploy worker
-        run: npx -y wrangler@4.149.0 deploy
+      - name: Discover existing binding, migrate, deploy and verify
+        run: npm run deploy:hub -- --name "$CLOUDFLARE_HUB_NAME" --existing

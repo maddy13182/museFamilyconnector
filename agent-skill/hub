@@ -267,6 +267,40 @@ def profile_dir(profile):
     return os.path.join(config_home(), APP_DIR, "profiles", profile)
 
 
+# Always-on, metadata-only diagnostics survive a failed non-debug invocation.
+_DIAGNOSTIC_PROFILE = "default"
+_DIAGNOSTIC_RUN = uuid.uuid4().hex
+_DIAGNOSTIC_WARNED = False
+_DIAGNOSTIC_STARTED = False
+
+
+def diagnostic(event, **fields):
+    """Private bounded JSONL; never pass bodies, headers, URLs or exception text."""
+    global _DIAGNOSTIC_WARNED
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "event": event, "run_id": _DIAGNOSTIC_RUN, "version": VERSION}
+    record.update(fields)
+    try:
+        directory = profile_dir(_DIAGNOSTIC_PROFILE)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        path = os.path.join(directory, "diagnostics.jsonl")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            # Keep recent history bounded; logging must never interrupt
+            # credential persistence. Older history is discarded at 1 MiB.
+            if os.fstat(stream.fileno()).st_size > 1024 * 1024:
+                stream.seek(0)
+                stream.truncate(0)
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+            stream.flush()
+    except OSError:
+        if not _DIAGNOSTIC_WARNED:
+            emit_err("warning: could not write private diagnostics; troubleshooting history is incomplete")
+            _DIAGNOSTIC_WARNED = True
+
+
 def config_path(profile):
     return os.path.join(profile_dir(profile), "config.json")
 
@@ -3221,18 +3255,33 @@ class HubClient:
         """
         last_status = None
         last_text = None
+        operation_id = uuid.uuid4().hex
         for attempt in range(retries + 1):
+            headers = dict(headers)
+            request_id = uuid.uuid4().hex
+            headers["X-Operation-ID"] = operation_id
+            headers["X-Request-ID"] = request_id
+            trace = {"operation_id": operation_id, "request_id": request_id,
+                     "attempt": attempt + 1, "method": method,
+                     "path": urlparse.urlsplit(_scrub_url(url)).path}
+            self.last_trace = trace
+            diagnostic("http_attempt_started", **trace)
+            started = time.monotonic()
             try:
                 status, resp_text = self.transport(method, url, headers, body_bytes)
             except _RETRYABLE_EXC as exc:
+                diagnostic("http_transport_failed", error_type=type(exc).__name__, **trace)
                 reason = "network error: %s" % exc
                 status, resp_text = None, None
             except HubError as exc:
                 if exc.code != "connection":
                     raise
+                diagnostic("http_transport_failed", error_type="connection", **trace)
                 reason = "connection error: %s" % exc
                 status, resp_text = None, None
             else:
+                diagnostic("http_response_received", status=status,
+                           ms=int((time.monotonic() - started) * 1000), **trace)
                 if status == 429 or status >= 500:
                     reason = "http %d" % status
                 else:
@@ -3247,6 +3296,7 @@ class HubClient:
                     % (time.strftime("%H:%M:%S"), method, _scrub_url(url), reason,
                        attempt + 1, retries, delay)
                 )
+            diagnostic("http_retry_scheduled", delay_ms=int(delay * 1000), **trace)
             time.sleep(delay)
         if last_status is not None:
             return last_status, last_text
@@ -3307,8 +3357,11 @@ class HubClient:
             if not resp_text:
                 return None
             try:
-                return json.loads(resp_text)
+                result = json.loads(resp_text)
+                diagnostic("http_json_parsed", **self.last_trace)
+                return result
             except ValueError:
+                diagnostic("http_json_invalid", **self.last_trace)
                 raise HubError("error", "Server returned non-JSON response.")
         try:
             payload = json.loads(resp_text) if resp_text else {}
@@ -3653,13 +3706,18 @@ def cmd_setup(args, transport):
         "auth_method": store,
     }
     token_file = default_token_path(profile)
+    diagnostic("credential_save_started", flow="setup")
     _write_secret_file_0600(token_file, (token + "\n").encode("utf-8"), "credential")
+    diagnostic("credential_file_saved", flow="setup")
     new_cfg["token_file"] = token_file
     storage_note = "Stored in a private 0600 file at %s. Protect this machine user account." % token_file
     save_config(profile, new_cfg)
+    diagnostic("credential_config_saved", flow="setup")
     # F11: the new credential is only real if the server accepts it —
     # verify before declaring success.
+    diagnostic("credential_verification_started", flow="setup")
     _verify_new_token(server, transport, args.debug, token, "setup")
+    diagnostic("credential_verified", flow="setup")
     # save_config scrubs tokens; assert nothing secret-bearing was written.
     emit("setup complete.")
     emit_json(
@@ -4530,6 +4588,7 @@ def _redeem_code(server, transport, debug, code, display_name="",
 def _store_circle_token(ctx, circle_id, token, member):
     """Persist a circle token + member record; never prints the token."""
     note_secret(token)
+    diagnostic("credential_save_started", flow="circle")
     circle_tokens = ctx.cfg.get("circle_tokens") or {}
     circle_tokens[circle_id] = token
     ctx.cfg["circle_tokens"] = circle_tokens
@@ -4684,7 +4743,9 @@ def cmd_circle_join(args, transport):
     ctx.cfg["active_circle_id"] = cid
     save_config(ctx.profile, ctx.cfg)
     # F11: report success only after the new token proves it authenticates.
+    diagnostic("credential_verification_started", flow="circle")
     _verify_new_token(ctx.server, transport, args.debug, token, "circle join")
+    diagnostic("credential_verified", flow="circle")
     # Friendly output: resolve the circle name with the new token.
     try:
         probe = HubClient(ctx.server, token, transport=transport)
@@ -7064,9 +7125,13 @@ _LOCAL_COMMANDS = frozenset(
 )
 
 
-def main(argv=None, transport=None):
+def _main(argv=None, transport=None):
+    global _DIAGNOSTIC_PROFILE, _DIAGNOSTIC_STARTED
     clear_secrets()
     args = build_parser().parse_args(argv)
+    _DIAGNOSTIC_PROFILE = args.profile
+    _DIAGNOSTIC_STARTED = True
+    diagnostic("command_started", command=getattr(args.func, "__name__", "unknown"))
     # Startup self-integrity check (WS-E). verify-install is exempt from
     # the hard refusal so it can diagnose a mismatch itself (it re-runs
     # the full check and reports exactly which step failed).
@@ -7097,6 +7162,20 @@ def main(argv=None, transport=None):
     except Exception as exc:  # noqa: BLE001 - last resort, still redacted
         emit_err("error: unexpected failure: %s" % redact(exc))
         return 1
+
+
+def main(argv=None, transport=None):
+    global _DIAGNOSTIC_RUN, _DIAGNOSTIC_WARNED, _DIAGNOSTIC_STARTED
+    _DIAGNOSTIC_STARTED = False
+    _DIAGNOSTIC_RUN = uuid.uuid4().hex
+    _DIAGNOSTIC_WARNED = False
+    result = None
+    try:
+        result = _main(argv, transport)
+        return result
+    finally:
+        if _DIAGNOSTIC_STARTED:
+            diagnostic("command_finished", exit_code=result)
 
 
 if __name__ == "__main__":
