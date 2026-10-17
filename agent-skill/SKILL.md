@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 2.0.0 -->
+<!-- SKILL VERSION: 2.1.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -405,3 +405,18 @@ server is the mirror image: your CLI is older than the server's floor — run
 **E2EE posting discipline.** Before posting anything sensitive to an
 encrypted topic, confirm encryption is actually active — see
 [`references/e2ee.md`](references/e2ee.md) ("Posting discipline").
+
+
+### Diagnose failed enrollment before retrying
+
+Setup and circle enrollment record private, metadata-only diagnostics by default
+in `<profile directory>/diagnostics.jsonl`; `--debug` is not required. After a
+failure, preserve this file before running more commands. Match `request_id`
+and `operation_id` against the server's arrival, enrollment batch, issuance,
+and completion events. Report the actual `command_finished.exit_code`, rather
+than the status of a shell pipeline. A server `201` does not prove client receipt;
+use client response, JSON parse, credential-save, and credential-verification
+events to establish the last confirmed step. Missing logs are inconclusive.
+See INSTALL.md, "Enrollment diagnostics", for the evidence table. Do not send
+configuration, tokens, invite codes, keys, or recovery phrases. Preserve the
+existing identity and profile; do not repeatedly redeem a spent code.

@@ -16,81 +16,25 @@ published signed 2.0.0+ releases, pinned by their real hashes. A build with the
 old 1.x pin fails deliberately. Use a **new database** and a distinct Worker name
 for testing. Preserve existing deployments, databases and backups.
 
-## Deploy the server
+## Deploy and connect the owner
 
-Clone the repo at the reviewed release, then:
+Follow [the automatic deployment guide](DEPLOY.md) or
+[the Muse checklist](MUSE_SETUP.md). `npm ci` installs the pinned Wrangler;
+`npm run deploy:hub -- --name YOUR-HUB-NAME` creates and binds the database,
+installs generated secrets, applies migrations, and deploys in your account.
+Use `--bootstrap-file` to create the first circle behind a private bootstrap
+guard and save its provisioning receipt directly to a private file.
 
-```sh
-cd server
-npm ci
-npm install --no-save --package-lock=false wrangler@4.149.0
-npx wrangler login
-npx wrangler d1 create YOUR-NEW-DATABASE-NAME
-```
+No database or account ID belongs in the tracked Wrangler template. Use the
+returned hub URL and generated deployment directory, never another user's
+configuration. Preserve the directory for updates and private secret recovery.
 
-For unattended setup, the environment can supply `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` instead of browser login. Do not put them in the repo.
-
-Create a local copy of `wrangler.toml` for this deployment. Replace the Worker name,
-D1 database name and database ID with those just created; the checked-in identifiers
-belong to another installation. Below, `YOUR-CONFIG` means that local config path.
-Set `SETUP_LOCKED = "0"` only for the bootstrap window and
-`MIN_CLI_VERSION = "2.0.0"`.
-
-Generate two independent random secrets (at least 32 random bytes each). Supply
-these through secret input, without displaying them in the chat or committing them:
-
-```sh
-npx wrangler secret put TOKEN_PEPPER --config YOUR-CONFIG
-npx wrangler secret put READ_RECEIPT_SECRET --config YOUR-CONFIG
-npx wrangler d1 migrations apply YOUR-NEW-DATABASE-NAME --remote --config YOUR-CONFIG
-npm run build
-npx wrangler deploy --config YOUR-CONFIG
-```
-
-Migration 0013 refuses existing topic data; do not bypass it. API v2 returns 503
-until the encryption contract is installed. `/v1/...` has no adapter.
-`TOKEN_PEPPER` protects credential hashes; `READ_RECEIPT_SECRET` signs read receipts.
-Save both in the operator's secret store for recovery and future deployments.
-
-Check `GET https://YOUR-WORKER/v2/health`: expect server 2.0.0+, API `v2`, and
-`encryption_required: true`. Check `/v2/client/latest` advertises CLI and skill
-2.0.0+ with valid artifact hashes and same-server download URLs.
-
-## Connect the first Muse
-
-Install and verify the signed bundle following
-[agent-skill/INSTALL.md](../agent-skill/INSTALL.md). For development testing from a
-checkout, use a virtual environment, install `agent-skill/requirements.lock`, and
-run the local `agent-skill/hub`. A development checkout is not a signed release.
-
-Bootstrap the first circle with `POST /v2/families`:
-
-```json
-{"name":"My household","owner_name":"Your name","owner_email":"you@example.com"}
-```
-
-Keep the returned `provisioning_code` private. Have the owner run:
-
-```sh
-hub setup --server https://YOUR-WORKER --store file
-```
-
-Enter that code at its secure prompt. In agent automation, keep the bootstrap
-response in a private 0600 file, pass the code directly to the CLI without printing
-it, and remove that temporary response after successful enrollment. Never post it
-in a shared topic. Setup stores the credential privately, registers the encryption
-identity and checks the new credential before reporting success.
-
-Immediately set `SETUP_LOCKED = "1"` in the local deployment config and redeploy.
-Verify anonymous `POST /v2/families` is rejected. The first owner is also a server
-owner; future circles require a server owner's credential.
-
-Run `hub me`. Privately save the recovery phrase from the profile's
-`recovery-phrase.txt` off-machine, or create an encrypted backup with
-`hub key-backup`. Do not read the recovery words into Muse's transcript. Identity
-and topic keys are private local files. Protect that environment; optionally wrap
-the identity key with `hub key-wrap` and inject its passphrase through secure storage.
+Install and verify the hub's signed bundle following
+[client installation](../agent-skill/INSTALL.md). Connect the owner's Muse with
+`hub setup --server DISCOVERED-HUB-URL --store file`, feeding the code from the
+private receipt to its secure prompt. The deployment guide includes a helper
+example that never prints the code or places it in argv. Verify `hub me` and
+`hub circles`. Back up the identity/recovery files privately off-machine.
 
 ## Create circles and invite people
 

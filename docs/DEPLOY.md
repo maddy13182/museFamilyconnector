@@ -1,157 +1,160 @@
-# Family Hub — Deploy guide
+# Deploy a hub in your own Cloudflare account
 
-Two ways to deploy. **A** is the primary path (Muse deploys from its
-execution environment or your computer). **B** is optional.
+Muse can perform this procedure. The human supplies Cloudflare authorization
+through secure environment settings; no database ID, Worker URL, or manual
+Wrangler-file editing is required.
 
-## A. Deploy from your machine (recommended)
+## Credentials and prerequisites
 
-You need:
+Use Linux, macOS, or Windows WSL with Node.js 22.23.3 or newer, npm, Git,
+and Python 3.11 or newer. `npm ci` installs
+the repository's pinned Wrangler locally; no global installation or browser login
+is needed.
 
-1. A free Cloudflare account (dash.cloudflare.com).
-2. Deploy credentials — either:
-   - `wrangler login` (browser OAuth — nothing to copy), **or**
-   - An API token + account ID, for agent-driven deploys with no browser:
-     - Dashboard → profile → **My Profile** → **API Tokens** → **Create Token**
-       → **Edit Cloudflare Workers** template → copy the token.
-     - Dashboard overview → right sidebar → copy the **Account ID**.
-     - Export them in your shell:
-       ```bash
-       export CLOUDFLARE_API_TOKEN="<paste>"
-       export CLOUDFLARE_ACCOUNT_ID="<paste>"
-       ```
-3. Follow the [Muse setup procedure](MUSE_SETUP.md#deployment-procedure):
-   create your own D1 database → set both required worker secrets → test and
-   build the server → deploy → create the first circle → lock public setup →
-   enroll the owner and verify a conversation and its Muse chat.
+Bind these variables using the environment's secure credential settings:
 
-No GitHub secrets involved. Nothing leaves your machine except the deploy
-itself.
+- `CLOUDFLARE_API_TOKEN`: a Cloudflare **API token**, not the Global API Key.
+  Restrict it to the intended account with **Workers Scripts: Edit**, **D1: Edit**,
+  permissions. The Workers template alone may
+  need D1 permission added. The token must be able to read those resources too.
+- `CLOUDFLARE_ACCOUNT_ID`: the Account ID shown in the Cloudflare dashboard.
 
-## B. Deploy from GitHub Actions (optional)
+Do not paste the API token into chat, source files, shell commands, or logs.
+Wrangler and the provisioner inherit it from the environment. It is never stored
+in the deployment directory. A temporary token can be revoked after setup;
+future updates need a valid token for the same account.
 
-Push-to-`main` auto-deploys: build → test → D1 migrations → deploy.
-PRs only run build + test.
+## One command provisions the backend
 
-Setup (one time):
-
-1. Same Cloudflare account as above.
-2. Repo → **Settings** → **Secrets and variables** → **Actions** → add:
-   - `CLOUDFLARE_API_TOKEN`
-   - `CLOUDFLARE_ACCOUNT_ID`
-3. That's it. The workflow skips gracefully when the secrets aren't set, so
-   forks without them just don't deploy (no failing runs).
-
-Secrets never appear in logs; the workflow passes them to wrangler as
-environment variables only.
-
-## TOKEN_PEPPER (one time, both paths, never in git)
-
-- Workers & Pages → `family-hub` → **Settings** → **Variables and Secrets** →
-  **Add** → type **Secret** → name `TOKEN_PEPPER`.
-- Value: 64 random hex chars (`openssl rand -hex 32`).
-- Mixed into every token/invite hash. If it ever leaks, generate a new one —
-  all agent tokens invalidate and everyone re-enrolls (by design).
-
-## READ_RECEIPT_SECRET (one time, both paths, never in git)
-
-- Same place: **Variables and Secrets** → **Add** → type **Secret** → name
-  `READ_RECEIPT_SECRET`.
-- Value: 64 random hex chars (`openssl rand -hex 32`).
-- Signs read receipts (server 1.2.0+). The server **fails closed** without it:
-  every topic-history read returns HTTP 500 `misconfigured`, so agents can
-  see new activity but can never read it. If it ever leaks, generate a new
-  one — in-flight receipts invalidate and agents simply re-read (stateless,
-  nothing is lost).
-
-## CRITICAL: secrets before deploy, deploy before bootstrap
-
-**Order: set secrets → deploy worker → run migrations → bootstrap.**
-Never create credentials before secrets exist.
-
-A worker upload does NOT carry secrets. If `TOKEN_PEPPER` is empty at runtime,
-every authenticated endpoint 500s. Worse: credentials created during that window
-are hashed against an empty pepper and become permanently invalid once the real
-secret is set — you must wipe the database and start over.
-
-## Rule: new required secrets must update this checklist
-
-The deploy workflow only pushes code — it never sets worker secrets. So any
-PR that adds a new required secret or environment variable **must** add it to
-this file before merge, or the deploy will ship a non-functioning server.
-(2026-10-13: `READ_RECEIPT_SECRET` shipped in 1.2.0 without this step and
-broke all topic reads until the secret was set by hand.)
-
-## Bootstrap (first deploy only, both paths)
-
-1. Set `SETUP_LOCKED = "0"` in `server/wrangler.toml` and deploy. (The repo
-   default is `"1"` — the safe state for a running instance — so a fresh
-   clone must unlock it explicitly for the first deploy.)
-2. `POST https://<your-worker>/v1/families`
-   `{name, owner_name, owner_email}` → save the provisioning code; enroll your
-   agent with it.
-3. Set `SETUP_LOCKED = "1"`, redeploy. Unauthenticated `POST /v1/families`
-   calls are now rejected. As an owner you can still create additional
-   circles any time (`hub circle create`) — a second circle is not a second
-   deployment. (Truly separate families that shouldn't share an operator
-   still get their own worker + D1 pair.)
-
-## Post-deploy: verify the client manifest
-
-After deploying the worker, confirm `GET /v1/client/latest` serves the
-manifest that is in the repo at that deploy (the server only advertises
-what `server/client-manifest.json` says — and the build bundles the pinned
-CLI artifacts into the worker via `npm run bundle:client`, so the deploy
-also serves exactly those bytes at `/v1/client/download/*`):
+Clone this repository, then run:
 
 ```sh
-curl -s https://<your-worker>/v1/client/latest | python3 -m json.tool
+cd museFamilyconnector/server
+npm ci
+npm test
+npm run deploy:hub -- --name YOUR-HUB-NAME
 ```
 
-Check that `version`, `sha256`, and `server_version` look right, and that
-the served artifact matches the signed `cli-v*` GitHub Release the pin was
-taken from:
+Choose a unique lowercase Worker name in your account, such as `our-family-hub`.
+Names, accounts, database IDs, and URLs are deployment inputs or discovered
+outputs. `server/wrangler.toml` is a portable template, not a live configuration.
+
+The command:
+
+1. Builds the Worker and verifies the published CLI/skill artifact pins.
+2. Checks for conflicting resources before making changes.
+3. Creates a D1 database in your account and captures its actual ID.
+4. Generates a private local Wrangler configuration binding that database as
+   `DB`. The Worker accesses it as `env.DB`, a Cloudflare resource binding,
+   rather than a database-ID string used to make connections.
+5. Generates independent `TOKEN_PEPPER`, `READ_RECEIPT_SECRET`, and
+   `BOOTSTRAP_SECRET` values in a private local file.
+6. Applies every D1 migration using the pinned Wrangler, then uses its
+   `--secrets-file` support to deploy the real Worker and required secrets
+   together, with public setup locked. An existing account subdomain is reused;
+   if none exists, a unique workers.dev subdomain is created for the account.
+7. Discovers the hub URL and verifies protocol 2, required encryption, and the
+   client manifest. It prints the URL and the private deployment directory.
+
+Settings live under `server/.deployments/ACCOUNT_ID/HUB_NAME/`, ignored by Git.
+Files are private (`0600`):
+
+| File | Purpose |
+| --- | --- |
+| `state.json` | Account, Worker, database identity, discovered URL, and progress |
+| `wrangler.json` | Generated bindings and nonsecret runtime settings |
+| `secrets.json` | Recovery copy of generated Worker secrets for a new deployment |
+| `owner-enrollment.json` | Private first-owner provisioning receipt, when requested |
+
+Privately back up this directory, especially `secrets.json`. Never commit it or
+read its contents into a model transcript. Do not regenerate `TOKEN_PEPPER` during
+an upgrade: that would invalidate existing credentials.
+
+## Create the first circle without opening public registration
+
+Muse can create a private JSON file containing the human-provided details:
+
+```json
+{"name":"Our family","owner_name":"Your name","owner_email":"you@example.com"}
+```
+
+Then run the same command with that file:
 
 ```sh
-gh release view "cli-v$(curl -s https://<your-worker>/v1/client/latest \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" \
-  --json tagName,assets --jq '{tag: .tagName, assets: [.assets[].name]}'
-curl -s https://<your-worker>/v1/client/download/hub | sha256sum
-# → must equal the `sha256` in /v1/client/latest
+npm run deploy:hub -- --name YOUR-HUB-NAME --bootstrap-file /PRIVATE/PATH/owner.json
 ```
 
-The response's `sha256` must equal the release's `manifest.json`
-`sha256`. The release workflow opens a **PR** updating
-`server/client-manifest.json` when it cuts a release (direct pushes to
-`main` are blocked by branch protection) — so after a CLI release lands:
-**merge the manifest PR, then redeploy the worker** (or fold it into the
-next deploy) for agents' `hub upgrade` to see the new version.
-`min_cli_version` in the manifest is never raised automatically; raise it
-deliberately per the rollout order in `docs/CLIENT_HARDENING_SPEC.md` §7,
-only after the fleet reports at-or-above the new version.
+This can also be supplied on the initial deployment command. The command briefly
+enables bootstrap behind the private `BOOTSTRAP_SECRET`, creates the first circle,
+saves the response directly to `owner-enrollment.json`, and locks setup again.
+An unauthenticated visitor cannot create a circle during that step. The API token
+and bootstrap secret are never printed. The first owner also becomes a server owner.
 
-## Raising the client version gate (MIN_CLI_VERSION)
+If the process is killed or the final deploy fails, rerun the same command to
+restore locked setup first. The private bootstrap guard remains required even
+before relocking. If a bootstrap response was lost, the command stops for
+investigation instead of issuing a duplicate request. This is distinct from
+resumable CLI enrollment; provisioning does not fix that separate limitation.
 
-The repo default `MIN_CLI_VERSION = "0.0.0"` in `server/wrangler.toml` is
-**gate off** — the safe state for a fresh deploy. Production runs the gate
-as a Cloudflare env binding so the value can change without a code edit.
+Install and verify the server's signed bundle as described in
+[the client installation guide](../agent-skill/INSTALL.md). Enroll the owner's
+Muse using the saved provisioning code without displaying it or putting it in
+shell history. For example, a trusted helper can pipe the private code to the
+CLI's secure prompt:
 
-For the 1.0.0 server / 1.0.0 CLI release: after the signed CLI release
-(`cli-v1.0.0`) is cut, its manifest PR merged, and the fleet has actually
-upgraded (agents reporting `family-hub-agent/1.0.0` or newer), set the
-production binding to `"1.0.0"` and redeploy:
+```python
+import json, subprocess
+from pathlib import Path
+receipt = json.loads(Path("PRIVATE-DEPLOYMENT-DIRECTORY/owner-enrollment.json").read_text())
+subprocess.run(
+    ["/ABSOLUTE/PATH/TO/VERIFIED/hub", "setup", "--server", "YOUR-DISCOVERED-HUB-URL", "--store", "file"],
+    input=receipt["provisioning_code"] + "\n", text=True, check=True,
+)
+```
 
-- Dashboard: Workers & Pages → `family-hub` → **Settings** → **Variables
-  and Secrets** → edit `MIN_CLI_VERSION` → `"1.0.0"` → **Save**, then
-  redeploy; or
-- `wrangler deploy --var MIN_CLI_VERSION=1.0.0`
+Use the CLI path installed for this Muse, not a guessed executable from `PATH`.
+Do not print the receipt or recovery words. Keep the existing identity on retries.
+Remove the spent receipt only after successful enrollment. See
+[the Muse setup guide](MUSE_SETUP.md) for connection and conversation checks.
 
-Never raise the gate before the installed fleet reports at-or-above the new
-version — a premature raise bricks older clients with 426 `client_too_old`.
-Do not change the repo's `"0.0.0"` default for this; the default is gate-off
-by design for fresh deploys.
+## Repeat runs and upgrades
 
-## Rotating the Cloudflare token
+Rerun the same command from the same checkout to reuse the recorded database,
+Worker identity, and secrets. Interrupted resource creation is reconciled by the
+saved intent and Cloudflare's actual resources. A database-binding or ownership
+mismatch stops deployment. Nothing is automatically deleted or reset.
 
-Dashboard → API Tokens → roll/delete it, create a new one from the same
-template, update wherever you kept it (shell env or the GitHub secret).
-No code changes needed.
+For an intentional update from a clean checkout or GitHub Actions:
+
+```sh
+npm run deploy:hub -- --name YOUR-EXISTING-HUB --existing
+```
+
+This explicitly discovers the named Worker's current `DB` binding and required
+secret names. It applies migrations and deploys code while retaining that
+binding and secret values. It refuses to create a replacement if the Worker
+is missing. It does not retrieve secret values or bootstrap another owner.
+Do not use it to convert a protocol-1 database: migration 0013 intentionally
+rejects old topic data. Preserve old databases and create a distinct deployment.
+
+The default minimum CLI version for new protocol-2 deployments is `2.0.0`.
+Signed newer CLI/skill releases must be published and their manifest PR merged
+before the backend can distribute those new bytes. Never invent artifact hashes.
+The diagnostic CLI history added in 2.1.0 requires installing that signed client.
+
+## GitHub Actions
+
+The optional Deploy workflow updates an **existing** backend; first provisioning
+uses the command above. Configure repository Actions secrets
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, plus repository variable
+`CLOUDFLARE_HUB_NAME`. Every run rediscovers that Worker's binding. No deployment
+ID or secret file needs to be committed or cached in GitHub.
+
+## Recovery and verification
+
+A failed command is not a completed install. Check its stage message and private
+state. There is no automatic resource deletion or secret rotation. The provisioner
+never prints raw API responses or subprocess output that might contain secrets.
+After setup, verify `hub me`, `hub circles`, encrypted topic reads, and a real
+exchange with another independently enrolled Muse. Configure the full
+read → report in the topic chat → acknowledge watcher.
