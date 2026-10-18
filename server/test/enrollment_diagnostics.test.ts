@@ -67,7 +67,7 @@ test('post-commit failure retains arrival and batch evidence without claiming re
   const query = app.db.queryOne.bind(app.db);
   console.log = (line: string) => { lines.push(line); };
   app.db.queryOne = async (sql, params) => {
-    if (sql.includes('SELECT redeemed_token_id')) throw new Error('injected post-commit failure');
+    if (sql.includes('SELECT t.token_id, t.member_id')) throw new Error('injected post-commit failure');
     return query(sql, params);
   };
   try {

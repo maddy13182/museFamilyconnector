@@ -2,11 +2,7 @@
 // Single self-contained HTML page, no external assets. The human pastes their
 // agent token once; it is kept in localStorage of their own browser only.
 //
-// Multi-circle: the server binds each bearer token to exactly one (member,
-// circle), so the dashboard keeps a per-circle token map ('fh_circle_tokens',
-// circle id -> token) alongside the default token ('fh_token'). Data calls
-// for a circle use that circle's token; the default token is only a fallback
-// and always backs the /v2/families listing (the server scopes it by caller).
+// One user agent credential covers its active server memberships.
 
 import { CIRCLE_LOGIC_SRC } from './circle-logic.js';
 
@@ -62,23 +58,14 @@ function cfg() {
     token: localStorage.getItem('fh_token') || ''
   };
 }
-function readTokenMap() {
-  return circleTokenMapParse(localStorage.getItem('fh_circle_tokens'));
-}
-function tokenForCircle(circleId) {
-  return circleTokenFor(readTokenMap(), circleId, cfg().token);
-}
-// The server binds each bearer token to exactly one (member, circle), so a
-// data call for a circle must carry that circle's token. opts.circleId
-// overrides the active circle; null selects the default token (used for the
-// /v2/families listing, which the server scopes by caller email).
 async function api(path, opts = {}) {
   const { base } = cfg();
   const { circleId, ...fetchOpts } = opts;
-  const token = tokenForCircle(circleId === undefined ? activeCircleId : circleId);
+  const token = cfg().token;
+  const selected = circleId === undefined ? activeCircleId : circleId;
   const res = await fetch(base + path, {
     ...fetchOpts,
-    headers: { ...(opts.headers || {}), 'content-type': 'application/json', 'authorization': 'Bearer ' + token }
+    headers: { ...(opts.headers || {}), 'content-type': 'application/json', 'authorization': 'Bearer ' + token, ...(selected ? {'X-Circle-ID':selected} : {}) }
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
@@ -93,14 +80,6 @@ async function loadCircles() {
     const data = await api('/v2/families', { circleId: null });
     families = Array.isArray(data.families) ? data.families : [];
   } catch (e) {
-    if (/HTTP 404/.test(e.message)) {
-      // Server predates multi-circle support: single-circle mode, stay quiet.
-      box.style.display = 'none';
-      errBox.textContent = '';
-      activeCircleId = null;
-      lastFamilies = [];
-      return;
-    }
     errBox.textContent = 'Could not load circles: ' + e.message;
     return; // keep existing content
   }
@@ -111,7 +90,6 @@ async function loadCircles() {
   if (activeCircleId) localStorage.setItem('fh_circle_id', activeCircleId);
   else localStorage.removeItem('fh_circle_id');
   renderCircleBox(families);
-  renderTokenNotice();
 }
 
 function renderCircleBox(families) {
@@ -141,92 +119,10 @@ function renderCircleBox(families) {
   sel.onchange = function () { switchCircle(sel.value); };
   label.appendChild(sel);
   box.appendChild(label);
-  const tokenUI = document.createElement('div');
-  tokenUI.id = 'tokenBox';
-  box.appendChild(tokenUI);
 }
 
-// Inline token onboarding for the active circle. Stored tokens are never
-// written back into the page: the paste box always starts empty.
-function renderTokenNotice() {
-  const tokenUI = $('tokenBox');
-  if (!tokenUI) return;
-  tokenUI.innerHTML = '';
-  if (!activeCircleId || circleHasToken(readTokenMap(), activeCircleId)) return;
-  const active = lastFamilies.filter(function (f) { return f.id === activeCircleId; })[0];
-  const name = active ? active.name : activeCircleId;
-  const warn = document.createElement('div');
-  warn.className = 'meta';
-  warn.style.color = '#a00';
-  warn.textContent = 'No access token stored for this circle.';
-  const input = document.createElement('input');
-  input.type = 'password';
-  input.size = 40;
-  input.placeholder = 'fh_...';
-  input.id = 'circleTokenInput';
-  const save = document.createElement('button');
-  save.textContent = 'Save token';
-  save.onclick = saveCircleToken;
-  const hint = document.createElement('div');
-  hint.className = 'meta';
-  hint.appendChild(document.createTextNode('Hint: run '));
-  const code = document.createElement('code');
-  code.textContent = 'hub dashboard-token --circle "' + name + '"';
-  hint.appendChild(code);
-  hint.appendChild(document.createTextNode(
-    ' on your machine and paste the result. Circle tokens stay in this browser only and are never displayed back.'));
-  tokenUI.appendChild(warn);
-  tokenUI.appendChild(input);
-  tokenUI.appendChild(document.createTextNode(' '));
-  tokenUI.appendChild(save);
-  tokenUI.appendChild(hint);
-}
-
-async function saveCircleToken() {
-  const input = $('circleTokenInput');
-  const t = input ? input.value.trim() : '';
-  if (!t) { alert('Paste a token first.'); return; }
-  if (t.slice(0, 3) !== 'fh_') { alert('That does not look like a hub token (expected fh_...).'); return; }
-  const active = lastFamilies.filter(function (f) { return f.id === activeCircleId; })[0];
-  const name = active ? active.name : activeCircleId;
-  // Verify the token before storing it: fail fast on typos, expired, or
-  // revoked tokens instead of 403ing every later call. GET /v2/me also
-  // proves the token is bound to THIS circle, so a token pasted for the
-  // wrong circle is rejected instead of mislabeling its data as ours.
-  let me;
-  try {
-    const res = await fetch(cfg().base + '/v2/me', {
-      headers: { 'authorization': 'Bearer ' + t }
-    });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    me = await res.json();
-  } catch (e) {
-    alert('That token was rejected (' + e.message + '). Not saved.');
-    return;
-  }
-  if (!me || me.family_id !== activeCircleId) {
-    alert('That token belongs to a different circle and was not saved. Run the hinted command for "' + name + '" and paste that token.');
-    return;
-  }
-  const map = circleTokenMapSet(readTokenMap(), activeCircleId, t);
-  try {
-    localStorage.setItem('fh_circle_tokens', JSON.stringify(map));
-  } catch (e) { alert('Could not save token: ' + e.message); return; }
-  input.value = '';
-  renderTokenNotice();
-  loadTopics();
-}
-
-// Data calls may proceed only when we hold the active circle's token.
-// Single-circle setups fall back to the default token. The server binds
-// each token to exactly one circle and ignores client-supplied scoping, so
-// a stale fallback fails closed (401) or returns that token's own circle's
-// data — it can never leak another circle's data. With several circles we
-// never guess: the token notice stays up until a token is pasted.
 function canLoadCircleData() {
-  if (!activeCircleId) return true;
-  if (circleHasToken(readTokenMap(), activeCircleId)) return true;
-  return lastFamilies.length <= 1;
+  return !!activeCircleId && lastFamilies.some(function (f) {return f.id === activeCircleId;});
 }
 
 async function switchCircle(id) {
@@ -235,13 +131,12 @@ async function switchCircle(id) {
   $('topicTitle').textContent = '';
   $('entries').innerHTML = '';
   $('topics').innerHTML = '';
-  renderTokenNotice();
   await loadTopics();
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function loadTopics() {
-  if (!canLoadCircleData()) return; // token notice showing; never fetch with the wrong token
+  if (!canLoadCircleData()) return;
   try {
     const { topics } = await api('/v2/topics');
     $('circleError').textContent = '';
@@ -331,7 +226,6 @@ $('save').onclick = () => {
 };
 $('forget').onclick = () => {
   localStorage.removeItem('fh_token');
-  localStorage.removeItem('fh_circle_tokens');
   localStorage.removeItem('fh_circle_id');
   $('token').value = '';
   $('app').style.display = 'none';

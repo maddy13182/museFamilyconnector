@@ -98,7 +98,7 @@ def captured():
         yield out, err
 
 
-HEALTH_OK = {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
+HEALTH_OK = {"ok": True, "version": "2.2.0", "api_versions": ["v2"]}
 # The 0.11.0 shape: health exists but carries no api_versions.
 HEALTH_OLD = {"ok": True, "version": "0.11.0"}
 
@@ -146,13 +146,13 @@ class VersionCheckBase(unittest.TestCase):
 
 
 class MinServerVersionTest(unittest.TestCase):
-    def test_floor_is_0_14_0(self):
+    def test_floor_requires_resumable_enrollment_release(self):
         # 1.0.0 is the first server with the sync-v2 flows
         # (/v2/sync/topics, receipt-bound ack, /v2/keys/commit) and the
         # enforced E2EE lifecycle (staged key envelopes, N05 plaintext
         # rejection, write-time key gates), which this CLI requires.
         # Clean break, no backcompat.
-        self.assertEqual(hub._MIN_SERVER_VERSION, "2.0.0")
+        self.assertEqual(hub._MIN_SERVER_VERSION, "2.2.0")
 
     def test_floor_is_valid_semver(self):
         hub._parse_version(hub._MIN_SERVER_VERSION)
@@ -181,11 +181,11 @@ class ServerCheckTest(VersionCheckBase):
         self.assertIn(self.exact_too_old("0.11.9"), err)
 
     def test_health_missing_api_versions_is_too_old(self):
-        health = {"ok": True, "version": "2.0.0"}  # version ok, contract missing
+        health = {"ok": True, "version": "2.2.0"}  # version ok, contract missing
         self.seed_config()
         rc, _out, err = self.run_cli(["topics"], health=health)
         self.assertEqual(rc, 1)
-        self.assertIn(self.exact_too_old("2.0.0"), err)
+        self.assertIn(self.exact_too_old("2.2.0"), err)
 
     def test_health_missing_version_is_too_old(self):
         self.seed_config()
@@ -194,11 +194,11 @@ class ServerCheckTest(VersionCheckBase):
         self.assertIn(self.exact_too_old("unknown"), err)
 
     def test_api_versions_without_v2_is_too_old(self):
-        health = {"ok": True, "version": "2.0.0", "api_versions": ["v3"]}
+        health = {"ok": True, "version": "2.2.0", "api_versions": ["v3"]}
         self.seed_config()
         rc, _out, err = self.run_cli(["topics"], health=health)
         self.assertEqual(rc, 1)
-        self.assertIn(self.exact_too_old("2.0.0"), err)
+        self.assertIn(self.exact_too_old("2.2.0"), err)
 
     def test_unreachable_server_is_connection_error_not_version_error(self):
         self.seed_config()
@@ -401,7 +401,7 @@ class NoBypassTest(unittest.TestCase):
             ):
                 rc, _out, err = base.run_cli(["topics"], health=HEALTH_OLD)
             self.assertEqual(rc, 1)
-            self.assertIn("needs server 2.0.0+", err)
+            self.assertIn("needs server 2.2.0+", err)
         finally:
             base.tearDown()
 
@@ -499,7 +499,7 @@ class UpgradeThroughMainTest(VersionCheckBase):
         with captured() as (out, err):
             rc = hub.main(["upgrade"], transport=self.fake)
         self.assertEqual(rc, 1)
-        self.assertIn("needs server 2.0.0+", err.getvalue())
+        self.assertIn("needs server 2.2.0+", err.getvalue())
         # The command never reached /v2/client/latest.
         self.assertEqual(
             [c for c in self.fake.calls

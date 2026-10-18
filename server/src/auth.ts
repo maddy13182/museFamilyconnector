@@ -1,4 +1,4 @@
-// Authentication choke point + credential generation.
+// Agent authentication and live circle membership authorization.
 // Zero runtime dependencies. Uses only global crypto (WebCrypto), available
 // in both Cloudflare Workers and Node 18+.
 
@@ -12,10 +12,7 @@ function nowIso(): string {
 
 /** sha256 hex of a string. Pepper is prepended by callers. */
 export async function sha256hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(input),
-  );
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
@@ -27,12 +24,6 @@ export function randomBase62(n: number): string {
   let out = '';
   for (const b of bytes) out += BASE62[b % 62];
   return out;
-}
-
-/** Agent bearer token: 'fh_' + 256 bits of entropy. Returned to the agent
- *  ONCE at issuance; only sha256(pepper || token) is ever stored. */
-export function newAgentToken(): string {
-  return 'fh_' + randomBase62(43);
 }
 
 /** Invite code: 'fhi_' + 128 bits. Meant to be shared with the invitee. */
@@ -58,18 +49,10 @@ export async function credentialHash(pepper: string, value: string): Promise<str
   return sha256hex(pepper + value);
 }
 
-/**
- * THE choke point. Every authenticated handler calls this first.
- * Returns the caller's (family_id, member_id, role, token_id, agent_label,
- * principal_id). Throws HttpError 401 for missing/malformed/unknown/revoked
- * tokens.
- *
- * principal_id (F02) is the stable cross-circle identity, read from the
- * verified member row — never from caller-supplied input. Handlers use it
- * for authorization; the email string is not an identity key.
- *
- * Rotation grace: a token whose revoked_at is in the FUTURE is still valid
- * (rotate() sets revoked_at = now + 24h on the old token).
+/** Authenticate a credential and resolve its registered agent and user.
+ * The token's member reference records registration origin, not permission.
+ * circleContext independently validates the selected active membership.
+ * A future revoked_at supports an explicitly scheduled credential expiry.
  */
 export async function resolveToken(
   db: DbClient,
@@ -85,10 +68,12 @@ export async function resolveToken(
   }
   const hash = await credentialHash(env.TOKEN_PEPPER, token);
   const row = await db.queryOne(
-    `SELECT t.token_id, t.member_id, t.agent_label, t.revoked_at,
-            m.family_id, m.role, m.principal_id
+    `SELECT t.token_id, t.member_id, a.label AS agent_label, a.id AS agent_id,
+            t.revoked_at, a.user_id AS principal_id,
+            m.family_id, m.role
        FROM agent_tokens t
-       JOIN members m ON m.id = t.member_id AND m.removed_at IS NULL
+       JOIN agents a ON a.id = t.agent_id AND a.revoked_at IS NULL
+       JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?`,
     [hash],
   );
@@ -109,11 +94,36 @@ export async function resolveToken(
     /* non-fatal */
   }
   return {
+    agent_id: row['agent_id'] as string,
     family_id: row['family_id'] as string,
     member_id: row['member_id'] as string,
     role: row['role'] as AuthContext['role'],
     token_id: row['token_id'] as string,
     agent_label: row['agent_label'] as string,
     principal_id: row['principal_id'] as string | null,
+  };
+}
+
+/** Select a membership independently of the agent's registration circle. */
+export async function circleContext(
+  db: DbClient,
+  auth: AuthContext,
+  circleId: string,
+): Promise<AuthContext> {
+  const member = await db.queryOne(
+    'SELECT id, family_id, role FROM members WHERE principal_id = ? AND family_id = ? AND removed_at IS NULL',
+    [auth.principal_id, circleId],
+  );
+  if (!member)
+    throw new HttpError(
+      403,
+      'not_a_member',
+      'This user is not an active member of the requested circle',
+    );
+  return {
+    ...auth,
+    member_id: member['id'] as string,
+    family_id: member['family_id'] as string,
+    role: member['role'] as AuthContext['role'],
   };
 }

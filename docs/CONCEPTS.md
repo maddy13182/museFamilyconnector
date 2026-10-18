@@ -47,35 +47,24 @@ promote other members to owner.
 could not — a kid's agent gets a 403 asking for a parent topic, from the
 server, with no client-side filtering to bypass.
 
-## Tokens: one per circle
+## Users, agents and credentials
 
-The server binds each bearer token to exactly one `(member, circle)`.
-Consequences:
+One verified email identifies one user on a server. A user can have multiple
+registered agents and memberships in several circles. Each agent has its own
+credential and encryption identity. Removing one membership does not revoke
+access to other circles; revoking an agent disables that agent across the server.
 
-- Your agent keeps **one token per circle** (the CLI stores them in
-  `circle_tokens` in the 0600 profile config; the dashboard keeps a per-circle
-  map in the browser). Commands authenticate with the *active* circle's token.
-- Creating a circle returns a one-time provisioning code; the CLI
-  auto-redeems it so the new circle works immediately.
-- Joining someone else's circle means redeeming an invite/provisioning code
-  for *that* circle (`hub circle join --code`), which mints a token bound to
-  it. Listing circles (`GET /v2/families`) works with any of your tokens —
-  the server scopes the list by your email.
-- Tokens are 256-bit from a CSPRNG. The server stores only
-  `sha256(TOKEN_PEPPER || token)` — a database leak alone yields nothing
-  usable without the pepper, which lives only as a worker secret.
+Every scoped request carries the agent credential and selected `X-Circle-ID`.
+The server authenticates the agent, resolves its user and checks the active
+circle membership and role. Topic operations also require topic participation.
+The CLI stores a server URL and private credential per profile, not one token
+per circle. A later invitation adds membership to the authenticated existing
+user. First registration and replacement-agent recovery require inbox ownership
+proof; entering an email on an invitation page is insufficient.
 
-## Auth model in one paragraph
-
-Every request carries `Authorization: Bearer fh_…` (except a tiny public
-surface: health, and the single-use code-redemption endpoints). One
-`resolveToken()` choke point maps the token to `(circle_id, member_id,
-role)`; every data query is scoped to that pair, and topic reads additionally
-require a `topic_participants` row. Unknown or revoked token → 401.
-Authenticated but not a participant → 403, final — the CLI is instructed
-never to work around it. Invite and provisioning codes are single-use,
-expiring, and grant no read access by themselves; they exist to be shared,
-unlike tokens.
+Names are not unique. Discovery returns server-qualified user and membership
+IDs, plus only shared-circle context. Muse must resolve ambiguous recipients
+before sending. See [the identity protocol](IDENTITY_PROTOCOL.md).
 
 ## Encryption — stated honestly
 
@@ -107,5 +96,5 @@ After setup you hold three kinds of secrets. Keep this list:
 
 Agent bearer tokens (`fh_…`) are shown **once** at issuance and go straight
 into the agent's Secure Vault (or 0600 file). The one deliberate exception is
-`hub dashboard-token`, which prints a circle's token so you can paste it into
+`hub dashboard-token`, which prints your server credential so you can paste it into
 the dashboard — treat its output like a password.

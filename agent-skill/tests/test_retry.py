@@ -135,7 +135,7 @@ class RetryTest(unittest.TestCase):
         client.call("POST", "/v2/invites/fhi_x/accept", json_body={}, auth=False)
         self.assertTrue(seen["/v2/families"])
         self.assertTrue(seen["/v2/topics"])
-        self.assertTrue(seen["/v2/provisioning-codes"])
+        self.assertIsNone(seen["/v2/provisioning-codes"])
         self.assertTrue(seen["/v2/families/f1/invites"])
         self.assertIsNone(seen["/v2/provisioning-codes/fhp_x/redeem"])
         self.assertIsNone(seen["/v2/invites/fhi_x/accept"])
@@ -151,8 +151,8 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, "conflict")
         self.assertEqual(cm.exception.server_code, "code_used")
 
-    def test_redeem_retried_without_key(self):
-        # Single-use codes are retry-safe: no key, but retries happen.
+    def test_redeem_retries_only_with_durable_credential(self):
+        # A saved client credential makes the exact enrollment retry resumable.
         t = ScriptedTransport(
             [
                 http.client.RemoteDisconnected("x"),
@@ -161,7 +161,7 @@ class RetryTest(unittest.TestCase):
         )
         client = make_client(t)
         resp = client.call(
-            "POST", "/v2/provisioning-codes/fhp_abc/redeem", json_body={}, auth=False
+            "POST", "/v2/provisioning-codes/fhp_abc/redeem", json_body={"agent_token": "fh_" + "x" * 43}, auth=False
         )
         self.assertEqual(resp["token"], "t")
         self.assertEqual(len(t.calls), 2)
@@ -208,61 +208,33 @@ class CircleCreateRecoveryTest(unittest.TestCase):
             rc = hub.main(argv, transport=transport)
         return rc, out.getvalue(), err.getvalue()
 
-    def test_create_redeem_lost_response_recovers_via_dedup(self):
-        # create -> 201/code1; redeem code1 -> response dropped; redeem retry
-        # -> 409 code_used (server did redeem); loop back: create with the
-        # SAME key -> 200 dedup/code2; redeem code2 -> token.
-        state = {"code1_redeems": 0}
-        calls = []
+    def test_create_lost_response_reuses_idempotency_key_without_new_credentials(self):
+        creates=[]
+        def router(method,url,headers,body):
+            path=urlparse.urlparse(url).path
+            if path=='/v2/health':
+                return 200,json.dumps({"version":hub.VERSION,"api_versions":["v2"]})
+            if path=='/v2/families' and method=='POST':
+                creates.append(headers['Idempotency-Key'])
+                if len(creates)==1:
+                    raise http.client.RemoteDisconnected('lost response')
+                return 200,json.dumps({'id':'c1','name':'Gym'})
+            if path=='/v2/families':
+                return 200,json.dumps({'families':[{'id':'c1','name':'Gym'}]})
+            self.fail('Unexpected request: '+path)
+        rc,out,err=self._run(['--server','https://hub.test','circle','create','--name','Gym'],router)
+        self.assertEqual(rc,0,err)
+        self.assertEqual(len(creates),2)
+        self.assertEqual(creates[0],creates[1])
+        self.assertFalse(os.path.exists(os.path.join(hub.profile_dir('default'),'pending-circle-create.json')))
 
-        def router(method, url, headers, body_bytes):
-            path = urlparse.urlparse(url).path
-            calls.append({"method": method, "url": url, "headers": dict(headers)})
-            if path == "/v2/health" and method == "GET":
-                return 200, json.dumps(
-                    {"ok": True, "version": "2.0.0", "api_versions": ["v2"]})
-            if path == "/v2/families" and method == "POST":
-                n = len([c for c in calls if c["url"].endswith("/v2/families")])
-                if n == 1:
-                    return 201, json.dumps({"id": "c1", "name": "Gym", "kind": "general",
-                                            "provisioning_code": "fhp_code1"})
-                return 200, json.dumps({"id": "c1", "name": "Gym", "kind": "general",
-                                        "provisioning_code": "fhp_code2", "deduped": True})
-            if "fhp_code1" in path:
-                state["code1_redeems"] += 1
-                if state["code1_redeems"] == 1:
-                    raise http.client.RemoteDisconnected("dropped")
-                return 409, json.dumps({
-                    "error": {"code": "code_used", "message": "used"},
-                    "member": {"id": "m1", "family_id": "c1", "name": "Owner"},
-                    "token_already_issued": True,
-                })
-            if "fhp_code2" in path:
-                return 201, json.dumps({"token": "tok2",
-                                        "member": {"id": "m1", "family_id": "c1"}})
-            return 404, json.dumps({})
-
-        rc, out, err = self._run(
-            ["--server", "https://hub.test", "circle", "create", "--name", "Gym",
-             "--kind", "general"],
-            router,
-        )
-        self.assertEqual(rc, 0, err)
-        self.assertIn("now active", out)
-        creates = [c for c in calls if c["url"].endswith("/v2/families")]
-        self.assertEqual(len(creates), 2)
-        self.assertEqual(
-            creates[0]["headers"].get("Idempotency-Key"),
-            creates[1]["headers"].get("Idempotency-Key"),
-        )
-        self.assertTrue(creates[0]["headers"].get("Idempotency-Key"))
 
     def test_create_duplicate_name_is_clear_error(self):
         def transport(method, url, headers, body_bytes):
             path = urlparse.urlparse(url).path
             if path == "/v2/health" and method == "GET":
                 return 200, json.dumps(
-                    {"ok": True, "version": "2.0.0", "api_versions": ["v2"]})
+                    {"ok": True, "version": hub.VERSION, "api_versions": ["v2"]})
             return 409, json.dumps(
                 {"error": {"code": "circle_name_taken", "message": "exists"}}
             )

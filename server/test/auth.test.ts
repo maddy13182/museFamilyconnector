@@ -67,7 +67,7 @@ test('non-owner cannot revoke another member token', async () => {
     token: kidToken,
     body: { token_id: ownerTokenId },
   });
-  assert.equal(denied.status, 403);
+  assert.equal(denied.status, 404);
 });
 
 test('revoke e2e: revoked agent is locked out everywhere; the member re-enrolls cleanly', async () => {

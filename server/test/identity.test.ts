@@ -10,13 +10,8 @@ import { b64 } from './syncv2_helpers.js';
 // that existed before principals did).
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { makeClientApp as makeApp } from './fixture-client.js';
 import type { TestClientApp as TestApp } from './fixture-client.js';
-import { sqliteClient } from './sqlite.js';
 
 async function bootstrap(app: TestApp, name: string, ownerName: string, email: string) {
   const fam = await app.call('POST', '/v2/families', {
@@ -79,69 +74,15 @@ async function lockedSetup(): Promise<Setup> {
   };
 }
 
-test('colliding email in circle A grants no hub-owner power over circle B', async () => {
-  const { app, ownerToken, strangerToken, famA, famB } = await lockedSetup();
-  // The attack (pre-F02): the owner of A invites B's owner email into A as a
-  // kid and an accomplice accepts. The email-string join in isHubOwner then
-  // treated the accomplice as a hub owner: circle B's metadata leaked via
-  // GET /v2/families and circles could be created while setup was locked.
-  const attacker = await inviteAccept(app, famA, ownerToken, 's@b.dev', 'kid', 'Impostor');
-
-  // 1. The new row gets a FRESH principal even though the email collides.
-  const rows = await app.db.queryAll(
-    `SELECT id, family_id, principal_id FROM members WHERE email = 's@b.dev' ORDER BY family_id`,
-  );
-  assert.equal(rows.length, 2);
-  assert.ok(rows[0]['principal_id']);
-  assert.ok(rows[1]['principal_id']);
-  assert.notEqual(
-    rows[0]['principal_id'],
-    rows[1]['principal_id'],
-    'colliding email must not share a principal',
-  );
-
-  // 2. Circle listing: sees only A, never B's metadata.
-  const list = await app.call('GET', '/v2/families', { token: attacker.token });
-  assert.equal(list.status, 200);
-  assert.deepEqual(
-    list.body.families.map((f: any) => f.id),
-    [famA],
-  );
-
-  // 3. Hub-owner circle creation while locked: denied.
-  const create = await app.call('POST', '/v2/families', {
-    token: attacker.token,
-    body: { name: 'Evil Circle' },
-  });
-  assert.equal(create.status, 403);
-  assert.equal(create.body.error.code, 'forbidden');
-
-  // 4. Minting a provisioning code for B's owner member: the member is not
-  // in the attacker's circle — 404 with no existence leak.
-  const bMembers = await app.call('GET', '/v2/members', { token: strangerToken });
-  assert.equal(bMembers.status, 200);
-  const bOwner = bMembers.body.members.find((m: any) => m.role === 'owner');
-  assert.ok(bOwner);
-  const mint = await app.call('POST', '/v2/provisioning-codes', {
-    token: attacker.token,
-    body: { member_id: bOwner.id, agent_label: 'evil-agent' },
-  });
-  assert.equal(mint.status, 404);
-
-  // Sanity: the real owners are unaffected — B's owner still lists B and can
-  // still create circles while locked.
-  const bList = await app.call('GET', '/v2/families', { token: strangerToken });
-  assert.equal(bList.status, 200);
-  assert.deepEqual(
-    bList.body.families.map((f: any) => f.id),
-    [famB],
-  );
-  const okCreate = await app.call('POST', '/v2/families', {
-    token: strangerToken,
-    body: { name: 'Legit Circle' },
-  });
-  assert.equal(okCreate.status, 201);
+test('an unverified email collision cannot attach an agent to the existing user', async()=>{
+ const {app,ownerToken,famA,famB,strangerToken}=await lockedSetup();
+ const invite=await app.call('POST',`/v2/families/${famA}/invites`,{token:ownerToken,body:{email:'s@b.dev',role:'kid'}});
+ const denied=await app.call('POST',`/v2/invites/${invite.body.invite_code}/accept`,{body:{display_name:'Impostor',agent_label:'evil',agent_public_key:b64(32),challenge_id:'invalid',verification_code:'invalid'}});
+ assert.equal(denied.status,403);assert.equal(denied.body.error.code,'email_verification_required');
+ assert.equal((await app.db.queryOne("SELECT count(*) n FROM members WHERE email='s@b.dev'"))?.n,1);
+ const list=await app.call('GET','/v2/families',{token:strangerToken});assert.deepEqual(list.body.families.map((f:any)=>f.id),[famB]);
 });
+
 
 test('verified owner keeps cross-circle visibility via locked creation', async () => {
   const { app, ownerToken, kidToken, famA, famB } = await lockedSetup();
@@ -179,88 +120,6 @@ test('verified owner keeps cross-circle visibility via locked creation', async (
     body: { name: 'Nope' },
   });
   assert.equal(kidCreate.status, 403);
-});
-
-// --- Migration 0005 backfill correctness ---
-
-function migrationsDir(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  // dist/test -> dist/migrations (copied by the test script).
-  return join(here, '..', 'migrations');
-}
-
-/** Apply migrations in filename order, stopping after maxFile (inclusive). */
-function applyUpTo(db: DatabaseSync, maxFile: string): void {
-  const dir = migrationsDir();
-  const files = readdirSync(dir)
-    .filter((f) => f.endsWith('.sql'))
-    .sort();
-  for (const f of files) {
-    if (f > maxFile) break;
-    db.exec(readFileSync(join(dir, f), 'utf8'));
-  }
-}
-
-function fixtureDbThrough0004(): DatabaseSync {
-  const db = new DatabaseSync(':memory:');
-  applyUpTo(db, '0004_credential_lineage.sql');
-  // Fixture: two circles. 'mahesh@a.dev' has a member row in BOTH (the
-  // pre-migration legitimate-linking case); the other emails are distinct.
-  db.exec(`
-    INSERT INTO families(id, name, created_at) VALUES
-      ('fam-a','Fam A','2026-01-01T00:00:00.000Z'),
-      ('fam-b','Fam B','2026-01-01T00:00:00.000Z');
-    INSERT INTO members(id, family_id, name, email, role, created_at) VALUES
-      ('m-a-owner','fam-a','Mahesh','mahesh@a.dev','owner','2026-01-01T00:00:00.000Z'),
-      ('m-a-kid','fam-a','Harshika','harshika@a.dev','kid','2026-01-01T00:00:00.000Z'),
-      ('m-b-owner','fam-b','Stranger','s@b.dev','owner','2026-01-01T00:00:00.000Z'),
-      ('m-b-parent','fam-b','Mahesh (B)','mahesh@a.dev','parent','2026-01-01T00:00:00.000Z');
-  `);
-  return db;
-}
-
-test('migration 0005 applies cleanly on an empty database', async () => {
-  const db = new DatabaseSync(':memory:');
-  applyUpTo(db, '0004_credential_lineage.sql');
-  db.exec(readFileSync(join(migrationsDir(), '0005_identity_principals.sql'), 'utf8'));
-  const c = sqliteClient(db);
-  const cols = await c.queryAll(`PRAGMA table_info(members)`);
-  assert.ok(cols.some((r) => r['name'] === 'principal_id'), 'principal_id column exists');
-  const count = await c.queryOne(`SELECT COUNT(*) AS n FROM principals`);
-  assert.equal(count!['n'], 0);
-});
-
-test('migration 0005 backfill: one principal per distinct email', async () => {
-  const db = fixtureDbThrough0004();
-  db.exec(readFileSync(join(migrationsDir(), '0005_identity_principals.sql'), 'utf8'));
-  const c = sqliteClient(db);
-
-  const n = await c.queryOne(`SELECT COUNT(*) AS n FROM principals`);
-  assert.equal(n!['n'], 3, 'one principal per distinct email');
-
-  const nulls = await c.queryOne(`SELECT COUNT(*) AS n FROM members WHERE principal_id IS NULL`);
-  assert.equal(nulls!['n'], 0, 'every member row backfilled');
-
-  // Same email across circles -> ONE principal (preserves the legitimate
-  // linking those rows were created under).
-  const same = await c.queryAll(
-    `SELECT principal_id FROM members WHERE email = 'mahesh@a.dev' ORDER BY family_id`,
-  );
-  assert.equal(same.length, 2);
-  assert.equal(
-    same[0]['principal_id'],
-    same[1]['principal_id'],
-    'same email across circles shares one principal',
-  );
-
-  // Distinct emails -> distinct principals.
-  const distinct = await c.queryAll(`SELECT DISTINCT principal_id AS p FROM members`);
-  assert.equal(distinct.length, 3);
-
-  // Principal ids are opaque: they carry no recoverable relation to the email.
-  const pid = same[0]['principal_id'] as string;
-  assert.ok(pid.startsWith('pr_'));
-  assert.ok(!pid.includes('mahesh'), 'principal id must not embed the email');
 });
 
 test('GET /v2/me exposes is_hub_owner for agent discovery', async () => {

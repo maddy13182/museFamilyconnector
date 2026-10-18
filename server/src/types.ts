@@ -35,6 +35,11 @@ export interface Env {
   /** Minimum CLI version allowed by the client version gate (B1).
    *  Absent/"0.0.0" = gate off. */
   MIN_CLI_VERSION?: string;
+  /** Resend delivery credentials; configured by the operator, never generated. */
+  EMAIL_API_TOKEN?: string;
+  EMAIL_FROM?: string;
+  /** Dependency injection for delivery tests; not populated from HTTP input. */
+  EMAIL_DELIVERY?: (email: string, code: string, challengeId: string) => Promise<void>;
 }
 
 /** HTTP error with a machine-readable code. Serialized as
@@ -49,14 +54,13 @@ export class HttpError extends Error {
   }
 }
 
-/** Result of the single auth choke point (auth.ts resolveToken).
- * principal_id is the stable cross-circle identity (F02): it is set at
- * member creation and never changes. Authorization joins use it, never the
- * email string. NULL only for rows that predate migration 0005 in a DB
- * where the backfill did not run — handlers treat that as fail-closed. */
+/** Authenticated agent/user and selected circle membership. principal_id is
+ * the stable user ID. circleContext resolves member_id and role for scoped
+ * requests; server-level discovery does not require an active circle. */
 export interface AuthContext {
   family_id: string;
   member_id: string;
+  agent_id: string;
   role: 'owner' | 'parent' | 'kid';
   token_id: string;
   agent_label: string;
@@ -84,13 +88,7 @@ export const ENTRY_KINDS = [
   'topic_archived',
 ] as const;
 
-export const TASK_STATUSES = [
-  'open',
-  'in_progress',
-  'blocked',
-  'done',
-  'cancelled',
-] as const;
+export const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done', 'cancelled'] as const;
 
 export const MEMBER_ROLES = ['owner', 'parent', 'kid'] as const;
 

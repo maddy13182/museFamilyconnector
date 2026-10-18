@@ -86,23 +86,18 @@ CREATE UNIQUE INDEX idx_entries_topic_msgid
   ON entries(topic_id, msg_id) WHERE msg_id IS NOT NULL;
 ```
 
-### 1.3 Authorization model — per-circle routing (no auth changes)
+### 1.3 Authorization model — selected circle membership
 
-Bearer tokens bind exactly one `(member_id, family_id)`; `member_id` itself
-is per-family. Every topic-scoped endpoint 404s cross-family
-(`getTopicInFamily` — never leaks cross-family existence). Therefore:
-
-- There is **no cross-circle sync**. `GET /v2/sync/topics` is called **once
-  per circle token**; the server never crosses family boundaries and there is
-  no `principal_id` resolution. (This preserves the existing blast-radius
-  boundary: one token, one circle.)
-- `hub read` / `hub ack` take `--circle` (default: active circle;
-  the skill always passes it explicitly from the sync output). Cross-family
-  topic ids 404 by construction.
+An agent credential authenticates a user on one server. `X-Circle-ID` selects
+the circle and the server checks active user membership, role and topic
+participation. Member IDs remain circle local. `GET /v2/sync/topics` is called
+once per active circle, using the same server credential and explicit circle
+context. `hub read` / `hub ack` use `--circle` from the sync result. Topic IDs
+from a different circle remain 404. See [IDENTITY_PROTOCOL.md](IDENTITY_PROTOCOL.md).
 
 ### 1.4 New endpoints
 
-**`GET /v2/sync/topics`** — changed-topic discovery, per circle token.
+**`GET /v2/sync/topics`** — changed-topic discovery, per selected circle.
 Params: `bootstrap_gseq` (first call only), `limit`, `page_token`. Returns
 per changed topic: `topic_id, circle_id, circle_name, subject, kind, e2ee,
 acked_seq, latest_seq, new_count, last_activity_ts, last_actor,
@@ -417,7 +412,7 @@ identical key material under fresh key_id.
 **Deferred explicitly (not in this build):** `hub key-purge` UX;
 weekly archive proposals (manual archiving suffices); sender-authenticated
 `fh2`, ratchets, MLS (wrong complexity for this threat model);
-cross-circle server authorization (per-circle tokens are the boundary).
+cross-circle server authorization (live circle memberships and topic participation are the boundary).
 Deferral is a scope decision, not disagreement — each stays on the
 hardening list with its reason recorded here.
 

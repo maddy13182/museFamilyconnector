@@ -79,7 +79,8 @@ test('owner removes a member: revoked, delisted, email re-invitable', async () =
 
   // Tokens revoked: the choke point 401s.
   const me = await app.call('GET', '/v2/me', { token: p.token });
-  assert.equal(me.status, 401);
+  assert.equal(me.status, 200);
+  assert.equal((await app.call('GET','/v2/members',{token:p.token,headers:{'X-Circle-ID':famId}})).status,403);
 
   // Gone from the member listing.
   const list = await app.call('GET', '/v2/members', { token: ownerToken });
@@ -210,7 +211,7 @@ test('removal drops topic participation and arms E2EE rotation', async () => {
   }
 });
 
-test('removed owner loses hub-owner powers (cannot create circles)', async () => {
+test('removing circle membership does not silently demote a server owner', async () => {
   const { app, famId, ownerToken } = await setup();
   const o2 = await inviteJoin(app, famId, ownerToken, 'suresh@fam.dev', 'owner', 'Suresh');
   app.env.SETUP_LOCKED = '1';
@@ -242,5 +243,5 @@ test('removed owner loses hub-owner powers (cannot create circles)', async () =>
     token: o2.token,
     body: { name: 'o2 circle 2' },
   });
-  assert.equal(after.status, 401);
+  assert.equal(after.status, 201);
 });

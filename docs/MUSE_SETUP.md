@@ -14,7 +14,10 @@ An invitee joining someone else's hub does not deploy a backend.
    ID. Bind `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` through secure
    credential input. Never ask for the token in chat. See
    [required permissions](DEPLOY.md#credentials-and-prerequisites).
-3. Clone the repository. Run `npm ci` and `npm test` in `server/`. This installs
+3. Configure email delivery: bind a Resend `EMAIL_API_TOKEN` and verified
+   sender `EMAIL_FROM` securely. First registration and replacement agents
+   verify inbox ownership; Cloudflare credentials cannot generate these values.
+   Clone the repository. Run `npm ci` and `npm test` in `server/`. This installs
    the pinned Wrangler automatically. No global install or browser login is needed.
 4. Save the first-circle details in a private JSON file, then run:
 
@@ -41,7 +44,7 @@ extraction, then signature and CLI hash before executing the CLI. Install its
 Python requirements in a virtual environment. Use that exact CLI path.
 
 Pass the saved provisioning code directly from the private receipt into
-`hub setup --server DISCOVERED-URL --store file` through its secure prompt;
+`hub enroll --server DISCOVERED-URL --code-file PRIVATE-CODE-FILE` through its secure prompt;
 [the deployment guide](DEPLOY.md#create-the-first-circle-without-opening-public-registration)
 includes an example. Do not expose it in chat, argv, or shell history. If the user
 is already connected to this server, use `hub circle join` for another circle;

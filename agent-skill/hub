@@ -30,11 +30,9 @@ requires ``--allow-server-override``. Plain ``http://`` is rejected for
 non-loopback hosts — ``https://`` is required (loopback ``localhost`` /
 ``127.0.0.1`` / ``[::1]`` stays allowed for development).
 
-Multi-circle (v0.2.0): the server binds each bearer token to ONE circle, so
-a profile keeps ``circle_tokens: {circle_id: token}`` in the 0600
-config.json. Every API call authenticates with the active circle's token,
-falling back to the single-token chain above when a circle has no stored
-token (bootstrap-family backwards compatibility).
+One agent credential authenticates one user on one server. Circle membership
+is checked by the server for every scoped request (X-Circle-ID). Profiles
+keep different servers' credentials and encryption material isolated.
 
 Python 3 with PyNaCl and mnemonic is required for content and key operations.
 There is no plaintext fallback. Setup persists credentials in a private file;
@@ -42,6 +40,8 @@ external environment/vault injection is a runtime lookup method only.
 """
 
 import argparse
+import contextlib
+import concurrent.futures
 import base64
 import getpass
 import hashlib
@@ -136,17 +136,12 @@ def _skill_version():
 VERSION = _cli_version()
 SKILL_VERSION = _skill_version()
 
-# Floor of the API version contract (spec §1, §4.1): the oldest server
-# this CLI will talk to. Bumped deliberately; covered by a test. Clean
-# break — no backcompat: 1.0.0 is the first server that serves the
-# sync-v2 flows (`/v2/sync/topics`, receipt-bound `ack`, `/v2/keys/commit`)
-# and enforces the E2EE lifecycle (staged key envelopes, N05 plaintext
-# rejection, write-time key gates, `rotation_required` transitions),
-# which this CLI requires.
-_MIN_SERVER_VERSION = "2.0.0"
+# Server 2.2 supplies request-bound enrollment receipts and protocol-2 E2EE.
+# Older enrollment protocols are deliberately unsupported.
+_MIN_SERVER_VERSION = "2.2.0"
 
 # API majors this CLI implements, highest first. The per-invocation check
-# selects the highest one the server advertises (v1 today) and prefixes
+# selects the highest one the server advertises (v2) and prefixes
 # requests accordingly. No 404-probing fallback.
 _API_MAJORS_IMPLEMENTED = ("v2",)
 
@@ -199,7 +194,7 @@ def emit_json(obj):
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_JSON_KEYS = frozenset({
-    "token", "provisioning_code", "provisioningCode", "onboarding_url",
+    "token", "agent_token", "verification_code", "enrollment_code", "provisioning_code", "provisioningCode", "onboarding_url",
 })
 
 
@@ -320,30 +315,19 @@ def load_config(profile):
 def save_config(profile, cfg):
     d = profile_dir(profile)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    # Belt and suspenders: the legacy single-token keys must never live in
-    # the config file (they belong in env / vault / the 0600 token file).
-    # circle_tokens is the sanctioned exception: one token per circle, and
-    # this file is already 0600. Tokens are never printed (see redact()).
-    scrubbed = {k: v for k, v in cfg.items() if k not in ("token", "bearer_token")}
-    tmp = config_path(profile) + ".tmp"
-    # Create 0600 from the first byte: circle_tokens live in this file, and a
-    # post-write chmod would leave a world-readable window on strict umasks.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(scrubbed, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, config_path(profile))
-    os.chmod(config_path(profile), 0o600)
+    # Authentication credentials live in the private token store.
+    scrubbed = {k: v for k, v in cfg.items() if k not in ("token", "bearer_token", "_request_circle_id")}
+    _atomic_private_json(config_path(profile), scrubbed)
 
 
-def load_token(cfg, profile):
+def load_token(cfg, profile, allow_env=True):
     """Return (token, source). Raises HubError if none is available."""
     # 1. Environment (Secure Vault injection at tool time).
-    token = os.environ.get("FAMILY_HUB_TOKEN")
+    token = os.environ.get("FAMILY_HUB_TOKEN") if allow_env else None
     if token and token.strip():
         return token.strip(), "env"
     # 2. Vault helper command.
-    vault_cmd = os.environ.get("FAMILY_HUB_VAULT_CMD") or cfg.get("vault_cmd")
+    vault_cmd = cfg.get("vault_cmd") or (os.environ.get("FAMILY_HUB_VAULT_CMD") if allow_env else None)
     if vault_cmd:
         try:
             # NOTE: vault_cmd is the operator's own configured helper command
@@ -464,20 +448,30 @@ class HubError(Exception):
         # friendly mapped value.
         self.server_code = server_code
         # The raw response payload (if any), for recovery flows that need
-        # fields beyond the error (e.g. the member on already_redeemed).
+        # fields beyond the error (for example a key-distribution delta).
         self.details = {}
         self.exit_code = 1
 
     def friendly(self):
         hints = {
+            "email_verification_required": "Provide the private email code with enroll --resume --verification-code-file PATH. Preserve the saved enrollment and keys.",
+            "email_not_configured": "Ask the server operator to configure verification email delivery. Your invitation has not been consumed.",
+            "email_delivery_failed": "The server could not deliver the verification email. Preserve the pending enrollment and retry later.",
+            "identity_mismatch": "The invitation and authenticated profile belong to different users. Select the intended person's profile; do not replace another user's keys.",
+            "agent_exists": "This label belongs to a different or revoked agent. Use a new label for a new agent; preserve the existing identity.",
+            "not_a_member": "This user has no active membership for that operation. Refresh circles and select an authorized circle; a new invitation is needed to rejoin a removed circle.",
+            "enrollment_state_changed": "Authorization changed before the enrollment transaction committed. Nothing was partially registered. Preserve the pending operation and export diagnostics.",
+            "enrollment_conflict": "Enrollment details conflict with an existing operation. Preserve the pending files and export diagnostics before changing anything.",
+            "enrollment_identity_changed": "The saved enrollment's encryption identity changed. Preserve the keys and export diagnostics.",
+            "no_memberships": "The user account is retained. Accept a new circle invitation to restore membership.",
+            "idempotency_conflict": "This operation key was already used with different details. Inspect the saved operation before retrying.",
             "auth": "Authentication failed (token invalid or revoked). "
-            "Run `hub setup` again or ask the family owner for a new invite.",
+            "Check the selected profile and export diagnostics before changing credentials.",
             "forbidden": "Access denied. You can only see topics you participate in. "
             "A 403 is final — never try to work around it; ask an owner/parent "
             "for access instead.",
             "not_found": "Not found. Check the topic/task/member ID.",
-            "conflict": "State conflict — e.g. a task cannot be marked done while "
-            "it still has open subtasks.",
+            "conflict": "The operation conflicts with the current server state.",
             "pii": "Blocked: the message looks like it contains sensitive data "
             "(card number, SSN, …). Rephrase without the sensitive value and retry.",
             "rate_limited": "Rate limited. Wait a minute and retry.",
@@ -528,7 +522,7 @@ class HubError(Exception):
             "`hub upgrade` to install the latest signed release, then retry.",
             "vault_error": "Could not load the credential from the vault helper.",
         }
-        hint = hints.get(self.code, "")
+        hint = hints.get(self.server_code or self.code, "") or hints.get(self.code, "")
         text = str(self)
         return "%s %s" % (text, hint) if hint else text
 
@@ -717,6 +711,221 @@ def _check_server_override(args, pinned, server):
 # ---------------------------------------------------------------------------
 
 
+def _atomic_private_json(path, value):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def _enrollment_lock(profile):
+    import fcntl
+    os.makedirs(profile_dir(profile), mode=0o700, exist_ok=True)
+    path = os.path.join(profile_dir(profile), "enrollment.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HubError("config", "Another enrollment is running for this profile.")
+        yield
+
+
+def _pending_enrollment(profile):
+    return os.path.join(profile_dir(profile), "pending-enrollment.json")
+
+
+def _read_email_verification_code(path):
+    if path:
+        with open(path, encoding="utf-8") as stream:
+            return stream.read().strip()
+    if not sys.stdin.isatty():
+        raise HubError("config", "Email verification required. Save the email code privately, then run enroll --resume --verification-code-file PATH.")
+    return getpass.getpass("Code from your verification email: ").strip()
+
+
+def _enrollment_call(server, transport, debug, profile, path, body, verification_code_file=None):
+    journal = _pending_enrollment(profile)
+    if os.path.exists(journal):
+        with open(journal, encoding="utf-8") as stream:
+            pending = json.load(stream)
+        previous = {k: v for k, v in pending["body"].items() if k not in ("agent_token", "challenge_id", "verification_code")}
+        if pending["server"] != server.rstrip("/") or pending["path"] != path or previous != body:
+            raise HubError("config", "A different enrollment is pending. Run `hub enroll --resume` with this profile; preserve its identity and files.")
+    else:
+        cfg = load_config(profile)
+        existing = None
+        if (cfg.get("user") or cfg.get("member") or cfg.get("family_id")) and path != "/v2/identity/agents":
+            # A registered profile must authenticate joins. Missing credentials
+            # require account recovery, never a fresh identity in this profile.
+            existing, _source = load_token(cfg, profile)
+        candidate = existing or "fh_" + base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+        pending = {"server": server.rstrip("/"), "path": path,
+                   "body": dict(body, agent_token=candidate), "authenticated": bool(existing), "operation_id": uuid.uuid4().hex}
+        _atomic_private_json(journal, pending)
+    note_secret(pending["body"]["agent_token"])
+    diagnostic("enrollment_prepared")
+    authenticated = pending.get("authenticated", False)
+    client = HubClient(server, token=pending["body"]["agent_token"] if authenticated else None,
+                       debug=debug, transport=transport, operation_id=pending.get("operation_id"))
+    if not authenticated and not pending.get("agent_approved"):
+        if not pending["body"].get("challenge_id"):
+            challenge_body = {"agent_token": pending["body"]["agent_token"], "agent_public_key": pending["body"]["agent_public_key"]}
+            if path == "/v2/identity/agents":
+                challenge_body["email"] = pending["body"]["email"]
+            else:
+                challenge_body["enrollment_code"] = urlparse.unquote(path.split("/")[-2])
+            try:
+                challenge = client.call("POST", "/v2/identity/challenges", auth=False, retries=0, json_body=challenge_body)
+            except HubError as exc:
+                if exc.server_code in ("invite_expired", "code_expired"):
+                    os.unlink(journal)
+                    diagnostic("enrollment_expired")
+                raise
+            if challenge.get("next_action") == "redeem_agent_approval":
+                pending["agent_approved"] = True
+                _atomic_private_json(journal, pending)
+            else:
+                pending["body"]["challenge_id"] = challenge["challenge_id"]
+                pending["challenge_expires_at"] = challenge["expires_at"]
+                _atomic_private_json(journal, pending)
+                emit_err("Verification email sent. Keep this pending enrollment; continue with enroll --resume.")
+        if not pending.get("agent_approved"):
+            if verification_code_file or not pending["body"].get("verification_code"):
+                pending["body"]["verification_code"] = _read_email_verification_code(verification_code_file)
+            note_secret(pending["body"]["verification_code"])
+            _atomic_private_json(journal, pending)
+    try:
+        response = client.call("POST", path, json_body=pending["body"], auth=authenticated)
+    except HubError as exc:
+        if exc.server_code in ("invite_expired", "code_expired"):
+            os.unlink(journal)
+            diagnostic("enrollment_expired")
+            raise
+        expiry = pending.get("challenge_expires_at", "")
+        if (not authenticated and exc.server_code == "email_verification_required"
+                and expiry and expiry <= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())):
+            pending["body"].pop("challenge_id", None)
+            pending["body"].pop("verification_code", None)
+            _atomic_private_json(journal, pending)
+            raise HubError("config", "The email proof expired. Run enroll --resume to request a fresh proof for the same saved enrollment.")
+        raise
+    if not isinstance(response, dict) or not response.get("token") or not isinstance(response.get("member"), dict) or not response["member"].get("id") or not response["member"].get("family_id"):
+        raise HubError("error", "Incomplete enrollment response; pending enrollment was preserved. Run `hub enroll --resume`.")
+    note_secret(response["token"])
+    if response["token"] != pending["body"]["agent_token"]:
+        raise HubError("error", "Server returned a different credential than the saved operation. Pending enrollment preserved; export diagnostics.")
+    # Preserve the usable response before touching the active profile.
+    pending["response"] = response
+    _atomic_private_json(journal, pending)
+    diagnostic("enrollment_response_saved")
+    return response
+
+
+def _complete_enrollment(profile):
+    for name in ("pending-enrollment.json",):
+        path = os.path.join(profile_dir(profile), name)
+        if os.path.exists(path):
+            os.unlink(path)
+    diagnostic("enrollment_complete")
+
+
+def cmd_diagnostics_export(args, transport):
+    """Export only a fixed metadata schema, never profile or journal contents."""
+    output = os.path.realpath(args.output)
+    profiles_root = os.path.realpath(os.path.join(config_home(), APP_DIR))
+    if os.path.commonpath([output, profiles_root]) == profiles_root:
+        raise HubError("config", "Export diagnostics outside the connector configuration directory.")
+    allowed = {"ts", "event", "run_id", "version", "request_id", "operation_id",
+               "attempt", "method", "path", "status", "ms", "delay_ms", "error_type",
+               "command", "exit_code", "flow"}
+    rows = []
+    path = os.path.join(profile_dir(args.profile), "diagnostics.jsonl")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict) or row.get("run_id") == _DIAGNOSTIC_RUN:
+                    continue
+                if args.run_id and row.get("run_id") != args.run_id:
+                    continue
+                safe = {}
+                for key in allowed:
+                    value = row.get(key)
+                    if isinstance(value, str):
+                        value = re.sub(r"(?:cfat_|fhip_|fhp_|fhi_|fh_)[A-Za-z0-9_-]+", "[redacted]", _scrub_url(value))
+                        safe[key] = value[:500]
+                    elif value is None or isinstance(value, (bool, int, float)):
+                        if key in row:
+                            safe[key] = value
+                rows.append(safe)
+    except FileNotFoundError:
+        pass
+    with open(__file__, "rb") as stream:
+        cli_hash = hashlib.sha256(stream.read()).hexdigest()
+    result = {"format_version": 1, "cli_version": VERSION, "skill_version": SKILL_VERSION,
+              "cli_sha256": cli_hash,
+              "pending_enrollment": os.path.exists(_pending_enrollment(args.profile)),
+              "events": rows}
+    _atomic_private_json(os.path.abspath(args.output), result)
+    emit("Diagnostics export saved to %s (%d events)." % (os.path.abspath(args.output), len(rows)))
+    return 0
+
+
+def cmd_enroll(args, transport):
+    pending = None
+    if sum(bool(value) for value in (args.resume,args.code_file,args.recover_email)) > 1:
+        raise HubError("bad_request", "Choose one of --resume, --code-file, or --recover-email.")
+    if args.resume:
+        try:
+            with open(_pending_enrollment(args.profile), encoding="utf-8") as stream:
+                pending = json.load(stream)
+        except FileNotFoundError:
+            raise HubError("config", "No enrollment is pending for this profile.")
+        args.server = pending["server"]
+        code = urlparse.unquote(pending["path"].split("/")[-2])
+        args.name = pending["body"].get("display_name", args.name)
+        args.label = pending["body"].get("agent_label", args.label)
+        args.recover_email = pending["body"].get("email") if pending["path"] == "/v2/identity/agents" else None
+    elif args.recover_email:
+        code = "recovery:" + args.recover_email.strip().lower()
+    elif args.code_file:
+        with open(args.code_file, encoding="utf-8") as stream:
+            code = stream.read().strip()
+    else:
+        code = getpass.getpass("Invite or provisioning code: ").strip()
+    note_secret(code)
+    cfg = load_config(args.profile)
+    args.server = args.server or cfg.get("server_url")
+    if not args.server:
+        raise HubError("config", "Provide the inviting server URL with --server.")
+    if cfg.get("server_url") and cfg["server_url"].rstrip("/") != args.server.rstrip("/"):
+        raise HubError("config", "This profile belongs to another server. Choose a separate --profile before enrolling.")
+    args.invite = args.code = code
+    args.store = "file"
+    if args.recover_email:
+        known_email = (cfg.get("user") or {}).get("email") or (cfg.get("member") or {}).get("email")
+        if (cfg.get("user") or cfg.get("member")) and (not known_email or known_email.strip().lower() != args.recover_email.strip().lower()):
+            raise HubError("config", "This profile belongs to another or unknown user identity. Select a separate profile; do not reuse its keys for another person.")
+        return cmd_setup(args, transport)
+    if cfg.get("member") or cfg.get("family_id"):
+        return cmd_circle_join(args, transport)
+    return cmd_setup(args, transport)
+
+
 def _probe_profile_writable(profile):
     """Fail before redeeming if the profile dir can't take the credential."""
     d = profile_dir(profile)
@@ -740,14 +949,13 @@ def _probe_profile_writable(profile):
 
 
 
-def _verify_new_token(server, transport, debug, token, flow_name):
-    """GET /v2/me with the fresh token; gate success on it.
+def _verify_new_token(server, transport, debug, token, flow_name, circle_id):
+    """Verify authentication and the actual enrolled membership before success.
 
-    Raises HubError spelling out whether the code is likely consumed, so
-    the operator knows whether to ask an owner for a fresh code or just
-    retry the network.
+    This is independent of the credential's original registration circle.
+    All failures preserve the credential and pending operation for diagnosis.
     """
-    probe = HubClient(server, token, debug=debug, transport=transport)
+    probe = HubClient(server, token, debug=debug, transport=transport, circle_id=circle_id)
     try:
         me = probe.call("GET", "/v2/me", auth=True, retries=0)
     except HubError as exc:
@@ -756,26 +964,24 @@ def _verify_new_token(server, transport, debug, token, flow_name):
                 "auth",
                 "Enrollment failed verification: the server rejected the "
                 "new credential (GET /v2/me: %s). The invite code is "
-                "consumed — ask the family owner for a fresh invite code "
-                "and run `hub %s` again." % (exc, flow_name),
+                "preserved in pending enrollment. Export diagnostics and check "
+                "the selected server/profile before retrying (%s)." % (exc, flow_name),
             )
             err.exit_code = 3
             raise err
         raise HubError(
             exc.code,
             "Could not verify the new credential (GET /v2/me: %s). The "
-            "credential WAS stored, so do NOT request a new code yet — "
-            "check your network and retry a command such as "
-            "`hub circles`; if the server keeps rejecting it, ask the "
-            "owner for a fresh code." % exc,
+            "credential WAS stored and the pending operation is preserved. "
+            "Check your network, then use `hub enroll --resume` with the same profile. "
+            "Export diagnostics if verification still fails." % exc,
         )
-    if not isinstance(me, dict) or not me.get("id"):
+    if not isinstance(me, dict) or not me.get("id") or me.get("family_id") != circle_id:
         err = HubError(
             "auth",
             "Enrollment failed verification: GET /v2/me returned an "
-            "unexpected response. The invite code may be consumed — ask "
-            "the family owner for a fresh invite code and run `hub %s` "
-            "again." % flow_name,
+            "unexpected response. Pending enrollment and the credential are "
+            "preserved; export diagnostics and resume %s after checking the server." % flow_name,
         )
         err.exit_code = 3
         raise err
@@ -855,6 +1061,8 @@ def _write_secret_file_0600(path, data, what):
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
     except BaseException:
         # Don't leave a half-written secret behind.
         try:
@@ -2390,50 +2598,17 @@ def _recover_pending_exit(topic_id):
 
 def _recover_rung3_instructions(cfg, profile, server, topic_id):
     """Rung 3 — no usable Bearer token: print the exact out-of-band steps."""
-    member = cfg.get("member") or {}
-    mid = member.get("id") or "<your member id — ask the hub owner>"
-    label = cfg.get("agent_label") or "<this agent's label>"
-    emit_err("[rung 3/3] provisioning code — out-of-band; a human must help.")
-    emit_err("")
-    emit_err(
-        "This agent has no working Bearer token, so it cannot authenticate to "
-        "the hub at all. Nothing below can run automatically — relay these "
-        "steps to a human:"
-    )
-    emit_err("")
-    emit_err(
-        "1. Ask the hub owner to mint a fresh single-use provisioning code for "
-        "this agent:"
-    )
-    emit_err("     member_id:   %s" % mid)
-    emit_err("     agent_label: %s" % label)
-    emit_err("   The owner mints it with an authenticated call:")
-    emit_err("     POST %s/v2/provisioning-codes" % server.rstrip("/"))
-    emit_err('     {"member_id": "%s", "agent_label": "%s"}' % (mid, label))
-    emit_err(
-        "   (Only the owner can mint for another member; any member can "
-        "self-mint for their own agent.) The code is single-use and expires — "
-        "have them send it to you OUT OF BAND, not through the hub."
-    )
-    emit_err("")
-    emit_err(
-        "2. Run `hub setup --server %s` and paste the code when prompted. "
-        "Setup generates a FRESH identity keypair and prints a NEW 24-word "
-        "recovery phrase — write it down this time." % server.rstrip("/")
-    )
-    emit_err("")
-    if topic_id:
-        emit_err(
-            "3. Then climb back up the ladder: `hub recover --topic %s` "
-            "(rung 2: re-register the new key, post a key-request, wait for a "
-            "member-agent to grant it)." % topic_id
-        )
-    else:
-        emit_err(
-            "3. Then climb back up the ladder: `hub recover --topic <id>` "
-            "for each E2EE topic (rung 2: re-register the new key, post a "
-            "key-request, wait for a member-agent to grant it)."
-        )
+    emit_err("[rung 3/3] restore your server login.")
+    emit_err("Use another of your own working agents to create a private provisioning code:")
+    emit_err("  hub agent-invite --label NEW-LABEL --output PRIVATE-FILE")
+    emit_err("Transfer that file privately to this device, then run:")
+    emit_err("  hub --profile %s enroll --server %s --code-file PRIVATE-FILE --label NEW-LABEL" % (profile, server.rstrip("/")))
+    emit_err("If none of your agents works, verify your own email instead:")
+    emit_err("  hub --profile %s enroll --server %s --recover-email YOUR-EMAIL --label NEW-LABEL" % (profile, server.rstrip("/")))
+    emit_err("Provide the email proof privately when prompted. Circle owners cannot issue another user's server login.")
+    emit_err("Preserve existing keys and backups. Restoring a login does not restore historical topic keys.")
+    emit_err("After restoring login, request an authorized key grant with:")
+    emit_err("  hub recover --topic %s" % (topic_id or "<id>"))
 
 
 def _is_auth_failure(exc):
@@ -2742,7 +2917,7 @@ def _load_identity_key(path):
         "who can read this file can impersonate this agent's E2EE identity. "
         "Run `hub key-wrap` to encrypt it with a passphrase, then export "
         "FAMILY_HUB_KEY_PASSPHRASE=<passphrase> for non-interactive use "
-        "(cron, agents). See agent-skill/INSTALL.md." % path
+        "(cron, agents). See INSTALL.md beside this CLI." % path
     )
     if len(data) != 32:
         raise HubError(
@@ -3134,7 +3309,7 @@ def cmd_key_wrap(args, transport):
     emit(
         "Ops note: non-interactive use (cron, agents) must now export "
         "%s=<passphrase> — without it, hub blocks on a passphrase prompt. "
-        "See agent-skill/INSTALL.md." % _KEYWRAP_ENV_VAR
+        "See INSTALL.md beside this CLI." % _KEYWRAP_ENV_VAR
     )
     return 0
 
@@ -3147,25 +3322,23 @@ def cmd_key_wrap(args, transport):
 def _auto_idem_key(path):
     """True when a POST to this path should auto-carry an idempotency key.
 
-    Covers the create operations (circle/topic/invite/provisioning-code).
+    Covers the create operations (circle/topic/invite).
     Redeem/accept paths are deliberately excluded: their codes are single-use
     by design, and a key would give a false sense of retry safety.
     """
-    if path in ("/v2/families", "/v2/topics", "/v2/provisioning-codes"):
+    if path in ("/v2/families", "/v2/topics"):
         return True
     return bool(re.match(r"^/v2/families/[^/]+/invites$", path))
 
 
-def _single_use_code_path(path):
-    """True for redeem/accept paths whose codes are single-use.
+def _resumable_enrollment_path(path):
+    """Exact retries use a durable client credential and server receipt.
 
-    Retrying these can never duplicate the effect: if the first attempt
-    committed, the retry gets 409 code_used/invite_used (which callers
-    handle); if it never arrived, the retry succeeds. So they are retry-safe
-    without an idempotency key.
+    A successful retry returns the same registration, never another credential.
     """
     return bool(
-        re.match(r"^/v2/provisioning-codes/.+/redeem$", path)
+        path == "/v2/identity/agents"
+        or re.match(r"^/v2/provisioning-codes/.+/redeem$", path)
         or re.match(r"^/v2/invites/.+/accept$", path)
     )
 
@@ -3202,8 +3375,10 @@ _opener = urlrequest.build_opener(_NoRedirect)
 
 
 class HubClient:
-    def __init__(self, base_url, token=None, timeout=20, debug=False, transport=None):
+    def __init__(self, base_url, token=None, timeout=20, debug=False, transport=None, circle_id=None, operation_id=None):
         self.base_url = base_url.rstrip("/")
+        self.circle_id = circle_id
+        self.operation_id = operation_id
         self.token = token
         if token:
             note_secret(token)
@@ -3255,7 +3430,7 @@ class HubClient:
         """
         last_status = None
         last_text = None
-        operation_id = uuid.uuid4().hex
+        operation_id = self.operation_id or uuid.uuid4().hex
         for attempt in range(retries + 1):
             headers = dict(headers)
             request_id = uuid.uuid4().hex
@@ -3309,7 +3484,7 @@ class HubClient:
     def call(self, method, path, query=None, json_body=None,
              idempotency_key=None, auth=True, retries=3):
         # API-major negotiation (spec §4.3): requests are prefixed with the
-        # major selected by the per-invocation version check (v1 today).
+        # major selected by the per-invocation version check (v2).
         url = self.base_url + _apply_api_major(path)
         if query:
             url += "?" + urlparse.urlencode(query)
@@ -3325,6 +3500,8 @@ class HubClient:
             if not self.token:
                 raise HubError("auth", "No credential available for this request.")
             headers["Authorization"] = "Bearer " + self.token
+            if self.circle_id:
+                headers["X-Circle-ID"] = self.circle_id
         body_bytes = None
         if json_body is not None:
             body_bytes = json.dumps(json_body).encode("utf-8")
@@ -3339,14 +3516,14 @@ class HubClient:
             headers["Idempotency-Key"] = idempotency_key
         # Retry is only safe when the operation cannot duplicate: GETs are
         # inherently safe; POSTs are safe with an idempotency key the server
-        # honors, or on single-use-code paths (redeem/accept) where a retry
-        # can at worst return 409. Without that, a dropped connection after
+        # honors, on enrollment paths whose persisted client credential and
+        # request-bound server receipt make exact retries resumable. Without that, a dropped connection after
         # the server committed would duplicate the operation on retry (e.g.
         # token rotation would rotate twice, leaving the client tokenless).
         safe_to_retry = (
             method == "GET"
             or idempotency_key is not None
-            or (method == "POST" and _single_use_code_path(path))
+            or (method == "POST" and _resumable_enrollment_path(path) and isinstance(json_body, dict) and bool(json_body.get("agent_token")))
         )
         status, resp_text = self._transport_with_retry(
             method, url, headers, body_bytes, retries if safe_to_retry else 0
@@ -3411,65 +3588,14 @@ def _message_text(args, attr="message", file_attr="message_file"):
 
 
 # ---------------------------------------------------------------------------
-# Per-circle tokens (v0.2.0): the server binds each bearer token to ONE
-# circle, so the profile keeps circle_tokens {circle_id: token} in the 0600
-# config. Every API call uses the active circle's token, falling back to
-# the legacy single-token chain when a circle has no stored token.
+# Server credential selection. Membership authorization stays on the server.
 # ---------------------------------------------------------------------------
 
 
-def _token_for_circle(cfg, profile, circle_id):
-    """Return (token, source) for a specific circle.
-
-    circle_tokens[circle_id] wins. The legacy single-token chain is only a
-    fallback for the bootstrap family it was minted for (cfg.family_id):
-    the server binds every token to exactly one family and 404s cross-
-    family calls, so sending the legacy token for any other circle would
-    only produce a confusing failure. Anything else needs its own token
-    via `hub circle join`.
-    """
-    circle_tokens = cfg.get("circle_tokens") or {}
-    tok = circle_tokens.get(circle_id)
-    if tok and str(tok).strip():
-        tok = str(tok).strip()
-        note_secret(tok)
-        return tok, "circle-token"
-    if circle_id and circle_id != cfg.get("family_id"):
-        raise HubError(
-            "auth",
-            "No token stored for this circle. Run "
-            "`hub circle join --code <invite code>` to join it.",
-        )
-    try:
-        return load_token(cfg, profile)
-    except HubError:
-        if circle_id:
-            raise HubError(
-                "auth",
-                "No token stored for this circle. Run "
-                "`hub circle join --code <invite code>` to join it "
-                "(or `hub setup` if this profile was never configured).",
-            )
-        raise
-
-
 def _has_usable_token(cfg, profile, circle_id):
-    """True when a call scoped to circle_id could authenticate.
-
-    Side-effect free: checks existence, never reads or warns.
-    """
-    if (cfg.get("circle_tokens") or {}).get(circle_id):
-        return True
-    # Legacy single-token chain is only valid for the bootstrap family.
-    if circle_id and circle_id == cfg.get("family_id"):
-        if os.environ.get("FAMILY_HUB_TOKEN", "").strip():
-            return True
-        if cfg.get("vault_cmd") or os.environ.get("FAMILY_HUB_VAULT_CMD"):
-            return True
-        token_file = cfg.get("token_file") or default_token_path(profile)
-        if os.path.exists(token_file):
-            return True
-    return False
+    return bool(os.environ.get("FAMILY_HUB_TOKEN", "").strip()
+                or cfg.get("vault_cmd") or os.environ.get("FAMILY_HUB_VAULT_CMD")
+                or os.path.exists(cfg.get("token_file") or default_token_path(profile)))
 
 
 def _member_for_circle(cfg, circle_id):
@@ -3495,52 +3621,24 @@ def _ctx(args, transport, need_auth=True):
     _validate_server_url(server)
     token = None
     if need_auth:
-        token, _source = _token_for_circle(cfg, profile, _active_circle_id(cfg))
-    client = HubClient(server, token, debug=args.debug, transport=transport)
-    return types.SimpleNamespace(
-        profile=profile, cfg=cfg, server=server, client=client
-    )
+        token, _source = load_token(cfg, profile)
+    client = HubClient(server, token, debug=args.debug, transport=transport, circle_id=_active_circle_id(cfg))
+    ctx = types.SimpleNamespace(profile=profile, cfg=cfg, server=server, client=client, resolved_circle=None)
+    if need_auth and getattr(args, "circle", None):
+        cid = _match_circle(_profile_circles(ctx), args.circle)
+        cfg["_request_circle_id"] = cid
+        ctx.client.circle_id = ctx.resolved_circle = cid
+    return ctx
 
 
 def _ctx_loose(args, transport):
-    """Context for discovery commands (circles, use, dashboard-token).
-
-    Tolerates a tokenless *active* circle: discovery works with any usable
-    token, since GET /v2/families lists by human (email), not by token.
-    Raises only when the profile has no credential at all.
-    """
-    ctx = _ctx(args, transport, need_auth=False)
-    circle_tokens = ctx.cfg.get("circle_tokens") or {}
-    for tok in circle_tokens.values():
-        if tok and str(tok).strip():
-            tok = str(tok).strip()
-            note_secret(tok)
-            ctx.client = HubClient(
-                ctx.server, tok, debug=args.debug, transport=transport
-            )
-            return ctx
-    token, _source = load_token(ctx.cfg, ctx.profile)
-    ctx.client = HubClient(
-        ctx.server, token, debug=args.debug, transport=transport
-    )
-    return ctx
+    return _ctx(args, transport)
 
 
 def _retarget_client(ctx, args, circle_id):
-    """Point ctx.client at another circle's token (for --circle overrides)."""
-    try:
-        token, _source = _token_for_circle(ctx.cfg, ctx.profile, circle_id)
-    except HubError:
-        raise HubError(
-            "auth",
-            "No token stored for circle %s. Run "
-            "`hub circle join --code <invite code>` first." % circle_id,
-        )
-    ctx.client = HubClient(
-        ctx.server, token, debug=ctx.client.debug,
-        transport=ctx.client.transport,
-    )
-    return ctx
+    ctx.client = HubClient(ctx.server, ctx.client.token, debug=ctx.client.debug,
+                           transport=ctx.client.transport, circle_id=circle_id)
+
 
 
 # ---------------------------------------------------------------------------
@@ -3549,13 +3647,26 @@ def _retarget_client(ctx, args, circle_id):
 
 
 def _active_circle_id(cfg):
-    """Effective circle id: explicit active_circle_id, else legacy family_id."""
-    return cfg.get("active_circle_id") or cfg.get("family_id")
+    """Effective circle id: explicit active_circle_id, else the first enrolled family_id."""
+    return cfg.get("_request_circle_id") or cfg.get("active_circle_id") or cfg.get("family_id")
 
 
 def _list_circles(client):
     """GET /v2/families -> the circles this agent belongs to."""
     return _as_list(client.call("GET", "/v2/families"), "families")
+
+
+def _profile_circles(ctx):
+    """The server is authoritative for every active membership of this user."""
+    circles = _list_circles(ctx.client)
+    for circle in circles:
+        if circle.get("member_id"):
+            ctx.cfg.setdefault("circle_members", {})[circle["id"]] = {
+                "id": circle["member_id"], "role": circle["my_role"],
+                "name": (ctx.cfg.get("member") or {}).get("name"),
+                "email": (ctx.cfg.get("member") or {}).get("email"),
+                "user_id": circle.get("user_id")}
+    return circles
 
 
 def _match_circle(circles, spec):
@@ -3606,15 +3717,17 @@ def _resolve_circle(args, ctx):
     """Central circle resolution for every command.
 
     `--circle <name-or-id>` wins; otherwise the profile's active circle
-    (active_circle_id, falling back to legacy family_id). Raises HubError
+    (active_circle_id, otherwise the initial registration family_id). Raises HubError
     when nothing resolves — callers never see a bare None.
 
     An explicit --circle override also retargets the client to that
-    circle's token: the flag switches BOTH the target and the credential.
+    circle membership while retaining the server credential.
     """
     override = getattr(args, "circle", None)
     if override:
-        cid = _match_circle(_list_circles(ctx.client), override)
+        if getattr(ctx,"resolved_circle",None):
+            return ctx.resolved_circle
+        cid = _match_circle(_profile_circles(ctx), override)
         _retarget_client(ctx, args, cid)
         return cid
     cid = _active_circle_id(ctx.cfg)
@@ -3644,6 +3757,8 @@ def cmd_setup(args, transport):
     if not server:
         raise HubError("bad_request", "A server URL is required.")
     _validate_server_url(server)
+    if cfg.get("server_url") and cfg["server_url"].rstrip("/") != server.rstrip("/"):
+        raise HubError("config", "This profile belongs to another server; use a separate --profile.")
 
     store = "file"
     # Validate private persistence before consuming a one-use enrollment code.
@@ -3654,7 +3769,12 @@ def cmd_setup(args, transport):
         raise HubError("bad_request", "An invite or provisioning code is required.")
     note_secret(code)  # bearer code: keep it out of --debug URL dumps etc.
     _key_priv, _key_pub_b64, _key_is_new = _ensure_identity_keypair(profile)
-    if code.startswith("fhp_"):
+    if getattr(args, "recover_email", None):
+        display_name = ""
+        agent_label = args.label or "muse-agent"
+        accept_path = "/v2/identity/agents"
+        accept_body = {"email": args.recover_email.strip().lower(), "agent_label": agent_label, "agent_public_key": _key_pub_b64}
+    elif code.startswith("fhp_"):
         # Owner bootstrap flow: the member already exists; the provisioning
         # code mints this agent's token directly (label set at bootstrap).
         accept_path = "/v2/provisioning-codes/%s/redeem" % urlparse.quote(code, safe="")
@@ -3679,20 +3799,14 @@ def cmd_setup(args, transport):
         accept_body = {"display_name": display_name, "agent_label": agent_label,
                        "agent_public_key": _key_pub_b64}
 
-    client = HubClient(server, token=None, debug=args.debug, transport=transport)
-    resp = client.call(
-        "POST",
-        accept_path,
-        json_body=accept_body,
-        auth=False,
-    )
-    if not isinstance(resp, dict) or "token" not in resp or "member" not in resp:
-        raise HubError("error", "Unexpected response from the server.")
+    resp = _enrollment_call(server, transport, args.debug, profile, accept_path, accept_body, getattr(args, "verification_code_file", None))
     token = resp["token"]
     member = resp["member"]
     note_secret(token)  # from here on, the token can never appear in output
 
-    new_cfg = {
+    agent_label = resp.get("agent_label") or agent_label
+    new_cfg = dict(cfg)
+    new_cfg.update({
         "server_url": server.rstrip("/"),
         "member": {
             "id": member.get("id"),
@@ -3704,7 +3818,13 @@ def cmd_setup(args, transport):
         "agent_label": agent_label,
         "token_id": resp.get("token_id"),
         "auth_method": store,
-    }
+        "user": resp.get("user"),
+        "agent": resp.get("agent"),
+    })
+    cid = member.get("family_id")
+    if cid:
+        new_cfg.setdefault("circle_members", {})[cid] = new_cfg["member"]
+        new_cfg["active_circle_id"] = cid
     token_file = default_token_path(profile)
     diagnostic("credential_save_started", flow="setup")
     _write_secret_file_0600(token_file, (token + "\n").encode("utf-8"), "credential")
@@ -3716,8 +3836,9 @@ def cmd_setup(args, transport):
     # F11: the new credential is only real if the server accepts it —
     # verify before declaring success.
     diagnostic("credential_verification_started", flow="setup")
-    _verify_new_token(server, transport, args.debug, token, "setup")
+    _verify_new_token(server, transport, args.debug, token, "setup", cid)
     diagnostic("credential_verified", flow="setup")
+    _complete_enrollment(profile)
     # save_config scrubs tokens; assert nothing secret-bearing was written.
     emit("setup complete.")
     emit_json(
@@ -3873,28 +3994,6 @@ def cmd_key_restore(args, transport):
 _SYNC_TOPICS_MAX_PAGES = 10  # safety cap while following server paging
 
 
-def _delete_legacy_cursors(profile, circle_ids):
-    """Delete pre-sync-v2 cursor files WITHOUT reading them.
-
-    Read state moved server-side (topic_read_state, keyed per agent); the
-    first sync-v2 run bootstraps from 0 — every visible topic is reported
-    once as changed and the skill dedupes. The legacy files
-    ("<profile>/cursor" and "<profile>/cursor-<safe circle id>") are
-    removed so nothing consults them again. cursor_path() itself was
-    deleted with the old sync; the name mangling below mirrors it exactly
-    so every legacy file is caught.
-    """
-    base = os.path.join(profile_dir(profile), "cursor")
-    paths = [base]
-    for cid in circle_ids:
-        safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(cid))[:64] or "x"
-        paths.append(base + "-" + safe)
-    for path in paths:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
 
 def _sync_topics_pages(client, limit):
     """GET /v2/sync/topics, following page_token.
@@ -3996,52 +4095,26 @@ def _maybe_nudge_updates(versions):
 
 
 def cmd_sync(args, transport):
-    """Changed-topic discovery: one GET /v2/sync/topics per circle token.
+    """Changed-topic discovery: one scoped GET /v2/sync/topics per active membership.
 
     Stateless — read state lives server-side per agent (topic_read_state),
     so there are no client cursors to maintain. The first run after the
-    upgrade bootstraps from 0: every visible topic is reported once as
-    changed and the skill dedupes; legacy cursor files are deleted without
-    being read. Each emitted topic carries its circle (circle_id /
+    first read reports all visible unread topics; the skill dedupes. Each emitted topic carries its circle (circle_id /
     circle_name); the skill then drives per-topic `hub read` / `hub ack`.
     One circle failing never loses the others' topics (a retry re-delivers;
     nothing local moved), but the exit code is non-zero and names the
     failed circle.
     """
     ctx = _ctx(args, transport)
-    circle_tokens = ctx.cfg.get("circle_tokens") or {}
-    targets = [(cid, tok) for cid, tok in circle_tokens.items() if tok]
-    legacy_cid = ctx.cfg.get("family_id")
-    if legacy_cid and legacy_cid not in dict(targets):
-        try:
-            tok, _src = load_token(ctx.cfg, ctx.profile)
-            targets.append((legacy_cid, tok))
-        except HubError:
-            pass
-    # Sync-v2 cutover: legacy cursor files are deleted WITHOUT being read.
-    _delete_legacy_cursors(ctx.profile, [cid for cid, _ in targets])
-    if not targets:
-        # No circle tokens at all (bare single-token profile): sync with the
-        # already-resolved client. Errors propagate (as the old legacy path
-        # did), they are not collected per-circle.
-        return _emit_sync_topics(
-            ctx.client, args.limit, _active_circle_id(ctx.cfg) or "default", None, ctx.profile
-        )
-    names = {}
-    try:
-        names = {
-            c.get("id"): c.get("name")
-            for c in _list_circles(ctx.client)
-            if isinstance(c, dict)
-        }
-    except HubError:
-        pass  # labels fall back to the circle id; sync must not die here
+    circles = _profile_circles(ctx)
+    targets = [(circle["id"], ctx.client.token) for circle in circles]
+    names = {circle["id"]: circle.get("name") for circle in circles}
     all_topics = []
     errors = []  # (circle_name, message): per-circle partial results
     adv_versions = {}  # update advertisement: first non-empty wins
     for cid, tok in targets:
         client = HubClient(ctx.server, tok, debug=ctx.client.debug,
-                           transport=transport)
+                           transport=transport, circle_id=cid)
         try:
             topics, versions = _sync_topics_pages(client, args.limit)
             _decrypt_topic_subjects(ctx.profile, topics, client)
@@ -4078,9 +4151,9 @@ def cmd_topics(args, transport):
 
 def _resolve_circle_soft(args, ctx):
     """Circle for read/ack: --circle wins (retargets the client to that
-    circle's token); otherwise the profile's active circle id, or None when
+    circle context); otherwise the profile's active circle id, or None when
     the profile names none (bare single-token setups keep working with the
-    already-resolved client — the old read behavior).
+    already-resolved client — the initial registration circle).
     """
     if getattr(args, "circle", None):
         return _resolve_circle(args, ctx)
@@ -4445,7 +4518,7 @@ def cmd_members(args, transport):
     circle_id = _active_circle_id(ctx.cfg)
     circle_name = None
     try:
-        circles = _list_circles(ctx.client)
+        circles = _profile_circles(ctx)
         for c in circles:
             if isinstance(c, dict) and c.get("id") == circle_id:
                 circle_name = c.get("name")
@@ -4464,7 +4537,7 @@ def cmd_members(args, transport):
 
 def cmd_me(args, transport):
     # Identity comes from the server (GET /v2/me): the member bound to the
-    # ACTIVE circle's token. The locally cached cfg["member"] is the legacy
+    # selected circle membership. The locally cached cfg["member"] is the initial
     # bootstrap record and goes stale across circles — never report it as
     # identity.
     ctx = _ctx(args, transport)
@@ -4529,9 +4602,147 @@ def cmd_token_revoke(args, transport):
     return 0
 
 
+def _discovery_pages(client, kind, query=None):
+    """Strict v1 envelope and keyset pagination; never accept a redirect/origin swap."""
+    cursor = None
+    seen = set()
+    items = []
+    for _page in range(1000):
+        params = dict(query or {}, limit=100)
+        if cursor:
+            params["cursor"] = cursor
+        response = client.call("GET", "/v2/discovery/" + kind, query=params)
+        if (not isinstance(response, dict) or type(response.get("protocol_version")) is not int or response["protocol_version"] != 1
+                or not isinstance(response.get("server"), dict)
+                or response["server"].get("url") != client.base_url
+                or not isinstance(response.get("data"), dict)
+                or not isinstance(response.get("data", {}).get(kind), list)
+                or not isinstance(response.get("page"), dict)
+                or "next_cursor" not in response["page"]
+                or type(response["page"].get("limit")) is not int
+                or not 1 <= response["page"]["limit"] <= 100):
+            raise HubError("protocol", "Invalid discovery response; refusing incomplete or misrouted results.")
+        rows = response["data"][kind]
+        id_key = "circle_id" if kind == "circles" else "user_id"
+        if len(rows) > 100 or any(not isinstance(row, dict) or (not isinstance(row.get(id_key), str) or not row[id_key] or len(row[id_key]) > 128) for row in rows):
+            raise HubError("protocol", "Invalid discovery items.")
+        items.extend(rows)
+        cursor = response["page"].get("next_cursor")
+        if cursor is None:
+            return items
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise HubError("protocol", "Discovery returned an invalid or repeated cursor.")
+        seen.add(cursor)
+    raise HubError("protocol", "Discovery exceeded the page limit; narrow the search.")
+
+
+def _discover(args, transport, kind):
+    all_servers = getattr(args, "all_servers", False)
+    if all_servers and args.server:
+        raise HubError("config", "Choose --all-servers or one --server, not both.")
+    if all_servers and getattr(args, "circle", None):
+        raise HubError("config", "Select a server profile before filtering by a circle ID.")
+    root = os.path.join(config_home(), APP_DIR, "profiles")
+    if all_servers:
+        profiles = sorted(entry.name for entry in os.scandir(root)
+                          if entry.is_dir(follow_symlinks=False) and os.path.isfile(os.path.join(entry.path, "config.json"))) if os.path.isdir(root) else []
+    else:
+        profiles = [args.profile]
+
+    def fetch_profile(profile):
+        server = None
+        try:
+            cfg = load_config(profile)
+            configured_server = cfg.get("server_url") if isinstance(cfg, dict) else None
+            if not isinstance(configured_server, str) or not configured_server:
+                raise HubError("config", "Profile has no valid server URL.")
+            _validate_server_url(configured_server)
+            server = configured_server.rstrip("/")
+            if args.server and args.server.rstrip("/") != server:
+                raise HubError("config", "Server does not match this profile; select the matching profile.")
+            # Never broadcast an unscoped environment credential to other servers.
+            token, _source = load_token(cfg, profile, allow_env=not all_servers)
+            client = HubClient(server, token, debug=args.debug, transport=transport)
+            health = client.call("GET", "/v2/health", auth=False, retries=1)
+            if not isinstance(health, dict) or health.get("discovery_protocol") != 1:
+                raise HubError("version", "This server does not support discovery protocol 1.")
+            query = {"q": args.query} if kind == "people" and args.query else {}
+            if kind == "people" and getattr(args, "circle", None):
+                query["circle_id"] = args.circle
+            rows = _discovery_pages(client, kind, query)
+            return {"profile": profile, "server_url": server, "status": "ok"}, [dict(row, profile=profile, server_url=server) for row in rows], None
+        except (HubError, OSError, ValueError, TypeError) as exc:
+            code = exc.server_code or exc.code if isinstance(exc, HubError) else "config"
+            # Fixed metadata only: raw exceptions can contain local paths or secrets.
+            return {"profile": profile, "server_url": server, "status": "error"}, [], {"profile": profile, "server_url": server, "code": code}
+
+    results = []
+    if profiles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(profiles))) as pool:
+            results = list(pool.map(fetch_profile, profiles))
+    servers = [result[0] for result in results]
+    items = [item for result in results for item in result[1]]
+    errors = [result[2] for result in results if result[2]]
+    emit_json({"protocol_version": 1, "complete": not errors, "data": {kind: items}, "servers": servers, "errors": errors})
+    return 1 if errors else 0
+
+
+def cmd_agents(args, transport):
+    ctx = _ctx(args, transport)
+    return _emit_json_result(ctx.client.call("GET", "/v2/agents"))
+
+
+def cmd_agent_invite(args, transport):
+    """Approve another own agent without exposing its single-use code in output."""
+    output = os.path.abspath(args.output)
+    resolved = os.path.realpath(output)
+    root = os.path.realpath(os.path.join(config_home(), APP_DIR))
+    if os.path.commonpath([resolved, root]) == root:
+        raise HubError("config", "Store the approval outside the connector configuration directory.")
+    ctx = _ctx(args, transport)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(output, flags, 0o600)
+    except OSError as exc:
+        raise HubError("config", "Cannot create private approval file; choose a new file in an existing directory.") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            me = ctx.client.call("GET", "/v2/me")
+            member_id = me.get("id")
+            if not member_id:
+                raise HubError("config", "Select one of your active circles before approving an agent.")
+            result = ctx.client.call("POST", "/v2/provisioning-codes", json_body={"member_id": member_id, "agent_label": args.label}, retries=0)
+            code = result.get("provisioning_code")
+            if not isinstance(code, str) or not re.fullmatch(r"fhp_[A-Za-z0-9_-]+", code):
+                raise HubError("config", "Server returned an invalid agent approval.")
+            note_secret(code)
+            stream.write(code + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        os.unlink(output)
+        raise
+    emit_json({"approval_file": output, "agent_label": args.label, "expires_at": result.get("expires_at"), "next_action": "Transfer this file privately; the new agent runs enroll --code-file PRIVATE-FILE with this label."})
+    return 0
+
+
+def cmd_agent_revoke(args, transport):
+    ctx = _ctx(args, transport)
+    if not args.yes:
+        raise HubError("bad_request", "Revoking an agent disables all of its server credentials. Confirm the agent ID and pass --yes.")
+    return _emit_json_result(ctx.client.call("POST", "/v2/agents/%s/revoke" % urlparse.quote(args.agent_id, safe="")))
+
+
+def cmd_people(args, transport):
+    return _discover(args, transport, "people")
+
+
 def cmd_circles(args, transport):
+    if getattr(args, "all_servers", False) or getattr(args, "json", False):
+        return _discover(args, transport, "circles")
     ctx = _ctx_loose(args, transport)
-    circles = _list_circles(ctx.client)
+    circles = _profile_circles(ctx)
     active = _active_circle_id(ctx.cfg)
     if not circles:
         emit("no circles — create one with `hub circle create --name ...`.")
@@ -4555,7 +4766,7 @@ def cmd_circles(args, transport):
 
 
 def _redeem_code(server, transport, debug, code, display_name="",
-                 agent_label="", profile="default"):
+                 agent_label="", profile="default", verification_code_file=None):
     """Redeem a provisioning (fhp_) or invite (fhi_) code; no auth needed.
 
     Returns (token, member dict). The raw code is registered as a secret so
@@ -4563,7 +4774,6 @@ def _redeem_code(server, transport, debug, code, display_name="",
     """
     _priv, public_key, is_new = _ensure_identity_keypair(profile)
     note_secret(code)
-    client = HubClient(server, token=None, debug=debug, transport=transport)
     if code.startswith("fhp_"):
         path = "/v2/provisioning-codes/%s/redeem" % urlparse.quote(code, safe="")
         body = {}
@@ -4579,28 +4789,17 @@ def _redeem_code(server, transport, debug, code, display_name="",
     body["agent_public_key"] = public_key
     if is_new:
         _print_recovery_phrase(_priv, profile)
-    resp = client.call("POST", path, json_body=body, auth=False)
+    resp = _enrollment_call(server, transport, debug, profile, path, body, verification_code_file)
     if not isinstance(resp, dict) or "token" not in resp or "member" not in resp:
         raise HubError("error", "Unexpected redeem response from the server.")
-    return resp["token"], resp["member"]
+    member = dict(resp["member"])
+    member["agent_label"] = resp.get("agent_label") or agent_label
+    return resp["token"], member
 
 
-def _store_circle_token(ctx, circle_id, token, member):
-    """Persist a circle token + member record; never prints the token."""
-    note_secret(token)
-    diagnostic("credential_save_started", flow="circle")
-    circle_tokens = ctx.cfg.get("circle_tokens") or {}
-    circle_tokens[circle_id] = token
-    ctx.cfg["circle_tokens"] = circle_tokens
-    if isinstance(member, dict) and member.get("id"):
-        circle_members = ctx.cfg.get("circle_members") or {}
-        circle_members[circle_id] = {
-            "id": member.get("id"),
-            "name": member.get("name"),
-            "role": member.get("role"),
-            "email": member.get("email"),
-        }
-        ctx.cfg["circle_members"] = circle_members
+def _store_membership(ctx, circle_id, member):
+    """Cache membership metadata, never a separate circle credential."""
+    ctx.cfg.setdefault("circle_members", {})[circle_id] = dict(member)
     save_config(ctx.profile, ctx.cfg)
 
 
@@ -4610,75 +4809,43 @@ def cmd_circle_create(args, transport):
     if not name:
         raise HubError("bad_request", "A non-empty --name is required.")
     check_pii(name)
-    # One idempotency key for the whole create→redeem flow, generated up
-    # front: any retry (dropped connection, lost response) reuses it, so the
-    # server returns the already-created circle instead of duplicating it.
-    idem_key = uuid.uuid4().hex
-    circle = None
-    for cycle in range(3):
+    create_path = os.path.join(profile_dir(ctx.profile), "pending-circle-create.json")
+    request_body = {"name": name, "kind": args.kind}
+    if os.path.exists(create_path):
+        with open(create_path, encoding="utf-8") as stream:
+            pending = json.load(stream)
+        if pending["server"] != ctx.server or pending["body"] != request_body:
+            raise HubError("config", "A different circle creation is pending; resume that same command first.")
+    else:
+        pending = {"server": ctx.server, "body": request_body, "idempotency_key": uuid.uuid4().hex}
+        _atomic_private_json(create_path, pending)
+    circle = pending.get("response")
+    if circle is None:
         try:
-            circle = ctx.client.call(
-                "POST",
-                "/v2/families",
-                json_body={"name": name, "kind": args.kind},
-                idempotency_key=idem_key,
-            ) or {}
+            circle = ctx.client.call("POST", "/v2/families", json_body=request_body,
+                                     idempotency_key=pending["idempotency_key"]) or {}
         except HubError as exc:
             if exc.server_code == "circle_name_taken":
-                raise HubError(
-                    "bad_request",
-                    'A circle named "%s" already exists. Circle names are '
-                    "unique — pick another name or join the existing one with "
-                    "`hub circles`." % name,
-                )
+                os.unlink(create_path)
+                raise HubError("bad_request", "A circle with that name already exists. Choose another name or inspect `hub circles`.")
             raise
-        cid = circle.get("id")
-        if not cid:
-            raise HubError("error", "Server did not return a circle id.")
-        code = circle.get("provisioning_code")
-        if not code:
-            # Older server: no auto-redeem possible; fall back to manual steps.
-            emit('created circle "%s" (id=%s)' % (circle.get("name", name), cid))
-            emit("select it with: hub circle use %s" % cid)
-            return 0
-        if circle.get("deduped") and args.debug:
-            emit_err("hub debug: create dedup hit — server re-issued a fresh code")
-        # Auto-redeem: mint this agent's token for the new circle immediately,
-        # so the creator can use it without a second round-trip.
-        try:
-            token, member = _redeem_code(
-                ctx.server, transport, args.debug, code, profile=ctx.profile,
-            )
-        except HubError as exc:
-            # The redeem landed but its response was lost: the code is spent
-            # and we hold no token. Loop back — the keyed create dedups and
-            # hands us a fresh code.
-            if exc.server_code == "code_used" and cycle < 2:
-                if args.debug:
-                    emit_err("hub debug: redeem already applied; re-issuing via dedup")
-                continue
-            raise
-        break
-    else:
-        raise HubError("error", "Circle created but the token could not be issued; "
-                                "run `hub circles` to check, then `hub circle join --code` "
-                                "with a fresh code from an owner.")
-    if member.get("family_id") and member.get("family_id") != cid:
-        raise HubError(
-            "error",
-            "Redeem returned a member for a different circle; refusing to "
-            "store the token.",
-        )
-    _store_circle_token(ctx, cid, token, member)
+        if not circle.get("id"):
+            raise HubError("error", "Circle response is incomplete; pending creation preserved.")
+        pending["response"] = circle
+        _atomic_private_json(create_path, pending)
+    cid = circle["id"]
+    if cid not in {row.get("id") for row in _profile_circles(ctx)}:
+        raise HubError("protocol", "Created circle was not returned as an active membership; pending creation preserved.")
     ctx.cfg["active_circle_id"] = cid
     save_config(ctx.profile, ctx.cfg)
+    os.unlink(create_path)
     emit('created circle "%s" (id=%s) — now active' % (circle.get("name", name), cid))
     return 0
 
 
 def cmd_circle_join(args, transport):
     """Join a circle with a provisioning or invite code someone shared."""
-    ctx = _ctx(args, transport, need_auth=False)
+    ctx = _ctx(args, transport)
     # F11: the redeemed token is persisted to this profile's 0600 config —
     # prove the sink works BEFORE the single-use code is burned.
     _probe_profile_writable(ctx.profile)
@@ -4692,60 +4859,22 @@ def cmd_circle_join(args, transport):
     member = ctx.cfg.get("member") or {}
     display_name = (args.name or member.get("name") or "").strip()
     agent_label = (args.label or ctx.cfg.get("agent_label") or "").strip()
-    try:
-        token, new_member = _redeem_code(
-            ctx.server, transport, args.debug, code, profile=ctx.profile,
-            display_name=display_name, agent_label=agent_label,
-        )
-    except HubError as exc:
-        # The redeem landed but its response was lost: this code is spent and
-        # we hold no token. The server tells us who the member is — surface a
-        # precise recovery step instead of a cryptic error.
-        if exc.server_code in ("code_used", "invite_used"):
-            member_info = (exc.details or {}).get("member") or {}
-            who = member_info.get("name") or display_name or "you"
-            where = member_info.get("family_id") or "the circle"
-            raise HubError(
-                "auth",
-                "This code was already used — %s is already a member (%s) but "
-                "this device holds no token for it. Ask an owner for a fresh "
-                "invite code and run `hub circle join --code` again."
-                % (who, where),
-            )
-        raise
+    token, new_member = _redeem_code(
+        ctx.server, transport, args.debug, code, profile=ctx.profile,
+        display_name=display_name, agent_label=agent_label,
+        verification_code_file=getattr(args, "verification_code_file", None),
+    )
     cid = new_member.get("family_id")
     if not cid:
-        # The token is issued and irreplaceable — never lose it over a
-        # malformed response. Fall back to resolving the circle with the new
-        # token itself: it is scoped to exactly the circle just joined.
-        if args.debug:
-            emit_err("hub debug: redeem response lacked family_id; resolving via /v2/families")
-        probe = HubClient(ctx.server, token, transport=transport)
-        fams = [
-            c for c in _as_list(probe.call("GET", "/v2/families"), "families")
-            if isinstance(c, dict) and c.get("id")
-        ]
-        if len(fams) == 1:
-            cid = fams[0]["id"]
-    if not cid:
-        # Truly unresolvable — but the token must still survive. Persist it
-        # keyed by member id and give a precise recovery step instead of
-        # dropping the credential.
-        mid = new_member.get("id") or "redeemed"
-        _store_circle_token(ctx, "pending-" + str(mid), token, new_member)
-        raise HubError(
-            "error",
-            "Joined, but the circle could not be identified. Your token was "
-            "saved — run `hub circles` to find the circle, then "
-            "`hub circle use <id>`.",
-        )
-    _store_circle_token(ctx, cid, token, new_member)
+        raise HubError("error", "Enrollment response has no circle ID. Pending enrollment preserved; export diagnostics.")
+    _store_membership(ctx, cid, new_member)
     ctx.cfg["active_circle_id"] = cid
     save_config(ctx.profile, ctx.cfg)
     # F11: report success only after the new token proves it authenticates.
     diagnostic("credential_verification_started", flow="circle")
-    _verify_new_token(ctx.server, transport, args.debug, token, "circle join")
+    _verify_new_token(ctx.server, transport, args.debug, token, "circle join", cid)
     diagnostic("credential_verified", flow="circle")
+    _complete_enrollment(ctx.profile)
     # Friendly output: resolve the circle name with the new token.
     try:
         probe = HubClient(ctx.server, token, transport=transport)
@@ -4763,7 +4892,7 @@ def cmd_circle_join(args, transport):
 
 def cmd_circle_use(args, transport):
     ctx = _ctx_loose(args, transport)
-    cid = _match_circle(_list_circles(ctx.client), args.target)
+    cid = _match_circle(_profile_circles(ctx), args.target)
     ctx.cfg["active_circle_id"] = cid
     save_config(ctx.profile, ctx.cfg)
     emit("active circle set to %s" % cid)
@@ -4942,21 +5071,8 @@ def cmd_dashboard_token(args, transport):
     (bypassing redaction) so it stays usable.
     """
     ctx = _ctx_loose(args, transport)
-    cid = _match_circle(_list_circles(ctx.client), args.circle)
-    tok = (ctx.cfg.get("circle_tokens") or {}).get(cid)
-    tok = str(tok).strip() if tok else ""
-    if not tok:
-        if cid == ctx.cfg.get("family_id"):
-            try:
-                tok, _src = load_token(ctx.cfg, ctx.profile)
-            except HubError:
-                tok = None
-        if not tok:
-            raise HubError(
-                "auth",
-                "No token stored for this circle. Run "
-                "`hub circle join --code <invite code>` first.",
-            )
+    cid = _match_circle(_profile_circles(ctx), args.circle)
+    tok, _source = load_token(ctx.cfg, ctx.profile)
     note_secret(tok)  # keep it out of any later redacted output
     emit(
         "WARNING: this token is a password-equivalent credential. "
@@ -6067,7 +6183,7 @@ def cmd_rollback(args, transport):
 # GET /v2/health (unauthenticated, cheap) and requires:
 #   1. server_version >= _MIN_SERVER_VERSION, AND
 #   2. the server's advertised `api_versions` includes an API major this
-#      CLI implements (v1 today).
+#      CLI implements (v2).
 # Outside this the CLI fails loudly with upgrade instructions — never
 # silently, never by guessing. There is no env var, flag, or config that
 # skips this check; the only exemptions are commands that never touch the
@@ -6136,6 +6252,12 @@ def _require_server_version(args, transport):
     # Mirror that here so the pre-command check uses the same server.
     if getattr(args, "setup_server", None):
         args.server = args.setup_server
+    if getattr(args, "resume", False):
+        try:
+            with open(_pending_enrollment(args.profile), encoding="utf-8") as stream:
+                args.server = json.load(stream)["server"]
+        except FileNotFoundError:
+            raise HubError("config", "No enrollment is pending for this profile.")
     ctx = _ctx(args, transport, need_auth=False)
     cached = _version_check_cache.get(ctx.server)
     if cached is not None:
@@ -6237,6 +6359,23 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
+    d = sub.add_parser("diagnostics", help="Export private, allowlisted troubleshooting metadata", description="Create a shareable report of request IDs, outcomes and local persistence milestones without credentials or key material.", epilog="example: hub diagnostics export --output join-diagnostics.json")
+    ds = d.add_subparsers(dest="diagnostics_command", required=True)
+    p = ds.add_parser("export", help="Write a shareable 0600 JSON report without credentials or keys", description="Export the CLI version and allowlisted local diagnostic events. This command works offline and never reads credentials or private keys.", epilog="example: hub diagnostics export --output join-diagnostics.json")
+    p.add_argument("--output", required=True, help="Destination JSON file; share only this export")
+    p.add_argument("--run-id", default=None, help="Optional invocation ID to include")
+    p.set_defaults(func=cmd_diagnostics_export)
+
+    p = sub.add_parser("enroll", help="Join safely, preserving existing circles; resume an interrupted enrollment", description="Enroll on the inviting server with a private code file. Automatically choose setup or circle join, preserve other circles, and resume interrupted enrollment using the same private operation.", epilog="example: hub --profile hub-example enroll --server https://hub.example.com --code-file /private/invite-code --name Your-name --label muse-agent")
+    p.add_argument("--server", dest="setup_server", default=None, help="Inviting server URL")
+    p.add_argument("--code-file", default=None, help="Private file containing only the invite/provisioning code; otherwise prompted")
+    p.add_argument("--resume", action="store_true", help="Resume this profile's saved enrollment without another invite")
+    p.add_argument("--recover-email", help="Register a replacement/additional agent for an existing account using verified email")
+    p.add_argument("--name", default=None, help="Invited person's display name")
+    p.add_argument("--label", default="muse-agent", help="Generic agent label; choose another if desired")
+    p.add_argument("--verification-code-file", help="Private file containing the code delivered to your email")
+    p.set_defaults(func=cmd_enroll)
+
     p = sub.add_parser(
         "setup",
         formatter_class=_RDH,
@@ -6245,7 +6384,7 @@ def build_parser():
         "provisioning code and configure this agent's profile (server "
         "origin, member name, agent label). Never prints the credential. "
         "On success the server returns one bearer token, stored per "
-        "--store. Re-running setup for a new invite code is safe.",
+        "--store. Prefer enroll for invitation setup and safe resumption.",
         epilog="examples:\n"
         "  hub setup --server https://hub.example.com --invite fhi_abc123 \\\n"
         "      --name \"Lakshmi\" --label phone-agent\n"
@@ -6263,6 +6402,7 @@ def build_parser():
         default="file",
         help="Where the credential lives (default: private local file)",
     )
+    p.add_argument("--verification-code-file", help="Private file containing the email verification code")
     p.set_defaults(func=_wrap_setup)
 
     p = sub.add_parser(
@@ -6434,7 +6574,7 @@ def build_parser():
         formatter_class=_RDH,
         help="Post a message to a topic",
         description="Post a plain message (or threaded reply) to a topic. "
-        "The post authenticates with the ACTIVE circle's token — confirm "
+        "The post uses your server credential and selected circle — confirm "
         "`hub circles` shows the right active circle first. For long text "
         "use --message-file. Exactly one of --message / --message-file is "
         "required.",
@@ -6819,11 +6959,30 @@ def build_parser():
         formatter_class=_RDH,
         help="List circles you belong to (active marked)",
         description="List the circles this profile belongs to, with the "
-        "active circle marked. The active circle's token authenticates "
+        "active circle marked. Your server credential authenticates "
         "your posts — check this before the first post of a session.",
         epilog="example:\n  hub circles",
     )
+    p.add_argument("--all-servers", action="store_true", help="Discover circles in every locally configured server profile; emit structured JSON")
+    p.add_argument("--json", action="store_true", help="Emit the structured, paginated discovery result for this server")
     p.set_defaults(func=cmd_circles)
+
+    p = sub.add_parser("people", help="Find distinct users and shared circle memberships", description="Search visible users on one server or all configured servers. Names can be ambiguous; use server_url, user_id and the selected circle membership to address a recipient.", epilog="example: hub people --query Lakshmi --all-servers")
+    p.add_argument("--query", default="", help="Literal name or email search")
+    p.add_argument("--all-servers", action="store_true", help="Search all locally configured server profiles")
+    p.add_argument("--circle", default=None, help="Restrict to this circle ID on the selected server; cannot be combined with --all-servers")
+    p.set_defaults(func=cmd_people)
+
+    p = sub.add_parser("agents", help="List this user’s registered agents on the selected server", description="Show stable agent IDs and revocation status for your user. Circle owners cannot manage another user’s server credentials.", epilog="example: hub agents")
+    p.set_defaults(func=cmd_agents)
+    p = sub.add_parser("agent-invite", help="Approve another of your own agents", description="Save a single-use account approval to a new private file. Transfer it privately to your other device; never paste it into topic messages or logs.", epilog="example: hub agent-invite --label phone --output /private/phone-approval.txt")
+    p.add_argument("--label", required=True, help="Unique label for your new agent")
+    p.add_argument("--output", required=True, help="New private file outside the connector configuration directory")
+    p.set_defaults(func=cmd_agent_invite)
+    p = sub.add_parser("agent-revoke", help="Revoke one of your agents on this server", description="Disable every credential of the chosen agent across this server’s circles. Other agents and other users are unaffected.", epilog="example: hub agent-revoke --agent-id AGENT_ID --yes")
+    p.add_argument("--agent-id", required=True, help="Own agent ID from hub agents")
+    p.add_argument("--yes", action="store_true", help="Confirm revocation of this exact agent")
+    p.set_defaults(func=cmd_agent_revoke)
 
     p = sub.add_parser(
         "circle",
@@ -6843,8 +7002,8 @@ def build_parser():
         "create",
         formatter_class=_RDH,
         help="Create a new circle",
-        description="Create a new circle. Your token is auto-redeemed for "
-        "it and it becomes the active circle. Circle names are unique.",
+        description="Create a new circle using your existing server credential. "
+        "It becomes the active circle. Circle names are unique.",
         epilog="example:\n  hub circle create --name \"Book Club\" --kind general",
     )
     c.add_argument("--name", required=True, help="Circle name")
@@ -6856,7 +7015,7 @@ def build_parser():
         formatter_class=_RDH,
         help="Set the active circle for this profile",
         description="Switch the active circle for this profile. The active "
-        "circle's token authenticates subsequent commands (or pass "
+        "circle scopes subsequent commands using your server credential (or pass "
         "--circle to a single command instead).",
         epilog="example:\n  hub circle use \"close-friends\"",
     )
@@ -6869,8 +7028,8 @@ def build_parser():
         help="Join a circle with an invite/provisioning code",
         description="Join a circle using an invite (fhi_) or provisioning "
         "(fhp_) code. The code is prompted securely if omitted so it "
-        "stays out of shell history. Stores the circle's token in the "
-        "profile.",
+        "stays out of shell history. Reuses this profile's server credential "
+        "and adds the membership. Use enroll for first registration.",
         epilog="example:\n  hub circle join --code fhi_abc123 --label phone-agent",
     )
     c.add_argument("--code", required=False, default=None,
@@ -6881,6 +7040,7 @@ def build_parser():
                    help="Display name for invite codes (default: profile member name)")
     c.add_argument("--label", default=None,
                    help="Agent label for invite codes (default: profile agent label)")
+    c.add_argument("--verification-code-file", help="Private file containing the email verification code")
     c.set_defaults(func=cmd_circle_join)
 
     c = csub.add_parser(
@@ -7016,7 +7176,7 @@ def build_parser():
     p = sub.add_parser(
         "dashboard-token",
         formatter_class=_RDH,
-        help="Print this circle's token for the dashboard (sensitive!)",
+        help="Print your server credential for the dashboard (sensitive!)",
         description="HUMAN ADMIN ONLY — agents must never run this or "
         "transmit its output: it prints the raw bearer credential to "
         "stdout. The human runs it themselves when they need the token "
@@ -7094,6 +7254,16 @@ def build_parser():
     p.add_argument("--yes", action="store_true", help="Use only after the human explicitly approved this verified identity")
     p.set_defaults(func=cmd_key_trust)
 
+    scoped_commands = {cmd_members, cmd_topics, cmd_post, cmd_new_topic, cmd_spawn,
+                       cmd_tasks, cmd_task_new, cmd_task_note, cmd_task_done, cmd_invite,
+                       cmd_topic_add_member, cmd_topic_remove_member, cmd_topic_rekey,
+                       cmd_key_fetch, cmd_key_grant, cmd_topic_key_status, cmd_recover,
+                       cmd_topic_archive}
+    for command_parser in sub.choices.values():
+        if command_parser.get_default("func") in scoped_commands and "--circle" not in command_parser._option_string_actions:
+            command_parser.add_argument("--circle", default=None, metavar="NAME_OR_ID",
+                                        help="Use this circle for this request without changing the saved active circle")
+
     return parser
 
 
@@ -7120,6 +7290,7 @@ _LOCAL_COMMANDS = frozenset(
         cmd_key_backup,
         cmd_key_restore,
         cmd_verify_install,
+        cmd_diagnostics_export,
         cmd_rollback,
     }
 )
@@ -7135,14 +7306,19 @@ def _main(argv=None, transport=None):
     # Startup self-integrity check (WS-E). verify-install is exempt from
     # the hard refusal so it can diagnose a mismatch itself (it re-runs
     # the full check and reports exactly which step failed).
-    if getattr(args, "func", None) is not cmd_verify_install:
+    if getattr(args, "func", None) not in (cmd_verify_install, cmd_diagnostics_export):
         if not _startup_integrity_check():
             return EXIT_TAMPERED
     try:
         # Server version contract (§4.2): fail before any command when the
         # server is too old. Local-only commands are exempt.
-        if getattr(args, "func", None) not in _LOCAL_COMMANDS:
+        if (getattr(args, "func", None) not in _LOCAL_COMMANDS
+                and args.func is not cmd_people
+                and not (args.func is cmd_circles and (args.all_servers or args.json))):
             _require_server_version(args, transport)
+        if args.func in (cmd_enroll, _wrap_setup, cmd_circle_join, cmd_circle_create):
+            with _enrollment_lock(args.profile):
+                return args.func(args, transport)
         return args.func(args, transport)
     except HubError as exc:
         emit_err("error: " + exc.friendly())

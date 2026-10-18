@@ -12,7 +12,7 @@ and account ID. Never ask the human to paste Cloudflare keys into conversation t
 
 This is the protocol-2 development release. Read the
 [release checklist](E2EE_FRESH_DEPLOY.md) first. The CLI and skill must both have
-published signed 2.0.0+ releases, pinned by their real hashes. A build with the
+published signed 2.2.0+ releases, pinned by their real hashes. A build with the
 old 1.x pin fails deliberately. Use a **new database** and a distinct Worker name
 for testing. Preserve existing deployments, databases and backups.
 

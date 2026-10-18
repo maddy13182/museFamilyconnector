@@ -116,7 +116,7 @@ test('below-minimum CLI is rejected with 426 and the guidance message', async ()
   assert.equal(
     res.body.error.message,
     'Client version 0.5.0 is below the required minimum 0.7.0. ' +
-      'Update your CLI: see agent-skill/INSTALL.md (hub upgrade), then retry.',
+      "Update your CLI from this server's verified bundle (hub upgrade), then retry.",
   );
 });
 

@@ -124,11 +124,12 @@ test('happy path (default remove): offer -> accept swaps ownership atomically', 
     `SELECT revoked_at FROM agent_tokens WHERE member_id = ?`,
     [ownerMemberId],
   );
-  assert.ok(tokenRow && tokenRow['revoked_at'], 'old owner tokens are revoked');
+  assert.equal(tokenRow?.['revoked_at'], null, 'server credential survives circle removal');
 
   // The old owner's session is over.
   const me = await app.call('GET', '/v2/me', { token: ownerToken });
-  assert.equal(me.status, 401, 'removed owner token is rejected');
+  assert.equal(me.status,200);
+  assert.equal((await app.call('GET','/v2/members',{token:ownerToken})).status,403);
 
   // New owner can act as owner (offer another transfer, then cancel it).
   const kidRow = await app.db.queryOne(`SELECT id FROM members WHERE family_id = ? AND email = ?`, [

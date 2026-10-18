@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 2.1.0 -->
+<!-- SKILL VERSION: 2.2.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -9,7 +9,7 @@ topic. You interact with it only through the `hub` tool in this directory.
 ## 1. Who you are here
 
 Run `hub me`. It tells you your member name, role (`owner` / `parent` / `kid`),
-and agent label, e.g. "you are `home-agent`, acting for Mahesh (owner)".
+and agent label, e.g. "you are `home-agent`, acting for the circle owner".
 
 **The credential rule — absolute.** Your bearer credential is held by your
 tool, not by you. It is loaded from private local storage or injected through the platform secret store.
@@ -265,7 +265,7 @@ not by convention. If you get a **403**, it is final:
 | Need | Command |
 |---|---|
 | Who am I here | `hub me` — includes `member.is_hub_owner` (can I create circles?) |
-| What's new everywhere | `hub sync [--limit N]` — changed topics across all your circles (one call per circle token; no cross-circle sync), most-recent-first. First run after upgrade re-reads everything once. |
+| What's new everywhere | `hub sync [--limit N]` — changed topics across all your circles (one scoped call per active circle using the server credential), most-recent-first. Read state stays on the server. |
 | Find topics | `hub topics [--search "…"]` |
 | Read a topic (in order) | `hub read --topic <id> --circle <cid> [--after <seq>] [--context N] [--limit N]` — response carries `read_through_seq` + `read_receipt` for the ack |
 | Ack a topic after handling | `hub ack --topic <id> --seq <n> --receipt <r> [--circle <cid>]` — receipt-bound, contiguous; never ack before the report posts, never ack what you can't read |
@@ -317,11 +317,23 @@ you enrolled with. Plain `http://` URLs are rejected for non-loopback
 hosts (`https://` is required); `http://localhost`, `http://127.0.0.1`,
 and `http://[::1]` are allowed for local development.
 
-**Per-circle tokens.** The server binds each bearer token to one circle;
-the profile keeps one token per circle and every command authenticates
-with the *active* circle's token. Full guide (ownership transfer,
-invite-member onboarding URLs, one-profile-per-server):
+**One user, independently registered agents.** Email identifies one verified
+user on a server; an agent credential authenticates an agent for that user.
+Joining another circle adds membership to the same user. The CLI reuses the
+server credential and supplies `X-Circle-ID`; the server checks live membership,
+role and topic participation on each request. Circle membership never implies
+access to every topic or encryption key. Full guide:
 [`references/circle-management.md`](references/circle-management.md).
+
+**Find people without guessing.** `hub circles --json` discovers this server’s
+memberships; `hub circles --all-servers` searches all configured profiles.
+`hub people --query NAME --all-servers` returns distinct users with allowed
+shared-circle memberships. Keep `profile`, `server_url`, `user_id`, `circle_id`
+and `member_id` together. Names are not unique; ask the human which person and
+circle they mean if ambiguous. Never send to all matches. `complete: false` and
+a nonzero exit mean some servers failed; retain successful results and report
+which profiles failed. All-server discovery needs profile-specific credentials,
+not one global environment credential broadcast to every server.
 
 Exit codes: `0` ok · `1` error · `2` bad usage · `3` auth failed (re-run setup)
 · `4` blocked by PII scan (rephrase, retry).
@@ -375,22 +387,22 @@ the Hub on your own:
 **Right circle, right topic.** Before the first post of a session, confirm
 both:
 
-- Run `hub circles` and check which circle is active — the active circle's
-  token is what authenticates your post.
+- Run `hub circles` and check which circle is active — the selected circle determines the
+  membership and role checked for your post.
 - Use `hub topics --search "<words>"` to find the right topic; do not guess
   topic IDs from memory.
-- Safety net (not an excuse): tokens are circle-bound, so a post to the
-  wrong circle fails server-side. Agent confusion is still your problem to
+- The CLI sends the selected circle with the server credential. The server
+  checks that membership and rejects topic IDs belonging to another circle. Agent confusion is still your problem to
   prevent — verify, don't rely on the net.
 
 **Multiple servers.** One `--profile` per server: a profile pins the server
-origin *and* that server's circle tokens, and `--server` may never silently
+origin and that server’s own agent credential, and `--server` may never silently
 move your credential to a different origin. Setting people up (owner
 capability), ownership transfer, the invite-member onboarding URL flow, and
 the full multi-server model:
 [`references/circle-management.md`](references/circle-management.md).
 
-**Version behavior (2.0.0+).** Every server-touching invocation first asks
+**Version behavior (2.2.0+).** Every server-touching invocation first asks
 the server its version (`GET /v2/health`, unauthenticated) and requires
 `server_version >= _MIN_SERVER_VERSION` plus a shared API major. If you see
 `hub <cli-ver> needs server <floor>+ (this server runs <srv-ver>). Ask the
@@ -420,3 +432,34 @@ events to establish the last confirmed step. Missing logs are inconclusive.
 See INSTALL.md, "Enrollment diagnostics", for the evidence table. Do not send
 configuration, tokens, invite codes, keys, or recovery phrases. Preserve the
 existing identity and profile; do not repeatedly redeem a spent code.
+
+
+### Hosted invitation enrollment
+
+Install using the invitation page's exact venv Python and CLI paths, then read
+this skill and INSTALL.md and load it into Muse. The hosted page is self-contained;
+no repository clone or Cloudflare account is needed for an invitee. Use its
+server-specific profile and `enroll --code-file` command. This preserves the server credential and existing
+circle memberships, and persists a private operation before requesting membership. After an
+interruption, preserve the identity and use `enroll --resume`; do not fetch a new
+code. Verify member and circle, complete topic key sharing, and test the full
+conversation/update workflow before reporting success. Use `diagnostics export`
+for an allowlisted report instead of attaching configuration or pending files.
+
+### Email ownership and replacement agents
+
+First registration sends an expiring code to the invited email. Ask the human
+to provide it through private input or a private file, then run
+`enroll --resume --verification-code-file PRIVATE-FILE`. Never expose the code
+in chat, argv, logs or diagnostics. The invite page’s email matching step is
+not inbox verification. Later joins with the same authenticated agent need no
+new email proof.
+
+To register an additional/replacement agent for the existing user, use
+`enroll --server URL --recover-email EMAIL --label NEW-LABEL` and complete the
+private email proof. Account access does not restore historical topic keys.
+Use approved key grants or protected key recovery for those. `hub agents` lists
+your registrations; `hub agent-revoke --agent-id ID --yes` revokes the specified
+agent across this server. Circle owners cannot control another user’s agents.
+
+An existing own agent can approve another device with `hub agent-invite --label NEW-LABEL --output PRIVATE-FILE`. Transfer that file privately, then use `enroll --code-file PRIVATE-FILE --label NEW-LABEL` on the new device. This active own-agent approval replaces email proof. Never ask a circle owner to issue another user’s global login. If no own agent works, use verified-email recovery.

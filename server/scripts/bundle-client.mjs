@@ -90,8 +90,8 @@ function readManifest(path) {
 function checkPin(m) {
   const errs = [];
   for (const field of ['version', 'skill_version']) {
-    if (!/^\d+\.\d+\.\d+$/.test(m[field] ?? '') || Number(m[field].split('.')[0]) < 2) {
-      errs.push(`pin ${field} must be protocol-2 compatible (2.0.0 or later); release the CLI and skill before deploying this server`);
+    if (!/^\d+\.\d+\.\d+$/.test(m[field] ?? '') || (Number(m[field].split('.')[0]) < 2 || (Number(m[field].split('.')[0]) === 2 && Number(m[field].split('.')[1]) < 2))) {
+      errs.push(`pin ${field} must be protocol-2 compatible (2.2.0 or later); release the CLI and skill before deploying this server`);
     }
   }
   if (!/^\d+\.\d+\.\d+$/.test(m.version ?? '')) {

@@ -2,9 +2,11 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location('deploy_hub', Path(__file__).resolve().parents[1] / 'deploy_hub.py')
 hub = importlib.util.module_from_spec(SPEC)
@@ -51,6 +53,9 @@ class Cloud:
 
 class ProvisioningTests(unittest.TestCase):
     def setUp(self):
+        self.email_env=mock.patch.dict(os.environ,{'EMAIL_API_TOKEN':'test-email-key','EMAIL_FROM':'Muse <muse@example.test>'})
+        self.email_env.start()
+        self.addCleanup(self.email_env.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name) / 'deployment'
@@ -79,12 +84,12 @@ class ProvisioningTests(unittest.TestCase):
 
     def response(self, url, payload=None, secret=None):
         if url.endswith('/v2/health'):
-            return {'ok': True, 'api_versions': ['v2'], 'encryption_required': True}
+            return {'ok': True, 'api_versions': ['v2'], 'encryption_required': True, 'enrollment_resume': True, 'identity_protocol': 1, 'discovery_protocol': 1}
         if url.endswith('/v2/client/latest'):
             origin = url.removesuffix('/v2/client/latest')
-            return {'version': '2.0.0', 'sha256': 'a' * 64,
+            return {'version': '2.2.0', 'sha256': 'a' * 64,
                     'download_url': origin + '/v2/client/download/hub',
-                    'skill': {'version': '2.0.0', 'sha256': 'b' * 64,
+                    'skill': {'version': '2.2.0', 'sha256': 'b' * 64,
                               'url': origin + '/v2/client/download/skill.tar.gz'}}
         self.assertTrue(secret)
         return {'provisioning_code': 'fhp_private_receipt', 'member': {'family_id': 'circle'}}
@@ -108,7 +113,8 @@ class ProvisioningTests(unittest.TestCase):
         self.assertNotEqual(first_secrets, self.api.created_secrets[0])
         for file in self.directory.iterdir():
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(len(self.api.created_secrets[0]), 3)
+        self.assertEqual(len(self.api.created_secrets[0]), 4)
+        self.assertEqual(self.api.created_secrets[0]['EMAIL_API_TOKEN'],'test-email-key')
 
     def test_retry_after_lost_database_create_reply_reuses_database(self):
         self.api.fail_db_reply = True
@@ -212,15 +218,15 @@ class ProvisioningTests(unittest.TestCase):
             {'type': 'plain_text', 'name': 'OPERATOR_SETTING', 'text': 'keep-me'})
         for binding in self.api.workers['my-hub']['bindings']:
             if binding['name'] == 'MIN_CLI_VERSION':
-                binding['text'] = '2.1.0'
+                binding['text'] = '2.2.0'
         self.run_provision()
         self.assertEqual(self.configs[-1]['vars']['OPERATOR_SETTING'], 'keep-me')
-        self.assertEqual(self.configs[-1]['vars']['MIN_CLI_VERSION'], '2.1.0')
+        self.assertEqual(self.configs[-1]['vars']['MIN_CLI_VERSION'], '2.2.0')
 
     def test_invalid_manifest_stops_before_bootstrap(self):
         def response(url, payload=None, secret=None):
             if url.endswith('/v2/client/latest'):
-                return {'version': '2.0.0', 'sha256': 'wrong'}
+                return {'version': '2.2.0', 'sha256': 'wrong'}
             return self.response(url, payload, secret)
         with self.assertRaisesRegex(hub.DeployError, 'manifest'):
             self.run_provision(bootstrap={'name': 'Family'}, hub_request=response)

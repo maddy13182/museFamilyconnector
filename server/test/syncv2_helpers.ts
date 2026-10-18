@@ -83,7 +83,7 @@ export async function addAgent(
   withKey: boolean,
 ): Promise<Party> {
   const m = await app.call('POST', '/v2/provisioning-codes', {
-    token: minterToken,
+    token: app.credentials.get(memberId) ?? minterToken,
     body: { member_id: memberId, agent_label: label },
   });
   assert.equal(m.status, 201);

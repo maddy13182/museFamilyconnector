@@ -20,7 +20,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / 'server'
-SECRET_NAMES = ('TOKEN_PEPPER', 'READ_RECEIPT_SECRET', 'BOOTSTRAP_SECRET')
+GENERATED_SECRET_NAMES = ('TOKEN_PEPPER', 'READ_RECEIPT_SECRET', 'BOOTSTRAP_SECRET')
+SECRET_NAMES = GENERATED_SECRET_NAMES + ('EMAIL_API_TOKEN',)
 
 
 class DeployError(Exception):
@@ -126,7 +127,7 @@ def check_worker(settings, state):
     marker_ok = marker == state['deployment_id'] or (state.get('adoption_pending') and marker == state.get('previous_marker'))
     if not marker_ok or db != state['database_id']:
         raise DeployError('Worker ownership or DB binding differs from local state. Refusing to overwrite it.')
-    required = SECRET_NAMES[:2] if state.get('existing') else SECRET_NAMES
+    required = GENERATED_SECRET_NAMES[:2] + ('EMAIL_API_TOKEN',) if state.get('existing') else SECRET_NAMES
     if not all(found.get(name, {}).get('type') == 'secret_text' for name in required):
         raise DeployError('Existing Worker is missing required secrets. Restore them; deployment never rotates them automatically.')
 
@@ -178,6 +179,9 @@ def provision(account, name, api, directory, existing=False, bootstrap=None,
               runner=wrangler, build=None, hub_request=get_json, report=print):
     if existing and bootstrap is not None:
         raise DeployError('Bootstrap cannot be combined with --existing updates.')
+    if not existing and not (directory / 'secrets.json').exists():
+        if not os.environ.get('EMAIL_API_TOKEN') or not os.environ.get('EMAIL_FROM'):
+            raise DeployError('Set EMAIL_API_TOKEN (Resend API key) and EMAIL_FROM (verified sender) before first deployment. Email ownership verification is required for registration.')
     state_path = directory / 'state.json'
     template = tomllib.loads((SERVER / 'wrangler.toml').read_text())
     # Build and verify signed client artifacts before making remote changes.
@@ -197,7 +201,7 @@ def provision(account, name, api, directory, existing=False, bootstrap=None,
             raise DeployError('--existing requires an existing Worker; nothing was created.')
         found = bindings(remote)
         db_id = found.get('DB', {}).get('id')
-        if not db_id or not all(found.get(key, {}).get('type') == 'secret_text' for key in SECRET_NAMES[:2]):
+        if not db_id or not found.get('EMAIL_FROM', {}).get('text') or not all(found.get(key, {}).get('type') == 'secret_text' for key in GENERATED_SECRET_NAMES[:2] + ('EMAIL_API_TOKEN',)):
             raise DeployError('Existing Worker must have a DB binding and both required secrets.')
         db = api.call('GET', '/d1/database/' + db_id)
         state = {'account_id': account, 'worker_name': name, 'database_name': db['name'],
@@ -211,7 +215,7 @@ def provision(account, name, api, directory, existing=False, bootstrap=None,
         if remote or list(api.databases(name + '-db')):
             raise DeployError('That Worker or database name already exists. Choose another name, or use --existing for an explicitly intended update.')
         state = {'account_id': account, 'worker_name': name, 'database_name': name + '-db',
-                 'deployment_id': uuid.uuid4().hex}
+                 'deployment_id': uuid.uuid4().hex, 'extra_vars': {'EMAIL_FROM': os.environ['EMAIL_FROM']}}
         # Durable intent precedes database creation: lost replies resume by name.
         private_json(state_path, state)
     if not state.get('database_id'):
@@ -237,7 +241,8 @@ def provision(account, name, api, directory, existing=False, bootstrap=None,
         if secret_path.exists():
             values = json.loads(secret_path.read_text())
         else:
-            values = {key: secrets.token_hex(32) for key in SECRET_NAMES}
+            values = {key: secrets.token_hex(32) for key in GENERATED_SECRET_NAMES}
+            values['EMAIL_API_TOKEN'] = os.environ['EMAIL_API_TOKEN']
             private_json(secret_path, values)
     report('Deployment identity and database binding resolved.')
     # Create the account's workers.dev namespace only if not already configured.
@@ -263,10 +268,12 @@ def provision(account, name, api, directory, existing=False, bootstrap=None,
     report('Worker and secrets deployed together with public setup locked.')
     health = hub_request(state['url'] + '/v2/health')
     manifest = hub_request(state['url'] + '/v2/client/latest')
-    if not health.get('ok') or health.get('api_versions') != ['v2'] or not health.get('encryption_required'):
+    if not health.get('ok') or health.get('api_versions') != ['v2'] or not health.get('encryption_required') or not health.get('enrollment_resume') or health.get('identity_protocol') != 1 or health.get('discovery_protocol') != 1:
         raise DeployError('Deployed hub failed protocol/encryption health verification.')
     skill = manifest.get('skill') or {}
-    version_ok = lambda value: bool(re.fullmatch(r'2\.\d+\.\d+', str(value)))
+    def version_ok(value):
+        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', str(value))
+        return bool(match and tuple(map(int, match.groups())) >= (2, 2, 0))
     hash_ok = lambda value: bool(re.fullmatch(r'[a-f0-9]{64}', str(value)))
     if not (hash_ok(manifest.get('sha256')) and hash_ok(skill.get('sha256'))
             and version_ok(manifest.get('version')) and version_ok(skill.get('version'))

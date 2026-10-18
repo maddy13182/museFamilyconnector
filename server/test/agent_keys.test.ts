@@ -132,7 +132,7 @@ test('fresh DB from the full migration chain carries the E2EE schema', async () 
     'created_at',
     'revoked_at',
     'last_used_at',
-    'issued_by_token_id',
+    'agent_id',
   ]);
 });
 
@@ -173,6 +173,8 @@ test('malformed agent_public_key is rejected 400 and does NOT burn the code', as
   ];
   let n = 0;
   for (const [label, key] of bad) {
+    // Separate simulated email-delivery windows; this test targets key validation.
+    await app.db.queryAll("UPDATE email_challenges SET created_at='2000-01-01T00:00:00Z'");
     n += 1;
     // Distinct client IP per sub-case: the redeem endpoint is rate-limited
     // (10/10min per IP) and the harness shares one IP otherwise.
@@ -232,7 +234,7 @@ test('key directory: same-circle keys visible, cross-circle invisible', async ()
   assert.equal(dirA.body.keys[0].member_id, a.owner.memberId);
   assert.deepEqual(
     Object.keys(dirA.body.keys[0]).sort(),
-    ['agent_label', 'created_at', 'member_id', 'public_key'],
+    ['agent_id', 'agent_label', 'created_at', 'member_id', 'public_key'],
   );
   // member_id filter for the other circle's member -> empty, not 403
   // (membership in the circle is the rule; the member simply isn't there).
@@ -346,7 +348,7 @@ test('second redeem for the same agent label with a key is rejected 409', async 
     { body: { agent_public_key: b64(32) } },
   );
   assert.equal(red2.status, 409);
-  assert.equal(red2.body.error.code, 'agent_key_exists');
+  assert.equal(red2.body.error.code, 'agent_exists');
   // The second code must NOT have been consumed.
   const retry = await app.call(
     'POST',

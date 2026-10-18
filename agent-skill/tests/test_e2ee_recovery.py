@@ -116,7 +116,7 @@ class RecoveryFakeHub:
         query = urlparse.parse_qs(parts.query)
         method = method.upper()
 
-        # The fake models a current (1.0.0) server: auto-answer the
+        # The fake models a current-release server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
         if method == "GET" and path == "/v2/health":
@@ -129,7 +129,7 @@ class RecoveryFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
+                {"ok": True, "version": hub.VERSION, "api_versions": ["v2"]}
             )
 
         self._record(method, url, headers, body_bytes)
@@ -504,8 +504,9 @@ class TestRecoverRung3(E2eeRecoveryTestBase):
         self.assertEqual(rc, 3, "stdout: %s\nstderr: %s" % (out, err))
         self.assertIn("[rung 3/3]", err)
         self.assertIn("provisioning code", err)
-        self.assertIn("hub setup", err)
-        self.assertIn("POST https://hub.example/v2/provisioning-codes", err)
+        self.assertIn("hub agent-invite", err)
+        self.assertIn("--recover-email YOUR-EMAIL", err)
+        self.assertIn("does not restore historical topic keys", err)
         self.assertIn("[rung 2/3] SKIPPED", err)
 
     def test_rung3_identity_only_without_topic(self):

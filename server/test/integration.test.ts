@@ -108,7 +108,7 @@ test('2. invite parent + kid; parent cannot invite an owner; invite reuse denied
     { body: { display_name: 'Again', agent_label: 'x' , agent_public_key: b64(32) } },
   );
   assert.equal(reuse.status, 409);
-  assert.equal(reuse.body.error.code, 'invite_used');
+  assert.equal(reuse.body.error.code, 'enrollment_conflict');
 });
 
 test('3. parents_only topic: kid gets 403 on read/history/post; invisible in list', async () => {
@@ -312,19 +312,8 @@ test('9. Plaintext PII posts rejected before storage', async () => {
 
 test('11. cross-family access denied everywhere', async () => {
   const { app, famB } = ctx;
-  // Mint a raw token for family B's member directly (provisioning code already used).
-  const bMember = (await app.db.queryOne(`SELECT id FROM members WHERE family_id=?`, [famB]))!['id'] as string;
-  const rawB = 'fh_' + 'b'.repeat(43);
-  const { sha256hex } = await import('../src/auth.js');
-  const pepper = app.env.TOKEN_PEPPER;
-  await app.db.execAtomically([
-    {
-      sql: `INSERT INTO agent_tokens(token_hash, token_id, member_id, agent_label, created_at, revoked_at, last_used_at)
-            VALUES (?,?,?,'b-agent',?,NULL,NULL)`,
-      params: [await sha256hex(pepper + rawB), 'tok-b-1', bMember, new Date().toISOString()],
-    },
-  ]);
-
+  const bMember=(await app.db.queryOne('SELECT id FROM members WHERE family_id=?',[famB]))!['id'] as string;
+  const rawB=app.credentials.get(bMember)!;
   const r1 = await app.call('GET', `/v2/topics/${ctx.parentTopic}`, { token: rawB });
   assert.equal(r1.status, 404); // family-scoped lookup: not found, not 403
   const r2 = await app.call('POST', `/v2/topics/${ctx.parentTopic}/entries`, {
