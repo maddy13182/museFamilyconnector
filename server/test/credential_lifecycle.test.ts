@@ -1,17 +1,9 @@
 import { b64 } from './syncv2_helpers.js';
-// Phase B credential-lifecycle tests (audit findings F01, F04, F05, F17).
-//
-// Covers: the mint caller/target role matrix (F01) incl. the parent-can-never-
-// touch-owner rule for mint and revoke; rotate-then-immediate-revoke
-// overwriting rotation grace plus the retired-credential rotation denial
-// (F04); single-winner concurrent redeem / invite-accept via atomic
-// conditional consume (F05); and the revoke cascade to pending provisioning
-// codes and one-level descendant tokens (F17).
+// Credential revocation and invitation concurrency.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeClientApp as makeApp } from './fixture-client.js';
 import type { TestClientApp as TestApp } from './fixture-client.js';
-import { credentialHash } from '../src/auth.js';
 
 interface Party {
   token: string;
@@ -53,7 +45,7 @@ async function setupRoles(): Promise<{
     const acc = await app.call(
       'POST',
       `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-      { body: { display_name: name, agent_label: `${role}-agent` , agent_public_key: b64(32) } },
+      { body: { display_name: name, agent_label: `${role}-agent`, agent_public_key: b64(32) } },
     );
     assert.equal(acc.status, 201);
     return {
@@ -71,80 +63,27 @@ async function meStatus(app: TestApp, token: string): Promise<number> {
   return (await app.call('GET', '/v2/me', { token })).status;
 }
 
-test('F01: mint matrix — only the user can authorize another agent', async () => {
+test('circle roles do not grant control of another user server credential', async () => {
   const { app, owner, parent, kid } = await setupRoles();
-  const parties: Record<string, Party> = { owner, parent, kid };
-  const members: Record<string, string> = {
-    owner: owner.memberId,
-    parent: parent.memberId,
-    kid: kid.memberId,
-  };
-  for (const [callerRole, caller] of Object.entries(parties)) {
-    for (const [targetRole, targetMemberId] of Object.entries(members)) {
-      const self = targetMemberId === caller.memberId;
-      const res = await app.call('POST', '/v2/provisioning-codes', {
-        token: caller.token,
-        body: { member_id: targetMemberId, agent_label: 'matrix-agent' },
-      });
-      const allowed = self;
-      assert.equal(
-        res.status,
-        allowed ? 201 : 403,
-        `${callerRole} -> ${self ? 'self' : targetRole}: expected ${allowed ? 201 : 403}, got ${res.status}`,
-      );
-      if (!allowed) assert.equal(res.body.error.code, 'forbidden');
-    }
+  for (const [caller, target] of [
+    [parent, owner],
+    [kid, owner],
+    [owner, parent],
+  ]) {
+    const denied = await app.call('POST', '/v2/auth/revoke', {
+      token: caller.token,
+      body: { token_id: target.tokenId },
+    });
+    assert.equal(denied.status, 404);
+    assert.equal(await meStatus(app, target.token), 200);
   }
-});
-
-test('circle roles do not grant control of another user server credential',async()=>{
- const {app,owner,parent,kid}=await setupRoles();
- for(const [caller,target] of [[parent,owner],[kid,owner],[owner,parent]]) {
-   const denied=await app.call('POST','/v2/auth/revoke',{token:caller.token,body:{token_id:target.tokenId}});
-   assert.equal(denied.status,404);assert.equal(await meStatus(app,target.token),200);
- }
- const revoked=await app.call('POST','/v2/auth/revoke',{token:parent.token,body:{token_id:parent.tokenId}});
- assert.equal(revoked.status,200);assert.equal(await meStatus(app,parent.token),401);assert.equal(await meStatus(app,owner.token),200);
-});
-
-
-test('F05: concurrent redeem of one code mints exactly one token', async () => {
-  const { app, owner } = await setupRoles();
-  const mint = await app.call('POST', '/v2/provisioning-codes', {
-    token: owner.token,
-    body: { member_id: owner.memberId, agent_label: 'race-agent' },
+  const revoked = await app.call('POST', '/v2/auth/revoke', {
+    token: parent.token,
+    body: { token_id: parent.tokenId },
   });
-  assert.equal(mint.status, 201);
-  const path = `/v2/provisioning-codes/${encodeURIComponent(mint.body.provisioning_code)}/redeem`;
-
-  const before = (
-    await app.db.queryAll(`SELECT token_id FROM agent_tokens WHERE member_id = ?`, [owner.memberId])
-  ).length;
-  const publicKey = b64(32);
-  const [r1, r2] = await Promise.all([
-    app.call('POST', path, { body: { agent_public_key: publicKey } }),
-    app.call('POST', path, { body: { agent_public_key: publicKey } }),
-  ]);
-  const statuses = [r1.status, r2.status].sort();
-  assert.deepEqual(statuses, [201, 409]);
-
-  const winner = r1.status === 201 ? r1 : r2;
-  const loser = r1.status === 201 ? r2 : r1;
-  assert.equal(loser.body.error.code, 'enrollment_conflict');
-  assert.equal(loser.body.token, undefined);
-
-  // exactly one new token, and the code row records the winner
-  const after = await app.db.queryAll(`SELECT token_id FROM agent_tokens WHERE member_id = ?`, [
-    owner.memberId,
-  ]);
-  assert.equal(after.length, before + 1);
-  assert.ok(after.some((r) => r['token_id'] === winner.body.token_id));
-  const codeHash = await credentialHash(app.env.TOKEN_PEPPER, mint.body.provisioning_code as string);
-  const pc = await app.db.queryOne(`SELECT redeemed_token_id, used_at FROM provisioning_codes WHERE code_hash = ?`, [
-    codeHash,
-  ]);
-  assert.equal(pc!['redeemed_token_id'], winner.body.token_id);
-  assert.ok(pc!['used_at']);
+  assert.equal(revoked.status, 200);
+  assert.equal(await meStatus(app, parent.token), 401);
+  assert.equal(await meStatus(app, owner.token), 200);
 });
 
 test('F05: concurrent accept of one invite creates exactly one member', async () => {
@@ -157,8 +96,12 @@ test('F05: concurrent accept of one invite creates exactly one member', async ()
   const path = `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`;
 
   const [r1, r2] = await Promise.all([
-    app.call('POST', path, { body: { display_name: 'R1', agent_label: 'r1' , agent_public_key: b64(32) } }),
-    app.call('POST', path, { body: { display_name: 'R2', agent_label: 'r2' , agent_public_key: b64(32) } }),
+    app.call('POST', path, {
+      body: { display_name: 'R1', agent_label: 'r1', agent_public_key: b64(32) },
+    }),
+    app.call('POST', path, {
+      body: { display_name: 'R2', agent_label: 'r2', agent_public_key: b64(32) },
+    }),
   ]);
   const statuses = [r1.status, r2.status].sort();
   assert.deepEqual(statuses, [201, 409]);
@@ -177,121 +120,17 @@ test('F05: concurrent accept of one invite creates exactly one member', async ()
   assert.equal(tokens.length, 1);
 });
 
-test('F17: revoking a token expires its pending provisioning codes', async () => {
-  const { app, owner, parent } = await setupRoles();
-
-  // code minted under the owner's token, for the parent member
-  const mint = await app.call('POST', '/v2/provisioning-codes', {
-    token: owner.token,
-    body: { member_id: owner.memberId, agent_label: 'doomed-agent' },
+test('bootstrap registration has one winner for different concurrent candidates', async () => {
+  const app = makeApp();
+  const fam = await app.call('POST', '/v2/families', {
+    body: { name: 'Race', owner_name: 'Owner', owner_email: 'owner@race.test' },
   });
-  assert.equal(mint.status, 201);
-  const codeHash = await credentialHash(app.env.TOKEN_PEPPER, mint.body.provisioning_code as string);
-  const pcRow = await app.db.queryOne(
-    `SELECT issued_by_token_id FROM provisioning_codes WHERE code_hash = ?`,
-    [codeHash],
-  );
-  assert.equal(pcRow!['issued_by_token_id'], owner.tokenId);
-
-  // control: code minted under the parent's own (live) token
-  const control = await app.call('POST', '/v2/provisioning-codes', {
-    token: parent.token,
-    body: { member_id: parent.memberId, agent_label: 'control-agent' },
-  });
-  assert.equal(control.status, 201);
-
-  // revoke the owner's token (self-revoke)
-  const rev = await app.call('POST', '/v2/auth/revoke', {
-    token: owner.token,
-    body: { token_id: owner.tokenId },
-  });
-  assert.equal(rev.status, 200);
-
-  // the pending code dies with the issuing token: redeem now reports expired
-  const dead = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(mint.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: b64(32) } },
-  );
-  assert.equal(dead.status, 410);
-  assert.equal(dead.body.error.code, 'code_expired');
-
-  // the control code, issued under a live token, still redeems
-  const live = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(control.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: b64(32) } },
-  );
-  assert.equal(live.status, 201);
-});
-
-test('revoking one agent credential preserves independent agents of the same user',async()=>{
- const {app,owner}=await setupRoles();
- const mint=await app.call('POST','/v2/provisioning-codes',{token:owner.token,body:{member_id:owner.memberId,agent_label:'second'}});
- const second=await app.call('POST',`/v2/provisioning-codes/${mint.body.provisioning_code}/redeem`,{body:{agent_public_key:b64(32)}});
- assert.equal(second.status,201);
- const revoked=await app.call('POST','/v2/auth/revoke',{token:owner.token,body:{token_id:owner.tokenId}});
- assert.equal(revoked.status,200);assert.equal(await meStatus(app,owner.token),401);assert.equal(await meStatus(app,second.body.token),200);
-});
-
-
-test('N01: transfer removes circle access for every agent without revoking their server credentials', async () => {
-  const { app, famId, owner, parent } = await setupRoles();
-
-  // The owner holds TWO agent tokens (two agents, e.g. phone + server).
-  const mint2 = await app.call('POST', '/v2/provisioning-codes', {
-    token: owner.token,
-    body: { member_id: owner.memberId, agent_label: 'owner-second-agent' },
-  });
-  assert.equal(mint2.status, 201);
-  const red2 = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(mint2.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: b64(32) } },
-  );
-  assert.equal(red2.status, 201);
-  const ownerToken2 = red2.body.token as string;
-  assert.equal(await meStatus(app, ownerToken2), 200, 'second owner agent works pre-transfer');
-
-  // Offer ownership to the parent; the recipient accepts (on_complete=remove).
-  const offer = await app.call('POST', `/v2/families/${famId}/transfer`, {
-    token: owner.token,
-    body: { to_member_id: parent.memberId },
-  });
-  assert.equal(offer.status, 201);
-  const acc = await app.call('POST', `/v2/families/${famId}/transfer/accept`, {
-    token: parent.token,
-  });
-  assert.equal(acc.status, 200);
-
-  // Atomicity: exactly one owner (the recipient), never zero, never two.
-  const owners = await app.db.queryAll(
-    `SELECT id FROM members WHERE family_id = ? AND role = 'owner'`,
-    [famId],
-  );
-  assert.equal(owners.length, 1);
-  assert.equal(owners[0]['id'], parent.memberId);
-
-  // EVERY credential of the removed owner is dead — both agents, same commit.
-  assert.equal(await meStatus(app, owner.token),200);
-  assert.equal((await app.call('GET','/v2/members',{token:owner.token})).status,403);
-  assert.equal(await meStatus(app, ownerToken2),200);
-  assert.equal((await app.call('GET','/v2/members',{token:ownerToken2})).status,403);
-  const rows = await app.db.queryAll(
-    `SELECT revoked_at FROM agent_tokens WHERE member_id = ?`,
-    [owner.memberId],
-  );
-  assert.ok(rows.length >= 2);
-  assert.ok(rows.every((r)=>r['revoked_at']===null),'other server access is preserved');
-
-  // The recipient's pre-existing credential keeps working and now carries
-  // owner powers (can mint for others).
-  assert.equal(await meStatus(app, parent.token), 200, 'recipient token survives the commit');
-  const me = await app.call('GET', '/v2/me', { token: parent.token });
-  assert.equal(me.body.role, 'owner');
-  const mint = await app.call('POST', '/v2/provisioning-codes', {
-    token: parent.token,
-    body: { member_id: parent.memberId, agent_label: 'post-transfer-agent' },
-  });
-  assert.equal(mint.status, 201, 'new owner can mint');
+  const path = '/v2/provisioning-codes/' + fam.body.provisioning_code + '/redeem';
+  const [one, two] = await Promise.all([
+    app.call('POST', path, { body: { agent_public_key: b64(32) } }),
+    app.call('POST', path, { body: { agent_public_key: b64(32) } }),
+  ]);
+  assert.deepEqual([one.status, two.status].sort(), [201, 409]);
+  assert.equal((await app.db.queryOne('SELECT count(*) n FROM agents'))?.n, 1);
+  assert.equal((await app.db.queryOne('SELECT count(*) n FROM agent_tokens'))?.n, 1);
 });

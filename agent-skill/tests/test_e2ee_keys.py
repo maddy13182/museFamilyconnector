@@ -60,8 +60,7 @@ class FakeHub:
 
     def __call__(self, method, url, headers, body_bytes):
         path = urlparse.urlparse(url).path
-        if method.upper()=="POST" and path=="/v2/identity/challenges" and ("POST",path) not in self.routes:
-            return 202,json.dumps({"challenge_id":"test-mail-challenge","expires_at":"2099-01-01T00:00:00Z"})
+
 
         if (
             method.upper() == "GET"
@@ -113,7 +112,7 @@ class FakeHub:
 @contextlib.contextmanager
 def captured():
     out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.object(hub,"_read_email_verification_code",return_value="test-mail-proof"):
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         yield out, err
 
 
@@ -141,7 +140,9 @@ class E2EETestBase(unittest.TestCase):
         hub.clear_secrets()
 
     def run_cli(self, argv):
-        with captured() as (out, err), mock.patch.object(hub,"_read_email_verification_code",return_value="test-mail-proof"):
+        if "setup" in argv and "--email" not in argv:
+            argv=list(argv)+["--email","tester@example.test"]
+        with captured() as (out, err):
             rc = hub.main(argv, transport=self.fake)
         return rc, out.getvalue(), err.getvalue()
 

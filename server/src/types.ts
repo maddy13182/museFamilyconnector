@@ -35,11 +35,6 @@ export interface Env {
   /** Minimum CLI version allowed by the client version gate (B1).
    *  Absent/"0.0.0" = gate off. */
   MIN_CLI_VERSION?: string;
-  /** Resend delivery credentials; configured by the operator, never generated. */
-  EMAIL_API_TOKEN?: string;
-  EMAIL_FROM?: string;
-  /** Dependency injection for delivery tests; not populated from HTTP input. */
-  EMAIL_DELIVERY?: (email: string, code: string, challengeId: string) => Promise<void>;
 }
 
 /** HTTP error with a machine-readable code. Serialized as

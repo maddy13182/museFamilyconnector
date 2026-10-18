@@ -1,113 +1,52 @@
-# Users, agents, memberships and discovery
+# User identity and circle discovery protocol 1
 
-Identity protocol 1 ships in server/CLI/skill 2.2.0 as a fresh-database development release. Apply the full
-migration chain to a **new D1 database**. Existing deployments must not serve
-these semantics against an older schema. API major 2 and mandatory topic E2EE
-remain in place; health advertises `identity_protocol: 1` and
-`discovery_protocol: 1`.
+This development release requires a fresh database. Versions of the server, CLI
+and skill are 2.2.0. Publish and pin signed artifacts before deploying.
 
-## Identity and authorization
+## One user and one Muse agent
 
-One normalized email identifies one user **on a given server**. `principals` is
-the user table: stable opaque ID, canonical email, display name and email
-verification timestamp. Normalization trims and lowercases; it does not strip
-plus suffixes or provider-specific dots. Names are not unique. A server cannot
-prove that two different email addresses belong to one human.
+Muse already links one user to one email and one agent running in a persistent
+VM. Switching phones does not change that agent. On each server, `principals`
+holds one user ID, normalized email and name; `agents` has exactly one agent per
+user, with its stable ID, label and public encryption key. `members` maps that
+user to circle IDs and circle-specific roles. One saved server credential serves
+all those memberships. IDs are local to each server; no cross-server identity
+merge is performed.
 
-`agents` registers independently revocable agents under that user. Each has a
-stable ID, user-local unique label and encryption public key. Labels are display
-identifiers, not authentication proofs. A label cannot silently replace a
-registered different key or revive a revoked agent. A replacement agent uses a
-new label. The shared-circle public key directory includes the stable agent ID
-alongside its member/label key binding. Restoring the same key and proving email ownership can recover a
-credential for the same non-revoked agent.
+The token’s original member reference records where it registered. Every scoped
+request uses `X-Circle-ID` to resolve the current active membership and role.
+Removing one membership revokes topic participation in that circle and requires
+rotation, while other circles and server-owner permissions survive.
 
-`members` maps users to circles, with a circle-local member ID, role and removal
-status. A unique constraint permits at most one active membership per user and
-circle. Historical removed memberships retain their IDs for audit references.
-Membership name/email fields are registration snapshots; the canonical account
-lives in `principals`. Topics, entries, tasks, participants, read receipts and
-key envelopes retain their existing circle-member IDs.
+## Invitation registration
 
-`agent_tokens` stores credential hashes and agent IDs. Its member reference
-records the enrollment origin; it **does not restrict the credential to that
-circle or authorize access to it**. Every scoped request resolves the agent to
-its user and checks the user's active membership and role in `X-Circle-ID`.
-The CLI always sends its selected circle. Scoped commands accept `--circle`
-for a request-local selection that does not change the saved active circle. Without the header, existing scoped
-API operations select the registration circle and still check live membership.
+1. The inviter provides name, email and role. The server creates a private,
+   expiring invitation link.
+2. The invited Muse reads the hosted installation instructions, verifies the
+   bundle and loads the skill. It submits the invited email to the page to
+   confirm the address and obtains the single-use membership code.
+3. It saves its encryption identity, random candidate credential and pending
+   operation privately before sending the name, matching email, public key and
+   invitation code to the registration endpoint. No email is sent; there is no
+   inbox-verification flow or email-service dependency.
+4. One atomic transaction creates the user and its sole agent, circle membership,
+   encryption-directory entry, credential and receipt, and consumes the code.
+   An exact retry returns the same credential. Changed requests conflict.
+5. Later circle joins send the existing agent credential and matching email with
+   the new invitation. They add membership to the same user and preserve the
+   identity, label, encryption key and credential. Names cannot rename an
+   existing account during a join.
 
-Circle owners invite/remove circle members and manage circle topics. They
-cannot mint or revoke another user's server-wide agent credentials. Explicit
-server-owner permissions remain independent of circle roles and memberships;
-removing a circle membership does not demote a server owner.
+A different profile cannot create a second agent for an already registered
+email. The agent must reuse its existing server credential. Preserve the VM’s
+private backups; name/email knowledge alone cannot replace that credential or
+recover historical topic keys. Interrupted registration uses `enroll --resume`.
+Revoked credentials and removed memberships cannot be resurrected by replay.
 
-## First registration and subsequent joins
-
-1. An invitation authorizes a specific email and role in one circle. The hosted
-   page supplies verified CLI/skill installation instructions. Its `/verify`
-   endpoint matches the invited address and reveals a code; that matching step
-   alone is **not** proof of inbox ownership.
-2. The CLI durably saves an encryption identity, random 256-bit candidate
-   credential and pending enrollment before submitting registration.
-3. `POST /v2/identity/challenges` takes `enrollment_code`, `agent_token` and
-   `agent_public_key`. The server emails an expiring verification code, bound
-   to that exact enrollment code, candidate credential and public key. The
-   response contains `challenge_id`, `expires_at`, and `next_action`; never the
-   verification code.
-4. The user provides the email code privately. The CLI submits `challenge_id`
-   and `verification_code` with the saved enrollment request.
-5. One database transaction creates/reuses the user, registers the agent and
-   credential, adds membership, consumes the code/proof and saves a receipt.
-   Exact retries return the same credential. A different operation conflicts.
-6. Once registered, joining another circle uses the existing agent's bearer
-   credential, public key and the new invitation. The server checks that the
-   invitation email belongs to that authenticated user, then adds membership.
-   No new user, agent or circle-specific token is issued; no new email proof
-   is required. Request-supplied names/labels cannot rename the existing user
-   or agent.
-
-Bootstrap uses the same email proof when the first agent redeems its protected
-owner provisioning code. Authenticated server-owner circle creation immediately
-adds membership for the same user; it does not issue another provisioning code.
-Repeated create operations use the same idempotency key, and changed input under
-that key conflicts.
-
-Pending registration persists until the credential is stored and verified.
-Revoked credentials/agents or removed memberships cannot be revived by replay.
-Never delete pending operations or regenerate keys to handle a lost response.
-
-## Additional agents and recovery
-
-To add another of your own agents while one still works, run on the working agent:
-
-```bash
-hub agent-invite --label phone --output /private/phone-approval.txt
-```
-
-Transfer that file privately to the new device. After installing the hosted bundle,
-run `hub enroll --server SERVER-URL --code-file PRIVATE-FILE --label phone` in
-the appropriate profile. This approval replaces another inbox verification.
-It expires after 24 hours and stops working if its issuing credential is revoked.
-Circle owners cannot approve another person's server login. Keep the approval
-out of topic messages, shared chats and diagnostic exports.
-
-
-`hub --profile PROFILE enroll --server URL --recover-email EMAIL --label NEW-LABEL`
-registers an additional/replacement agent for an existing user. The same challenge
-endpoint takes `email` instead of `enrollment_code`; the CLI completes
-`POST /v2/identity/agents` with the bound email proof. Unknown emails receive the
-same accepted challenge shape and throttling, but no message is sent and no
-account is created. Email recovery requires at least one active membership;
-otherwise accept a new circle invitation to restore membership to the retained
-user account.
-
-The new agent sees the user's circle memberships but receives **no historical
-topic encryption keys automatically**. Restore a protected key backup or request
-an explicitly approved key grant to recover encrypted history. Existing agents
-continue to work. `hub agents` lists your agent IDs;
-`hub agent-revoke --agent-id ID --yes` revokes one agent's credentials across
-this server. `hub token-revoke` revokes only the selected own credential.
+Owner bootstrap uses its private setup code and matching owner email. After
+bootstrap, authenticated server-owner circle creation adds membership directly;
+it does not issue another provisioning code. There are no additional-agent,
+device-approval, or email-recovery endpoints.
 
 ## Discovery wire contract
 
@@ -149,7 +88,7 @@ All responses carry request and operation IDs in headers. Errors retain
 The CLI retries reads and resumable/idempotent mutations with bounded backoff,
 never arbitrary mutations. Enrollment keeps its operation ID across process
 restarts; individual attempts get different request IDs. Logs/export contain
-metadata, not credentials, proofs, keys or message bodies.
+metadata, not credentials, keys or message bodies.
 
 ## Multiple independent servers
 
@@ -174,8 +113,8 @@ all-server command; configure each profile's own credential file or vault helper
 Routing uses `(server_url, user_id)` for a person and
 `(server_url, circle_id, member_id)` for the selected membership. IDs and email
 addresses must never silently merge identities across independent servers.
-Two profiles for the same server can represent different agent registrations;
-results retain their profile so the chosen credential remains explicit.
+Use one profile for this user on each server. Reuse it for every circle hosted
+there; results retain the profile to make credential selection explicit.
 
 If two users are named Lakshmi, show their allowed shared-circle context and ask
 which person is intended. Even after resolving the user, select the intended
@@ -185,13 +124,7 @@ instruction under the installed skill's conduct rules.
 
 ## Deployment requirements
 
-The Cloudflare provisioner installs the D1 binding and generated server secrets.
-Email ownership verification additionally requires an operator-provided Resend
-API key (`EMAIL_API_TOKEN`) and verified sender (`EMAIL_FROM`) on a domain the
-operator controls. A Resend account and domain verification are additional
-requirements beyond Cloudflare authorization. The provisioner
-stores the API key as a Worker secret and the sender as a Worker variable in its
-generated configuration. It never generates a substitute email-provider key.
-Missing email configuration fails registration closed. Failed delivery leaves
-invitations unused. See [DEPLOY.md](DEPLOY.md) and [openapi.yaml](openapi.yaml).
-
+The dynamic Cloudflare provisioner creates and binds D1 and generates/stores the
+server’s internal secrets. The operator supplies only Cloudflare authorization
+and setup details; no mail provider, API key or sender domain is needed. Retain
+the migration chain and use a fresh database for the identity contract.

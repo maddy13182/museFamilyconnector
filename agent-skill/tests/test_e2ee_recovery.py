@@ -503,10 +503,9 @@ class TestRecoverRung3(E2eeRecoveryTestBase):
             rc, out, err = self.run_cli(["recover", "--topic", TOPIC_ID])
         self.assertEqual(rc, 3, "stdout: %s\nstderr: %s" % (out, err))
         self.assertIn("[rung 3/3]", err)
-        self.assertIn("provisioning code", err)
-        self.assertIn("hub agent-invite", err)
-        self.assertIn("--recover-email YOUR-EMAIL", err)
-        self.assertIn("does not restore historical topic keys", err)
+        self.assertIn("private backup", err)
+        self.assertIn("one Muse agent per user", err)
+        self.assertIn("enroll --resume", err)
         self.assertIn("[rung 2/3] SKIPPED", err)
 
     def test_rung3_identity_only_without_topic(self):

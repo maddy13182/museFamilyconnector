@@ -194,7 +194,7 @@ def emit_json(obj):
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_JSON_KEYS = frozenset({
-    "token", "agent_token", "verification_code", "enrollment_code", "provisioning_code", "provisioningCode", "onboarding_url",
+    "token", "agent_token", "enrollment_code", "provisioning_code", "provisioningCode", "onboarding_url",
 })
 
 
@@ -454,12 +454,11 @@ class HubError(Exception):
 
     def friendly(self):
         hints = {
-            "email_verification_required": "Provide the private email code with enroll --resume --verification-code-file PATH. Preserve the saved enrollment and keys.",
-            "email_not_configured": "Ask the server operator to configure verification email delivery. Your invitation has not been consumed.",
-            "email_delivery_failed": "The server could not deliver the verification email. Preserve the pending enrollment and retry later.",
             "identity_mismatch": "The invitation and authenticated profile belong to different users. Select the intended person's profile; do not replace another user's keys.",
             "agent_exists": "This label belongs to a different or revoked agent. Use a new label for a new agent; preserve the existing identity.",
             "not_a_member": "This user has no active membership for that operation. Refresh circles and select an authorized circle; a new invitation is needed to rejoin a removed circle.",
+            "invite_email_mismatch": "Use the email address that the invitation was issued for; no verification email is sent.",
+            "existing_identity": "This email already has its Muse identity on this server. Reuse that profile and saved credential; do not create another agent.",
             "enrollment_state_changed": "Authorization changed before the enrollment transaction committed. Nothing was partially registered. Preserve the pending operation and export diagnostics.",
             "enrollment_conflict": "Enrollment details conflict with an existing operation. Preserve the pending files and export diagnostics before changing anything.",
             "enrollment_identity_changed": "The saved enrollment's encryption identity changed. Preserve the keys and export diagnostics.",
@@ -745,29 +744,20 @@ def _pending_enrollment(profile):
     return os.path.join(profile_dir(profile), "pending-enrollment.json")
 
 
-def _read_email_verification_code(path):
-    if path:
-        with open(path, encoding="utf-8") as stream:
-            return stream.read().strip()
-    if not sys.stdin.isatty():
-        raise HubError("config", "Email verification required. Save the email code privately, then run enroll --resume --verification-code-file PATH.")
-    return getpass.getpass("Code from your verification email: ").strip()
-
-
-def _enrollment_call(server, transport, debug, profile, path, body, verification_code_file=None):
+def _enrollment_call(server, transport, debug, profile, path, body):
     journal = _pending_enrollment(profile)
     if os.path.exists(journal):
         with open(journal, encoding="utf-8") as stream:
             pending = json.load(stream)
-        previous = {k: v for k, v in pending["body"].items() if k not in ("agent_token", "challenge_id", "verification_code")}
+        previous = {k: v for k, v in pending["body"].items() if k != "agent_token"}
         if pending["server"] != server.rstrip("/") or pending["path"] != path or previous != body:
             raise HubError("config", "A different enrollment is pending. Run `hub enroll --resume` with this profile; preserve its identity and files.")
     else:
         cfg = load_config(profile)
         existing = None
-        if (cfg.get("user") or cfg.get("member") or cfg.get("family_id")) and path != "/v2/identity/agents":
+        if (cfg.get("user") or cfg.get("member") or cfg.get("family_id")):
             # A registered profile must authenticate joins. Missing credentials
-            # require account recovery, never a fresh identity in this profile.
+            # must be restored from backup, never replaced with another identity.
             existing, _source = load_token(cfg, profile)
         candidate = existing or "fh_" + base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
         pending = {"server": server.rstrip("/"), "path": path,
@@ -778,47 +768,14 @@ def _enrollment_call(server, transport, debug, profile, path, body, verification
     authenticated = pending.get("authenticated", False)
     client = HubClient(server, token=pending["body"]["agent_token"] if authenticated else None,
                        debug=debug, transport=transport, operation_id=pending.get("operation_id"))
-    if not authenticated and not pending.get("agent_approved"):
-        if not pending["body"].get("challenge_id"):
-            challenge_body = {"agent_token": pending["body"]["agent_token"], "agent_public_key": pending["body"]["agent_public_key"]}
-            if path == "/v2/identity/agents":
-                challenge_body["email"] = pending["body"]["email"]
-            else:
-                challenge_body["enrollment_code"] = urlparse.unquote(path.split("/")[-2])
-            try:
-                challenge = client.call("POST", "/v2/identity/challenges", auth=False, retries=0, json_body=challenge_body)
-            except HubError as exc:
-                if exc.server_code in ("invite_expired", "code_expired"):
-                    os.unlink(journal)
-                    diagnostic("enrollment_expired")
-                raise
-            if challenge.get("next_action") == "redeem_agent_approval":
-                pending["agent_approved"] = True
-                _atomic_private_json(journal, pending)
-            else:
-                pending["body"]["challenge_id"] = challenge["challenge_id"]
-                pending["challenge_expires_at"] = challenge["expires_at"]
-                _atomic_private_json(journal, pending)
-                emit_err("Verification email sent. Keep this pending enrollment; continue with enroll --resume.")
-        if not pending.get("agent_approved"):
-            if verification_code_file or not pending["body"].get("verification_code"):
-                pending["body"]["verification_code"] = _read_email_verification_code(verification_code_file)
-            note_secret(pending["body"]["verification_code"])
-            _atomic_private_json(journal, pending)
     try:
         response = client.call("POST", path, json_body=pending["body"], auth=authenticated)
     except HubError as exc:
-        if exc.server_code in ("invite_expired", "code_expired"):
+        if exc.server_code in ("invite_expired", "code_expired", "invite_email_mismatch"):
+            # These authoritative rejections happen before code consumption.
+            # Keep encryption keys; allow a corrected email or fresh invitation.
             os.unlink(journal)
-            diagnostic("enrollment_expired")
-            raise
-        expiry = pending.get("challenge_expires_at", "")
-        if (not authenticated and exc.server_code == "email_verification_required"
-                and expiry and expiry <= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())):
-            pending["body"].pop("challenge_id", None)
-            pending["body"].pop("verification_code", None)
-            _atomic_private_json(journal, pending)
-            raise HubError("config", "The email proof expired. Run enroll --resume to request a fresh proof for the same saved enrollment.")
+            diagnostic("enrollment_rejected")
         raise
     if not isinstance(response, dict) or not response.get("token") or not isinstance(response.get("member"), dict) or not response["member"].get("id") or not response["member"].get("family_id"):
         raise HubError("error", "Incomplete enrollment response; pending enrollment was preserved. Run `hub enroll --resume`.")
@@ -887,8 +844,8 @@ def cmd_diagnostics_export(args, transport):
 
 def cmd_enroll(args, transport):
     pending = None
-    if sum(bool(value) for value in (args.resume,args.code_file,args.recover_email)) > 1:
-        raise HubError("bad_request", "Choose one of --resume, --code-file, or --recover-email.")
+    if sum(bool(value) for value in (args.resume,args.code_file)) > 1:
+        raise HubError("bad_request", "Choose one of --resume or --code-file.")
     if args.resume:
         try:
             with open(_pending_enrollment(args.profile), encoding="utf-8") as stream:
@@ -899,9 +856,7 @@ def cmd_enroll(args, transport):
         code = urlparse.unquote(pending["path"].split("/")[-2])
         args.name = pending["body"].get("display_name", args.name)
         args.label = pending["body"].get("agent_label", args.label)
-        args.recover_email = pending["body"].get("email") if pending["path"] == "/v2/identity/agents" else None
-    elif args.recover_email:
-        code = "recovery:" + args.recover_email.strip().lower()
+        args.email = pending["body"].get("email", args.email)
     elif args.code_file:
         with open(args.code_file, encoding="utf-8") as stream:
             code = stream.read().strip()
@@ -916,11 +871,6 @@ def cmd_enroll(args, transport):
         raise HubError("config", "This profile belongs to another server. Choose a separate --profile before enrolling.")
     args.invite = args.code = code
     args.store = "file"
-    if args.recover_email:
-        known_email = (cfg.get("user") or {}).get("email") or (cfg.get("member") or {}).get("email")
-        if (cfg.get("user") or cfg.get("member")) and (not known_email or known_email.strip().lower() != args.recover_email.strip().lower()):
-            raise HubError("config", "This profile belongs to another or unknown user identity. Select a separate profile; do not reuse its keys for another person.")
-        return cmd_setup(args, transport)
     if cfg.get("member") or cfg.get("family_id"):
         return cmd_circle_join(args, transport)
     return cmd_setup(args, transport)
@@ -2598,17 +2548,11 @@ def _recover_pending_exit(topic_id):
 
 def _recover_rung3_instructions(cfg, profile, server, topic_id):
     """Rung 3 — no usable Bearer token: print the exact out-of-band steps."""
-    emit_err("[rung 3/3] restore your server login.")
-    emit_err("Use another of your own working agents to create a private provisioning code:")
-    emit_err("  hub agent-invite --label NEW-LABEL --output PRIVATE-FILE")
-    emit_err("Transfer that file privately to this device, then run:")
-    emit_err("  hub --profile %s enroll --server %s --code-file PRIVATE-FILE --label NEW-LABEL" % (profile, server.rstrip("/")))
-    emit_err("If none of your agents works, verify your own email instead:")
-    emit_err("  hub --profile %s enroll --server %s --recover-email YOUR-EMAIL --label NEW-LABEL" % (profile, server.rstrip("/")))
-    emit_err("Provide the email proof privately when prompted. Circle owners cannot issue another user's server login.")
-    emit_err("Preserve existing keys and backups. Restoring a login does not restore historical topic keys.")
-    emit_err("After restoring login, request an authorized key grant with:")
-    emit_err("  hub recover --topic %s" % (topic_id or "<id>"))
+    emit_err("[rung 3/3] restore this Muse VM's saved server credential and encryption keys from a private backup.")
+    emit_err("There is one Muse agent per user. Switching phones does not create another agent.")
+    emit_err("Do not create a new identity, request email verification, or delete pending enrollment files.")
+    emit_err("If enrollment was interrupted, run hub --profile %s enroll --resume." % profile)
+    emit_err("After restoring the credential, use hub recover --topic %s for missing topic keys." % (topic_id or "<id>"))
 
 
 def _is_auth_failure(exc):
@@ -3337,8 +3281,7 @@ def _resumable_enrollment_path(path):
     A successful retry returns the same registration, never another credential.
     """
     return bool(
-        path == "/v2/identity/agents"
-        or re.match(r"^/v2/provisioning-codes/.+/redeem$", path)
+        re.match(r"^/v2/provisioning-codes/.+/redeem$", path)
         or re.match(r"^/v2/invites/.+/accept$", path)
     )
 
@@ -3769,12 +3712,7 @@ def cmd_setup(args, transport):
         raise HubError("bad_request", "An invite or provisioning code is required.")
     note_secret(code)  # bearer code: keep it out of --debug URL dumps etc.
     _key_priv, _key_pub_b64, _key_is_new = _ensure_identity_keypair(profile)
-    if getattr(args, "recover_email", None):
-        display_name = ""
-        agent_label = args.label or "muse-agent"
-        accept_path = "/v2/identity/agents"
-        accept_body = {"email": args.recover_email.strip().lower(), "agent_label": agent_label, "agent_public_key": _key_pub_b64}
-    elif code.startswith("fhp_"):
+    if code.startswith("fhp_"):
         # Owner bootstrap flow: the member already exists; the provisioning
         # code mints this agent's token directly (label set at bootstrap).
         accept_path = "/v2/provisioning-codes/%s/redeem" % urlparse.quote(code, safe="")
@@ -3791,7 +3729,7 @@ def cmd_setup(args, transport):
         display_name = args.name or input("Your display name: ").strip()
         if not display_name:
             raise HubError("bad_request", "A display name is required.")
-        default_label = "%s-agent" % socket.gethostname().split(".")[0]
+        default_label = "muse-agent"
         agent_label = args.label or input(
             "Agent label [%s]: " % default_label
         ).strip() or default_label
@@ -3799,7 +3737,9 @@ def cmd_setup(args, transport):
         accept_body = {"display_name": display_name, "agent_label": agent_label,
                        "agent_public_key": _key_pub_b64}
 
-    resp = _enrollment_call(server, transport, args.debug, profile, accept_path, accept_body, getattr(args, "verification_code_file", None))
+    email = (args.email or (cfg.get("user") or cfg.get("member") or {}).get("email") or input("Your invited email: ")).strip()
+    accept_body["email"] = email
+    resp = _enrollment_call(server, transport, args.debug, profile, accept_path, accept_body)
     token = resp["token"]
     member = resp["member"]
     note_secret(token)  # from here on, the token can never appear in output
@@ -4363,12 +4303,15 @@ def cmd_invite_member(args, transport):
     if role not in ("owner", "parent", "kid"):
         raise HubError("bad_request", "--role must be one of: owner, parent, kid.")
     email = (args.email or "").strip()
+    name = (args.name or "").strip()
+    if not name:
+        raise HubError("bad_request", "Provide the invited person’s --name.")
     if not email or "@" not in email:
         raise HubError("bad_request", "A valid --email is required.")
     resp = ctx.client.call(
         "POST",
         "/v2/families/%s/invites" % urlparse.quote(family_id, safe=""),
-        json_body={"email": email, "role": role},
+        json_body={"email": email, "name": name, "role": role},
     )
     resp = resp or {"ok": True}
     emit_json(resp)
@@ -4561,8 +4504,8 @@ def cmd_token_revoke(args, transport):
     device/agent that holds it; there is no undo. Requires an explicit
     confirmation prompt (bypass with --yes only when the incident demands
     it — this is the one command where unattended use is expected to be
-    rare). If you revoke the token this CLI is currently using, re-enroll
-    the agent afterwards: every later call 401s until then.
+    rare). Revoking the active credential requires operator-assisted account
+    access; an invitation cannot replace this registered Muse identity.
     """
     ctx = _ctx(args, transport)
     token_id = (args.token_id or "").strip()
@@ -4578,8 +4521,8 @@ def cmd_token_revoke(args, transport):
             "EMERGENCY REVOCATION: this permanently revokes token %r. The "
             "token stops authenticating immediately on every device/agent "
             "that holds it; there is no undo. Use this when a token is "
-            "suspected compromised (incident runbook §3.8), then re-enroll "
-            "the affected agent.\n"
+            "suspected compromised (incident runbook §3.8), then involve "
+            "your server operator for account access.\n"
             "Type 'yes' to revoke, anything else aborts." % token_id
         )
         try:
@@ -4687,53 +4630,6 @@ def _discover(args, transport, kind):
     return 1 if errors else 0
 
 
-def cmd_agents(args, transport):
-    ctx = _ctx(args, transport)
-    return _emit_json_result(ctx.client.call("GET", "/v2/agents"))
-
-
-def cmd_agent_invite(args, transport):
-    """Approve another own agent without exposing its single-use code in output."""
-    output = os.path.abspath(args.output)
-    resolved = os.path.realpath(output)
-    root = os.path.realpath(os.path.join(config_home(), APP_DIR))
-    if os.path.commonpath([resolved, root]) == root:
-        raise HubError("config", "Store the approval outside the connector configuration directory.")
-    ctx = _ctx(args, transport)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(output, flags, 0o600)
-    except OSError as exc:
-        raise HubError("config", "Cannot create private approval file; choose a new file in an existing directory.") from exc
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            me = ctx.client.call("GET", "/v2/me")
-            member_id = me.get("id")
-            if not member_id:
-                raise HubError("config", "Select one of your active circles before approving an agent.")
-            result = ctx.client.call("POST", "/v2/provisioning-codes", json_body={"member_id": member_id, "agent_label": args.label}, retries=0)
-            code = result.get("provisioning_code")
-            if not isinstance(code, str) or not re.fullmatch(r"fhp_[A-Za-z0-9_-]+", code):
-                raise HubError("config", "Server returned an invalid agent approval.")
-            note_secret(code)
-            stream.write(code + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        os.unlink(output)
-        raise
-    emit_json({"approval_file": output, "agent_label": args.label, "expires_at": result.get("expires_at"), "next_action": "Transfer this file privately; the new agent runs enroll --code-file PRIVATE-FILE with this label."})
-    return 0
-
-
-def cmd_agent_revoke(args, transport):
-    ctx = _ctx(args, transport)
-    if not args.yes:
-        raise HubError("bad_request", "Revoking an agent disables all of its server credentials. Confirm the agent ID and pass --yes.")
-    return _emit_json_result(ctx.client.call("POST", "/v2/agents/%s/revoke" % urlparse.quote(args.agent_id, safe="")))
-
-
 def cmd_people(args, transport):
     return _discover(args, transport, "people")
 
@@ -4766,7 +4662,7 @@ def cmd_circles(args, transport):
 
 
 def _redeem_code(server, transport, debug, code, display_name="",
-                 agent_label="", profile="default", verification_code_file=None):
+                 agent_label="", profile="default", email=""):
     """Redeem a provisioning (fhp_) or invite (fhi_) code; no auth needed.
 
     Returns (token, member dict). The raw code is registered as a secret so
@@ -4789,7 +4685,8 @@ def _redeem_code(server, transport, debug, code, display_name="",
     body["agent_public_key"] = public_key
     if is_new:
         _print_recovery_phrase(_priv, profile)
-    resp = _enrollment_call(server, transport, debug, profile, path, body, verification_code_file)
+    body["email"] = email
+    resp = _enrollment_call(server, transport, debug, profile, path, body)
     if not isinstance(resp, dict) or "token" not in resp or "member" not in resp:
         raise HubError("error", "Unexpected redeem response from the server.")
     member = dict(resp["member"])
@@ -4862,7 +4759,7 @@ def cmd_circle_join(args, transport):
     token, new_member = _redeem_code(
         ctx.server, transport, args.debug, code, profile=ctx.profile,
         display_name=display_name, agent_label=agent_label,
-        verification_code_file=getattr(args, "verification_code_file", None),
+        email=args.email or (ctx.cfg.get("user") or ctx.cfg.get("member") or {}).get("email") or input("Your invited email: ").strip(),
     )
     cid = new_member.get("family_id")
     if not cid:
@@ -6366,14 +6263,13 @@ def build_parser():
     p.add_argument("--run-id", default=None, help="Optional invocation ID to include")
     p.set_defaults(func=cmd_diagnostics_export)
 
-    p = sub.add_parser("enroll", help="Join safely, preserving existing circles; resume an interrupted enrollment", description="Enroll on the inviting server with a private code file. Automatically choose setup or circle join, preserve other circles, and resume interrupted enrollment using the same private operation.", epilog="example: hub --profile hub-example enroll --server https://hub.example.com --code-file /private/invite-code --name Your-name --label muse-agent")
+    p = sub.add_parser("enroll", help="Join safely, preserving existing circles; resume an interrupted enrollment", description="Enroll on the inviting server with a private code file. Automatically choose setup or circle join, preserve other circles, and resume interrupted enrollment using the same private operation.", epilog="example: hub --profile hub-example enroll --server https://hub.example.com --code-file /private/invite-code --name Your-name --email person@example.com --label muse-agent")
     p.add_argument("--server", dest="setup_server", default=None, help="Inviting server URL")
     p.add_argument("--code-file", default=None, help="Private file containing only the invite/provisioning code; otherwise prompted")
     p.add_argument("--resume", action="store_true", help="Resume this profile's saved enrollment without another invite")
-    p.add_argument("--recover-email", help="Register a replacement/additional agent for an existing account using verified email")
     p.add_argument("--name", default=None, help="Invited person's display name")
     p.add_argument("--label", default="muse-agent", help="Generic agent label; choose another if desired")
-    p.add_argument("--verification-code-file", help="Private file containing the code delivered to your email")
+    p.add_argument("--email", default=None, help="Email address the invitation or owner setup was issued for")
     p.set_defaults(func=cmd_enroll)
 
     p = sub.add_parser(
@@ -6387,7 +6283,7 @@ def build_parser():
         "--store. Prefer enroll for invitation setup and safe resumption.",
         epilog="examples:\n"
         "  hub setup --server https://hub.example.com --invite fhi_abc123 \\\n"
-        "      --name \"Lakshmi\" --label phone-agent\n"
+        "      --name \"Lakshmi\" --email person@example.com --label muse-agent\n"
         "  hub setup   # prompts for anything not passed as flags",
     )
     p.add_argument("--server", dest="setup_server", default=None,
@@ -6402,7 +6298,7 @@ def build_parser():
         default="file",
         help="Where the credential lives (default: private local file)",
     )
-    p.add_argument("--verification-code-file", help="Private file containing the email verification code")
+    p.add_argument("--email", default=None, help="Owner or invited email address (else prompted)")
     p.set_defaults(func=_wrap_setup)
 
     p = sub.add_parser(
@@ -6742,12 +6638,12 @@ def build_parser():
         formatter_class=_RDH,
         help="E2EE: walk the recovery ladder when you have no usable topic "
              "key (local backup -> re-register + key request -> "
-             "provisioning code)",
+             "restore VM credential)",
         description="Recover from key loss, rung by rung: (1) restore the "
         "identity key from your local backup or 24-word phrase; (2) "
         "re-register a fresh keypair and post a `key-request` for a "
         "member-agent to grant after human approval; (3) out-of-band "
-        "re-enrollment instructions for a lost bearer token. NEVER create "
+        "private VM credential restoration for a lost bearer token. NEVER create "
         "a replacement topic for key-loss reasons without completing this "
         "ladder first — silent topic replacement strands history. Exit 2 "
         "means 'parked, waiting on a human' (request posted, no grant "
@@ -6803,6 +6699,7 @@ def build_parser():
     p.add_argument("--circle", default=None, metavar="NAME_OR_ID",
                    help="Circle name or id (default: active circle)")
     p.add_argument("--email", required=True, help="New member's email address")
+    p.add_argument("--name", required=True, help="Invited person’s name")
     p.add_argument("--role", required=True, choices=["owner", "parent", "kid"],
                    help="Role for the new member")
     p.set_defaults(func=cmd_invite_member)
@@ -6816,8 +6713,8 @@ def build_parser():
         "immediate and irreversible — the token stops authenticating "
         "everywhere at once. Requires an explicit confirmation prompt "
         "(bypass with --yes only when the incident demands it). If you "
-        "revoke the token this CLI is currently using, re-enroll the agent "
-        "afterwards: every later call 401s until then.",
+        "revoke the active credential, involve the server operator for account "
+        "access. An invitation cannot replace an existing Muse identity.",
         epilog="example:\n"
         "  hub token-revoke --token-id tok_abc123   # confirm at the prompt",
     )
@@ -6973,17 +6870,6 @@ def build_parser():
     p.add_argument("--circle", default=None, help="Restrict to this circle ID on the selected server; cannot be combined with --all-servers")
     p.set_defaults(func=cmd_people)
 
-    p = sub.add_parser("agents", help="List this user’s registered agents on the selected server", description="Show stable agent IDs and revocation status for your user. Circle owners cannot manage another user’s server credentials.", epilog="example: hub agents")
-    p.set_defaults(func=cmd_agents)
-    p = sub.add_parser("agent-invite", help="Approve another of your own agents", description="Save a single-use account approval to a new private file. Transfer it privately to your other device; never paste it into topic messages or logs.", epilog="example: hub agent-invite --label phone --output /private/phone-approval.txt")
-    p.add_argument("--label", required=True, help="Unique label for your new agent")
-    p.add_argument("--output", required=True, help="New private file outside the connector configuration directory")
-    p.set_defaults(func=cmd_agent_invite)
-    p = sub.add_parser("agent-revoke", help="Revoke one of your agents on this server", description="Disable every credential of the chosen agent across this server’s circles. Other agents and other users are unaffected.", epilog="example: hub agent-revoke --agent-id AGENT_ID --yes")
-    p.add_argument("--agent-id", required=True, help="Own agent ID from hub agents")
-    p.add_argument("--yes", action="store_true", help="Confirm revocation of this exact agent")
-    p.set_defaults(func=cmd_agent_revoke)
-
     p = sub.add_parser(
         "circle",
         formatter_class=_RDH,
@@ -7030,7 +6916,7 @@ def build_parser():
         "(fhp_) code. The code is prompted securely if omitted so it "
         "stays out of shell history. Reuses this profile's server credential "
         "and adds the membership. Use enroll for first registration.",
-        epilog="example:\n  hub circle join --code fhi_abc123 --label phone-agent",
+        epilog="example:\n  hub circle join --code fhi_abc123 --label muse-agent",
     )
     c.add_argument("--code", required=False, default=None,
                    help="Invite (fhi_) or provisioning (fhp_) code "
@@ -7040,7 +6926,7 @@ def build_parser():
                    help="Display name for invite codes (default: profile member name)")
     c.add_argument("--label", default=None,
                    help="Agent label for invite codes (default: profile agent label)")
-    c.add_argument("--verification-code-file", help="Private file containing the email verification code")
+    c.add_argument("--email", default=None, help="Email address the invitation or owner setup was issued for")
     c.set_defaults(func=cmd_circle_join)
 
     c = csub.add_parser(
@@ -7247,7 +7133,7 @@ def build_parser():
 
     p = sub.add_parser("key-trust", help="Approve a changed recipient encryption identity",
                        description="Use only after verifying the person's SHA256 public-key fingerprint through an independent channel.",
-                       epilog="example: hub key-trust --member MEMBER_ID --agent phone-agent --fingerprint SHA256_HEX")
+                       epilog="example: hub key-trust --member MEMBER_ID --agent muse-agent --fingerprint SHA256_HEX")
     p.add_argument("--member", required=True, help="Recipient member ID in the active circle")
     p.add_argument("--agent", required=True, help="Recipient's exact agent label")
     p.add_argument("--fingerprint", required=True, help="Independently verified SHA256 hex fingerprint")

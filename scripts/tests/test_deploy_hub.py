@@ -53,9 +53,6 @@ class Cloud:
 
 class ProvisioningTests(unittest.TestCase):
     def setUp(self):
-        self.email_env=mock.patch.dict(os.environ,{'EMAIL_API_TOKEN':'test-email-key','EMAIL_FROM':'Muse <muse@example.test>'})
-        self.email_env.start()
-        self.addCleanup(self.email_env.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name) / 'deployment'
@@ -113,8 +110,7 @@ class ProvisioningTests(unittest.TestCase):
         self.assertNotEqual(first_secrets, self.api.created_secrets[0])
         for file in self.directory.iterdir():
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(len(self.api.created_secrets[0]), 4)
-        self.assertEqual(self.api.created_secrets[0]['EMAIL_API_TOKEN'],'test-email-key')
+        self.assertEqual(len(self.api.created_secrets[0]), 3)
 
     def test_retry_after_lost_database_create_reply_reuses_database(self):
         self.api.fail_db_reply = True

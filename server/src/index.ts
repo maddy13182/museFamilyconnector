@@ -41,12 +41,6 @@ import {
   parseFh1Header,
 } from './validate.js';
 import { discoverCircles, discoverPeople } from './discovery.js';
-import {
-  issueEmailChallenge,
-  verifyEmailChallenge,
-  hasAgentApproval,
-  AGENT_APPROVAL_PREDICATE,
-} from './identity.js';
 import { d1Client } from './db.js';
 import { UI_HTML } from './ui.js';
 // Single source of truth for the server version: server/package.json.
@@ -85,11 +79,10 @@ const PROVISION_TTL_HOURS = 24;
 const INVITE_TTL_DAYS = 7;
 const TRANSFER_TTL_DAYS = 7;
 
-// Idempotency for create operations (family/topic/invite). Entries use the
-// separate idempotency_keys table; creates use create_idempotency, which also
-// remembers the provisioning code so a deduped retry can mint a fresh one
-// and revoke the orphaned token from the first attempt.
-type CreateScope = 'family' | 'topic' | 'invite' | 'ownership_transfer';
+// Circle, invitation and ownership-transfer creates use durable receipts.
+// Enrollment retries recover the original credential via enrollment_receipts;
+// they never revoke or reissue it after a lost response.
+type CreateScope = 'family' | 'invite' | 'ownership_transfer';
 
 function readIdemKey(req: Request): string | null {
   const k = req.headers.get('idempotency-key');
@@ -111,42 +104,6 @@ async function findCreateIdem(
        WHERE scope = ? AND member_id = ? AND key = ? AND expires_at > ?`,
     [scope, memberId, key, nowIso()],
   );
-}
-
-// Mint a private, single-use approval for another agent of the same user.
-// F17: issuedByTokenId records the token under whose authority the code is
-// minted (the caller's auth.token_id); NULL when no auth context exists.
-async function mintProvisioningCode(
-  db: DbClient,
-  env: Env,
-  opts: {
-    familyId: string;
-    memberId: string;
-    agentLabel: string;
-    createdBy: string;
-    issuedByTokenId?: string | null;
-  },
-): Promise<{ code: string; codeHash: string; expiresAt: string }> {
-  const code = newProvisioningCode();
-  const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
-  const expiresAt = hoursFromNow(PROVISION_TTL_HOURS);
-  await db.execAtomically([
-    {
-      sql: `INSERT INTO provisioning_codes(code_hash, family_id, member_id, agent_label, created_by, expires_at, used_at, issued_by_token_id)
-            VALUES (?,?,?,?,?,?,NULL,?)`,
-      params: [
-        codeHash,
-        opts.familyId,
-        opts.memberId,
-        opts.agentLabel,
-        opts.createdBy,
-        expiresAt,
-        opts.issuedByTokenId ?? null,
-      ],
-    },
-  ]);
-  logEvent('info', 'provisioning_code_minted', {});
-  return { code, codeHash, expiresAt };
 }
 
 // True when the DB error is a UNIQUE constraint violation (used to convert
@@ -227,7 +184,7 @@ function clientIp(req: Request): string {
 async function checkRateLimit(
   db: DbClient,
   req: Request,
-  endpoint: 'invite_accept' | 'code_redeem' | 'invite_page' | 'client_download' | 'email_challenge',
+  endpoint: 'invite_accept' | 'code_redeem' | 'invite_page' | 'client_download',
   // Per-endpoint bucket override. Credential endpoints use the tight default
   // (10/10min); public download endpoints get a generous bucket (spec §3.4).
   max: number = RATE_LIMIT_MAX,
@@ -273,7 +230,7 @@ function newId(): string {
   return crypto.randomUUID();
 }
 
-// Stable user identity. Email is unique; ownership must be proven before enrollment.
+// Stable user identity. The private invitation authorizes registration for its email.
 function newPrincipalId(): string {
   return 'pr_' + newId().replace(/-/g, '');
 }
@@ -1332,6 +1289,8 @@ async function handleCreateInvite(
   }
   const body = await readJson(req);
   const email = reqEmail(body['email']);
+  const inviteName = reqString(body['name'], 'name', 1, 120).trim();
+  if (!inviteName) throw new HttpError(400, 'bad_request', 'name must not be blank');
   const role = reqEnum(body['role'], 'role', MEMBER_ROLES);
   if (role === 'owner' && auth.role !== 'owner') {
     throw new HttpError(403, 'forbidden', 'Only the owner can invite another owner');
@@ -1340,6 +1299,20 @@ async function handleCreateInvite(
   if (idemKey) {
     const prior = await findCreateIdem(db, 'invite', auth.member_id, idemKey);
     if (prior) {
+      const original = await db.queryOne('SELECT email,name,role FROM invites WHERE code_hash=?', [
+        prior['resource_id'] as string,
+      ]);
+      if (
+        !original ||
+        original['email'] !== email ||
+        original['name'] !== inviteName ||
+        original['role'] !== role
+      )
+        throw new HttpError(
+          409,
+          'idempotency_conflict',
+          'This invitation operation already has different name, email or role',
+        );
       // Mirror the normal path: if the email joined since, report it.
       // Removed members don't block: their email is free for re-invite.
       const already = await db.queryOne(
@@ -1356,9 +1329,9 @@ async function handleCreateInvite(
       const page = await mintInvitePage(env, req, codeHash, expiresAt);
       await db.execAtomically([
         {
-          sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
-                VALUES (?,?,?,?,?,?,NULL)`,
-          params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
+          sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, name, used_at)
+                VALUES (?,?,?,?,?,?,?,NULL)`,
+          params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt, inviteName],
         },
         {
           sql: `INSERT OR REPLACE INTO create_idempotency
@@ -1398,9 +1371,9 @@ async function handleCreateInvite(
   const page = await mintInvitePage(env, req, codeHash, expiresAt);
   const ops: { sql: string; params: (string | number | null)[] }[] = [
     {
-      sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
-            VALUES (?,?,?,?,?,?,NULL)`,
-      params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt],
+      sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, name, used_at)
+            VALUES (?,?,?,?,?,?,?,NULL)`,
+      params: [codeHash, auth.family_id, email, role, auth.member_id, expiresAt, inviteName],
     },
     { sql: page.sql, params: page.params },
   ];
@@ -1451,6 +1424,7 @@ async function enrollmentInput(
       codeHash,
       tokenHash,
       body['agent_public_key'],
+      reqEmail(body['email'], 'email'),
       body['display_name'] ?? null,
       body['agent_label'] ?? null,
     ]),
@@ -1518,7 +1492,7 @@ function membershipAgentKeys(account: { id: string } | { email: string }, ts: st
     sql: `INSERT INTO agent_keys(id,member_id,agent_label,public_key,created_at,superseded_at)
     SELECT lower(hex(randomblob(16))),m.id,a.label,a.public_key,?,NULL
     FROM members m JOIN principals u ON u.id=m.principal_id
-    JOIN agents a ON a.user_id=u.id AND a.revoked_at IS NULL
+    JOIN agents a ON a.user_id=u.id
     WHERE u.${column}=? AND m.removed_at IS NULL
       AND NOT EXISTS(SELECT 1 FROM agent_keys k WHERE k.member_id=m.id AND k.agent_label=a.label AND k.superseded_at IS NULL)`,
     params: [ts, value],
@@ -1533,10 +1507,9 @@ async function enrollmentResponse(
   status: number,
   resumed = false,
 ): Promise<Response> {
-  const user = await db.queryOne(
-    'SELECT id,email,name,email_verified_at FROM principals WHERE id=?',
-    [auth.principal_id],
-  );
+  const user = await db.queryOne('SELECT id,email,name FROM principals WHERE id=?', [
+    auth.principal_id,
+  ]);
   return json(
     {
       token,
@@ -1549,129 +1522,6 @@ async function enrollmentResponse(
     },
     status,
   );
-}
-
-async function recoverAgent(db: DbClient, env: Env, req: Request): Promise<Response> {
-  const body = await readJson(req);
-  const email = reqEmail(body['email'], 'email');
-  const label = reqString(body['agent_label'], 'agent_label', 1, 80);
-  const key = reqAgentPublicKey(body['agent_public_key'], 'agent_public_key');
-  const challengeId = reqString(body['challenge_id'], 'challenge_id', 1, 128);
-  const input = await enrollmentInput(env, body, 'recovery:' + challengeId, 'recovery');
-  const replay = await resumeEnrollment(db, env, req, input, key);
-  if (replay) return replay;
-  const challenge = await verifyEmailChallenge(db, env, body, 'recovery:' + email, email);
-  const user = await db.queryOne('SELECT * FROM principals WHERE email=?', [email]);
-  if (!user) throw new HttpError(403, 'email_verification_required', 'Email verification required');
-  const member = await db.queryOne(
-    'SELECT * FROM members WHERE principal_id=? AND removed_at IS NULL ORDER BY id LIMIT 1',
-    [user['id'] as string],
-  );
-  if (!member)
-    throw new HttpError(
-      409,
-      'no_memberships',
-      'Accept a new circle invitation to restore membership; the existing user account is retained',
-    );
-  const existing = await db.queryOne('SELECT * FROM agents WHERE user_id=? AND label=?', [
-    user['id'] as string,
-    label,
-  ]);
-  if (existing && (existing['public_key'] !== key || existing['revoked_at']))
-    throw new HttpError(
-      409,
-      'agent_exists',
-      'Choose a new label for a new agent; registered or revoked identities cannot be replaced',
-    );
-  const ts = nowIso(),
-    agentId = (existing?.['id'] as string) || newId(),
-    tokenId = newId();
-  const ops: { sql: string; params: (string | number | null)[] }[] = [];
-  if (!existing)
-    ops.push({
-      sql: 'INSERT INTO agents(id,user_id,label,public_key,created_at) VALUES(?,?,?,?,?)',
-      params: [agentId, user['id'] as string, label, key, ts],
-    });
-  ops.push({
-    sql: 'INSERT INTO agent_tokens(token_hash,token_id,member_id,agent_label,agent_id,created_at) VALUES(?,?,?,?,?,?)',
-    params: [input.tokenHash, tokenId, member['id'] as string, label, agentId, ts],
-  });
-  ops.push(membershipAgentKeys({ id: user['id'] as string }, ts));
-  ops.push({
-    sql: "UPDATE email_challenges SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-    params: [ts, challenge['id'] as string],
-  });
-  ops.push({
-    sql: `INSERT INTO enrollment_receipts(code_hash,request_hash,token_id,member_id,created_at)
-      VALUES(?,?,?,(SELECT id FROM members WHERE id=? AND removed_at IS NULL
-        AND EXISTS(SELECT 1 FROM email_challenges WHERE id=? AND used_at=?)),?)`,
-    params: [
-      input.codeHash,
-      input.requestHash,
-      tokenId,
-      member['id'] as string,
-      challengeId,
-      ts,
-      ts,
-    ],
-  });
-  logEvent('info', 'enrollment_batch_started', {
-    request_id: req.headers.get('X-Request-ID'),
-    operation_id: req.headers.get('X-Operation-ID'),
-    flow: 'recovery',
-  });
-  try {
-    await db.execAtomically(ops);
-  } catch (error) {
-    const retry = await resumeEnrollment(db, env, req, input, key);
-    if (retry) return retry;
-    if (
-      error instanceof Error &&
-      (error.message.includes('enrollment_receipts.member_id') ||
-        error.message.includes('credential_identity_mismatch'))
-    )
-      throw new HttpError(
-        409,
-        'enrollment_state_changed',
-        'Enrollment authorization changed before commit. Preserve the saved operation and retry.',
-      );
-    throw error;
-  }
-  logEvent('info', 'enrollment_batch_completed', {
-    request_id: req.headers.get('X-Request-ID'),
-    operation_id: req.headers.get('X-Operation-ID'),
-    flow: 'recovery',
-  });
-  const auth = await resolveToken(db, env, 'Bearer ' + input.token);
-  logEvent('info', 'enrollment_issued', {
-    flow: 'recovery',
-    token_id: tokenId,
-    member_id: member['id'],
-    request_id: req.headers.get('X-Request-ID'),
-    operation_id: req.headers.get('X-Operation-ID'),
-    user_id: auth.principal_id,
-    agent_id: auth.agent_id,
-  });
-  return enrollmentResponse(db, input.token, auth, member, 201);
-}
-
-async function revokeAgent(db: DbClient, auth: AuthContext, id: string): Promise<Response> {
-  const agent = await db.queryOne('SELECT id FROM agents WHERE id=? AND user_id=?', [
-    id,
-    auth.principal_id,
-  ]);
-  if (!agent) throw new HttpError(404, 'not_found', 'Agent not found for this user');
-  const ts = nowIso();
-  await db.execAtomically([
-    { sql: 'UPDATE agents SET revoked_at=? WHERE id=?', params: [ts, id] },
-    { sql: 'UPDATE agent_tokens SET revoked_at=? WHERE agent_id=?', params: [ts, id] },
-    {
-      sql: 'UPDATE provisioning_codes SET expires_at=? WHERE issued_by_token_id IN (SELECT token_id FROM agent_tokens WHERE agent_id=?) AND used_at IS NULL',
-      params: [ts, id],
-    },
-  ]);
-  logEvent('info', 'agent_revoked', { agent_id: id, user_id: auth.principal_id });
-  return json({ revoked_agent_id: id });
 }
 
 async function registerOrJoin(
@@ -1732,6 +1582,12 @@ async function registerOrJoinOnce(
       'Enrollment code expired',
     );
   const email = source['email'] as string;
+  if (reqEmail(body['email'], 'email') !== email)
+    throw new HttpError(
+      403,
+      'invite_email_mismatch',
+      'Use the email address this invitation was issued for',
+    );
   const circleId = source['family_id'] as string;
   const name = provisioning
     ? (source['name'] as string)
@@ -1739,8 +1595,6 @@ async function registerOrJoinOnce(
   if (!name) throw new HttpError(400, 'bad_request', 'display_name must not be blank');
   const existingUser = await db.queryOne('SELECT * FROM principals WHERE email=?', [email]);
   let authenticated: AuthContext | null = null;
-  let challenge: Row | null = null;
-  let approved = false;
   if (req.headers.has('authorization')) {
     authenticated = await resolveToken(db, env, req.headers.get('authorization'));
     if (!existingUser || authenticated.principal_id !== existingUser['id'])
@@ -1758,9 +1612,15 @@ async function registerOrJoinOnce(
         'Use the existing agent credential and encryption identity to join',
       );
     }
-  } else {
-    approved = provisioning && (await hasAgentApproval(db, input.codeHash));
-    if (!approved) challenge = await verifyEmailChallenge(db, env, body, code, email);
+  } else if (
+    existingUser &&
+    (await db.queryOne('SELECT id FROM agents WHERE user_id=?', [existingUser['id'] as string]))
+  ) {
+    throw new HttpError(
+      409,
+      'existing_identity',
+      'This user already has a registered Muse agent. Join with that agent’s existing server credential; do not create another profile or identity.',
+    );
   }
   const userId = (existingUser?.['id'] as string | undefined) ?? newPrincipalId();
   const label =
@@ -1768,44 +1628,21 @@ async function registerOrJoinOnce(
     (provisioning
       ? (source['agent_label'] as string)
       : reqString(body['agent_label'], 'agent_label', 1, 80));
-  let existingAgent: Row | null = null;
-  if (!authenticated && existingUser) {
-    const duplicate = await db.queryOne('SELECT * FROM agents WHERE user_id=? AND label=?', [
-      userId,
-      label,
-    ]);
-    if (duplicate && (duplicate['public_key'] !== publicKey || duplicate['revoked_at']))
-      throw new HttpError(
-        409,
-        'agent_exists',
-        'This label belongs to another or revoked agent. Choose a new label for a new agent.',
-      );
-    existingAgent = duplicate;
-  }
   const memberId = provisioning ? (source['member_id'] as string) : newId();
-  const agentId = authenticated?.agent_id ?? (existingAgent?.['id'] as string) ?? newId();
+  const agentId = authenticated?.agent_id ?? newId();
   const tokenId = authenticated?.token_id ?? newId();
   const table = provisioning ? 'provisioning_codes' : 'invites';
   const nowSql = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
   const permission = authenticated
-    ? `EXISTS(SELECT 1 FROM agent_tokens t JOIN agents a ON a.id=t.agent_id WHERE t.token_hash=? AND a.revoked_at IS NULL AND (t.revoked_at IS NULL OR t.revoked_at>${nowSql}))`
-    : approved
-      ? AGENT_APPROVAL_PREDICATE
-      : `EXISTS(SELECT 1 FROM email_challenges e WHERE e.id=? AND e.used_at IS NULL AND e.expires_at>${nowSql})`;
+    ? `EXISTS(SELECT 1 FROM agent_tokens t JOIN agents a ON a.id=t.agent_id WHERE t.token_hash=? AND (t.revoked_at IS NULL OR t.revoked_at>${nowSql}))`
+    : `NOT EXISTS(SELECT 1 FROM agents a JOIN principals u ON u.id=a.user_id WHERE u.email=?)`;
   const guard = `EXISTS(SELECT 1 FROM ${table} p WHERE p.code_hash=? AND p.used_at IS NULL AND p.expires_at>${nowSql} AND ${permission})`;
-  const guardParams = [
-    input.codeHash,
-    ...(authenticated ? [input.tokenHash] : approved ? [] : [challenge!['id'] as string]),
-  ];
+  const guardParams = [input.codeHash, authenticated ? input.tokenHash : email];
   const ops: { sql: string; params: (string | number | null)[] }[] = [];
   if (!authenticated) {
     ops.push({
-      sql: `INSERT OR IGNORE INTO principals(id,email,name,email_verified_at,created_at) SELECT ?,?,?,?,? WHERE ${guard}`,
-      params: [userId, email, name, ts, ts, ...guardParams],
-    });
-    ops.push({
-      sql: `UPDATE principals SET email_verified_at=COALESCE(email_verified_at,?) WHERE email=? AND ${guard}`,
-      params: [ts, email, ...guardParams],
+      sql: `INSERT OR IGNORE INTO principals(id,email,name,created_at) SELECT ?,?,?,? WHERE ${guard}`,
+      params: [userId, email, name, ts, ...guardParams],
     });
   }
   if (!provisioning)
@@ -1816,33 +1653,39 @@ async function registerOrJoinOnce(
       params: [memberId, circleId, source['role'] as string, ts, email, ...guardParams, circleId],
     });
   if (!authenticated) {
-    if (!existingAgent)
-      ops.push({
-        sql: `INSERT INTO agents(id,user_id,label,public_key,created_at)
+    ops.push({
+      sql: `INSERT INTO agents(id,user_id,label,public_key,created_at)
       SELECT ?,u.id,?,?,? FROM principals u WHERE u.email=? AND ${guard}`,
         params: [agentId, label, publicKey, ts, email, ...guardParams],
       });
     ops.push({
       sql: `INSERT INTO agent_tokens(token_hash,token_id,member_id,agent_label,agent_id,created_at)
       SELECT ?,?,m.id,?,?,? FROM members m JOIN principals u ON u.id=m.principal_id
-      WHERE u.email=? AND m.family_id=? AND m.removed_at IS NULL AND ${guard}`,
-      params: [input.tokenHash, tokenId, label, agentId, ts, email, circleId, ...guardParams],
+      WHERE u.email=? AND m.family_id=? AND m.removed_at IS NULL AND EXISTS(SELECT 1 FROM agents a WHERE a.id=? AND a.user_id=u.id)
+        AND EXISTS(SELECT 1 FROM ${table} p WHERE p.code_hash=? AND p.used_at IS NULL AND p.expires_at>${nowSql})`,
+      params: [
+        input.tokenHash,
+        tokenId,
+        label,
+        agentId,
+        ts,
+        email,
+        circleId,
+        agentId,
+        input.codeHash,
+      ],
     });
   }
   // Read the user by its unique email inside the transaction: concurrent
-  // first registrations with different invitations must converge on one user.
+  // registration writes refer to the canonical account inside the transaction.
   ops.push(membershipAgentKeys({ email }, ts));
+  const consumeGuard = `EXISTS(SELECT 1 FROM agent_tokens t JOIN agents a ON a.id=t.agent_id WHERE t.token_id=? AND t.token_hash=? AND a.id=? AND (t.revoked_at IS NULL OR t.revoked_at>${nowSql}))`;
   ops.push({
-    sql: `UPDATE ${table} SET used_at=?${provisioning ? ',redeemed_token_id=?' : ''} WHERE code_hash=? AND ${guard}`,
+    sql: `UPDATE ${table} SET used_at=?${provisioning ? ',redeemed_token_id=?' : ''} WHERE code_hash=? AND used_at IS NULL AND expires_at>${nowSql} AND ${consumeGuard}`,
     params: provisioning
-      ? [ts, tokenId, input.codeHash, ...guardParams]
-      : [ts, input.codeHash, ...guardParams],
+      ? [ts, tokenId, input.codeHash, tokenId, input.tokenHash, agentId]
+      : [ts, input.codeHash, tokenId, input.tokenHash, agentId],
   });
-  if (challenge)
-    ops.push({
-      sql: 'UPDATE email_challenges SET used_at=? WHERE id=? AND used_at IS NULL',
-      params: [ts, challenge['id'] as string],
-    });
   if (!provisioning)
     ops.push({
       sql: 'UPDATE invites SET used_at=? WHERE family_id=? AND email=? AND used_at IS NULL AND (SELECT used_at FROM invites WHERE code_hash=?)=?',
@@ -1850,7 +1693,7 @@ async function registerOrJoinOnce(
     });
   // A scalar membership result is deliberately NOT NULL. If any guard
   // stopped consumption, this insert aborts the whole batch, including keys
-  // and proof state. No pre-check/commit race can leave partial enrollment.
+  // and invitation state. No pre-check/commit race can leave partial enrollment.
   ops.push({
     sql: `INSERT INTO enrollment_receipts(code_hash,request_hash,token_id,member_id,created_at)
       VALUES(?,?,?,(SELECT m.id FROM members m JOIN principals u ON u.id=m.principal_id
@@ -1942,8 +1785,8 @@ async function handleAcceptInvite(
 
 // ---------------------------------------------------------------------------
 // Hosted invite pages reveal a single-use membership code after matching the
-// invited address. This is not inbox ownership verification. First agent
-// registration separately verifies a bound email challenge; authenticated joins
+// invited address. This is not inbox ownership verification. The private invitation authorizes first
+// registration; authenticated joins
 // reuse the same user and agent. Page verification replaces the hashed code
 // because its plaintext cannot be recovered. All sibling invitations for that
 // circle and email are consumed atomically on successful enrollment.
@@ -1975,6 +1818,7 @@ function extractPageToken(segment: string): string {
 interface InvitePage {
   pageTokenHash: string;
   email: string;
+  name: string;
   role: string;
   familyId: string;
   familyName: string;
@@ -1995,6 +1839,7 @@ async function loadInvitePage(db: DbClient, env: Env, rawToken: string): Promise
             p.verify_attempts AS verify_attempts,
             p.last_attempt_at AS last_attempt_at,
             i.email AS email,
+            i.name AS name,
             i.role AS role,
             i.family_id AS family_id,
             i.created_by AS created_by,
@@ -2018,6 +1863,7 @@ async function loadInvitePage(db: DbClient, env: Env, rawToken: string): Promise
   return {
     pageTokenHash,
     email: row['email'] as string,
+    name: row['name'] as string,
     role: row['role'] as string,
     familyId: row['family_id'] as string,
     familyName: row['family_name'] as string,
@@ -2088,14 +1934,13 @@ function inviteCommands(origin: string) {
   const command = `${p.python} ${p.cli} --profile ${p.profile}`;
   const quotedOrigin = "'" + origin.replace(/'/g, "'\\''") + "'";
   return {
-    enroll: `${command} enroll --server ${quotedOrigin} --code-file /PRIVATE/PATH/invite-code --name "YOUR DISPLAY NAME" --label muse-agent`,
+    enroll: `${command} enroll --server ${quotedOrigin} --code-file /PRIVATE/PATH/invite-code --name "YOUR DISPLAY NAME" --email "INVITED EMAIL" --label muse-agent`,
     resume: `${command} enroll --resume`,
     me: `${command} me`,
     circles: `${command} circles`,
     topics: `${command} topics`,
     circles_all: `${command} circles --all-servers`,
     people: `${command} people --query "PERSON NAME" --all-servers`,
-    agents: `${command} agents`,
     diagnostics: `${command} diagnostics export --output /PRIVATE/PATH/join-diagnostics.json`,
   };
 }
@@ -2131,12 +1976,11 @@ function inviteAgentInstructions(origin: string): string[] {
     'Run the install block in one shell, in order, stopping on any error. Hash-check the archive before extraction; verify the CLI signature and both hashes before executing it. Use the listed venv Python and CLI paths for every later tool call, including scheduled jobs; the final install step prints the actual absolute paths. Record those paths for tool configuration; shell variables and PATH changes do not persist between agent calls.',
     `Read ${paths.directory}/SKILL.md and INSTALL.md completely after verification. Register/load that skill using Muse’s supported skill mechanism, and configure its tool command to use the listed venv Python plus hub path. Downloading files alone does not activate a skill. Report if the platform cannot load it.`,
     `Use profile ${paths.profile} for this server, or an explicitly chosen profile already pinned to this same origin. Do not send an existing profile’s credential to another server or overwrite its keys. The enroll command chooses first-time setup versus joining another circle and preserves existing circles.`,
-    'First registration sends a verification code to the invited email inbox. Ask the user to provide it through a private file or secure input; never expose it in chat or argv. Resume with enroll --resume --verification-code-file PRIVATE-FILE. Matching an email on the invite page alone does not prove inbox ownership. Later circle joins use this profile’s existing agent credential and add membership to the same user.',
-    'To approve another of your own agents, use agent-invite --label NEW-LABEL --output PRIVATE-FILE on your working agent. Transfer that file privately, then enroll --code-file PRIVATE-FILE --label NEW-LABEL on the new device. A live own-agent approval replaces email proof. If none of your agents works, use enroll --recover-email YOUR-EMAIL --label NEW-LABEL and private email verification. These restore login, not historical topic keys.',
+    'Each user has one Muse agent linked to their email, running in their Muse VM. Switching phones does not require another agent or connector registration. First join supplies the private invitation, name and invited email; no verification email or email service is needed. Later circles reuse the same profile, agent identity and server credential.',
     'Use circles --json on this server or circles --all-servers across configured profiles. Use people --query NAME --all-servers to find visible recipients and shared memberships. Results include profile, server_url and stable IDs; never merge by name/email across servers. Ask the user to disambiguate matching names and choose the intended circle/topic before sending. complete:false and a nonzero exit mean partial failure, not an empty directory.',
-    'Only after installation and skill loading succeed, POST the invited email to the invitation’s verify endpoint. If you already have an owner provisioning code, skip the page address-matching step and save that code privately instead; initial agent registration still verifies your email inbox. Save the returned invite_code directly into a private 0600 file using a tool/helper; never print it, place it in argv, or persist the whole invite-page response. Email matching is not an email-inbox verification flow.',
+    'Only after installation and skill loading succeed, POST the invited email to the invitation’s verify endpoint. If you already have an owner provisioning code, skip the page address-matching step and save that code privately instead; supply your owner email when enrolling. Save the returned invite_code directly into a private 0600 file using a tool/helper; never print it, place it in argv, or persist the whole invite-page response. Confirm the invited email; no inbox verification code is sent.',
     `Run ${commands.enroll}. Replace the private file path and display name; muse-agent is a generic label and may be changed. Enrollment saves a private operation and identity before sending the request.`,
-    `If interrupted, preserve the profile and identity and run ${commands.resume}. Do not fetch another code, regenerate keys, or repeat email verification to recover a pending enrollment. A different credential cannot reuse a spent code.`,
+    `If interrupted, preserve the profile and identity and run ${commands.resume}. Do not fetch another code, regenerate keys, or repeat the invite-page email confirmation to recover a pending enrollment. A different credential cannot reuse a spent code.`,
     `Confirm ${commands.me}, then ${commands.circles}. Check that the joined circle and identity match this invitation, then run ${commands.topics}. An empty topic list can be normal: circle membership does not grant access to every topic.`,
     'Ask the inviter to add this member to a test topic and complete encrypted key distribution. Verify an approved message/reply in both people’s matching Muse topic chats. Enrollment already creates the identity; do not regenerate it. Privately back up recovery information outside model-visible output.',
     'Load the installed skill’s full discovery → read → report in the matching topic chat → acknowledge workflow. Schedule it in the same Python environment and profile. If the platform cannot schedule or create chats, explain that limitation and verify manual checks. Do not acknowledge before reporting.',
@@ -2168,6 +2012,7 @@ function invitePageJson(
     family_name: page.familyName,
     role: page.role,
     email_hint: maskEmail(page.email),
+    invited_name: page.name,
     expires_at: page.expiresAt,
     client: {
       version: clientManifest.version,
@@ -2213,7 +2058,7 @@ function invitePageHtml(page: InvitePage, rawToken: string, origin: string): Res
 server with messaging circles, and every family member&rsquo;s AI agent gets its
 own login. This page onboards the new member&rsquo;s agent &mdash; no account or
 password needed, just the invite below.</p>
-<p>This invitation was sent to <strong>${escapeHtml(maskEmail(page.email))}</strong>
+<p>This invitation is for <strong>${escapeHtml(page.name)}</strong> at <strong>${escapeHtml(maskEmail(page.email))}</strong>
 and expires on <code>${escapeHtml(page.expiresAt)}</code>.</p>
 <h2>1. Install the skill bundle</h2>
 <p>Give this page to your Muse. It can install and join without cloning a repository.
@@ -2367,9 +2212,17 @@ async function handleInvitePageVerify(
   const codeHash = await credentialHash(env.TOKEN_PEPPER, code);
   await db.execAtomically([
     {
-      sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, used_at)
-            VALUES (?,?,?,?,?,?,NULL)`,
-      params: [codeHash, page.familyId, page.email, page.role, page.createdBy, page.expiresAt],
+      sql: `INSERT INTO invites(code_hash, family_id, email, role, created_by, expires_at, name, used_at)
+            VALUES (?,?,?,?,?,?,?,NULL)`,
+      params: [
+        codeHash,
+        page.familyId,
+        page.email,
+        page.role,
+        page.createdBy,
+        page.expiresAt,
+        page.name,
+      ],
     },
     {
       sql: `UPDATE invite_pages SET invite_code_hash = ?, verify_attempts = ?, last_attempt_at = ? WHERE page_token_hash = ?`,
@@ -2883,38 +2736,6 @@ async function handleDemoteServerOwner(
   return json({ removed: principalId });
 }
 
-// POST /v2/provisioning-codes — mint a single-use code for an extra agent.
-// (SPEC §6 step 4; endpoint added — see SPEC_GAPS.md note.)
-async function handleMintProvisioning(
-  db: DbClient,
-  env: Env,
-  req: Request,
-  auth: AuthContext,
-): Promise<Response> {
-  const body = await readJson(req);
-  const memberId = reqString(body['member_id'], 'member_id', 1, 128);
-  const agentLabel = reqString(body['agent_label'], 'agent_label', 1, 80);
-  const target = await db.queryOne(
-    `SELECT * FROM members WHERE id = ? AND family_id = ? AND removed_at IS NULL`,
-    [memberId, auth.family_id],
-  );
-  if (!target) throw new HttpError(404, 'not_found', 'Member not found');
-  if (target['principal_id'] !== auth.principal_id)
-    throw new HttpError(
-      403,
-      'forbidden',
-      'Only a user can authorize an additional agent for their account',
-    );
-  const minted = await mintProvisioningCode(db, env, {
-    familyId: auth.family_id,
-    memberId,
-    agentLabel,
-    createdBy: auth.member_id,
-    issuedByTokenId: auth.token_id,
-  });
-  return json({ provisioning_code: minted.code, expires_at: minted.expiresAt }, 201);
-}
-
 // POST /v2/provisioning-codes/:code/redeem — no auth; the code is the credential.
 async function handleRedeemProvisioning(
   db: DbClient,
@@ -2943,7 +2764,7 @@ async function handleAgentKeyDirectory(
   const base = `SELECT k.member_id, a.id AS agent_id, k.agent_label, k.public_key, k.created_at
       FROM agent_keys k
       JOIN members m ON m.id = k.member_id
-      JOIN agents a ON a.user_id=m.principal_id AND a.label=k.agent_label AND a.revoked_at IS NULL
+      JOIN agents a ON a.user_id=m.principal_id AND a.label=k.agent_label
      WHERE k.superseded_at IS NULL AND m.family_id = ? AND m.removed_at IS NULL
        AND EXISTS (SELECT 1 FROM agent_tokens t WHERE t.agent_id=a.id
          AND (t.revoked_at IS NULL OR t.revoked_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')))`;
@@ -3178,7 +2999,7 @@ async function handleGetEnvelopes(db: DbClient, auth: AuthContext, tid: string):
   return json({ envelopes: rows });
 }
 
-// Revoke one of this user’s credentials and its pending agent approvals.
+// Revoke this user’s server credential.
 // Circle roles never grant control of another user’s server credentials.
 async function handleRevoke(
   db: DbClient,
@@ -3196,10 +3017,6 @@ async function handleRevoke(
   const now = nowIso();
   await db.execAtomically([
     { sql: 'UPDATE agent_tokens SET revoked_at=? WHERE token_id=?', params: [now, tokenId] },
-    {
-      sql: 'UPDATE provisioning_codes SET expires_at=? WHERE issued_by_token_id=? AND used_at IS NULL AND expires_at>?',
-      params: [now, tokenId, now],
-    },
   ]);
   // B3: revocation audit — the active key fingerprint for the revoked
   // token's (member_id, agent_label), so the trail
@@ -3240,9 +3057,7 @@ async function handleGetSelf(db: DbClient, auth: AuthContext): Promise<Response>
     ...(row['removed_at'] ? {} : publicMember(row)),
     membership: row['removed_at'] ? null : publicMember(row),
     token_id: auth.token_id,
-    user: await db.queryOne('SELECT id,email,name,email_verified_at FROM principals WHERE id=?', [
-      auth.principal_id,
-    ]),
+    user: await db.queryOne('SELECT id,email,name FROM principals WHERE id=?', [auth.principal_id]),
     agent: { id: auth.agent_id, label: auth.agent_label },
     agent_label: auth.agent_label,
     // Hub-owner discovery: the agent learns from `hub me` whether it may
@@ -4266,7 +4081,7 @@ async function handleKeysCommit(
        FROM agents a JOIN agent_tokens t ON t.agent_id=a.id
        JOIN members m ON m.principal_id=a.user_id AND m.removed_at IS NULL
        JOIN topic_participants p ON p.member_id=m.id
-      WHERE p.topic_id = ? AND a.revoked_at IS NULL AND (t.revoked_at IS NULL OR t.revoked_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+      WHERE p.topic_id = ? AND (t.revoked_at IS NULL OR t.revoked_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
     [tid],
   );
   const current = new Set(
@@ -4795,27 +4610,6 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       throw new HttpError(404, 'not_found', 'Not found');
     }
 
-    if (path === '/v2/identity/challenges' && method === 'POST') {
-      const limited = await checkRateLimit(db, req, 'email_challenge', 5);
-      if (limited) return limited;
-      logEvent('info', 'email_challenge_started', {
-        request_id: req.headers.get('X-Request-ID'),
-        operation_id: req.headers.get('X-Operation-ID'),
-      });
-      const challenge = await issueEmailChallenge(db, env, await readJson(req));
-      logEvent('info', 'email_challenge_accepted', {
-        request_id: req.headers.get('X-Request-ID'),
-        operation_id: req.headers.get('X-Operation-ID'),
-      });
-      return json(challenge, 202);
-    }
-
-    if (path === '/v2/identity/agents' && method === 'POST') {
-      const limited = await checkRateLimit(db, req, 'invite_accept');
-      if (limited) return limited;
-      return await recoverAgent(db, env, req);
-    }
-
     // Public: bootstrap + invite/provisioning redemption (code is the credential).
     // The two redemption endpoints are rate-limited per IP: they are the only
     // unauthenticated brute-force surface (128-bit codes, but hammering still
@@ -4861,13 +4655,8 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       '/v2/discovery/circles',
       '/v2/discovery/people',
       '/v2/auth/revoke',
-      '/v2/agents',
     ];
-    if (
-      !serverScoped.includes(path) &&
-      !path.startsWith('/v2/server/') &&
-      !path.startsWith('/v2/agents/')
-    ) {
+    if (!serverScoped.includes(path) && !path.startsWith('/v2/server/')) {
       auth = await circleContext(db, auth, req.headers.get('X-Circle-ID') || auth.family_id);
     }
 
@@ -4878,26 +4667,12 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       agent_id: auth.agent_id,
       token_id: auth.token_id,
       circle_id:
-        serverScoped.includes(path) ||
-        path.startsWith('/v2/server/') ||
-        path.startsWith('/v2/agents/')
-          ? null
-          : auth.family_id,
+        serverScoped.includes(path) || path.startsWith('/v2/server/') ? null : auth.family_id,
     });
     if (path === '/v2/discovery/circles' && method === 'GET')
       return await discoverCircles(db, req, auth);
     if (path === '/v2/discovery/people' && method === 'GET')
       return await discoverPeople(db, req, auth);
-    const agentRevoke = /^\/v2\/agents\/([^/]+)\/revoke$/.exec(path);
-    if (agentRevoke && method === 'POST')
-      return await revokeAgent(db, auth, decodeURIComponent(agentRevoke[1]));
-    if (path === '/v2/agents' && method === 'GET')
-      return json({
-        agents: await db.queryAll(
-          'SELECT id,label,created_at,revoked_at FROM agents WHERE user_id=? ORDER BY created_at',
-          [auth.principal_id],
-        ),
-      });
     if (path === '/v2/auth/revoke' && method === 'POST')
       return await handleRevoke(db, env, req, auth);
     if (path === '/v2/families' && method === 'GET') return await handleListFamilies(db, auth);
@@ -4906,9 +4681,6 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       if (req.headers.has('X-Circle-ID'))
         auth = await circleContext(db, auth, req.headers.get('X-Circle-ID')!);
       return await handleGetSelf(db, auth);
-    }
-    if (path === '/v2/provisioning-codes' && method === 'POST') {
-      return await handleMintProvisioning(db, env, req, auth);
     }
     // E2EE (Phase 1) key infrastructure.
     if (path === '/v2/agent-keys' && method === 'GET') {
@@ -4964,7 +4736,7 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
 
     // Server ownership control plane (migration 0012): GET/POST
     // /v2/server/owners, DELETE /v2/server/owners/:principal — server
-    // owners only. See the handlers above handleMintProvisioning.
+    // Topic operations check the selected circle and live membership.
     if (path === '/v2/server/owners' && method === 'GET') {
       return await handleListServerOwners(db, auth);
     }

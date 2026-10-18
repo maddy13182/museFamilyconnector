@@ -18,14 +18,8 @@ Bind these variables using the environment's secure credential settings:
   permissions. The Workers template alone may
   need D1 permission added. The token must be able to read those resources too.
 - `CLOUDFLARE_ACCOUNT_ID`: the Account ID shown in the Cloudflare dashboard.
-- `EMAIL_API_TOKEN`: a Resend API key authorized to send verification emails.
-- `EMAIL_FROM`: a sender on a domain verified with Resend, such as
-  `Muse Connector <muse@example.com>`. Use a sender domain you control; Resend requires domain verification.
-
-Email proof is mandatory for first registration and recovery when no working own agent can approve the replacement. The
-provisioner installs `EMAIL_API_TOKEN` as a Worker secret and `EMAIL_FROM` as a
-Worker variable. These provider inputs cannot be generated from Cloudflare
-credentials. Invitees need access to their email inbox, not provider credentials.
+No email provider or sender domain is needed. Invitees confirm their invited
+email using the private invitation; the server does not send verification emails.
 
 Do not paste the API token into chat, source files, shell commands, or logs.
 Wrangler and the provisioner inherit it from the environment. It is never stored
@@ -71,7 +65,7 @@ Files are private (`0600`):
 | --- | --- |
 | `state.json` | Account, Worker, database identity, discovered URL, and progress |
 | `wrangler.json` | Generated bindings and nonsecret runtime settings |
-| `secrets.json` | Recovery copy of generated Worker secrets and the supplied email API key |
+| `secrets.json` | Recovery copy of generated Worker secrets |
 | `owner-enrollment.json` | Private first-owner provisioning receipt, when requested |
 
 Privately back up this directory, especially `secrets.json`. Never commit it or
@@ -117,7 +111,7 @@ import json, subprocess
 from pathlib import Path
 receipt = json.loads(Path("PRIVATE-DEPLOYMENT-DIRECTORY/owner-enrollment.json").read_text())
 subprocess.run(
-    ["/ABSOLUTE/VENV/PYTHON", "/ABSOLUTE/PATH/TO/VERIFIED/hub", "--profile", "HOSTED-GUIDE-PROFILE", "enroll", "--server", "YOUR-DISCOVERED-HUB-URL"],
+    ["/ABSOLUTE/VENV/PYTHON", "/ABSOLUTE/PATH/TO/VERIFIED/hub", "--profile", "HOSTED-GUIDE-PROFILE", "enroll", "--server", "YOUR-DISCOVERED-HUB-URL", "--email", "YOUR-OWNER-EMAIL"],
     input=receipt["provisioning_code"] + "\n", text=True, check=True,
 )
 ```
@@ -172,4 +166,4 @@ read → report in the topic chat → acknowledge watcher.
 Identity/discovery protocol 1 requires a new database with the full migration
 chain, including the fresh identity-contract guard. The provisioner verifies
 these capabilities after deployment. Follow [IDENTITY_PROTOCOL.md](IDENTITY_PROTOCOL.md)
-for the registration, replacement-agent and cross-server routing contracts.
+for the invitation registration and cross-server routing contracts.

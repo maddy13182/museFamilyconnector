@@ -4,16 +4,11 @@ import { handleRequest } from '../dist/src/index.js';
 import { freshDb, sqliteClient } from '../dist/test/sqlite.js';
 const raw = freshDb();
 const db = sqliteClient(raw);
-let emailCode='';
-const env = {EMAIL_DELIVERY:async(_email,code)=>{emailCode=code;},TOKEN_PEPPER:'integration-pepper',READ_RECEIPT_SECRET:'integration-receipts',SETUP_LOCKED:'0'};
+const env = {TOKEN_PEPPER:'integration-pepper',READ_RECEIPT_SECRET:'integration-receipts',SETUP_LOCKED:'0'};
 console.log = () => {}; // Request metadata is noise; the protocol owns stdout.
 for await (const line of readline.createInterface({input:process.stdin})) {
   try {
     const input = JSON.parse(line);
-    if(input.mailbox) {
-      process.stdout.write(JSON.stringify({code:emailCode})+'\n');
-      continue;
-    }
     if(input.lock_setup) {
       env.SETUP_LOCKED='1';
       process.stdout.write(JSON.stringify({status:200,body:'{"ok":true}'})+'\n');

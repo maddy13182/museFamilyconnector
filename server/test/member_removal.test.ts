@@ -49,27 +49,35 @@ async function inviteJoin(
     body: { email, role },
   });
   assert.equal(inv.status, 201);
+  const existing = await app.db.queryOne(
+    'SELECT a.public_key,m.id FROM agents a JOIN principals u ON u.id=a.user_id JOIN members m ON m.principal_id=u.id WHERE u.email=? ORDER BY m.created_at',
+    [email],
+  );
+  const saved = existing ? app.credentials.get(existing['id'] as string) : undefined;
   const acc = await app.call(
     'POST',
     `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: name, agent_label: `${name.toLowerCase()}-agent` , agent_public_key: b64(32) } },
+    {
+      token: saved,
+      body: {
+        ...(saved ? { agent_token: saved } : {}),
+        display_name: name,
+        agent_label: `${name.toLowerCase()}-agent`,
+        agent_public_key: existing?.public_key ?? b64(32),
+      },
+    },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
 }
 
-async function removeMember(
-  app: TestApp,
-  famId: string,
-  callerToken: string,
-  memberId: string,
-) {
+async function removeMember(app: TestApp, famId: string, callerToken: string, memberId: string) {
   return app.call('DELETE', `/v2/families/${famId}/members/${memberId}`, {
     token: callerToken,
   });
 }
 
-test('owner removes a member: revoked, delisted, email re-invitable', async () => {
+test('owner removes circle access; the same Muse can rejoin with a fresh invitation', async () => {
   const { app, famId, ownerToken } = await setup();
   const p = await inviteJoin(app, famId, ownerToken, 'lakshmi@fam.dev', 'parent', 'Lakshmi');
 
@@ -77,19 +85,24 @@ test('owner removes a member: revoked, delisted, email re-invitable', async () =
   assert.equal(res.status, 200);
   assert.equal(res.body.removed, p.memberId);
 
-  // Tokens revoked: the choke point 401s.
+  // The saved server credential survives; this circle membership is removed.
   const me = await app.call('GET', '/v2/me', { token: p.token });
   assert.equal(me.status, 200);
-  assert.equal((await app.call('GET','/v2/members',{token:p.token,headers:{'X-Circle-ID':famId}})).status,403);
+  assert.equal(
+    (await app.call('GET', '/v2/members', { token: p.token, headers: { 'X-Circle-ID': famId } }))
+      .status,
+    403,
+  );
 
   // Gone from the member listing.
   const list = await app.call('GET', '/v2/members', { token: ownerToken });
   assert.equal(list.status, 200);
   assert.ok(!list.body.members.some((m: { id: string }) => m.id === p.memberId));
 
-  // Email freed for re-invite: a fresh identity can be provisioned.
+  // A fresh invitation restores membership using the same Muse identity.
   const p2 = await inviteJoin(app, famId, ownerToken, 'lakshmi@fam.dev', 'parent', 'Lakshmi2');
   assert.notEqual(p2.memberId, p.memberId);
+  assert.equal(p2.token, p.token);
 
   // Removing twice is a clean 404, not a 500.
   const again = await removeMember(app, famId, ownerToken, p.memberId);
@@ -197,10 +210,9 @@ test('removal drops topic participation and arms E2EE rotation', async () => {
   const rm = await removeMember(app, famId, ownerToken, p.memberId);
   assert.equal(rm.status, 200);
 
-  const parts = await app.db.queryAll(
-    `SELECT * FROM topic_participants WHERE member_id = ?`,
-    [p.memberId],
-  );
+  const parts = await app.db.queryAll(`SELECT * FROM topic_participants WHERE member_id = ?`, [
+    p.memberId,
+  ]);
   assert.equal(parts.length, 0);
 
   if (tid2) {

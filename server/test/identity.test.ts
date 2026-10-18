@@ -43,7 +43,13 @@ async function inviteAccept(
   const acc = await app.call(
     'POST',
     `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
+    {
+      body: {
+        display_name: displayName,
+        agent_label: `${displayName.toLowerCase()}-agent`,
+        agent_public_key: b64(32),
+      },
+    },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
@@ -74,15 +80,27 @@ async function lockedSetup(): Promise<Setup> {
   };
 }
 
-test('an unverified email collision cannot attach an agent to the existing user', async()=>{
- const {app,ownerToken,famA,famB,strangerToken}=await lockedSetup();
- const invite=await app.call('POST',`/v2/families/${famA}/invites`,{token:ownerToken,body:{email:'s@b.dev',role:'kid'}});
- const denied=await app.call('POST',`/v2/invites/${invite.body.invite_code}/accept`,{body:{display_name:'Impostor',agent_label:'evil',agent_public_key:b64(32),challenge_id:'invalid',verification_code:'invalid'}});
- assert.equal(denied.status,403);assert.equal(denied.body.error.code,'email_verification_required');
- assert.equal((await app.db.queryOne("SELECT count(*) n FROM members WHERE email='s@b.dev'"))?.n,1);
- const list=await app.call('GET','/v2/families',{token:strangerToken});assert.deepEqual(list.body.families.map((f:any)=>f.id),[famB]);
+test('an unauthenticated email collision cannot attach an agent to the existing user', async () => {
+  const { app, ownerToken, famA, famB, strangerToken } = await lockedSetup();
+  const invite = await app.call('POST', `/v2/families/${famA}/invites`, {
+    token: ownerToken,
+    body: { email: 's@b.dev', role: 'kid' },
+  });
+  const denied = await app.call('POST', `/v2/invites/${invite.body.invite_code}/accept`, {
+    body: { display_name: 'Impostor', agent_label: 'evil', agent_public_key: b64(32) },
+  });
+  assert.equal(denied.status, 409);
+  assert.equal(denied.body.error.code, 'existing_identity');
+  assert.equal(
+    (await app.db.queryOne("SELECT count(*) n FROM members WHERE email='s@b.dev'"))?.n,
+    1,
+  );
+  const list = await app.call('GET', '/v2/families', { token: strangerToken });
+  assert.deepEqual(
+    list.body.families.map((f: any) => f.id),
+    [famB],
+  );
 });
-
 
 test('verified owner keeps cross-circle visibility via locked creation', async () => {
   const { app, ownerToken, kidToken, famA, famB } = await lockedSetup();

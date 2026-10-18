@@ -14,16 +14,29 @@ import {
   TestApp,
   setupKeyedFamily,
   addMember,
-  addAgent,
+  addPeer,
+  inviteToTopic,
   createActiveTopic,
   wireBody,
   postEntry as rawPostEntry,
   readState,
 } from './syncv2_helpers.js';
 
-async function postEntry(app: TestApp, token: string, tid: string, text: string, extra: Record<string,unknown> = {}) {
+async function postEntry(
+  app: TestApp,
+  token: string,
+  tid: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+) {
   const row = await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?', [tid]);
-  return rawPostEntry(app, token, tid, text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string), extra);
+  return rawPostEntry(
+    app,
+    token,
+    tid,
+    text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string),
+    extra,
+  );
 }
 
 async function postN(app: TestApp, token: string, tid: string, n: number) {
@@ -132,15 +145,15 @@ test('cross-agent receipt replay -> 403 (binding is inside the HMAC)', async () 
   const tid = await createActiveTopic(app, owner.token, 'xagent topic');
   await postN(app, owner.token, tid, 4);
 
-  // Second agent for the SAME member (participants are per-member, so both
-  // agents may read — but the receipt binds the agent_label).
-  const agent2 = await addAgent(app, owner.token, owner.memberId, 'owner-second', false);
+  // A different person in the same topic cannot replay this user’s receipt.
+  const agent2 = await addPeer(app, owner, 'owner-second');
+  await inviteToTopic(app, owner.token, tid, [agent2.memberId], 'full');
 
   const { receipt } = await readPage(app, owner.token, tid); // bound to owner-agent
   const r = await ack(app, agent2.token, tid, 4, receipt); // replayed by owner-second
   assert.equal(r.status, 403);
   assert.equal(r.body.error.code, 'invalid_read_receipt');
-  assert.equal(await readState(app, owner.memberId, 'owner-second', tid), null);
+  assert.equal(await readState(app, agent2.memberId, agent2.agentLabel, tid), null);
 
   // The receipt works for the agent it was minted for.
   const ok = await ack(app, owner.token, tid, 4, receipt);
@@ -198,12 +211,12 @@ test('ack with a from_seq gap -> 409 noncontiguous_ack', async () => {
 // Per-agent isolation
 // ---------------------------------------------------------------------------
 
-test('two agents of one member keep independent acked_seq', async () => {
+test('two people keep independent acked_seq', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'AckIso');
-  const tid = await createActiveTopic(app, owner.token, 'iso topic');
+  const agent2 = await addPeer(app, owner, 'owner-second');
+  const tid = await createActiveTopic(app, owner.token, 'iso topic', [agent2.memberId]);
   await postN(app, owner.token, tid, 8);
-  const agent2 = await addAgent(app, owner.token, owner.memberId, 'owner-second', false);
 
   const r1 = await readPage(app, owner.token, tid);
   await ack(app, owner.token, tid, 8, r1.receipt);
@@ -218,7 +231,7 @@ test('two agents of one member keep independent acked_seq', async () => {
   const r2 = await readPage(app, agent2.token, tid);
   const a2 = await ack(app, agent2.token, tid, 5, r2.receipt);
   assert.equal(a2.status, 200);
-  assert.equal(await readState(app, owner.memberId, 'owner-second', tid), 5);
+  assert.equal(await readState(app, agent2.memberId, agent2.agentLabel, tid), 5);
   assert.equal(await readState(app, owner.memberId, owner.agentLabel, tid), 8);
 });
 

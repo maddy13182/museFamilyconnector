@@ -66,7 +66,6 @@ Give Muse this repository link and say:
 
 - **A Cloudflare account.** If you do not have one, Muse can walk you through creating it.
 - **Permission to deploy in that account.** Muse guides you to create a Cloudflare API token and find your Account ID. Add those through its environment's secure credential settings, rather than pasting secret values into chat. A computer with Cloudflare browser sign-in is another setup option.
-- **Verification email delivery.** The hosting Muse helps configure a Resend account and a verified sender domain you control. Everyone verifies their own email when first connecting or registering a replacement agent.
 - **Your first circle's name, your name, and your email.** For example, “Our family” or “Harbour Hotel.”
 
 **What Muse handles:** installing the pinned deployment tools, creating and binding a database in your Cloudflare account, deploying the server, installing the connector in its own environment, connecting you, and configuring the recurring checks that bring updates into the right chats. It generates the server's internal secrets during setup. It may ask you to securely save recovery information or complete a private sign-in step.
@@ -79,7 +78,7 @@ Setup needs an environment where Muse can install tools, run commands, create to
 
 Tell Muse:
 
-> “Invite my partner at partner@example.com to Our family, so we can plan together.”
+> “Invite my partner Lakshmi at partner@example.com to Our family, so we can plan together.”
 
 Muse creates a private, one-time invitation link. Send it by text or email with this message:
 
@@ -93,7 +92,7 @@ Give the private invitation link to your Muse and say:
 
 > “Use this Family Hub invitation to connect me to the circle. My invited email is [your email]. Follow the invitation's installation instructions, verify the connector, set up topic chats and regular checks, and help me exchange a first message with the inviter.”
 
-Muse uses the invitation to install and connect the skill in its environment. It asks for any setup permission or recovery step you need to complete, then confirms who you joined as and which circle you are in. You do not deploy a server or create a Cloudflare account. First-time connection includes a private email verification step. If setup was interrupted, Muse resumes the saved operation; an expired, unused invitation needs a new link.
+Muse uses the invitation to install and connect the skill in its environment. It asks for any setup permission or recovery step you need to complete, then confirms who you joined as and which circle you are in. You do not deploy a server or create a Cloudflare account. First-time connection uses your name, invited email, and private invitation; no verification email is sent. If setup was interrupted, Muse resumes the saved operation; an expired, unused invitation needs a new link.
 
 You can also open the link in a browser to see its joining instructions. The [setup guide for Muse](docs/MUSE_SETUP.md#join-an-existing-hub) covers the complete connection flow.
 

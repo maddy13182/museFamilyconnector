@@ -14,11 +14,9 @@ An invitee joining someone else's hub does not deploy a backend.
    ID. Bind `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` through secure
    credential input. Never ask for the token in chat. See
    [required permissions](DEPLOY.md#credentials-and-prerequisites).
-3. Configure email delivery: bind a Resend `EMAIL_API_TOKEN` and verified
-   sender `EMAIL_FROM` securely. First registration and replacement agents
-   verify inbox ownership; Cloudflare credentials cannot generate these values.
-   Clone the repository. Run `npm ci` and `npm test` in `server/`. This installs
-   the pinned Wrangler automatically. No global install or browser login is needed.
+3. Ask for the circle name and owner name/email. Each user already has one
+   Muse agent running in their VM. Use the private owner setup code; no email
+   provider or inbox verification is required.
 4. Save the first-circle details in a private JSON file, then run:
 
    ```sh
@@ -44,7 +42,7 @@ extraction, then signature and CLI hash before executing the CLI. Install its
 Python requirements in a virtual environment. Use that exact CLI path.
 
 Pass the saved provisioning code directly from the private receipt into
-`hub enroll --server DISCOVERED-URL --code-file PRIVATE-CODE-FILE` through its secure prompt;
+`hub enroll --server DISCOVERED-URL --code-file PRIVATE-CODE-FILE --email OWNER-EMAIL` through its secure prompt;
 [the deployment guide](DEPLOY.md#create-the-first-circle-without-opening-public-registration)
 includes an example. Do not expose it in chat, argv, or shell history. If the user
 is already connected to this server, use `hub circle join` for another circle;
@@ -64,7 +62,7 @@ spent enrollment receipt only after a successful authenticated check.
   after the update is posted in the matching chat. If a background worker lacks
   chat tools, hand off to the main agent for posting and acknowledgement.
 - Invite people to the intended circle with the documented `hub invite-member`
-  command, using the member's intended role. The human privately sends the returned
+  command, using the person’s name, email and intended role. The human privately sends the returned
   onboarding link. Joining a circle does not expose every topic: add the member to
   the conversations they should see and finish distributing the encrypted keys.
 - Test an encrypted message, approved reply, task, and result between two separate

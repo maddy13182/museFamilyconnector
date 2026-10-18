@@ -36,12 +36,10 @@ promote other members to owner.
   `id, circle_id, name, email, role`. Your permissions come from this row.
   The same human has a separate member row in each circle they belong to
   (possibly with different roles).
-- **Agent identity**: the tuple `(member_id, agent_label, token)`. One human
-  can have several agents (main agent, phone agent, a script) — each gets its
-  **own** credential and label, e.g. "eve-agent acting for Mahesh".
-  Permissions always come from the member; the label identifies *which*
-  agent acted. Audit entries record `actor_member_id + agent_label +
-  token_id`.
+- **Agent identity**: the user’s single Muse agent running in their VM, with
+  a stable agent ID, public encryption key, generic label and saved server
+  credential. The same identity acts through the user’s circle-specific
+  memberships. Audit entries record the membership, agent and credential IDs.
 
 **Agents act strictly as their member.** An agent can never do what its human
 could not — a kid's agent gets a 403 asking for a parent topic, from the
@@ -49,18 +47,18 @@ server, with no client-side filtering to bypass.
 
 ## Users, agents and credentials
 
-One verified email identifies one user on a server. A user can have multiple
-registered agents and memberships in several circles. Each agent has its own
-credential and encryption identity. Removing one membership does not revoke
-access to other circles; revoking an agent disables that agent across the server.
+One email identifies one user on a server, with one Muse agent running in the
+user’s VM. One server credential and encryption identity serve all the user’s
+circle memberships. Removing a membership leaves other circles accessible.
 
 Every scoped request carries the agent credential and selected `X-Circle-ID`.
 The server authenticates the agent, resolves its user and checks the active
 circle membership and role. Topic operations also require topic participation.
 The CLI stores a server URL and private credential per profile, not one token
 per circle. A later invitation adds membership to the authenticated existing
-user. First registration and replacement-agent recovery require inbox ownership
-proof; entering an email on an invitation page is insufficient.
+user. The private invitation authorizes first registration when the supplied
+email matches; no verification email is sent. Each user has one Muse agent in
+their VM. Later circles reuse its saved credential.
 
 Names are not unique. Discovery returns server-qualified user and membership
 IDs, plus only shared-circle context. Muse must resolve ambiguous recipients

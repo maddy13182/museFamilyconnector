@@ -1,7 +1,7 @@
 // Shared builders for sync-v2 / E2EE-lifecycle tests (spec §5).
 //
-// Every helper here drives the public HTTP surface via makeApp(); the only
-// direct-DB reads are assertions. No @types/node in this repo: random bytes
+// Registration and topic changes use the public HTTP surface via makeApp().
+// Fixture lookups resolve the sole agent; key-loss tests explicitly alter state. No @types/node in this repo: random bytes
 // via WebCrypto (DOM lib), base64 via btoa.
 import assert from 'node:assert';
 import { makeApp, TestApp } from './app.js';
@@ -33,7 +33,9 @@ export async function setupKeyedFamily(
     body: { name, owner_name: 'Ow', owner_email: `o-${name}@x.dev` },
   });
   assert.equal(fam.status, 201);
-  const famId = (await app.db.queryOne('SELECT id FROM families WHERE name = ?', [name]))!['id'] as string;
+  const famId = (await app.db.queryOne('SELECT id FROM families WHERE name = ?', [name]))![
+    'id'
+  ] as string;
   const red = await app.call(
     'POST',
     `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
@@ -50,7 +52,7 @@ export async function setupKeyedFamily(
   };
 }
 
-/** Extra member via the invite flow (no identity key unless added later). */
+/** Another user and their sole Muse agent, through invitation registration. */
 export async function addMember(
   app: TestApp,
   famId: string,
@@ -67,34 +69,52 @@ export async function addMember(
   const acc = await app.call(
     'POST',
     `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
+    {
+      body: {
+        display_name: displayName,
+        agent_label: `${displayName.toLowerCase()}-agent`,
+        agent_public_key: b64(32),
+      },
+    },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
 }
 
-/** Extra agent for an existing member (distinct token + agent_label),
- *  optionally with a registered identity key. */
-export async function addAgent(
+/** Return the one registered Muse agent for this member. */
+export async function memberAgent(
   app: TestApp,
-  minterToken: string,
   memberId: string,
-  label: string,
   withKey: boolean,
 ): Promise<Party> {
-  const m = await app.call('POST', '/v2/provisioning-codes', {
-    token: app.credentials.get(memberId) ?? minterToken,
-    body: { member_id: memberId, agent_label: label },
-  });
-  assert.equal(m.status, 201);
-  const red = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(m.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: (await app.db.queryOne('SELECT public_key FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL',[memberId,label]))?.public_key ?? b64(32) } },
+  const agent = await app.db.queryOne(
+    'SELECT a.label FROM agents a JOIN members m ON m.principal_id=a.user_id WHERE m.id=?',
+    [memberId],
   );
-  assert.equal(red.status, 201);
-  if (!withKey) await app.db.execAtomically([{sql: 'DELETE FROM agent_keys WHERE member_id = ? AND agent_label = ?',params:[memberId,label]}]);
-  return { token: red.body.token as string, memberId: red.body.member.id as string, agentLabel: label };
+  assert.ok(agent);
+  const label = agent!['label'] as string;
+  if (!withKey)
+    await app.db.execAtomically([
+      {
+        sql: 'DELETE FROM agent_keys WHERE member_id=? AND agent_label=?',
+        params: [memberId, label],
+      },
+    ]);
+  return { token: app.credentials.get(memberId)!, memberId, agentLabel: label };
+}
+
+/** Another person, each with their own Muse identity and read state. */
+export async function addPeer(app: TestApp, owner: Party, label: string): Promise<Party> {
+  const m = await app.db.queryOne('SELECT family_id FROM members WHERE id=?', [owner.memberId]);
+  const peer = await addMember(
+    app,
+    m!['family_id'] as string,
+    owner.token,
+    label + '@peer.test',
+    'parent',
+    label,
+  );
+  return memberAgent(app, peer.memberId, true);
 }
 
 export async function createE2eeTopic(
@@ -117,12 +137,22 @@ export async function createE2eeTopic(
 
 /** An active encrypted topic for read/ack business journeys. */
 export async function createActiveTopic(
-  app: TestApp, token: string, _subject: string, participantIds: string[] = [],
+  app: TestApp,
+  token: string,
+  _subject: string,
+  participantIds: string[] = [],
 ): Promise<string> {
-  const { tid } = await createE2eeTopic(app, token, {participantIds});
-  const row = await app.call('GET', `/v2/topics/${tid}`, {token});
-  const keys = await app.call('GET', '/v2/agent-keys', {token});
-  await genesisCommit(app, token, tid, keys.body.keys.filter((k: any)=>row.body.participants.some((p: any)=>p.member_id===k.member_id)).map((k: any)=>({memberId:k.member_id,agentLabel:k.agent_label})));
+  const { tid } = await createE2eeTopic(app, token, { participantIds });
+  const row = await app.call('GET', `/v2/topics/${tid}`, { token });
+  const keys = await app.call('GET', '/v2/agent-keys', { token });
+  await genesisCommit(
+    app,
+    token,
+    tid,
+    keys.body.keys
+      .filter((k: any) => row.body.participants.some((p: any) => p.member_id === k.member_id))
+      .map((k: any) => ({ memberId: k.member_id, agentLabel: k.agent_label })),
+  );
   return tid;
 }
 

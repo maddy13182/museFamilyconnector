@@ -53,27 +53,27 @@ class EncryptionJourney(unittest.TestCase):
         return code,json.loads(text)
     def cli(self,profile,*args,expected=0):
         out,err=io.StringIO(),io.StringIO()
-        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err), mock.patch.object(hub.sys.stdin,"isatty",return_value=True), mock.patch.object(hub.getpass,"getpass",side_effect=lambda _:self.exchange({"mailbox":True})["code"]):
+        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
             rc=hub.main(['--profile',profile,*args],transport=self.transport)
         self.assertEqual(rc,expected,err.getvalue())
         return json.loads(out.getvalue()) if out.getvalue().lstrip().startswith(('{','[')) else out.getvalue()
     def setup_owner(self):
         code,result=self.api('POST','/v2/families',{'name':'Private circle','owner_name':'Owner','owner_email':'owner@example.test'})
         self.assertEqual(code,201)
-        self.cli('owner','setup','--server','https://hub.test','--invite',result['provisioning_code'],'--store','file')
+        self.cli('owner','setup','--server','https://hub.test','--invite',result['provisioning_code'],'--email','owner@example.test','--store','file')
         return self.cli('owner','me')['member']['id']
     def join(self,name,role='parent'):
         owner_token=hub.load_token(hub.load_config('owner'),'owner')[0]
         fam=hub.load_config('owner')['family_id']
-        code,inv=self.api('POST',f'/v2/families/{fam}/invites',{'email':name+'@example.test','role':role},owner_token)
+        code,inv=self.api('POST',f'/v2/families/{fam}/invites',{'email':name+'@example.test','name':name,'role':role},owner_token)
         self.assertEqual(code,201)
-        self.cli(name,'setup','--server','https://hub.test','--invite',inv['invite_code'],'--store','file','--name',name,'--label',name+'-agent')
+        self.cli(name,'setup','--server','https://hub.test','--invite',inv['invite_code'],'--store','file','--name',name,'--email',name+'@example.test','--label',name+'-agent')
         return self.cli(name,'me')['member']['id']
     def invitation(self, email, family=None):
         cfg = hub.load_config('owner')
         family = family or cfg['active_circle_id']
         token = hub.load_token(cfg, 'owner')[0]
-        status, response = self.api('POST', '/v2/families/' + family + '/invites', {'email':email,'role':'parent'}, token)
+        status, response = self.api('POST', '/v2/families/' + family + '/invites', {'email':email,'name':'Person','role':'parent'}, token)
         self.assertEqual(status, 201)
         return response
 
@@ -94,7 +94,7 @@ class EncryptionJourney(unittest.TestCase):
             return result
         self.transport = unreliable
         with mock.patch.object(hub.time, 'sleep'):
-            self.cli('person','enroll','--server','https://hub.test','--code-file',str(code_file),'--name','Person')
+            self.cli('person','enroll','--server','https://hub.test','--code-file',str(code_file),'--name','Person','--email','person@example.test')
         self.assertEqual(statuses,[201,200])
         self.assertEqual(credentials[0],credentials[1])
         cfg=hub.load_config('person')
@@ -116,7 +116,7 @@ class EncryptionJourney(unittest.TestCase):
                 raise OSError('injected credential persistence failure')
             return write(path,data,what)
         with mock.patch.object(hub,'_write_secret_file_0600',side_effect=fail_credential):
-            self.cli('person','enroll','--server','https://hub.test','--code-file',str(code_file),'--name','Person',expected=1)
+            self.cli('person','enroll','--server','https://hub.test','--code-file',str(code_file),'--name','Person','--email','person@example.test',expected=1)
         journal=Path(hub._pending_enrollment('person'))
         self.assertTrue(journal.exists())
         self.assertEqual(journal.stat().st_mode & 0o777,0o600)
@@ -141,14 +141,14 @@ class EncryptionJourney(unittest.TestCase):
         inv=self.invitation('person@example.test',first)
         code=Path(self.temp.name)/'code'
         code.write_text(inv['invite_code'])
-        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person','--label','first-agent')
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person','--email','person@example.test','--label','first-agent')
         original=hub.load_token(hub.load_config('person'),'person')[0]
         self.exchange({'lock_setup':True})
         self.cli('owner','circle','create','--name','Second circle','--kind','general')
         second=hub.load_config('owner')['active_circle_id']
         inv=self.invitation('person@example.test',second)
         code.write_text(inv['invite_code'])
-        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person','--label','second-agent')
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person','--email','person@example.test','--label','second-agent')
         cfg=hub.load_config('person')
         self.assertEqual(hub.load_token(cfg,'person')[0],original)
         self.assertNotIn('circle_tokens',cfg)
@@ -186,30 +186,22 @@ class EncryptionJourney(unittest.TestCase):
         self.cli('owner','post','--topic',topic_first,'--message','PRIVATE-FAMILY-MESSAGE')
         self.assertIn('PRIVATE-FAMILY-MESSAGE',json.dumps(self.cli('person','read','--topic',topic_first)))
 
-    def test_own_agent_approval_installs_another_agent_without_email_prompt(self):
+    def test_first_join_confirms_invited_email_without_email_delivery(self):
         self.setup_owner()
-        approval=Path(self.temp.name)/'new-device-approval'
-        result=self.cli('owner','agent-invite','--label','phone','--output',str(approval))
-        self.assertEqual(result['agent_label'],'phone')
-        with mock.patch.object(hub,'_read_email_verification_code',side_effect=AssertionError('Approved agent must not request another email proof')):
-            self.cli('phone','enroll','--server','https://hub.test','--code-file',str(approval),'--label','phone')
-        owner=hub.load_config('owner');phone=hub.load_config('phone')
-        self.assertEqual(owner['user']['id'],phone['user']['id'])
-        self.assertNotEqual(owner['agent']['id'],phone['agent']['id'])
-        self.assertEqual(len(self.cli('phone','circles','--json')['data']['circles']),1)
-        self.assertEqual(approval.stat().st_mode & 0o777,0o600)
-
-    def test_replacement_agent_keeps_user_identity_without_inheriting_historical_keys(self):
-        owner=self.setup_owner();person=self.join('person')
-        topic=self.cli('owner','new-topic','--subject','Private history','--with',owner+','+person)['topic']['id']
-        self.cli('owner','post','--topic',topic,'--message','PRIVATE-HISTORICAL-CONTENT')
-        original=hub.load_config('person')['user']['id']
-        self.cli('replacement','enroll','--server','https://hub.test','--recover-email','person@example.test','--label','replacement-agent')
-        self.assertEqual(hub.load_config('replacement')['user']['id'],original)
-        self.assertEqual(hub._load_topic_keys('replacement',topic),{})
-        received=self.cli('replacement','read','--topic',topic)
-        self.assertNotIn('PRIVATE-HISTORICAL-CONTENT',json.dumps(received))
-        self.assertIn('PRIVATE-HISTORICAL-CONTENT',json.dumps(self.cli('person','read','--topic',topic)))
+        invitation=self.invitation('person@example.test')
+        path=Path(self.temp.name)/'invitation-code';path.write_text(invitation['invite_code'])
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(path),'--name','Person','--email','wrong@example.test',expected=1)
+        identity=Path(hub.profile_dir('person'))/'agent.key'
+        original=identity.read_bytes()
+        self.assertFalse(Path(hub._pending_enrollment('person')).exists())
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len(snapshot['principals']),1)
+        self.assertEqual(len(snapshot['agents']),1)
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(path),'--name','Person','--email','person@example.test')
+        self.assertEqual(identity.read_bytes(),original)
+        cfg=hub.load_config('person')
+        self.assertEqual(cfg['user']['email'],'person@example.test')
+        self.assertEqual(self.cli('person','me')['member']['name'],'Person')
 
     def test_rejoining_removed_circle_reuses_user_agent_and_server_credential(self):
         owner=self.setup_owner();member=self.join('person')
@@ -329,9 +321,9 @@ class EncryptionJourney(unittest.TestCase):
         code, created = self.api('POST','/v2/families',{'name':'Fresh','owner_name':'Owner','owner_email':'owner@example.test'})
         self.assertEqual(code,201)
         with mock.patch.object(hub,'_require_nacl',side_effect=hub.HubError('config','crypto unavailable')):
-            self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--store','file',expected=1)
+            self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--email','owner@example.test','--store','file',expected=1)
         # The same one-use code still works after local prerequisites are fixed.
-        self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--store','file')
+        self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--email','owner@example.test','--store','file')
         self.assertTrue(self.cli('owner','me')['member']['id'])
 
     def test_tamper_and_missing_local_keys_never_send_plaintext(self):

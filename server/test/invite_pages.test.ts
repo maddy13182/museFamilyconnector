@@ -282,6 +282,11 @@ test('verify rejects wrong email, accepts normalized right email', async () => {
   assert.notEqual(right.body.invite_code, inv.invite_code, 'verify mints a fresh code');
   assert.ok(right.body.enroll_command.includes('enroll --server'));
   assert.ok(right.body.enroll_command.includes('--code-file'));
+  assert.ok(right.body.enroll_command.includes('--email'));
+  const fresh = await app.call('GET', `/i/${pageToken}`, {...ip(73),headers:{Accept:'application/json'}});
+  assert.equal(fresh.body.invited_name,'Invited person');
+  const stored=await app.db.queryOne('SELECT name FROM invites WHERE code_hash=(SELECT invite_code_hash FROM invite_pages LIMIT 1)');
+  assert.equal(stored?.name,'Invited person');
   assert.ok(right.body.enroll_command.includes('.venv/bin/python'));
   assert.ok(!right.body.enroll_command.includes(right.body.invite_code));
   assert.ok(right.body.resume_command.endsWith('enroll --resume'));

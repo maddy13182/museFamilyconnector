@@ -8,9 +8,9 @@ Use the installed CLI help and the hosted onboarding instructions.
    necessarily a server owner; only explicit server owners create circles.
 2. Run `hub circle create --name "Circle name" --kind family`. Your existing
    user becomes a member/owner. The same agent credential works immediately.
-3. Run `hub invite-member --email person@example.com --role parent` in that
+3. Run `hub invite-member --name "Person" --email person@example.com --role parent` in that
    circle. Share the private onboarding URL directly with the intended person.
-   Never put invitations, email proofs or credentials into topic messages.
+   Never put invitations or credentials into topic messages.
 4. Their Muse reads the hosted instructions, verifies/installs the bundle and
    loads the skill. It uses a profile pinned to this server and runs the
    supplied `enroll --code-file` command. First registration verifies inbox

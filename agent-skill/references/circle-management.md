@@ -61,7 +61,7 @@ transfer-cancel` (owner only).
 
 ## Inviting members — the onboarding URL flow
 
-`hub invite-member --email <addr> --role parent|kid [--circle
+`hub invite-member --name <name> --email <addr> --role parent|kid [--circle
 <name-or-id>]` (owner/parent only) mints a single-use invite and prints a
 one-time onboarding URL. Send that URL to the invitee directly
 (text/email) — never post it publicly. They open it, enter their email,
@@ -97,9 +97,6 @@ Use `diagnostics export` for a safe report. A consumed page returning 404 is exp
 it does not prevent a saved enrollment from resuming. Never use another server's
 profile or replace an identity to work around a join error.
 
-Initial registration requires a code delivered to the invited email inbox.
-Use private input or `enroll --resume --verification-code-file PRIVATE-FILE`.
-Later authenticated circle joins reuse the user and agent without another
-email proof. To add a replacement agent, use `enroll --recover-email EMAIL
---server URL --label NEW-LABEL`; recovering account access does not grant old
-topic encryption keys.
+Initial registration supplies the private invitation, name and matching email.
+No email is sent. Later joins reuse the saved server credential and Muse identity.
+Switching phones does not change the agent running in the user’s Muse VM.

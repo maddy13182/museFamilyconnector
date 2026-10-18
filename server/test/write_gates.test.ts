@@ -15,7 +15,7 @@ import {
   hex,
   setupKeyedFamily,
   addMember,
-  addAgent,
+  memberAgent,
   createE2eeTopic,
   inviteToTopic,
   postEntry,
@@ -36,7 +36,7 @@ interface Ctx {
 async function committed(app: TestApp, name: string): Promise<Ctx> {
   const { famId, owner } = await setupKeyedFamily(app, name);
   const m = await addMember(app, famId, owner.token, 'bee@w.dev', 'parent', 'Bee');
-  const bee = await addAgent(app, owner.token, m.memberId, 'bee-agent', true);
+  const bee = await memberAgent(app, m.memberId, true);
   const { tid } = await createE2eeTopic(app, owner.token, { participantIds: [bee.memberId] });
   const keyId1 = hex(16);
   for (const a of [
@@ -106,7 +106,10 @@ test('rotation_required after member removal: encrypted writes pause until rekey
   // postable while writes are paused).
   const sys = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
-    body: { kind: 'key_request', data: {member_id:owner.memberId,agent_label:owner.agentLabel} },
+    body: {
+      kind: 'key_request',
+      data: { member_id: owner.memberId, agent_label: owner.agentLabel },
+    },
   });
   assert.equal(sys.status, 201);
 
@@ -127,7 +130,7 @@ test('rotation_required after from_join accept: newcomer gets no current-key env
   const app = makeApp();
   const { famId, owner, bee, tid, keyId1 } = await committed(app, 'GateFromJoin');
   const cm = await addMember(app, famId, owner.token, 'cee@w.dev', 'parent', 'Cee');
-  const cee = await addAgent(app, owner.token, cm.memberId, 'cee-agent', true);
+  const cee = await memberAgent(app, cm.memberId, true);
 
   await inviteToTopic(app, owner.token, tid, [cee.memberId], 'from_join');
 

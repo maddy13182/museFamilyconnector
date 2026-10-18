@@ -72,7 +72,7 @@ export async function resolveToken(
             t.revoked_at, a.user_id AS principal_id,
             m.family_id, m.role
        FROM agent_tokens t
-       JOIN agents a ON a.id = t.agent_id AND a.revoked_at IS NULL
+       JOIN agents a ON a.id = t.agent_id
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?`,
     [hash],

@@ -122,14 +122,6 @@ class IdentityDiscoveryTest(HubTestBase):
         self.assertEqual(rc,1)
         self.assertEqual(json.loads(out.getvalue())['errors'][0]['code'],'protocol')
 
-    def test_recovery_cannot_overwrite_another_users_profile(self):
-        self.seed_config(user={'id':'first-user','email':'first@example.test'})
-        path=Path(hub.config_path('default'));before=path.read_bytes()
-        rc,out,err=self.run_cli(['enroll','--recover-email','second@example.test','--label','replacement'])
-        self.assertEqual(rc,1);self.assertIn('separate profile',err)
-        self.assertEqual(path.read_bytes(),before)
-        self.assertFalse(any(c['method']=='POST' for c in self.fake.calls))
-
     def test_join_without_saved_credential_never_redeems_invite(self):
         self.seed_config(user={'id':'first-user','email':'first@example.test'})
         os.environ.pop('FAMILY_HUB_TOKEN',None)
@@ -138,33 +130,7 @@ class IdentityDiscoveryTest(HubTestBase):
         self.assertFalse(any(c['method']=='POST' for c in self.fake.calls))
         self.assertFalse(Path(hub._pending_enrollment('default')).exists())
 
-    def test_email_proof_error_explains_enrollment_instead_of_topic_permissions(self):
-        error=hub.HubError('forbidden','Proof required',server_code='email_verification_required')
-        message=error.friendly()
-        self.assertIn('--verification-code-file',message)
-        self.assertNotIn('topics you participate',message)
-
-    def test_agent_approval_is_private_and_never_overwrites_existing_files(self):
-        self.seed_config()
-        target=Path(self.tmp)/'approval.txt'
-        self.fake.add('GET','/v2/me',200,{'id':'own-member'})
-        self.fake.add('POST','/v2/provisioning-codes',201,{'provisioning_code':'fhp_PRIVATEapproval','expires_at':'2030-01-01T00:00:00Z'})
-        rc,out,err=self.run_cli(['agent-invite','--label','phone','--output',str(target)])
-        self.assertEqual(rc,0,err)
-        self.assertEqual(target.read_text(),'fhp_PRIVATEapproval\n')
-        self.assertEqual(target.stat().st_mode & 0o777,0o600)
-        self.assertNotIn('fhp_PRIVATEapproval',out+err)
-        before=len(self.fake.calls)
-        rc,out,err=self.run_cli(['agent-invite','--label','phone','--output',str(target)])
-        self.assertEqual(rc,1)
-        self.assertFalse(any(c['method']=='POST' for c in self.fake.calls[before:]))
-        self.assertEqual(target.read_text(),'fhp_PRIVATEapproval\n')
-
-    def test_failed_approval_removes_only_the_new_empty_file(self):
-        self.seed_config()
-        target=Path(self.tmp)/'approval.txt'
-        self.fake.add('GET','/v2/me',200,{'id':'own-member'})
-        self.fake.add('POST','/v2/provisioning-codes',403,{'error':{'code':'forbidden','message':'Denied'}})
-        rc,out,err=self.run_cli(['agent-invite','--label','phone','--output',str(target)])
-        self.assertEqual(rc,1);self.assertFalse(target.exists())
-        self.assertEqual(len([c for c in self.fake.calls if c['method']=='POST']),1)
+    def test_matching_email_error_explains_invitation_confirmation(self):
+        error=hub.HubError('forbidden','Mismatch',server_code='invite_email_mismatch')
+        self.assertIn('email address that the invitation was issued for',error.friendly())
+        self.assertNotIn('topic permissions',error.friendly())

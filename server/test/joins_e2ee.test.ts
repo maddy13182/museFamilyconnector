@@ -15,7 +15,7 @@ import {
   hex,
   setupKeyedFamily,
   addMember,
-  addAgent,
+  memberAgent,
   createE2eeTopic,
   inviteToTopic,
   postEntry,
@@ -40,7 +40,7 @@ interface Ctx {
 async function twoEpochs(app: TestApp, name: string): Promise<Ctx> {
   const { famId, owner } = await setupKeyedFamily(app, name);
   const m = await addMember(app, famId, owner.token, 'bee@j.dev', 'parent', 'Bee');
-  const bee = await addAgent(app, owner.token, m.memberId, 'bee-agent', true);
+  const bee = await memberAgent(app, m.memberId, true);
   const { tid } = await createE2eeTopic(app, owner.token, { participantIds: [bee.memberId] });
 
   const keyId1 = hex(16);
@@ -49,10 +49,19 @@ async function twoEpochs(app: TestApp, name: string): Promise<Ctx> {
     { memberId: owner.memberId, agentLabel: owner.agentLabel },
     { memberId: bee.memberId, agentLabel: bee.agentLabel },
   ]) {
-    assert.equal((await postEnvelope(app, owner.token, tid, a.memberId, a.agentLabel, keyId1)).status, 201);
+    assert.equal(
+      (await postEnvelope(app, owner.token, tid, a.memberId, a.agentLabel, keyId1)).status,
+      201,
+    );
   }
   assert.equal(
-    (await commitKey(app, owner.token, tid, { expectedEpoch: 1, keyId: keyId1, commitment: commitment1 })).status,
+    (
+      await commitKey(app, owner.token, tid, {
+        expectedEpoch: 1,
+        keyId: keyId1,
+        commitment: commitment1,
+      })
+    ).status,
     200,
   );
 
@@ -62,10 +71,19 @@ async function twoEpochs(app: TestApp, name: string): Promise<Ctx> {
     { memberId: owner.memberId, agentLabel: owner.agentLabel },
     { memberId: bee.memberId, agentLabel: bee.agentLabel },
   ]) {
-    assert.equal((await postEnvelope(app, owner.token, tid, a.memberId, a.agentLabel, keyId2)).status, 201);
+    assert.equal(
+      (await postEnvelope(app, owner.token, tid, a.memberId, a.agentLabel, keyId2)).status,
+      201,
+    );
   }
   assert.equal(
-    (await commitKey(app, owner.token, tid, { expectedEpoch: 2, keyId: keyId2, commitment: commitment2 })).status,
+    (
+      await commitKey(app, owner.token, tid, {
+        expectedEpoch: 2,
+        keyId: keyId2,
+        commitment: commitment2,
+      })
+    ).status,
     200,
   );
   return { app, famId, owner, bee, tid, keyId1, keyId2, commitment1, commitment2 };
@@ -78,10 +96,13 @@ async function keyStatus(app: TestApp, token: string, tid: string): Promise<stri
 }
 
 test('full_history accept: no rotation gate; joiner sealed all committed epoch keys', async () => {
-  const { app, famId, owner, tid, keyId1, keyId2, commitment1, commitment2 } = await twoEpochs(makeApp(), 'JoinFull');
+  const { app, famId, owner, tid, keyId1, keyId2, commitment1, commitment2 } = await twoEpochs(
+    makeApp(),
+    'JoinFull',
+  );
 
   const cm = await addMember(app, famId, owner.token, 'cee@j.dev', 'parent', 'Cee');
-  const cee = await addAgent(app, owner.token, cm.memberId, 'cee-agent', true);
+  const cee = await memberAgent(app, cm.memberId, true);
   await inviteToTopic(app, owner.token, tid, [cee.memberId], 'full');
 
   // No rotation gate for full_history: encrypted writes continue.
@@ -126,7 +147,7 @@ test('from_join contrast: rotation gate set, no current-key envelope, pending', 
   const { app, famId, owner, tid, keyId2 } = await twoEpochs(makeApp(), 'JoinFromJoin');
 
   const cm = await addMember(app, famId, owner.token, 'dee@j.dev', 'parent', 'Dee');
-  const dee = await addAgent(app, owner.token, cm.memberId, 'dee-agent', true);
+  const dee = await memberAgent(app, cm.memberId, true);
   await inviteToTopic(app, owner.token, tid, [dee.memberId], 'from_join');
 
   const rr = await app.db.queryOne(`SELECT rotation_required FROM topics WHERE id = ?`, [tid]);
@@ -150,7 +171,7 @@ test('keyless full_history joiner: envelopes cannot be staged; stays pending', a
 
   // Elle joins with history_from=full but never ran key-init.
   const em = await addMember(app, famId, owner.token, 'elle@j.dev', 'parent', 'Elle');
-  const elle = await addAgent(app, owner.token, em.memberId, 'elle-agent', false);
+  const elle = await memberAgent(app, em.memberId, false);
   await inviteToTopic(app, owner.token, tid, [elle.memberId], 'full');
 
   const e = await postEnvelope(app, owner.token, tid, elle.memberId, elle.agentLabel, keyId1);
@@ -165,8 +186,16 @@ test('keyless full_history joiner: envelopes cannot be staged; stays pending', a
     body: { agent_public_key: b64(32) },
   });
   assert.equal(rot.status, 200);
-  for (const kid of [keyId1, (await app.db.queryOne(`SELECT current_key_id FROM topics WHERE id = ?`, [tid]))!['current_key_id'] as string]) {
-    assert.equal((await postEnvelope(app, owner.token, tid, elle.memberId, elle.agentLabel, kid)).status, 201);
+  for (const kid of [
+    keyId1,
+    (await app.db.queryOne(`SELECT current_key_id FROM topics WHERE id = ?`, [tid]))![
+      'current_key_id'
+    ] as string,
+  ]) {
+    assert.equal(
+      (await postEnvelope(app, owner.token, tid, elle.memberId, elle.agentLabel, kid)).status,
+      201,
+    );
   }
   assert.equal(await keyStatus(app, elle.token, tid), 'ok');
 });

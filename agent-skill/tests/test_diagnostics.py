@@ -55,13 +55,10 @@ class DiagnosticsTest(unittest.TestCase):
     def test_save_failure_records_actual_nonzero_exit_and_last_milestone(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'FAMILY_HUB_CONFIG_HOME': tmp}), mock.patch.object(hub, '_startup_integrity_check', return_value=True), mock.patch.object(hub, '_require_server_version'), mock.patch.object(hub, '_ensure_identity_keypair', return_value=(b'key', 'public', False)), mock.patch.object(hub, '_write_secret_file_0600', side_effect=OSError('storage failed')):
             def transport(*args):
-                if args[1].endswith('/identity/challenges'):
-                    return 202,json.dumps({'challenge_id':'test','expires_at':'2099-01-01T00:00:00Z'})
                 return 201, json.dumps({'token': json.loads(args[3])['agent_token'], 'token_id': 'id',
                     'member': {'id': 'member', 'family_id': 'circle'}})
-            with mock.patch.object(hub,'_read_email_verification_code',return_value='test-proof'):
-                result = hub.main(['setup', '--server', 'https://hub.test', '--invite',
-                'fhi_private_code', '--name', 'Private name', '--label', 'agent'], transport)
+            result = hub.main(['setup', '--server', 'https://hub.test', '--invite',
+                'fhi_private_code', '--name', 'Private name', '--email','person@example.test','--label', 'agent'], transport)
             self.assertNotEqual(result, 0)
             raw = (Path(hub.profile_dir('default')) / 'diagnostics.jsonl').read_text()
             rows = [json.loads(line) for line in raw.splitlines()]

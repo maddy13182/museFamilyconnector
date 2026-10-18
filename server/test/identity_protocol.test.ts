@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeApp, TestApp } from './app.js';
 import { handleRequest } from '../src/index.js';
-import { issueEmailChallenge } from '../src/identity.js';
 import { randomBase62 } from '../src/auth.js';
 
 const publicKey = () => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
@@ -108,76 +107,6 @@ test('one user and one agent join two circles; server discovery is authoritative
       (k: any) => k.member_id === secondJoin.body.member.id && k.public_key === key,
     ),
   );
-});
-
-test('email matching and invitation possession alone cannot attach to an existing user', async () => {
-  const app = makeApp();
-  const o = await owner(app);
-  const code = await invite(app, o.token, o.circle, 'person@example.test');
-  const body = {
-    agent_token: credential(),
-    agent_public_key: publicKey(),
-    display_name: 'Person',
-    agent_label: 'phone',
-  };
-  const raw = await handleRequest(
-    new Request('https://hub.test/v2/invites/' + code + '/accept', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
-    app.db,
-    app.env,
-  );
-  assert.equal(raw.status, 400); // challenge_id is required before any identity is created
-  assert.equal(
-    app.raw.prepare('SELECT count(*) n FROM principals WHERE email=?').get('person@example.test')!
-      .n,
-    0,
-  );
-  assert.equal(
-    app.raw
-      .prepare('SELECT used_at FROM invites WHERE code_hash IS NOT NULL AND email=?')
-      .get('person@example.test')!.used_at,
-    null,
-  );
-  const attacker = await accept(app, code, 'Person', 'phone', body.agent_public_key, o.token);
-  assert.equal(attacker.status, 403);
-  assert.equal(attacker.body.error.code, 'identity_mismatch');
-});
-
-test('email proof is bound to the enrollment code, candidate credential and public key', async () => {
-  const app = makeApp();
-  const o = await owner(app);
-  const code = await invite(app, o.token, o.circle, 'person@example.test');
-  let proof = '';
-  app.env.EMAIL_DELIVERY = async (_email, value) => {
-    proof = value;
-  };
-  const token = credential();
-  const key = publicKey();
-  const challenge = await issueEmailChallenge(app.db, app.env, {
-    enrollment_code: code,
-    agent_token: token,
-    agent_public_key: key,
-  });
-  const body = {
-    agent_token: token,
-    agent_public_key: key,
-    display_name: 'Person',
-    agent_label: 'phone',
-    challenge_id: challenge.challenge_id,
-    verification_code: proof,
-  };
-  const changed = await app.call('POST', '/v2/invites/' + code + '/accept', {
-    body: { ...body, agent_token: credential() },
-  });
-  assert.equal(changed.status, 403);
-  const accepted = await app.call('POST', '/v2/invites/' + code + '/accept', { body });
-  assert.equal(accepted.status, 201);
-  const replay = await app.call('POST', '/v2/invites/' + code + '/accept', { body });
-  assert.equal(replay.status, 200);
-  assert.equal(replay.body.token, token);
 });
 
 test('people search separates duplicate names and exposes only shared active circles', async () => {
@@ -290,53 +219,6 @@ test('removing one membership preserves the agent and its other circle; circle a
   assert.equal(circles.body.data.circles[0].circle_id, second.body.id);
 });
 
-test('email recovery adds an independent agent to the same user; agent revocation cannot cross users', async () => {
-  const app = makeApp();
-  const o = await owner(app);
-  const joined = await accept(
-    app,
-    await invite(app, o.token, o.circle, 'person@example.test'),
-    'Person',
-    'phone',
-    publicKey(),
-  );
-  let proof = '';
-  app.env.EMAIL_DELIVERY = async (_email, value) => {
-    proof = value;
-  };
-  const token = credential(),
-    key = publicKey();
-  const challenge = await app.call('POST', '/v2/identity/challenges', {
-    body: { email: 'person@example.test', agent_token: token, agent_public_key: key },
-  });
-  assert.equal(challenge.status, 202);
-  assert.equal(challenge.body.verification_code, undefined);
-  const body = {
-    email: 'person@example.test',
-    agent_label: 'replacement',
-    agent_token: token,
-    agent_public_key: key,
-    challenge_id: challenge.body.challenge_id,
-    verification_code: proof,
-  };
-  const registered = await app.call('POST', '/v2/identity/agents', { body });
-  assert.equal(registered.status, 201);
-  assert.equal(registered.body.user.id, joined.body.user.id);
-  assert.notEqual(registered.body.agent.id, joined.body.agent.id);
-  assert.equal((await app.call('POST', '/v2/identity/agents', { body })).status, 200);
-  const denied = await app.call('POST', `/v2/agents/${registered.body.agent.id}/revoke`, {
-    token: o.token,
-  });
-  assert.equal(denied.status, 404);
-  const revoked = await app.call('POST', `/v2/agents/${registered.body.agent.id}/revoke`, {
-    token: joined.body.token,
-  });
-  assert.equal(revoked.status, 200);
-  assert.equal((await app.call('GET', '/v2/me', { token })).status, 401);
-  assert.equal((await app.call('GET', '/v2/me', { token: joined.body.token })).status, 200);
-  assert.equal((await app.call('POST', '/v2/identity/agents', { body })).status, 401);
-});
-
 test('a full 100-person page stays within D1 parameter limits and resumes without skipped users', async () => {
   const app = makeApp();
   const o = await owner(app);
@@ -346,8 +228,8 @@ test('a full 100-person page stays within D1 parameter limits and resumes withou
     const id = 'batch-' + String(i).padStart(3, '0'),
       email = id + '@example.test';
     ops.push({
-      sql: 'INSERT INTO principals(id,email,name,created_at,email_verified_at) VALUES(?,?,?,?,?)',
-      params: [id, email, 'Batch person', ts, ts],
+      sql: 'INSERT INTO principals(id,email,name,created_at) VALUES(?,?,?,?)',
+      params: [id, email, 'Batch person', ts],
     });
     ops.push({
       sql: "INSERT INTO members(id,family_id,principal_id,name,email,role,created_at) VALUES(?,?,?,?,?,'parent',?)",
@@ -375,142 +257,110 @@ test('a full 100-person page stays within D1 parameter limits and resumes withou
   assert.ok(page.body.data.people.every((user: any) => user.memberships.length === 1));
 });
 
-test('concurrent first registrations for the same verified email converge on one user across circles', async () => {
+test('private invite plus matching email registers directly with no email service', async () => {
   const app = makeApp();
   const o = await owner(app);
+  const code = await invite(app, o.token, o.circle, 'Person@Example.Test');
+  const key = publicKey(),
+    token = credential();
+  const body = {
+    email: ' PERSON@example.test ',
+    display_name: 'Person',
+    agent_label: 'muse-agent',
+    agent_public_key: key,
+    agent_token: token,
+  };
+  async function raw(input: Record<string, unknown>) {
+    return handleRequest(
+      new Request('https://hub.test/v2/invites/' + code + '/accept', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      }),
+      app.db,
+      app.env,
+    );
+  }
+  assert.equal((await raw({ ...body, email: 'wrong@example.test' })).status, 403);
+  assert.equal(
+    (await app.db.queryOne("SELECT count(*) n FROM principals WHERE email='person@example.test'"))
+      ?.n,
+    0,
+  );
+  const registered = await raw(body);
+  assert.equal(registered.status, 201);
+  const user = (await registered.json()) as any;
+  assert.equal(user.user.email, 'person@example.test');
+  assert.equal((await raw(body)).status, 200);
+  assert.equal((await raw({ ...body, email: 'wrong@example.test' })).status, 409);
+  assert.equal(
+    (await app.db.queryOne('SELECT count(*) n FROM agents WHERE user_id=?', [user.user.id]))?.n,
+    1,
+  );
+});
+
+test('an invitation cannot create another Muse identity for an already registered email', async () => {
+  const app = makeApp();
+  const o = await owner(app);
+  const code = await invite(app, o.token, o.circle, 'person@example.test');
+  const first = await accept(app, code, 'Person', 'muse-agent', publicKey());
+  assert.equal(first.status, 201);
   const second = await app.call('POST', '/v2/families', {
     token: o.token,
     body: { name: 'Second' },
   });
-  assert.equal(second.status, 201);
-  const code1 = await invite(app, o.token, o.circle, ' Person@Example.Test ');
-  const code2 = await invite(app, o.token, second.body.id, 'person@example.test');
-  const [one, two] = await Promise.all([
-    accept(app, code1, 'Person', 'phone', publicKey()),
-    accept(app, code2, 'Person', 'computer', publicKey()),
-  ]);
-  assert.equal(one.status, 201);
-  assert.equal(two.status, 201);
-  assert.equal(one.body.user.id, two.body.user.id);
-  assert.notEqual(one.body.agent.id, two.body.agent.id);
+  const next = await invite(app, o.token, second.body.id, 'person@example.test');
+  const rejected = await accept(app, next, 'Person', 'another-agent', publicKey());
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.error.code, 'existing_identity');
   assert.equal(
-    (await app.db.queryOne("SELECT count(*) n FROM principals WHERE email='person@example.test'"))
+    (await app.db.queryOne('SELECT count(*) n FROM agents WHERE user_id=?', [first.body.user.id]))
       ?.n,
     1,
   );
-  const circles = await app.call('GET', '/v2/discovery/circles', { token: one.body.token });
-  assert.equal(circles.body.data.circles.length, 2);
-});
-
-test('an existing own agent can approve another agent without repeating email verification', async () => {
-  const app = makeApp();
-  const o = await owner(app);
-  const code = await app.call('POST', '/v2/provisioning-codes', {
-    token: o.token,
-    body: { member_id: o.joined.body.member.id, agent_label: 'computer' },
-  });
-  assert.equal(code.status, 201);
-  app.env.EMAIL_DELIVERY = async () => {
-    throw new Error('No email should be sent for existing agent approval');
-  };
-  const token = credential(),
-    key = publicKey();
-  const next = await app.call('POST', '/v2/identity/challenges', {
-    body: {
-      enrollment_code: code.body.provisioning_code,
-      agent_token: token,
-      agent_public_key: key,
-    },
-  });
-  assert.equal(next.status, 202);
-  assert.equal(next.body.next_action, 'redeem_agent_approval');
-  assert.equal(next.body.challenge_id, undefined);
-  const registered = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${code.body.provisioning_code}/redeem`,
-    { body: { agent_token: token, agent_public_key: key } },
-  );
-  assert.equal(registered.status, 201);
-  assert.equal(registered.body.user.id, o.joined.body.user.id);
-  assert.notEqual(registered.body.agent.id, o.joined.body.agent.id);
-  assert.equal((await app.call('GET', '/v2/me', { token })).status, 200);
-});
-
-test('issuer revocation between approval check and commit leaves no partial agent or consumed code', async () => {
-  const app = makeApp();
-  const o = await owner(app);
-  const code = await app.call('POST', '/v2/provisioning-codes', {
-    token: o.token,
-    body: { member_id: o.joined.body.member.id, agent_label: 'computer' },
-  });
-  const original = app.db.execAtomically.bind(app.db);
-  let injected = false;
-  app.db.execAtomically = async (ops) => {
-    if (!injected && ops.some((op) => op.sql.includes('INSERT INTO enrollment_receipts'))) {
-      injected = true;
-      app.raw
-        .prepare("UPDATE agent_tokens SET revoked_at='2000-01-01T00:00:00Z' WHERE token_id=?")
-        .run(o.joined.body.token_id);
-    }
-    return original(ops);
-  };
-  const result = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${code.body.provisioning_code}/redeem`,
-    { body: { agent_token: credential(), agent_public_key: publicKey() } },
-  );
-  assert.equal(result.status, 409);
-  assert.equal(result.body.error.code, 'enrollment_state_changed');
-  assert.equal((await app.db.queryOne('SELECT count(*) n FROM agents'))?.n, 1);
-  assert.equal((await app.db.queryOne('SELECT count(*) n FROM agent_tokens'))?.n, 1);
   assert.equal(
-    (await app.db.queryOne("SELECT used_at FROM provisioning_codes WHERE agent_label='computer'"))
-      ?.used_at,
-    null,
+    (
+      await app.db.queryOne('SELECT count(*) n FROM members WHERE family_id=? AND email=?', [
+        second.body.id,
+        'person@example.test',
+      ])
+    )?.n,
+    0,
   );
+  const key = (await app.db.queryOne('SELECT public_key FROM agents WHERE id=?', [
+    first.body.agent.id,
+  ]))!.public_key as string;
+  const joined = await accept(app, next, 'Person', 'muse-agent', key, first.body.token);
+  assert.equal(joined.status, 201);
+  assert.equal(joined.body.agent.id, first.body.agent.id);
+  assert.equal(joined.body.token, first.body.token);
 });
 
-test('proof expiry at commit rolls back user, membership, keys and credential together', async () => {
+test('expiry at commit rolls back registration and leaves the invitation unused', async () => {
   const app = makeApp();
   const o = await owner(app);
   const code = await invite(app, o.token, o.circle, 'person@example.test');
-  const original = app.db.execAtomically.bind(app.db);
+  const batch = app.db.execAtomically.bind(app.db);
   let injected = false;
   app.db.execAtomically = async (ops) => {
     if (!injected && ops.some((op) => op.sql.includes('INSERT INTO enrollment_receipts'))) {
       injected = true;
       app.raw
-        .prepare("UPDATE email_challenges SET expires_at='2000-01-01T00:00:00Z' WHERE email=?")
+        .prepare("UPDATE invites SET expires_at='2000-01-01T00:00:00Z' WHERE email=?")
         .run('person@example.test');
     }
-    return original(ops);
+    return batch(ops);
   };
-  const body = {
-    display_name: 'Person',
-    agent_label: 'phone',
-    agent_token: credential(),
-    agent_public_key: publicKey(),
-  };
-  const failed = await app.call('POST', `/v2/invites/${code}/accept`, { body });
-  assert.equal(failed.status, 409);
-  assert.equal(failed.body.error.code, 'enrollment_state_changed');
+  const result = await accept(app, code, 'Person', 'muse-agent', publicKey());
+  assert.equal(result.status, 409);
   assert.equal(
     (await app.db.queryOne("SELECT count(*) n FROM principals WHERE email='person@example.test'"))
       ?.n,
     0,
   );
-  assert.equal(
-    (await app.db.queryOne("SELECT count(*) n FROM members WHERE email='person@example.test'"))?.n,
-    0,
-  );
-  assert.equal((await app.db.queryOne('SELECT count(*) n FROM agent_tokens'))?.n, 1);
   assert.equal(
     (await app.db.queryOne("SELECT used_at FROM invites WHERE email='person@example.test'"))
       ?.used_at,
     null,
   );
-  app.raw
-    .prepare("UPDATE email_challenges SET expires_at='2099-01-01T00:00:00Z' WHERE email=?")
-    .run('person@example.test');
-  assert.equal((await app.call('POST', `/v2/invites/${code}/accept`, { body })).status, 201);
 });

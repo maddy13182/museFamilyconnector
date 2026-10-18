@@ -63,8 +63,7 @@ class FakeHub:
         if method.upper()=="GET" and path=="/v2/families" and ("GET",path) not in self.routes and ("GET",path) not in self.seqs:
             cfg=hub.load_config("default")
             return 200,json.dumps({"families":[{"id":cfg.get("active_circle_id") or cfg.get("family_id") or "default","name":"Family"}]})
-        if method.upper()=="POST" and path=="/v2/identity/challenges" and ("POST",path) not in self.routes:
-            return 202,json.dumps({"challenge_id":"test-mail-challenge","expires_at":"2099-01-01T00:00:00Z"})
+
 
         if (
             method.upper() == "GET"
@@ -147,7 +146,11 @@ class HubTestBase(unittest.TestCase):
         hub.clear_secrets()
 
     def run_cli(self, argv):
-        with captured() as (out, err), mock.patch.object(hub,"_read_email_verification_code",return_value="test-mail-proof"):
+        if "invite-member" in argv and "--name" not in argv:
+            argv=list(argv)+["--name","Invited person"]
+        if any(command in argv for command in ("setup", "enroll")) and "--email" not in argv:
+            argv = list(argv) + ["--email", "tester@example.test"]
+        with captured() as (out, err):
             rc = hub.main(argv, transport=self.fake)
         return rc, out.getvalue(), err.getvalue()
 
@@ -167,7 +170,7 @@ class HubTestBase(unittest.TestCase):
     def seed_config(self, profile="default", **over):
         cfg = {
             "server_url": "https://hub.example",
-            "member": {"id": "m1", "name": "Tester", "role": "parent"},
+            "member": {"id": "m1", "name": "Tester", "role": "parent", "email":"tester@example.test"},
             "agent_label": "test-agent",
             "auth_method": "env",
         }
@@ -639,7 +642,7 @@ class TestCloudflareAndInvite(HubTestBase):
         self.assertEqual(rc, 0)
         self.assertIn("/v2/families/fam1/invites", self.fake.last_url())
         body = json.loads(self.fake.calls[0]["body"])
-        self.assertEqual(body, {"email": "lakshmi@example.com", "role": "parent"})
+        self.assertEqual(body, {"email": "lakshmi@example.com", "name":"Invited person", "role": "parent"})
         self.assertIn("inv_abc", out)
 
     def test_invite_member_needs_family_id(self):

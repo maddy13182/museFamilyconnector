@@ -3,7 +3,7 @@
 Use the private invitation page from the circle owner. Ask Muse to read its
 agent-facing JSON (`Accept: application/json`). If you already hold an owner
 provisioning code, read `GET /v2/client/onboarding` on your server instead; skip the invite-page address-matching step.
-First agent registration still verifies ownership of the owner email. The page and this bundle contain
+Provide the owner email when registering with its setup code. The page and this bundle contain
 all join instructions; no repository clone or Cloudflare account is needed.
 
 ## Install before accepting the invitation
@@ -64,24 +64,19 @@ After installation and skill loading succeed:
 The command has this form:
 
 ```text
-PYTHON CLI --profile PROFILE enroll --server SERVER-URL --code-file PRIVATE-CODE-FILE --name "Your name" --label muse-agent
+PYTHON CLI --profile PROFILE enroll --server SERVER-URL --code-file PRIVATE-CODE-FILE --name "Your name" --email "invited@example.com" --label muse-agent
 ```
 
 `enroll` chooses setup for a new profile or circle join for an already connected
 profile. It preserves the server credential and adds a membership to the same user. Use one profile per server;
 never overwrite another server's profile or send its token to this server.
 
-First registration creates and saves the encryption identity and a fresh private
-login credential **before** its request. The server sends an email ownership
-code; an interactive user enters it privately. For an unattended agent, ask the
-user to save the code privately and continue with `enroll --resume
---verification-code-file PRIVATE-FILE`. Never put the email code in argv or chat
-output. Joining a later circle uses the existing authenticated agent and needs
-no additional credential or email proof. The server atomically binds the credential,
-creates membership when necessary, consumes the invite, and records a
-request-bound receipt. An identical retry resumes the same registration. A
-different credential or changed request cannot recover it, and revoked
-credentials or removed members cannot be resurrected.
+First registration saves the encryption identity and private candidate credential
+before sending the invitation, name and matching email. The server registers one
+user and one Muse agent, adds the circle membership and consumes the invitation
+in one transaction with a resumable receipt. No verification email is sent.
+Later joins reuse the same user, agent and server credential. Use the existing
+server profile; another phone still uses the same Muse VM and identity.
 
 A private pending operation remains until the credential is stored and verified
 with `/v2/me`. If interrupted, preserve the profile and run:
@@ -90,10 +85,8 @@ with `/v2/me`. If interrupted, preserve the profile and run:
 PYTHON CLI --profile PROFILE enroll --resume
 ```
 
-No new invitation is needed for that saved operation. If registration awaits
-email verification, add `--verification-code-file PRIVATE-FILE` to resume. Do not regenerate
-keys, delete pending files, or re-verify the email to recover a pending join. A
-404 from the consumed invitation page is expected after acceptance.
+No new invitation is needed for that saved operation. Preserve its keys and
+pending files. A 404 from a consumed invitation page is expected after acceptance.
 
 ## Verify and use the circle
 
@@ -167,27 +160,7 @@ exit and `complete: false` mean some profiles failed, not that memberships
 disappeared. All-server discovery uses each profile’s stored credential, never
 a single environment token sent to every server.
 
-One email identifies one user per server. A person can have several registered
-agents and circle memberships. Names are not unique. Resolve duplicate names
-with the user, choose the intended server/circle, and use stable IDs.
-
-To add another of your own agents while one still works, run on the working agent:
-
-```bash
-hub agent-invite --label phone --output /private/phone-approval.txt
-```
-
-Transfer that file privately to the new device. After installing the hosted bundle,
-run `hub enroll --server SERVER-URL --code-file PRIVATE-FILE --label phone` in
-the appropriate profile. This approval replaces another inbox verification.
-It expires after 24 hours and stops working if its issuing credential is revoked.
-Circle owners cannot approve another person's server login. Keep the approval
-out of topic messages, shared chats and diagnostic exports.
-
-
-For a replacement agent, use `enroll --server URL --recover-email EMAIL
---label NEW-LABEL` in the appropriate profile. Complete the private email proof;
-the existing user is reused. This restores account access, not historical topic
-keys. Use protected key recovery or an explicitly approved key grant for those.
-`agents` lists your registrations; `agent-revoke --agent-id ID --yes` revokes
-one of your agents across that server.
+One email identifies one user with one Muse agent per server. The Muse VM holds
+the profile, server credential and encryption keys; changing phones does not
+change that identity. Restore private backups if the VM loses credentials.
+Never create another identity as a workaround for an interrupted enrollment.

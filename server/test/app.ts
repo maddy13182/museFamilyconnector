@@ -1,7 +1,7 @@
 // Test harness: drives handleRequest() against an in-memory SQLite DB.
 // Mirrors how the worker serves requests, minus D1.
 
-import { issueEmailChallenge } from '../src/identity.js';
+import { credentialHash } from '../src/auth.js';
 import { randomBase62 } from '../src/auth.js';
 import { handleRequest } from '../src/index.js';
 import { DbClient, Env } from '../src/types.js';
@@ -26,13 +26,8 @@ export interface CallResult {
 export function makeApp() {
   const raw = freshDb();
   const db: DbClient = sqliteClient(raw);
-  const deliveredCodes = new Map<string, string>();
   const credentials = new Map<string, string>();
-  const challenges = new Map<string, { challenge_id: unknown; verification_code: string }>();
   const env: Env = {
-    EMAIL_DELIVERY: async (_email, code, id) => {
-      deliveredCodes.set(id, code);
-    },
     TOKEN_PEPPER: 'test-pepper-do-not-use-in-production',
     // Sync v2 read receipts need a secret; tests use a fixed throwaway.
     READ_RECEIPT_SECRET: 'test-read-receipt-secret-do-not-use-in-production',
@@ -55,37 +50,28 @@ export function makeApp() {
       }
       if (
         method === 'POST' &&
-        /^\/v2\/(invites|provisioning-codes)\/[^/]+\/(accept|redeem)$/.test(path) &&
-        !opts.token &&
+        /\/v2\/(invites|provisioning-codes)\/[^/]+\/(accept|redeem)$/.test(path) &&
         opts.body &&
         typeof opts.body === 'object' &&
-        !('challenge_id' in opts.body)
+        !('email' in opts.body)
       ) {
-        const enrollment = opts.body as Record<string, unknown>;
-        try {
-          const key = JSON.stringify([
-            path,
-            enrollment['agent_token'],
-            enrollment['agent_public_key'],
-          ]);
-          let cached = challenges.get(key);
-          if (!cached) {
-            const challenge = await issueEmailChallenge(db, env, {
-              ...enrollment,
-              enrollment_code: decodeURIComponent(path.split('/')[3]),
-            });
-            if (challenge['challenge_id']) {
-              cached = {
-                challenge_id: challenge['challenge_id'],
-                verification_code: deliveredCodes.get(challenge['challenge_id'] as string)!,
-              };
-              challenges.set(key, cached);
-            }
-          }
-          opts = { ...opts, body: { ...enrollment, ...cached } };
-        } catch {
-          /* Invalid enrollment tests must reach the actual endpoint. */
-        }
+        const hash = await credentialHash(env.TOKEN_PEPPER, decodeURIComponent(path.split('/')[3]));
+        const row = path.startsWith('/v2/invites/')
+          ? await db.queryOne('SELECT email FROM invites WHERE code_hash=?', [hash])
+          : await db.queryOne(
+              'SELECT m.email FROM provisioning_codes p JOIN members m ON m.id=p.member_id WHERE p.code_hash=?',
+              [hash],
+            );
+        opts = { ...opts, body: { ...opts.body, email: row?.['email'] ?? 'unknown@example.test' } };
+      }
+      if (
+        method === 'POST' &&
+        /^\/v2\/families\/[^/]+\/invites$/.test(path) &&
+        opts.body &&
+        typeof opts.body === 'object' &&
+        !('name' in opts.body)
+      ) {
+        opts = { ...opts, body: { ...opts.body, name: 'Invited person' } };
       }
       headers['content-type'] = 'application/json';
       body = JSON.stringify(opts.body);

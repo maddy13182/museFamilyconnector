@@ -46,7 +46,7 @@ request-bound receipt atomically. Matching retries resume the same enrollment.
 A changed request or credential, revoked token, or removed member cannot resume.
 
 Preserve the profile and encryption identity and run the page's `resume_command`:
-`enroll --resume` with the same profile. Do not repeat email verification, request
+`enroll --resume` with the same profile. Do not request
 another invitation, regenerate keys, or delete pending files. A used invitation
 page returning 404 is expected; the saved operation does not need the page again.
 
@@ -62,15 +62,7 @@ build refuses earlier artifact pins. Publish the signed release and merge its
 manifest PR before deploying the fresh server.
 
 
-To add another of your own agents while one still works, run on the working agent:
-
-```bash
-hub agent-invite --label phone --output /private/phone-approval.txt
-```
-
-Transfer that file privately to the new device. After installing the hosted bundle,
-run `hub enroll --server SERVER-URL --code-file PRIVATE-FILE --label phone` in
-the appropriate profile. This approval replaces another inbox verification.
-It expires after 24 hours and stops working if its issuing credential is revoked.
-Circle owners cannot approve another person's server login. Keep the approval
-out of topic messages, shared chats and diagnostic exports.
+One user has one Muse agent in a persistent VM. The first join supplies the
+private invitation, name and matching email. No verification email is sent.
+Later invitations reuse the same server profile and credential. Switching
+phones does not require another registration.
