@@ -9,9 +9,14 @@ console.log = () => {}; // Request metadata is noise; the protocol owns stdout.
 for await (const line of readline.createInterface({input:process.stdin})) {
   try {
     const input = JSON.parse(line);
+    if(input.lock_setup) {
+      env.SETUP_LOCKED='1';
+      process.stdout.write(JSON.stringify({status:200,body:'{"ok":true}'})+'\n');
+      continue;
+    }
     if(input.snapshot) {
       const data = {};
-      for(const table of ['topics','entries','tasks']) data[table]=raw.prepare(`SELECT * FROM ${table}`).all();
+      for(const table of ['topics','entries','tasks','members','agent_tokens','enrollment_receipts','principals','agents']) data[table]=raw.prepare(`SELECT * FROM ${table}`).all();
       process.stdout.write(JSON.stringify({status:200,body:JSON.stringify(data)})+'\n');
       continue;
     }

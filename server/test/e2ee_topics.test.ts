@@ -6,7 +6,7 @@ import { wireBody } from './syncv2_helpers.js';
 // envelope POST access control (caller must be a participant; target must
 // be a participant with an ACTIVE registered key); envelope re-POST
 // idempotency; GET envelopes returns only the caller's own envelopes;
-// plaintext topic creation behaves byte-identically to before.
+// content remains encrypted and envelopes remain isolated between people.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp, TestApp } from './app.js';
@@ -31,12 +31,17 @@ interface Party {
 }
 
 // Family whose owner's agent has a registered identity key.
-async function setupKeyedFamily(app: TestApp, name: string): Promise<{ famId: string; owner: Party }> {
+async function setupKeyedFamily(
+  app: TestApp,
+  name: string,
+): Promise<{ famId: string; owner: Party }> {
   const fam = await app.call('POST', '/v2/families', {
     body: { name, owner_name: 'Ow', owner_email: `o-${name}@x.dev` },
   });
   assert.equal(fam.status, 201);
-  const famId = (await app.db.queryOne('SELECT id FROM families WHERE name = ?', [name]))!['id'] as string;
+  const famId = (await app.db.queryOne('SELECT id FROM families WHERE name = ?', [name]))![
+    'id'
+  ] as string;
   const red = await app.call(
     'POST',
     `/v2/provisioning-codes/${encodeURIComponent(fam.body.provisioning_code)}/redeem`,
@@ -53,26 +58,13 @@ async function setupKeyedFamily(app: TestApp, name: string): Promise<{ famId: st
   };
 }
 
-// Extra agent for an existing member (distinct token + agent_label),
-// always registers its identity at enrollment.
-async function addAgent(
-  app: TestApp,
-  minterToken: string,
-  memberId: string,
-  label: string,
-): Promise<Party> {
-  const m = await app.call('POST', '/v2/provisioning-codes', {
-    token: minterToken,
-    body: { member_id: memberId, agent_label: label },
-  });
-  assert.equal(m.status, 201);
-  const red = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(m.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: (await app.db.queryOne('SELECT public_key FROM agent_keys WHERE member_id = ? AND agent_label = ? AND superseded_at IS NULL',[memberId,label]))?.public_key ?? b64(32) } },
+// Look up the sole agent that joined this member through its invitation.
+async function memberAgent(app: TestApp, memberId: string): Promise<Party> {
+  const row = await app.db.queryOne(
+    'SELECT a.label FROM agents a JOIN members m ON m.principal_id=a.user_id WHERE m.id=?',
+    [memberId],
   );
-  assert.equal(red.status, 201);
-  return { token: red.body.token as string, memberId: red.body.member.id as string, agentLabel: label };
+  return { token: app.credentials.get(memberId)!, memberId, agentLabel: row!['label'] as string };
 }
 
 // Extra member via mandatory identity enrollment.
@@ -92,7 +84,13 @@ async function addMember(
   const acc = await app.call(
     'POST',
     `/v2/invites/${encodeURIComponent(inv.body.invite_code)}/accept`,
-    { body: { display_name: displayName, agent_label: `${displayName.toLowerCase()}-agent` , agent_public_key: b64(32) } },
+    {
+      body: {
+        display_name: displayName,
+        agent_label: `${displayName.toLowerCase()}-agent`,
+        agent_public_key: b64(32),
+      },
+    },
   );
   assert.equal(acc.status, 201);
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
@@ -122,12 +120,14 @@ test('Topic creation without a registered creator key is 400 with key-init guida
     { body: { agent_public_key: b64(32) } }, // Fault injection below models a lost identity registration.
   );
   assert.equal(red.status, 201);
-  await app.db.execAtomically([{sql:'DELETE FROM agent_keys WHERE member_id = ?',params:[red.body.member.id]}]);
+  await app.db.execAtomically([
+    { sql: 'DELETE FROM agent_keys WHERE member_id = ?', params: [red.body.member.id] },
+  ]);
   const res = await createTopic(app, red.body.token as string, {
-    topic_id: hex(16), subject: wireBody(hex(16)),
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
     kind: 'group',
     participant_member_ids: [],
-
   });
   assert.equal(res.status, 400);
   assert.match(String(res.body.error.message), /hub key-init/);
@@ -141,10 +141,10 @@ test('Topic creation with a registered key creates the topic; subject stored opa
   const { owner } = await setupKeyedFamily(app, 'E2eeFam1');
   const ciphertextSubject = wireBody(hex(16)); // simulated client-side ciphertext
   const res = await createTopic(app, owner.token, {
-    topic_id:hex(16), subject: ciphertextSubject,
+    topic_id: hex(16),
+    subject: ciphertextSubject,
     kind: 'group',
     participant_member_ids: [],
-
   });
   assert.equal(res.status, 201);
   assert.equal(res.body.topic.e2ee, 1);
@@ -155,10 +155,6 @@ test('Topic creation with a registered key creates the topic; subject stored opa
   assert.equal(row!['e2ee'], 1);
   assert.equal(row!['subject'], ciphertextSubject);
 });
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Envelope POST
@@ -177,10 +173,10 @@ test('envelope POST: non-participant caller is 403; unknown topic is 404', async
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'E2eeFam4');
   const topic = await createTopic(app, owner.token, {
-    topic_id: hex(16), subject: wireBody(hex(16)),
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
     kind: 'group',
     participant_member_ids: [],
-
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -208,7 +204,7 @@ test('envelope POST: target must be a participant with an ACTIVE registered key'
   const memberB = await addMember(app, famId, owner.token, 'b@e.dev', 'parent', 'Bee');
   const memberC = await addMember(app, famId, owner.token, 'c@e.dev', 'parent', 'Cee');
   // B's agent registers an identity key (via rotate = initial registration).
-  const agentB = await addAgent(app, owner.token, memberB.memberId, 'bee-agent');
+  const agentB = await memberAgent(app, memberB.memberId);
   const rot = await app.call('POST', '/v2/agent-keys/rotate', {
     token: agentB.token,
     body: { agent_public_key: b64(32) },
@@ -216,10 +212,10 @@ test('envelope POST: target must be a participant with an ACTIVE registered key'
   assert.equal(rot.status, 200);
 
   const topic = await createTopic(app, owner.token, {
-    topic_id: hex(16), subject: wireBody(hex(16)),
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
     kind: 'group',
     participant_member_ids: [memberB.memberId],
-
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -263,24 +259,15 @@ test('envelope POST: target must be a participant with an ACTIVE registered key'
   // CURRENT active key, not the superseded one. Register a fresh agent to
   // test the superseded-only case.
   assert.equal(superseded.status, 201);
-  const agentB2 = await addAgent(app, owner.token, memberB.memberId, 'bee2-agent');
-  await app.call('POST', '/v2/agent-keys/rotate', {
-    token: agentB2.token,
-    body: { agent_public_key: b64(32) },
-  });
-  // bee2-agent now has exactly one key row and it is superseded... no:
-  // rotate supersedes the old and inserts a new active one. To leave ONLY a
-  // superseded key, mark the active row superseded directly via SQL — the
-  // API never deletes, so this models "key retired with no replacement".
   await app.db.execAtomically([
     {
       sql: `UPDATE agent_keys SET superseded_at = ? WHERE member_id = ? AND agent_label = ?`,
-      params: [new Date().toISOString(), memberB.memberId, 'bee2-agent'],
+      params: [new Date().toISOString(), memberB.memberId, 'bee-agent'],
     },
   ]);
   const onlySuperseded = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: owner.token,
-    body: await envelopeBody({ member_id: memberB.memberId, agent_label: 'bee2-agent' }),
+    body: await envelopeBody({ member_id: memberB.memberId, agent_label: 'bee-agent' }),
   });
   assert.equal(onlySuperseded.status, 400);
 });
@@ -289,10 +276,10 @@ test('envelope POST: malformed key_id / envelope / member fields are 400', async
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'E2eeFam6');
   const topic = await createTopic(app, owner.token, {
-    topic_id: hex(16), subject: wireBody(hex(16)),
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
     kind: 'group',
     participant_member_ids: [],
-
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -319,23 +306,31 @@ test('envelope POST: re-POST of the same (topic, member, label, key_id) is idemp
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'E2eeFam7');
   const topic = await createTopic(app, owner.token, {
-    topic_id: hex(16), subject: wireBody(hex(16)),
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
     kind: 'group',
     participant_member_ids: [],
-
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
   const keyId = hex(16);
   const first = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: owner.token,
-    body: await envelopeBody({ member_id: owner.memberId, agent_label: owner.agentLabel, key_id: keyId }),
+    body: await envelopeBody({
+      member_id: owner.memberId,
+      agent_label: owner.agentLabel,
+      key_id: keyId,
+    }),
   });
   assert.equal(first.status, 201);
   // Same envelope again: still 201, still exactly one row.
   const again = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
     token: owner.token,
-    body: await envelopeBody({ member_id: owner.memberId, agent_label: owner.agentLabel, key_id: keyId }),
+    body: await envelopeBody({
+      member_id: owner.memberId,
+      agent_label: owner.agentLabel,
+      key_id: keyId,
+    }),
   });
   assert.equal(again.status, 201);
   let n = await app.db.queryOne(
@@ -353,7 +348,9 @@ test('envelope POST: re-POST of the same (topic, member, label, key_id) is idemp
     }),
   });
   assert.equal(other.status, 201);
-  n = await app.db.queryOne(`SELECT COUNT(*) AS c FROM topic_key_envelopes WHERE topic_id = ?`, [tid]);
+  n = await app.db.queryOne(`SELECT COUNT(*) AS c FROM topic_key_envelopes WHERE topic_id = ?`, [
+    tid,
+  ]);
   assert.equal(n!['c'], 2);
 });
 
@@ -365,14 +362,15 @@ test('envelope GET: each agent sees only its own envelopes; non-participant 403'
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'E2eeFam8');
   const memberB = await addMember(app, famId, owner.token, 'b@e.dev', 'parent', 'Bee');
-  const agentB = await addAgent(app, owner.token, memberB.memberId, 'bee-agent');
-  const agentB2 = await addAgent(app, owner.token, memberB.memberId, 'bee2-agent');
+  const agentB = await memberAgent(app, memberB.memberId);
+  const memberC = await addMember(app, famId, owner.token, 'bee2@e.dev', 'parent', 'Bee2');
+  const agentB2 = await memberAgent(app, memberC.memberId);
 
   const topic = await createTopic(app, owner.token, {
-    topic_id: hex(16), subject: wireBody(hex(16)),
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
     kind: 'group',
-    participant_member_ids: [memberB.memberId],
-
+    participant_member_ids: [memberB.memberId, memberC.memberId],
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -382,7 +380,7 @@ test('envelope GET: each agent sees only its own envelopes; non-participant 403'
   for (const [mid, label] of [
     [owner.memberId, owner.agentLabel],
     [memberB.memberId, 'bee-agent'],
-    [memberB.memberId, 'bee2-agent'],
+    [memberC.memberId, 'bee2-agent'],
   ] as Array<[string, string]>) {
     const r = await app.call('POST', `/v2/topics/${tid}/envelopes`, {
       token: owner.token,
@@ -428,6 +426,8 @@ test('envelope GET: each agent sees only its own envelopes; non-participant 403'
   assert.equal(denied.status, 403);
 
   // Unknown topic: 404.
-  const missing = await app.call('GET', `/v2/topics/nope-not-here/envelopes`, { token: owner.token });
+  const missing = await app.call('GET', `/v2/topics/nope-not-here/envelopes`, {
+    token: owner.token,
+  });
   assert.equal(missing.status, 404);
 });

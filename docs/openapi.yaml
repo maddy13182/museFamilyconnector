@@ -1,14 +1,15 @@
 openapi: 3.1.0
 info:
   title: Family Hub API
-  version: 2.0.0
+  version: 2.2.0
   license:
     name: MIT
     url: https://opensource.org/license/mit
-  description: Family Hub protocol 2. Every conversation is end-to-end encrypted. The client encrypts
-    content; the server validates envelopes and lifecycle state and stores ciphertext. This development
-    release deliberately has no API v1 or plaintext compatibility. The browser dashboard shows metadata
-    only.
+  description: Family Hub protocol 2. Every conversation is end-to-end encrypted. The client encrypts content; the
+    server validates envelopes and lifecycle state and stores ciphertext. This development release deliberately
+    has no API v1 or plaintext compatibility. The browser dashboard shows metadata only. Identity protocol 1 uses
+    one invitation-registered user and one Muse agent per server, and user-to-circle memberships. Scoped requests
+    select X-Circle-ID and are authorized against live membership; encryption remains per topic.
 servers:
 - url: https://REPLACE-WITH-YOUR-WORKER.workers.dev
   description: Your family's deployment (set after `wrangler deploy`).
@@ -40,19 +41,17 @@ paths:
       - families
       operationId: bootstrapFamily
       summary: Bootstrap a family (one-time)
-      description: |
-        With SETUP_LOCKED=0, creates the first family and owner and returns a
-        single-use provisioning code. Automatically provisioned hubs require
-        the private X-Bootstrap-Secret capability during this setup window.
-        With SETUP_LOCKED=1, requires an authenticated server owner and creates
-        an additional circle with its own provisioning code. A circle owner
-        does not automatically have server-owner authority.
+      description: Unlocked bootstrap requires the private bootstrap capability and returns the initial owner provisioning
+        code. Locked creation requires a server-owner agent credential and adds the new circle membership to that
+        same user. The existing Muse agent works immediately; no additional credential or provisioning code is issued. Idempotent
+        retries return the same circle, and changed input under the same key conflicts.
       security: []
       parameters:
       - in: header
         name: X-Bootstrap-Secret
         required: false
-        description: Required during unlocked bootstrap when BOOTSTRAP_SECRET is configured; never log this value. It does not bypass authentication in locked mode.
+        description: Required during unlocked bootstrap when BOOTSTRAP_SECRET is configured; never log this value.
+          It does not bypass authentication in locked mode.
         schema:
           type: string
       requestBody:
@@ -82,15 +81,8 @@ paths:
                   maxLength: 254
       responses:
         '201':
-          description: 'Family/circle created. Two shapes: open (bootstrap) mode returns
-
-            `{family, member, provisioning_code, provisioning_expires_at}`;
-
-            locked (hub-owner) mode returns the flat
-
-            `{id, name, kind, created_at, provisioning_code, provisioning_expires_at}`.
-
-            '
+          description: Circle created or matching retry resumed. Bootstrap alone returns an initial owner provisioning
+            code.
           content:
             application/json:
               schema:
@@ -108,8 +100,8 @@ paths:
                       $ref: '#/components/schemas/Member'
                     provisioning_code:
                       type: string
-                      description: 128-bit random, single-use. Redeem at POST /v2/provision/{code}/accept.
-                        Shown once.
+                      description: 128-bit random, single-use. Redeem at POST /v2/provision/{code}/accept. Shown
+                        once.
                     provisioning_expires_at:
                       type: string
                       format: date-time
@@ -120,8 +112,6 @@ paths:
                   - name
                   - kind
                   - created_at
-                  - provisioning_code
-                  - provisioning_expires_at
                   properties:
                     id:
                       type: string
@@ -132,20 +122,9 @@ paths:
                     created_at:
                       type: string
                       format: date-time
-                    provisioning_code:
-                      type: string
-                      description: Single-use, 24h TTL. Shown once.
-                    provisioning_expires_at:
-                      type: string
-                      format: date-time
         '200':
-          description: 'Locked mode, idempotent retry with a repeated Idempotency-Key —
-
-            the circle already existed, so a FRESH provisioning code is issued
-
-            and the orphaned token from the first attempt is revoked.
-
-            '
+          description: Circle created or matching retry resumed. Bootstrap alone returns an initial owner provisioning
+            code.
           content:
             application/json:
               schema:
@@ -155,8 +134,6 @@ paths:
                 - name
                 - kind
                 - created_at
-                - provisioning_code
-                - provisioning_expires_at
                 - deduped
                 properties:
                   id:
@@ -166,12 +143,6 @@ paths:
                   kind:
                     type: string
                   created_at:
-                    type: string
-                    format: date-time
-                  provisioning_code:
-                    type: string
-                    description: Single-use, 24h TTL. Shown once.
-                  provisioning_expires_at:
                     type: string
                     format: date-time
                   deduped:
@@ -210,11 +181,8 @@ paths:
       - families
       operationId: listFamilies
       summary: List circles I am a member of
-      description: 'Membership is matched by email (one human, one member row per circle).
-
-        Each entry carries `my_role` — the caller''s role in that circle.
-
-        '
+      description: List every active circle membership of the authenticated user on this server. One Muse agent
+        and saved server credential serve all circles for that user.
       responses:
         '200':
           description: Circle list
@@ -278,6 +246,7 @@ paths:
         '
       parameters:
       - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -287,6 +256,7 @@ paths:
               required:
               - email
               - role
+              - name
               properties:
                 email:
                   type: string
@@ -294,6 +264,10 @@ paths:
                   maxLength: 254
                 role:
                   $ref: '#/components/schemas/Role'
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
       responses:
         '201':
           description: Invite created
@@ -370,10 +344,12 @@ paths:
       - invites
       operationId: acceptInvite
       summary: Accept an invite (new member enrollment)
-      description: Redeem a single-use code and atomically issue credentials with a mandatory X25519 encryption
-        identity. Invalid or missing public keys do not consume the code. Re-enrollment of the same label
-        cannot replace its identity key.
-      security: []
+      description: Redeem the private code with the matching email and registered encryption identity. First join
+        creates one user and one Muse agent per server; later joins authenticate with the saved server credential.
+        Code consumption, membership, credential and receipt commit atomically. Exact retries resume the same result.
+      security:
+      - {}
+      - bearerAuth: []
       parameters:
       - name: code
         in: path
@@ -392,6 +368,8 @@ paths:
               - display_name
               - agent_label
               - agent_public_key
+              - agent_token
+              - email
               properties:
                 display_name:
                   type: string
@@ -401,38 +379,41 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 100
-                  example: lakshmi-phone-agent
+                  example: muse-agent
+                agent_token:
+                  type: string
+                  pattern: ^fh_[A-Za-z0-9_-]{43}$
+                  description: Fresh private client-generated credential, durably saved before sending. Identical
+                    requests resume without issuing another token.
                 agent_public_key:
                   type: string
                   description: Canonical standard base64, exactly 32 decoded bytes.
+                email:
+                  type: string
+                  format: email
+                  description: Must match the email this private invitation or owner setup code was issued for.
+                    No email is sent.
       responses:
-        '201':
-          description: Member created, token issued (once)
+        '200':
+          description: Matching enrollment resumed; the original active credential and identity are required. Removed
+            members and revoked credentials cannot resume.
           content:
             application/json:
               schema:
-                type: object
-                required:
-                - member
-                - token
-                - token_id
-                properties:
-                  member:
-                    $ref: '#/components/schemas/Member'
-                  token:
-                    type: string
-                    description: Bearer token, format fh_<256-bit random base62>. Shown once — never returned
-                      again.
-                  token_id:
-                    type: string
-                    description: Stable id for this credential (used for revoke/rotate and audit).
+                $ref: '#/components/schemas/RegistrationResult'
+        '201':
+          description: Member created, credential registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationResult'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: Invite already used — also returns the member and a flag so the client can tell
-            the user they are already enrolled but hold no token
+          description: Invite already used — also returns the member and a flag so the client can tell the user
+            they are already enrolled but hold no token
           content:
             application/json:
               schema:
@@ -518,6 +499,7 @@ paths:
                 - family_name
                 - role
                 - email_hint
+                - invited_name
                 - expires_at
                 - client
                 - install
@@ -530,6 +512,9 @@ paths:
                     type: string
                   role:
                     $ref: '#/components/schemas/Role'
+                  invited_name:
+                    type: string
+                    description: Name supplied by the inviter.
                   email_hint:
                     type: string
                     example: s***@gmail.com
@@ -571,9 +556,8 @@ paths:
                       path:
                         type: string
                         example: /i/{token}/verify
-                        description: Absolute path with the page token echoed back to its holder (the
-                          party that presented it in the request URL). A relative ./verify would resolve
-                          to /i/verify and 404.
+                        description: Absolute path with the page token echoed back to its holder (the party that
+                          presented it in the request URL). A relative ./verify would resolve to /i/verify and 404.
                       body:
                         type: object
                         properties:
@@ -649,15 +633,16 @@ paths:
                 type: object
                 required:
                 - invite_code
-                - setup_command
+                - enroll_command
                 - expires_at
                 properties:
                   invite_code:
                     type: string
                     description: Fresh single-use invite code for POST /v2/invites/{code}/accept.
-                  setup_command:
+                  enroll_command:
                     type: string
-                    example: hub setup --server https://<server> --invite fhi_…
+                    description: Exact verified venv/CLI command using a private code file; never contains the invite
+                      code.
                   expires_at:
                     type: string
                     format: date-time
@@ -702,6 +687,7 @@ paths:
         '
       parameters:
       - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -779,6 +765,7 @@ paths:
         '
       parameters:
       - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: The pending transfer, or null
@@ -803,25 +790,11 @@ paths:
       - families
       operationId: acceptOwnershipTransfer
       summary: Accept an ownership transfer offer
-      description: 'Only the named recipient (`to_member_id`) may accept — 403 otherwise.
-
-        The offer must be pending and unexpired (expired → 410
-
-        `transfer_expired`, and the offer is marked cancelled). The role swap
-
-        is applied in ONE atomic batch — the recipient is promoted to `owner`
-
-        and the offering owner is demoted or access-revoked per `on_complete`
-
-        — so the circle never sits with zero owners. `remove` revokes every
-
-        agent token the previous owner held for this circle; their member row
-
-        is retained for audit history.
-
-        '
+      description: Accept the pending ownership transfer atomically. Promote the recipient, then demote or remove
+        the offering member. Removal ends topic participation and requires rekey without revoking server credentials.
       parameters:
       - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Ownership transferred
@@ -886,6 +859,7 @@ paths:
         '
       parameters:
       - $ref: '#/components/parameters/FamilyId'
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Offer cancelled
@@ -934,6 +908,7 @@ paths:
       parameters:
       - $ref: '#/components/parameters/FamilyId'
       - $ref: '#/components/parameters/MemberId'
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Member removed
@@ -961,13 +936,9 @@ paths:
       - auth
       operationId: revokeToken
       summary: Revoke an agent token
-      description: 'Revokes `token_id` immediately. A member may revoke their own agents''
-
-        tokens; `owner`/`parent` may revoke any token in the family.
-
-        Revoking the token used for this call is allowed; subsequent calls 401.
-
-        '
+      description: Revoke one credential belonging to the authenticated user, immediately overriding any expiry
+        grace. Pending approval codes issued under it expire. Other agents remain independent; circle roles never
+        authorize revoking another user’s server credential.
       requestBody:
         required: true
         content:
@@ -1005,65 +976,6 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '426':
           $ref: '#/components/responses/ClientTooOld'
-  /v2/provisioning-codes:
-    post:
-      tags:
-      - auth
-      operationId: mintProvisioningCode
-      summary: Mint a provisioning code for an additional agent
-      x-spec-note: Gap-fill implemented by WS-1 — not in SPEC §13. Required by SPEC §6.4.
-      description: 'Mints a single-use provisioning code (24h TTL) for the given member.
-
-        member_id is required: callers mint for their own member, or
-
-        (`owner`/`parent` only) for another member of the family.
-
-        '
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-              - member_id
-              - agent_label
-              properties:
-                member_id:
-                  type: string
-                agent_label:
-                  type: string
-                  minLength: 1
-                  maxLength: 80
-      responses:
-        '201':
-          description: Provisioning code minted
-          content:
-            application/json:
-              schema:
-                type: object
-                required:
-                - provisioning_code
-                - expires_at
-                properties:
-                  provisioning_code:
-                    type: string
-                    description: Single-use, 24h TTL. Shown once.
-                  expires_at:
-                    type: string
-                    format: date-time
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '429':
-          $ref: '#/components/responses/RateLimited'
-        '426':
-          $ref: '#/components/responses/ClientTooOld'
   /v2/provisioning-codes/{code}/redeem:
     post:
       tags:
@@ -1071,10 +983,12 @@ paths:
       operationId: redeemProvisioningCode
       summary: Redeem a provisioning code for an agent token
       x-spec-note: Gap-fill implemented by WS-1 — not in SPEC §13. Required by SPEC §6.1/§6.4.
-      description: Redeem a single-use code and atomically issue credentials with a mandatory X25519 encryption
-        identity. Invalid or missing public keys do not consume the code. Re-enrollment of the same label
-        cannot replace its identity key.
-      security: []
+      description: Redeem the private code with the matching email and registered encryption identity. First join
+        creates one user and one Muse agent per server; later joins authenticate with the saved server credential.
+        Code consumption, membership, credential and receipt commit atomically. Exact retries resume the same result.
+      security:
+      - {}
+      - bearerAuth: []
       parameters:
       - name: code
         in: path
@@ -1083,41 +997,48 @@ paths:
           type: string
           minLength: 16
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
               properties:
+                agent_token:
+                  type: string
+                  pattern: ^fh_[A-Za-z0-9_-]{43}$
+                  description: Fresh private client-generated credential, durably saved before sending. Identical
+                    requests resume without issuing another token.
                 agent_public_key:
                   type: string
                   description: Canonical standard base64, exactly 32 decoded bytes.
+                email:
+                  type: string
+                  format: email
+                  description: Must match the email this private invitation or owner setup code was issued for.
+                    No email is sent.
               required:
               - agent_public_key
+              - agent_token
+              - email
       responses:
-        '201':
-          description: Token issued (once)
+        '200':
+          description: Matching enrollment resumed; the original active credential and identity are required. Removed
+            members and revoked credentials cannot resume.
           content:
             application/json:
               schema:
-                type: object
-                required:
-                - member
-                - token
-                - token_id
-                properties:
-                  member:
-                    $ref: '#/components/schemas/Member'
-                  token:
-                    type: string
-                    description: Bearer token, shown once.
-                  token_id:
-                    type: string
+                $ref: '#/components/schemas/RegistrationResult'
+        '201':
+          description: Credential registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationResult'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: Code already used — also returns the member and a flag so the client can tell the
-            user they are already enrolled but hold no token
+          description: Code already used — also returns the member and a flag so the client can tell the user they
+            are already enrolled but hold no token
           content:
             application/json:
               schema:
@@ -1174,6 +1095,7 @@ paths:
         schema:
           type: string
         description: Restrict to one member's keys; omit to list every visible key.
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Key directory
@@ -1193,6 +1115,7 @@ paths:
                       - agent_label
                       - public_key
                       - created_at
+                      - agent_id
                       properties:
                         member_id:
                           type: string
@@ -1204,6 +1127,8 @@ paths:
                         created_at:
                           type: string
                           format: date-time
+                        agent_id:
+                          type: string
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1265,6 +1190,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      parameters:
+      - $ref: '#/components/parameters/CircleContext'
   /v2/members:
     get:
       tags:
@@ -1287,21 +1214,17 @@ paths:
                       $ref: '#/components/schemas/Member'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      parameters:
+      - $ref: '#/components/parameters/CircleContext'
   /v2/me:
     get:
       tags:
       - members
       operationId: getSelf
-      summary: My own identity (the member bound to this token)
-      description: 'Returns the member record the calling bearer token is bound to,
-
-        plus the token''s `agent_label`. Clients MUST use this — not
-
-        `/v2/members[0]` — to learn who "I" am: members are ordered by
-
-        creation time, so `[0]` is typically the owner, not the caller.
-
-        '
+      summary: Authenticated user, agent and selected membership
+      description: Return the authenticated user and agent, token_id and selected membership. X-Circle-ID selects
+        an active membership. Without that header the registration membership is shown if still active; otherwise
+        membership is null. Explicit server-owner permissions are independent of circle role.
       responses:
         '200':
           description: Caller identity
@@ -1338,11 +1261,8 @@ paths:
                     description: The agent label recorded when this token was issued.
                   is_hub_owner:
                     type: boolean
-                    description: 'True when the caller''s principal holds the owner role in at least one
-                      circle — i.e. this agent may create circles (POST /v2/families while setup is locked).
-                      Lets the agent learn this from `hub me` instead of via a 403.
-
-                      '
+                    description: True only for an explicitly authorized server owner; circle ownership alone does
+                      not confer this permission.
         '401':
           $ref: '#/components/responses/Unauthorized'
   /v2/topics:
@@ -1351,10 +1271,10 @@ paths:
       - topics
       operationId: createTopic
       summary: Create a topic
-      description: Create an encrypted topic at epoch zero. The caller must have a registered encryption
-        identity and owner/parent role. The subject is already encrypted using the client-chosen topic
-        ID as authenticated context. Writes remain blocked until a complete recipient set and the encrypted
-        subject are committed as epoch one. No encryption flag or initial_key_id is accepted.
+      description: Create an encrypted topic at epoch zero. The caller must have a registered encryption identity
+        and owner/parent role. The subject is already encrypted using the client-chosen topic ID as authenticated
+        context. Writes remain blocked until a complete recipient set and the encrypted subject are committed as
+        epoch one. No encryption flag or initial_key_id is accepted.
       requestBody:
         required: true
         content:
@@ -1371,8 +1291,8 @@ paths:
                 topic_id:
                   type: string
                   pattern: ^[0-9a-f]{32}$
-                  description: Client-generated operation/topic ID chosen before encryption; retry the
-                    identical payload with this ID.
+                  description: Client-generated operation/topic ID chosen before encryption; retry the identical
+                    payload with this ID.
                 subject: &id002
                   $ref: '#/components/schemas/EncryptedContent'
                 kind:
@@ -1400,8 +1320,8 @@ paths:
                   topic:
                     $ref: '#/components/schemas/Topic'
         '200':
-          description: Idempotent retry with a repeated Idempotency-Key — the already-created topic is
-            returned, nothing is duplicated
+          description: Idempotent retry with a repeated Idempotency-Key — the already-created topic is returned,
+            nothing is duplicated
           content:
             application/json:
               schema:
@@ -1423,14 +1343,17 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '426':
           $ref: '#/components/responses/ClientTooOld'
+      parameters:
+      - $ref: '#/components/parameters/CircleContext'
     get:
       tags:
       - topics
       operationId: listTopics
       summary: Search / list visible topics
-      description: List visible encrypted topics. Subjects are ciphertext; clients decrypt and search
-        locally. A server-side q parameter is rejected.
-      parameters: []
+      description: List visible encrypted topics. Subjects are ciphertext; clients decrypt and search locally. A
+        server-side q parameter is rejected.
+      parameters:
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Visible topics
@@ -1456,6 +1379,7 @@ paths:
       description: 403 unless the caller is a participant.
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Topic detail
@@ -1485,48 +1409,24 @@ paths:
       - sync
       operationId: syncTopics
       summary: Changed-topic discovery (sync v2)
-      description: 'Changed-topic discovery, per circle token — one call per circle, never
-
-        crossing family boundaries (cross-family topic ids 404 by
-
-        construction). Returns per changed topic: topic_id, circle_id,
-
-        circle_name, subject, kind, e2ee, acked_seq, latest_seq, new_count,
-
-        last_activity_ts, last_actor, key_status (ok|pending|not_e2ee),
-
-        assigned_to_me. Changed = visible entry with
-
-        seq > max(acked_seq, history_from_seq - 1). Bootstrap: the first call
-
-        sends no cursor — a deliberate full re-read; every visible entry is
-
-        reported as unread once, duplicates handled by the skill''s dedupe
-
-        rule. The CLI deletes legacy cursor files without reading them.
-
-        '
+      description: Changed-topic discovery for the selected active circle membership. The CLI uses the same server
+        credential with explicit X-Circle-ID for each circle; read positions remain per member/agent/topic. Topic
+        IDs from another circle are rejected. Only limit and page_token query parameters are accepted.
       parameters:
-      - name: bootstrap_gseq
-        in: query
-        required: false
-        schema:
-          type: integer
-          minimum: 0
-        description: First call only; legacy cursor, ignored after bootstrap.
       - name: limit
         in: query
         required: false
         schema:
           type: integer
           minimum: 1
-          maximum: 500
-          default: 100
+          maximum: 200
+          default: 50
       - name: page_token
         in: query
         required: false
         schema:
           type: string
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Changed topics
@@ -1584,14 +1484,13 @@ paths:
                           enum:
                           - ok
                           - pending
-                          - not_e2ee
                         assigned_to_me:
                           type: boolean
                   versions:
                     type: object
-                    description: 'Update advertisement (decoupled releases): the newest released server
-                      / CLI / skill versions known to this server. `hub sync` compares these against the
-                      installed versions and nudges the agent to run `hub upgrade` when either is newer.
+                    description: 'Update advertisement (decoupled releases): the newest released server / CLI /
+                      skill versions known to this server. `hub sync` compares these against the installed versions
+                      and nudges the agent to run `hub upgrade` when either is newer.
 
                       '
                     required:
@@ -1667,6 +1566,7 @@ paths:
           maximum: 50
           default: 10
         description: Sync v2 — also return up to N entries before after_seq (flagged is_context).
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: History page
@@ -1697,8 +1597,8 @@ paths:
                     description: Highest newly-read seq in this page (context rows excluded).
                   read_receipt:
                     type: string
-                    description: 'HMAC-bound receipt for this (member, agent, topic, from_seq, through_seq);
-                      present to POST .../ack.
+                    description: 'HMAC-bound receipt for this (member, agent, topic, from_seq, through_seq); present
+                      to POST .../ack.
 
                       '
         '400':
@@ -1738,6 +1638,7 @@ paths:
         '
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -1807,6 +1708,7 @@ paths:
         '
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -1876,6 +1778,7 @@ paths:
         schema:
           type: string
         description: Member id to remove.
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Member removed
@@ -1903,12 +1806,12 @@ paths:
       - topics
       operationId: spawnTopic
       summary: Spawn a linked child topic
-      description: Initialize an independently encrypted child through the same lifecycle as ordinary
-        topic creation. The caller must participate in the parent. No parent key or history is shared.
-        After activation the client posts the approved briefing as a child-key-encrypted briefing entry.
-        Inline briefing content is rejected.
+      description: Initialize an independently encrypted child through the same lifecycle as ordinary topic creation.
+        The caller must participate in the parent. No parent key or history is shared. After activation the client
+        posts the approved briefing as a child-key-encrypted briefing entry. Inline briefing content is rejected.
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -1949,9 +1852,9 @@ paths:
       - entries
       operationId: postEntry
       summary: Post an entry (message)
-      description: Append encrypted message or briefing content. Metadata-only system events use fixed
-        server-generated labels, strict per-kind data and no body. Content is accepted only for the active
-        key and outside a rotation gate.
+      description: Append encrypted message or briefing content. Metadata-only system events use fixed server-generated
+        labels, strict per-kind data and no body. Content is accepted only for the active key and outside a rotation
+        gate.
       parameters:
       - $ref: '#/components/parameters/TopicId'
       - name: Idempotency-Key
@@ -1961,6 +1864,7 @@ paths:
           type: string
           maxLength: 128
         description: Opaque client key; same key + same topic returns the original entry.
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -1996,8 +1900,8 @@ paths:
                     - topic_archived
                   data:
                     type: object
-                    description: 'Strict per-kind metadata: key IDs, real member/agent identifiers, successor
-                      topic ID and booleans only. No free text, notes, reasons or content.'
+                    description: 'Strict per-kind metadata: key IDs, real member/agent identifiers, successor topic
+                      ID and booleans only. No free text, notes, reasons or content.'
                 additionalProperties: false
       responses:
         '201':
@@ -2048,12 +1952,12 @@ paths:
       - tasks
       operationId: createTask
       summary: Create a task in a topic
-      description: Participant-only content write. All supplied content fields must be encrypted under
-        the active topic key. Initialization and pending rotation block writes. Task ownership, history
-        floors, and subtask completion rules remain enforced. PII scanning happens on the client before
-        encryption.
+      description: Participant-only content write. All supplied content fields must be encrypted under the active
+        topic key. Initialization and pending rotation block writes. Task ownership, history floors, and subtask
+        completion rules remain enforced. PII scanning happens on the client before encryption.
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -2098,11 +2002,11 @@ paths:
       - tasks
       operationId: listTopicTasks
       summary: List tasks in a topic
-      x-spec-note: Added at WS-1/WS-2 request — not in SPEC §13. Needed by the agent CLI to list a topic's
-        tasks.
+      x-spec-note: Added at WS-1/WS-2 request — not in SPEC §13. Needed by the agent CLI to list a topic's tasks.
       description: Caller must be a participant of the topic. Returns tasks in creation order.
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: Topic tasks
@@ -2170,6 +2074,7 @@ paths:
         required: true
         schema:
           type: string
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -2191,9 +2096,9 @@ paths:
                   description: Random 128-bit topic-key id, 32 hex chars.
                 envelope:
                   type: string
-                  description: 'Standard base64 crypto_box_seal of (topic_id_bytes || 0x00 || key_id_bytes
-                    || topic_key) to the target agent''s X25519 public key (secfix F2: the topic_id binding
-                    stops cross-topic envelope transplants). Opaque to the server.
+                  description: 'Standard base64 crypto_box_seal of (topic_id_bytes || 0x00 || key_id_bytes || topic_key)
+                    to the target agent''s X25519 public key (secfix F2: the topic_id binding stops cross-topic
+                    envelope transplants). Opaque to the server.
 
                     '
       responses:
@@ -2261,6 +2166,7 @@ paths:
         required: true
         schema:
           type: string
+      - $ref: '#/components/parameters/CircleContext'
       responses:
         '200':
           description: The caller's envelopes for this topic
@@ -2303,8 +2209,8 @@ paths:
                         commitment:
                           type: string
                           nullable: true
-                          description: 'Hex SHA256 of the topic key for verify-on-open; null for grandfathered
-                            pre-migration epochs.
+                          description: 'Hex SHA256 of the topic key for verify-on-open; null for grandfathered pre-migration
+                            epochs.
 
                             '
         '401':
@@ -2319,12 +2225,13 @@ paths:
       - e2ee
       operationId: commitTopicKey
       summary: Staged atomic key activation (sync v2)
-      description: Commit the complete staged recipient set for current_epoch + 1. The subject must be
-        encrypted with this candidate key. The epoch, encrypted subject and write-unblocking transition
-        commit atomically against the membership snapshot. Removed recipients burn the key; missing identities
-        or envelopes block activation. There is no force bypass.
+      description: Commit the complete staged recipient set for current_epoch + 1. The subject must be encrypted
+        with this candidate key. The epoch, encrypted subject and write-unblocking transition commit atomically
+        against the membership snapshot. Removed recipients burn the key; missing identities or envelopes block
+        activation. There is no force bypass.
       parameters:
       - $ref: '#/components/parameters/TopicId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -2383,12 +2290,12 @@ paths:
       - tasks
       operationId: addTaskNote
       summary: Add a progress note to a task
-      description: Participant-only content write. All supplied content fields must be encrypted under
-        the active topic key. Initialization and pending rotation block writes. Task ownership, history
-        floors, and subtask completion rules remain enforced. PII scanning happens on the client before
-        encryption.
+      description: Participant-only content write. All supplied content fields must be encrypted under the active
+        topic key. Initialization and pending rotation block writes. Task ownership, history floors, and subtask
+        completion rules remain enforced. PII scanning happens on the client before encryption.
       parameters:
       - $ref: '#/components/parameters/TaskId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: true
         content:
@@ -2427,12 +2334,12 @@ paths:
       - tasks
       operationId: completeTask
       summary: Complete a task with a structured result
-      description: Participant-only content write. All supplied content fields must be encrypted under
-        the active topic key. Initialization and pending rotation block writes. Task ownership, history
-        floors, and subtask completion rules remain enforced. PII scanning happens on the client before
-        encryption.
+      description: Participant-only content write. All supplied content fields must be encrypted under the active
+        topic key. Initialization and pending rotation block writes. Task ownership, history floors, and subtask
+        completion rules remain enforced. PII scanning happens on the client before encryption.
       parameters:
       - $ref: '#/components/parameters/TaskId'
+      - $ref: '#/components/parameters/CircleContext'
       requestBody:
         required: false
         content:
@@ -2506,6 +2413,33 @@ paths:
                       ["v1","v2"] if a breaking change ever lands.
 
                       '
+  /v2/client/onboarding:
+    get:
+      tags:
+      - ops
+      operationId: getClientOnboarding
+      summary: Complete self-contained installation and enrollment guide
+      description: Public verified-bundle installation, venv, exact tool paths, skill loading, enrollment/resume,
+        post-join checks and diagnostic export instructions. Contains no invitation code or member data.
+      security: []
+      responses:
+        '200':
+          description: Hosted agent onboarding guide, also embedded in invitations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - install
+                - cli_version
+                - skill_version
+                properties:
+                  install:
+                    type: object
+                  cli_version:
+                    type: string
+                  skill_version:
+                    type: string
   /v2/client/latest:
     get:
       tags:
@@ -2569,8 +2503,8 @@ paths:
                     type: string
                     format: uri
                     example: https://<server>/v2/client/download/hub
-                    description: Kept for field continuity; repointed at this server. The explicit contract
-                      the CLI uses is `assets`.
+                    description: Kept for field continuity; repointed at this server. The explicit contract the
+                      CLI uses is `assets`.
                   assets:
                     type: object
                     required:
@@ -2597,8 +2531,8 @@ paths:
                     - sha256
                     - version
                     description: The versioned skill bundle (SKILL.md, references/, INSTALL.md, requirements.txt
-                      plus the hub artifact, its sigstore bundle, and the release manifest), hash-verified
-                      at build time. `hub upgrade`'s skill-refresh reads this block.
+                      plus the hub artifact, its sigstore bundle, and the release manifest), hash-verified at build
+                      time. `hub upgrade`'s skill-refresh reads this block.
                     properties:
                       url:
                         type: string
@@ -2607,13 +2541,13 @@ paths:
                       sha256:
                         type: string
                         example: 9f2c…
-                        description: sha256 of skill.tar.gz (pin skill_sha256, cross-checked against the
-                          release manifest at build time)
+                        description: sha256 of skill.tar.gz (pin skill_sha256, cross-checked against the release
+                          manifest at build time)
                       version:
                         type: string
                         example: 0.11.0
-                        description: Skill version, from the SKILL VERSION header of agent-skill/SKILL.md
-                          (versions independently from the CLI)
+                        description: Skill version, from the SKILL VERSION header of agent-skill/SKILL.md (versions
+                          independently from the CLI)
   /v2/client/download/hub:
     get:
       tags:
@@ -2938,14 +2872,194 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/RateLimited'
+  /v2/discovery/circles:
+    get:
+      tags:
+      - members
+      summary: Discover circles for the authenticated user on this server
+      description: 'Active memberships only. People show only shared circles. IDs are server-local: route with the
+        trusted server URL plus user_id and member_id. Names and emails are never global authorization proofs. Pagination
+        is a live view, not a snapshot; restart if membership changes.'
+      parameters:
+      - &id004
+        name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+      - &id005
+        name: cursor
+        in: query
+        schema:
+          type: string
+          maxLength: 128
+      responses:
+        '200':
+          description: Bounded discovery page
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - protocol_version
+                - server
+                - data
+                - page
+                - request_id
+                properties:
+                  protocol_version:
+                    const: 1
+                  server:
+                    type: object
+                    required:
+                    - url
+                    properties:
+                      url:
+                        type: string
+                        format: uri
+                  data:
+                    type: object
+                    required:
+                    - circles
+                    properties:
+                      circles:
+                        type: array
+                        maxItems: 100
+                        items:
+                          type: object
+                          required:
+                          - circle_id
+                          - member_id
+                          - user_id
+                          - name
+                          - role
+                          properties:
+                            circle_id:
+                              type: string
+                            member_id:
+                              type: string
+                            role:
+                              type: string
+                            user_id:
+                              type: string
+                            name:
+                              type: string
+                            kind:
+                              type: string
+                  page:
+                    $ref: '#/components/schemas/DiscoveryPage'
+                  request_id:
+                    type: string
+        '400': &id003
+          description: Structured error with error.code and error.message; request and operation IDs are returned
+            in headers.
+        '401': *id003
+        '403': *id003
+  /v2/discovery/people:
+    get:
+      tags:
+      - members
+      summary: Discover people for the authenticated user on this server
+      description: 'Active memberships only. People show only shared circles. IDs are server-local: route with the
+        trusted server URL plus user_id and member_id. Names and emails are never global authorization proofs. Pagination
+        is a live view, not a snapshot; restart if membership changes.'
+      parameters:
+      - *id004
+      - *id005
+      - name: q
+        in: query
+        schema:
+          type: string
+          maxLength: 120
+        description: Literal case-insensitive name/email substring. Duplicate names remain separate user IDs.
+      - name: circle_id
+        in: query
+        schema:
+          type: string
+        description: Restrict to one circle the caller is an active member of.
+      responses:
+        '200':
+          description: Bounded discovery page
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - protocol_version
+                - server
+                - data
+                - page
+                - request_id
+                properties:
+                  protocol_version:
+                    const: 1
+                  server:
+                    type: object
+                    required:
+                    - url
+                    properties:
+                      url:
+                        type: string
+                        format: uri
+                  data:
+                    type: object
+                    required:
+                    - people
+                    properties:
+                      people:
+                        type: array
+                        maxItems: 100
+                        items:
+                          type: object
+                          required:
+                          - user_id
+                          - name
+                          - email
+                          - memberships
+                          properties:
+                            user_id:
+                              type: string
+                            name:
+                              type: string
+                            email:
+                              type: string
+                            memberships:
+                              type: array
+                              items:
+                                type: object
+                                required:
+                                - member_id
+                                - circle_id
+                                - circle_name
+                                - role
+                                properties:
+                                  circle_id:
+                                    type: string
+                                  member_id:
+                                    type: string
+                                  role:
+                                    type: string
+                                  circle_name:
+                                    type: string
+                                  user_id:
+                                    type: string
+                  page:
+                    $ref: '#/components/schemas/DiscoveryPage'
+                  request_id:
+                    type: string
+        '400': *id003
+        '401': *id003
+        '403': *id003
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: fh_<token>
-      description: 'Per-agent bearer token issued at invite/provision accept. Sent as `Authorization:
-        Bearer <token>`.'
+      description: 'Per-agent bearer token issued at invite/provision accept. Sent as `Authorization: Bearer <token>`.'
   parameters:
     FamilyId:
       name: fid
@@ -2975,6 +3089,13 @@ components:
       schema:
         type: string
         minLength: 1
+    CircleContext:
+      name: X-Circle-ID
+      in: header
+      description: Circle selected for this request. The server checks active user membership and role. The CLI
+        supplies its selected circle. Discovery is server scoped.
+      schema:
+        type: string
   schemas:
     Role:
       type: string
@@ -3034,9 +3155,7 @@ components:
       - not_found
       - subtasks_open
       - already_member
-      - invite_used
       - invite_expired
-      - code_used
       - code_expired
       - pii_detected
       - rate_limited
@@ -3064,6 +3183,15 @@ components:
       - rotation_required
       - operation_conflict
       - history_not_granted
+      - identity_mismatch
+      - enrollment_conflict
+      - enrollment_state_changed
+      - enrollment_identity_changed
+      - invalid_enrollment
+      - idempotency_conflict
+      - not_a_member
+      - invite_email_mismatch
+      - existing_identity
     Error:
       type: object
       required:
@@ -3095,22 +3223,21 @@ components:
           format: date-time
     Member:
       type: object
-      description: 'family_id is present on roster endpoints (GET /v2/members, GET /v2/me) and absent
-        from enrollment responses (invite accept, bootstrap), which return a narrower shape.
-
-        '
+      description: A circle membership of the stable user. Enrollment and roster responses include family_id and
+        user_id.
       required:
       - id
       - name
       - email
       - role
       - created_at
+      - user_id
+      - family_id
       properties:
         id:
           type: string
         family_id:
           type: string
-          description: Present on roster/self endpoints; absent on enrollment responses.
         name:
           type: string
         email:
@@ -3121,22 +3248,15 @@ components:
         created_at:
           type: string
           format: date-time
+        user_id:
+          type: string
     TransferCompletionMode:
       type: string
       enum:
       - demote
       - remove
-      description: 'What happens to the offering owner once the recipient accepts:
-
-        `demote` drops them to parent (their tokens keep working); `remove`
-
-        strips the owner role AND revokes all of their agent tokens for the
-
-        circle, ending their access entirely. The member row itself is
-
-        retained for audit history.
-
-        '
+      description: Remove ends the offering user’s membership and topic participation in this circle and requires
+        topic rekey. Their server agent credentials and other circle memberships survive.
     Transfer:
       type: object
       required:
@@ -3210,9 +3330,8 @@ components:
       description: Token metadata. The token VALUE is never returned by any endpoint after issuance.
     TopicParticipantView:
       type: object
-      description: 'Participant as returned by the topic detail and export endpoints — a separate top-level
-        array, not nested in the topic. history_from_seq is present on export; the detail endpoint omits
-        it.
+      description: 'Participant as returned by the topic detail and export endpoints — a separate top-level array,
+        not nested in the topic. history_from_seq is present on export; the detail endpoint omits it.
 
         '
       required:
@@ -3235,9 +3354,8 @@ components:
           minimum: 1
     Topic:
       type: object
-      description: 'Note: the SQLite-backed server encodes booleans as integers, so parents_only may arrive
-        as true/false or 1/0 — clients MUST accept both. (Server-side coercion to true booleans is a recommended
-        cleanup.)
+      description: 'Note: the SQLite-backed server encodes booleans as integers, so parents_only may arrive as true/false
+        or 1/0 — clients MUST accept both. (Server-side coercion to true booleans is a recommended cleanup.)
 
         '
       required:
@@ -3308,9 +3426,8 @@ components:
           type: string
         token_id:
           type: string
-          description: 'Credential attribution. Required by SPEC section 3 but currently omitted by the
-            server — clients MUST NOT require it. (Recommended server cleanup: include it in the serialized
-            entry.)
+          description: 'Credential attribution. Required by SPEC section 3 but currently omitted by the server —
+            clients MUST NOT require it. (Recommended server cleanup: include it in the serialized entry.)
 
             '
         kind:
@@ -3381,8 +3498,80 @@ components:
     EncryptedContent:
       type: string
       pattern: ^fh1\.[0-9a-f]{32}\.[0-9a-f]{32}\.[A-Za-z0-9+/]+={0,2}$
-      description: XChaCha20-Poly1305 encrypted field, bound to topic ID, key ID and message ID. Canonical
-        padded base64 contains a 24-byte nonce and at least a 16-byte tag.
+      description: XChaCha20-Poly1305 encrypted field, bound to topic ID, key ID and message ID. Canonical padded
+        base64 contains a 24-byte nonce and at least a 16-byte tag.
+    DiscoveryPage:
+      type: object
+      required:
+      - limit
+      - next_cursor
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Opaque last-item ID; repeat unchanged on the next request. Null means complete.
+    User:
+      type: object
+      required:
+      - id
+      - email
+      - name
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+    Agent:
+      type: object
+      required:
+      - id
+      - label
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        created_at:
+          type: string
+        revoked_at:
+          type:
+          - string
+          - 'null'
+    RegistrationResult:
+      type: object
+      required:
+      - token
+      - token_id
+      - user
+      - agent
+      - member
+      - agent_label
+      - resumed
+      properties:
+        token:
+          type: string
+          writeOnly: true
+          description: Private credential; store durably, never print or log.
+        token_id:
+          type: string
+        user:
+          $ref: '#/components/schemas/User'
+        agent:
+          $ref: '#/components/schemas/Agent'
+        member:
+          $ref: '#/components/schemas/Member'
+        agent_label:
+          type: string
+        resumed:
+          type: boolean
   responses:
     BadRequest:
       description: Bad request — input failed validation (400)
@@ -3483,5 +3672,5 @@ components:
           example:
             error:
               code: client_too_old
-              message: 'Client version 0.5.0 is below the required minimum 0.9.0. Update your CLI: see
-                agent-skill/INSTALL.md (hub upgrade), then retry.'
+              message: 'Client version 0.5.0 is below the required minimum 0.9.0. Update your CLI: see agent-skill/INSTALL.md
+                (hub upgrade), then retry.'

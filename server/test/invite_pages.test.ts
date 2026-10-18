@@ -149,13 +149,13 @@ test('GET page as JSON returns the agent page shape without secrets', async () =
       b.install.summary.includes('skill bundle'),
       `${label}: summary names the bundle flow`,
     );
-    assert.ok(Array.isArray(b.install.steps) && b.install.steps.length === 8, label);
+    assert.ok(Array.isArray(b.install.steps) && b.install.steps.length >= 12, label);
     assert.ok(
       (b.install.steps as string[]).some((s) => s.includes(manifest.skill_sha256)),
       `${label}: a step verifies the bundle sha256 against the page-provided hash`,
     );
     assert.ok(
-      (b.install.steps as string[]).some((s) => s.includes('tar -xzf skill.tar.gz')),
+      (b.install.steps as string[]).some((s) => s.includes("extractall(filter='data')")),
       `${label}: a step extracts the bundle`,
     );
     assert.ok(
@@ -280,10 +280,17 @@ test('verify rejects wrong email, accepts normalized right email', async () => {
   assert.equal(right.status, 200);
   assert.match(right.body.invite_code, CODE_RE);
   assert.notEqual(right.body.invite_code, inv.invite_code, 'verify mints a fresh code');
-  assert.equal(
-    right.body.setup_command,
-    `hub setup --server https://hub.test --invite ${right.body.invite_code}`,
-  );
+  assert.ok(right.body.enroll_command.includes('enroll --server'));
+  assert.ok(right.body.enroll_command.includes('--code-file'));
+  assert.ok(right.body.enroll_command.includes('--email'));
+  const fresh = await app.call('GET', `/i/${pageToken}`, {...ip(73),headers:{Accept:'application/json'}});
+  assert.equal(fresh.body.invited_name,'Invited person');
+  const stored=await app.db.queryOne('SELECT name FROM invites WHERE code_hash=(SELECT invite_code_hash FROM invite_pages LIMIT 1)');
+  assert.equal(stored?.name,'Invited person');
+  assert.ok(right.body.enroll_command.includes('.venv/bin/python'));
+  assert.ok(!right.body.enroll_command.includes(right.body.invite_code));
+  assert.ok(right.body.resume_command.endsWith('enroll --resume'));
+  assert.ok(right.body.diagnostics_command.includes('diagnostics export'));
   assert.equal(right.body.expires_at, inv.expires_at, 'fresh code keeps the invite TTL');
 });
 

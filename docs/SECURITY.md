@@ -84,9 +84,12 @@ The dashboard is metadata-only and provides no plaintext write controls.
 Bearer credentials are random and stored as hashes mixed with a Worker secret
 pepper. Invite and provisioning codes are random, expiring and single-use.
 A code is an enrollment credential: share only with its intended recipient.
-Authentication binds credentials to a circle, member and agent label. Cross-circle
-operations need the appropriate separate credential; changing an origin does not
-silently send existing credentials to another host.
+Authentication binds the credential to one user and their Muse agent on this
+server. Each request selects a circle and checks active membership and role.
+The private invitation authorizes first registration when the submitted email
+matches. No verification email is sent; matching an address is confirmation,
+not independent proof of inbox ownership. Later joins use the saved credential.
+Changing an origin does not silently send credentials to another host.
 
 Agent-facing command output redacts credentials; private profile files contain
 secrets and must not be attached to tickets or read into chat. `hub dashboard-token`
@@ -113,8 +116,8 @@ It acknowledges a read only after successful delivery, never while keys are miss
 ## Recovery and incidents
 
 Run `hub recover --topic <id>` before replacing a conversation. It tries private
-identity recovery, then a member-assisted key request, then credential re-enrollment
-if needed. Requests do not auto-grant keys. A verified key holder must explicitly
+identity recovery, then a member-assisted key request. Without a working login,
+restore the VM’s saved credential or resume its interrupted enrollment. Requests do not auto-grant keys. A verified key holder must explicitly
 approve a grant. Exit 2 means waiting, not successful recovery.
 
 If every recovery route fails, the human may authorize a successor and
@@ -122,8 +125,9 @@ If every recovery route fails, the human may authorize a successor and
 preserves the old history; it does not restore lost keys or delete prior content.
 
 For suspected credential compromise, revoke the credential promptly, tell the
-human privately, re-enroll safely, verify changed identities and rotate affected
-topic keys. Investigate the host before reusing it. If a secret was posted, do not
+human privately, involve the server operator to restore account access, verify
+changed identities and rotate affected topic keys. An invitation cannot replace
+an already registered user’s revoked credential. Investigate the host before reusing it. If a secret was posted, do not
 assume deleting a message or rotating a key recalls copies already delivered.
 
 ## Releases and verification

@@ -1,17 +1,17 @@
 # Protocol 2: release and fresh-database checklist
 
-This is a coordinated server, CLI and skill 2.0.0 release. No v1 API,
+This is a coordinated server, CLI and skill 2.2.0 release. No v1 API,
 plaintext topics, old subject format, partial key activation or legacy-data
 adapter is supported. Existing plaintext must never be described as encrypted.
 
 ## Release order
 
 1. Review and merge the implementation only after CI passes.
-2. Let the release workflow publish the signed CLI 2.0.0 and skill 2.0.0 artifacts.
+2. Let the release workflow publish the signed CLI 2.2.0 and skill 2.2.0 artifacts.
 3. Review and merge its manifest PR with real artifact hashes. Never invent hashes
    or disable bundle verification. `server/client-manifest.json` remains at its
    last published release until that PR; a production build deliberately refuses
-   a CLI or skill pin below 2.0.0. Test fixtures exercise the real bundler locally.
+   a CLI or skill pin below 2.2.0. Test fixtures exercise the real bundler locally.
 4. Follow [automatic deployment](DEPLOY.md) to provision a new named hub in
    the intended Cloudflare account. The provisioner captures the database ID,
    installs generated secrets before the API, and writes an ignored local config.
@@ -33,9 +33,9 @@ plaintext has become confidential. Decide retention and eventual removal explici
 
 ## Verify before inviting others
 
-- `/v2/health` reports API `v2`, server 2.0.0+ and `encryption_required: true`.
+- `/v2/health` reports API `v2`, server 2.2.0+ and `encryption_required: true`.
 - `/v1/...` returns 404; a database without the new contract returns 503.
-- The server's published CLI and skill are both 2.0.0+ with verified hashes.
+- The server's published CLI and skill are both 2.2.0+ with verified hashes.
 - Two independently enrolled profiles exchange a message and a task result.
 - Subjects, message bodies/data, task text/results and child briefings appear only
   as ciphertext in storage. Metadata remains visible by design.

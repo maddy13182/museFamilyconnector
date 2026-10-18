@@ -83,7 +83,7 @@ test('owner can create a family while locked; kind defaults to family', async ()
   assert.equal(res.body.kind, 'family');
   assert.ok(res.body.id);
   assert.ok(res.body.created_at);
-  assert.ok(res.body.provisioning_code, 'creator gets a provisioning code for the new family');
+  assert.equal(res.body.provisioning_code, undefined, 'existing agent needs no extra credential');
 });
 
 test('owner can create a general-kind circle explicitly', async () => {
@@ -191,40 +191,34 @@ test('new family is fully usable: redeem code, invite, topic round-trip', async 
   assert.equal(created.status, 201);
   const newFamId = created.body.id as string;
 
-  // Creator redeems the provisioning code -> token bound to the NEW family.
-  const red = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(created.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: b64(32) } },
-  );
-  assert.equal(red.status, 201);
-  const newToken = red.body.token as string;
-  assert.equal(red.body.member.role, 'owner');
-
+  const newToken=ownerToken;
   // Invite a member into the new family with the new token.
-  const invited = await inviteAccept(app, newFamId, newToken, 'coach@gym.dev', 'parent', 'Coach');
-  assert.ok(invited.token);
+  const invite=await app.call('POST',`/v2/families/${newFamId}/invites`,{token:newToken,headers:{'X-Circle-ID':newFamId},body:{email:'coach@gym.dev',role:'parent'}});
+  assert.equal(invite.status,201);
+  const invited=await app.call('POST',`/v2/invites/${invite.body.invite_code}/accept`,{body:{display_name:'Coach',agent_label:'coach',agent_public_key:b64(32)}});
+  assert.equal(invited.status,201);
+  assert.ok(invited.body.token);
 
   // Members endpoint is scoped to the new family.
-  const members = await app.call('GET', '/v2/members', { token: newToken });
+  const members = await app.call('GET', '/v2/members', { token: newToken,headers:{'X-Circle-ID':newFamId} });
   assert.equal(members.status, 200);
   assert.equal(members.body.members.length, 2);
 
   // Topic round-trip in the new family: create, post, read back.
   const topic = await app.call('POST', '/v2/topics', {
-    token: newToken,
+    token: newToken, headers:{'X-Circle-ID':newFamId},
     body: { subject: 'Leg day', kind: 'group', participant_member_ids: [] },
   });
   assert.equal(topic.status, 201);
   const topicId = topic.body.topic.id as string;
 
   const post = await app.call('POST', `/v2/topics/${topicId}/entries`, {
-    token: newToken,
+    token: newToken, headers:{'X-Circle-ID':newFamId},
     body: { kind: 'message', body: 'See you at 6am' },
   });
   assert.equal(post.status, 201);
 
-  const hist = await app.call('GET', `/v2/topics/${topicId}/history`, { token: newToken });
+  const hist = await app.call('GET', `/v2/topics/${topicId}/history`, { token: newToken,headers:{'X-Circle-ID':newFamId} });
   assert.equal(hist.status, 200);
   assert.equal(hist.body.entries.length, 1);
   assert.equal(hist.body.entries[0].body, 'See you at 6am');
@@ -248,16 +242,8 @@ test('invite accept response member carries family_id (CLI circle-join needs it)
   });
   assert.equal(created.status, 201);
   const famId = created.body.id as string;
-  const red = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(created.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: b64(32) } },
-  );
-  assert.equal(red.status, 201);
-  const newToken = red.body.token as string;
-
   const inv = await app.call('POST', `/v2/families/${famId}/invites`, {
-    token: newToken,
+    token: ownerToken, headers:{'X-Circle-ID':famId},
     body: { email: 'regret@a.dev', role: 'parent' },
   });
   assert.equal(inv.status, 201);

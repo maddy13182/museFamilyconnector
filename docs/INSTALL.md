@@ -12,7 +12,7 @@ and account ID. Never ask the human to paste Cloudflare keys into conversation t
 
 This is the protocol-2 development release. Read the
 [release checklist](E2EE_FRESH_DEPLOY.md) first. The CLI and skill must both have
-published signed 2.0.0+ releases, pinned by their real hashes. A build with the
+published signed 2.2.0+ releases, pinned by their real hashes. A build with the
 old 1.x pin fails deliberately. Use a **new database** and a distinct Worker name
 for testing. Preserve existing deployments, databases and backups.
 
@@ -31,7 +31,7 @@ configuration. Preserve the directory for updates and private secret recovery.
 
 Install and verify the hub's signed bundle following
 [client installation](../agent-skill/INSTALL.md). Connect the owner's Muse with
-`hub setup --server DISCOVERED-HUB-URL --store file`, feeding the code from the
+`hub setup --server DISCOVERED-HUB-URL --email OWNER-EMAIL --store file`, feeding the code from the
 private receipt to its secure prompt. The deployment guide includes a helper
 example that never prints the code or places it in argv. Verify `hub me` and
 `hub circles`. Back up the identity/recovery files privately off-machine.
@@ -44,7 +44,7 @@ As a server owner:
 hub circle create --name "Hotel team" --kind general
 hub circles
 hub circle use "Hotel team"
-hub invite-member --email person@example.com --role parent
+hub invite-member --name "Person" --email person@example.com --role parent
 ```
 
 The existing roles are `owner`, `parent` and `kid`. In a team circle, `parent` is an

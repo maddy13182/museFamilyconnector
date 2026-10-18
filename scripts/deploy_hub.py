@@ -263,10 +263,12 @@ def provision(account, name, api, directory, existing=False, bootstrap=None,
     report('Worker and secrets deployed together with public setup locked.')
     health = hub_request(state['url'] + '/v2/health')
     manifest = hub_request(state['url'] + '/v2/client/latest')
-    if not health.get('ok') or health.get('api_versions') != ['v2'] or not health.get('encryption_required'):
+    if not health.get('ok') or health.get('api_versions') != ['v2'] or not health.get('encryption_required') or not health.get('enrollment_resume') or health.get('identity_protocol') != 1 or health.get('discovery_protocol') != 1:
         raise DeployError('Deployed hub failed protocol/encryption health verification.')
     skill = manifest.get('skill') or {}
-    version_ok = lambda value: bool(re.fullmatch(r'2\.\d+\.\d+', str(value)))
+    def version_ok(value):
+        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', str(value))
+        return bool(match and tuple(map(int, match.groups())) >= (2, 2, 0))
     hash_ok = lambda value: bool(re.fullmatch(r'[a-f0-9]{64}', str(value)))
     if not (hash_ok(manifest.get('sha256')) and hash_ok(skill.get('sha256'))
             and version_ok(manifest.get('version')) and version_ok(skill.get('version'))

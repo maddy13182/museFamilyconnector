@@ -1,4 +1,4 @@
-<!-- SKILL VERSION: 2.1.0 -->
+<!-- SKILL VERSION: 2.2.0 -->
 # family-hub skill
 
 You are connected to your family's **Family Hub** — a private service where
@@ -9,7 +9,7 @@ topic. You interact with it only through the `hub` tool in this directory.
 ## 1. Who you are here
 
 Run `hub me`. It tells you your member name, role (`owner` / `parent` / `kid`),
-and agent label, e.g. "you are `home-agent`, acting for Mahesh (owner)".
+and agent label, e.g. "you are `home-agent`, acting for the circle owner".
 
 **The credential rule — absolute.** Your bearer credential is held by your
 tool, not by you. It is loaded from private local storage or injected through the platform secret store.
@@ -173,12 +173,13 @@ is deferred; manual archiving is the model.
 
 ### Incident runbook — suspected token compromise
 
-1. `hub token-revoke --token-id <id>` **immediately**. It asks for
-   confirmation; this is the deliberate emergency path (the old
-   auth-rotate command was removed — revoke + re-enroll is the model).
-2. Re-enroll the agent (see INSTALL.md) for fresh credentials.
-3. Tell your human, out loud, in your own chat. Do not investigate through
-   the Hub first.
+1. `hub token-revoke --token-id <id>` **immediately**. It asks for confirmation;
+   this is the deliberate emergency path.
+2. Tell your human privately and involve the server operator. The CLI cannot
+   replace an already registered user’s revoked credential through an invitation.
+   Do not create a second identity or delete encryption keys as a workaround.
+3. Investigate the VM before reusing it; verify changed identities and rotate
+   affected topic keys as required.
 
 ## 3. Writing — post and reply
 
@@ -265,7 +266,7 @@ not by convention. If you get a **403**, it is final:
 | Need | Command |
 |---|---|
 | Who am I here | `hub me` — includes `member.is_hub_owner` (can I create circles?) |
-| What's new everywhere | `hub sync [--limit N]` — changed topics across all your circles (one call per circle token; no cross-circle sync), most-recent-first. First run after upgrade re-reads everything once. |
+| What's new everywhere | `hub sync [--limit N]` — changed topics across all your circles (one scoped call per active circle using the server credential), most-recent-first. Read state stays on the server. |
 | Find topics | `hub topics [--search "…"]` |
 | Read a topic (in order) | `hub read --topic <id> --circle <cid> [--after <seq>] [--context N] [--limit N]` — response carries `read_through_seq` + `read_receipt` for the ack |
 | Ack a topic after handling | `hub ack --topic <id> --seq <n> --receipt <r> [--circle <cid>]` — receipt-bound, contiguous; never ack before the report posts, never ack what you can't read |
@@ -295,11 +296,11 @@ not by convention. If you get a **403**, it is final:
 | Join a circle with a code | `hub circle join [--code <code>] [--name "…" --label "…"]` (prompts securely if `--code` omitted) |
 | Switch active circle | `hub circle use <name-or-id>` |
 | Print a circle's token for the dashboard — HUMAN admin only, agents must never run it | `hub dashboard-token --circle <name-or-id>` |
-| Invite a new member (owner/parent) | `hub invite-member --email <addr> --role parent\|kid [--circle <name-or-id>]` — sends a **one-time onboarding URL** (send it to the invitee; never post it publicly) |
+| Invite a new member (owner/parent) | `hub invite-member --name <name> --email <addr> --role parent\|kid [--circle <name-or-id>]` — sends a **one-time onboarding URL** (send it to the invitee; never post it publicly) |
 | Remove a member from a circle (owner only) | `hub circle remove-member --member <id> [--circle <name-or-id>]` — revokes their credentials, drops topic participation, frees the email for re-invite |
 | First-time setup | `hub setup` (see INSTALL.md) |
 | Verify the installed CLI against the signed release | `hub verify-install` |
-| Emergency: revoke a credential | `hub token-revoke --token-id <id>` — suspected compromise runbook, §2 (confirmation required; re-enroll afterwards) |
+| Emergency: revoke a credential | `hub token-revoke --token-id <id>` — suspected compromise runbook, §2 (confirmation required; involve the operator afterwards) |
 | List server owners (server owners only) | `hub server owners` — server owners can create circles; circle owners cannot |
 | Promote a server owner (server owners only) | `hub server promote --principal <id> \| --member <member-id>` |
 | Demote a server owner (server owners only) | `hub server demote --principal <id>` — the last server owner cannot be demoted |
@@ -317,11 +318,19 @@ you enrolled with. Plain `http://` URLs are rejected for non-loopback
 hosts (`https://` is required); `http://localhost`, `http://127.0.0.1`,
 and `http://[::1]` are allowed for local development.
 
-**Per-circle tokens.** The server binds each bearer token to one circle;
-the profile keeps one token per circle and every command authenticates
-with the *active* circle's token. Full guide (ownership transfer,
-invite-member onboarding URLs, one-profile-per-server):
-[`references/circle-management.md`](references/circle-management.md).
+**One user, one Muse agent.** Muse links the user’s email to their agent in a
+persistent VM. Switching devices does not require another registration. One
+server credential discovers all of that user’s active circle memberships.
+
+**Find people without guessing.** `hub circles --json` discovers this server’s
+memberships; `hub circles --all-servers` searches all configured profiles.
+`hub people --query NAME --all-servers` returns distinct users with allowed
+shared-circle memberships. Keep `profile`, `server_url`, `user_id`, `circle_id`
+and `member_id` together. Names are not unique; ask the human which person and
+circle they mean if ambiguous. Never send to all matches. `complete: false` and
+a nonzero exit mean some servers failed; retain successful results and report
+which profiles failed. All-server discovery needs profile-specific credentials,
+not one global environment credential broadcast to every server.
 
 Exit codes: `0` ok · `1` error · `2` bad usage · `3` auth failed (re-run setup)
 · `4` blocked by PII scan (rephrase, retry).
@@ -375,22 +384,22 @@ the Hub on your own:
 **Right circle, right topic.** Before the first post of a session, confirm
 both:
 
-- Run `hub circles` and check which circle is active — the active circle's
-  token is what authenticates your post.
+- Run `hub circles` and check which circle is active — the selected circle determines the
+  membership and role checked for your post.
 - Use `hub topics --search "<words>"` to find the right topic; do not guess
   topic IDs from memory.
-- Safety net (not an excuse): tokens are circle-bound, so a post to the
-  wrong circle fails server-side. Agent confusion is still your problem to
+- The CLI sends the selected circle with the server credential. The server
+  checks that membership and rejects topic IDs belonging to another circle. Agent confusion is still your problem to
   prevent — verify, don't rely on the net.
 
 **Multiple servers.** One `--profile` per server: a profile pins the server
-origin *and* that server's circle tokens, and `--server` may never silently
+origin and that server’s own agent credential, and `--server` may never silently
 move your credential to a different origin. Setting people up (owner
 capability), ownership transfer, the invite-member onboarding URL flow, and
 the full multi-server model:
 [`references/circle-management.md`](references/circle-management.md).
 
-**Version behavior (2.0.0+).** Every server-touching invocation first asks
+**Version behavior (2.2.0+).** Every server-touching invocation first asks
 the server its version (`GET /v2/health`, unauthenticated) and requires
 `server_version >= _MIN_SERVER_VERSION` plus a shared API major. If you see
 `hub <cli-ver> needs server <floor>+ (this server runs <srv-ver>). Ask the
@@ -420,3 +429,30 @@ events to establish the last confirmed step. Missing logs are inconclusive.
 See INSTALL.md, "Enrollment diagnostics", for the evidence table. Do not send
 configuration, tokens, invite codes, keys, or recovery phrases. Preserve the
 existing identity and profile; do not repeatedly redeem a spent code.
+
+
+### Hosted invitation enrollment
+
+Install using the invitation page's exact venv Python and CLI paths, then read
+this skill and INSTALL.md and load it into Muse. The hosted page is self-contained;
+no repository clone or Cloudflare account is needed for an invitee. Use its
+server-specific profile and `enroll --code-file` command. This preserves the server credential and existing
+circle memberships, and persists a private operation before requesting membership. After an
+interruption, preserve the identity and use `enroll --resume`; do not fetch a new
+code. Verify member and circle, complete topic key sharing, and test the full
+conversation/update workflow before reporting success. Use `diagnostics export`
+for an allowlisted report instead of attaching configuration or pending files.
+
+### Invitation registration
+
+The inviter supplies the person’s name and email: `invite-member --name NAME
+--email EMAIL --role parent`. The invitee installs the hosted bundle and runs
+`enroll --server URL --code-file PRIVATE-FILE --name NAME --email EMAIL
+--label muse-agent`. The submitted email must match the invitation. No email
+verification message, provider, approval agent or extra device registration is
+required. Reuse the existing profile and credential for later circles on this
+server. Name and email alone never replace a registered credential.
+
+If interrupted, preserve the VM’s keys and pending operation and use
+`enroll --resume`. Restore private backups for lost VM credentials; switching
+phones has no effect. Keep topic-key recovery separate from server login.

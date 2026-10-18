@@ -34,22 +34,22 @@ export function makeClientApp() {
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k,v])=>[k,display(v)]));
     return value;
   }
-  async function activate(tid: string, token: string) {
-    const record = await app.call('GET', `/v2/topics/${tid}`, {token});
+  async function activate(tid: string, token: string, headers?:Record<string,string>) {
+    const record = await app.call('GET', `/v2/topics/${tid}`, {token,headers});
     const key = topicKeys.get(tid)!;
     const epoch = (record.body.topic.current_epoch || 0) + 1;
     if (epoch > 1) { key.id = hex(16); key.key = sodium.randombytes_buf(32); }
     const subject = display(record.body.topic.subject) as string;
-    const directory = await app.call('GET', '/v2/agent-keys', {token});
+    const directory = await app.call('GET', '/v2/agent-keys', {token,headers});
     for (const participant of record.body.participants) {
       for (const agent of directory.body.keys.filter((a: any)=>a.member_id===participant.member_id)) {
         const plain = new Uint8Array([...bytes(tid),0,...sodium.from_hex(key.id),...key.key]);
         const envelope = b64(sodium.crypto_box_seal(plain,sodium.from_base64(agent.public_key,sodium.base64_variants.ORIGINAL)));
-        const r = await app.call('POST',`/v2/topics/${tid}/envelopes`,{token,body:{member_id:agent.member_id,agent_label:agent.agent_label,key_id:key.id,envelope}});
+        const r = await app.call('POST',`/v2/topics/${tid}/envelopes`,{token,headers,body:{member_id:agent.member_id,agent_label:agent.agent_label,key_id:key.id,envelope}});
         if(r.status!==201) return r;
       }
     }
-    return app.call('POST',`/v2/topics/${tid}/keys/commit`,{token,body:{expected_epoch:epoch,key_id:key.id,commitment:sodium.to_hex(sodium.crypto_hash_sha256(key.key)),subject:seal(tid,subject)}});
+    return app.call('POST',`/v2/topics/${tid}/keys/commit`,{token,headers,body:{expected_epoch:epoch,key_id:key.id,commitment:sodium.to_hex(sodium.crypto_hash_sha256(key.key)),subject:seal(tid,subject)}});
   }
   async function call(method: string, path: string, opts: CallOpts = {}): Promise<CallResult> {
     await sodium.ready;
@@ -90,13 +90,13 @@ export function makeClientApp() {
     }
     let result=await app.call(method,path,{...opts,body});
     if(created && result.status===201) {
-      const activated=await activate(created,opts.token!);
+      const activated=await activate(created,opts.token!,opts.headers);
       if(activated.status!==200)return activated;
       if(briefing) await call('POST',`/v2/topics/${created}/entries`,{token:opts.token,body:{kind:'briefing',body:briefing}});
     }
     if(method==='POST' && /\/invite$/.test(path) && result.status===200 && body.history_from==='from_join') {
       const tid=path.split('/')[3];
-      if(topicKeys.has(tid))await activate(tid,opts.token!);
+      if(topicKeys.has(tid))await activate(tid,opts.token!,opts.headers);
     }
     return {...result,body:display(result.body)};
   }

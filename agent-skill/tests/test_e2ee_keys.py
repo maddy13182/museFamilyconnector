@@ -60,12 +60,14 @@ class FakeHub:
 
     def __call__(self, method, url, headers, body_bytes):
         path = urlparse.urlparse(url).path
+
+
         if (
             method.upper() == "GET"
             and path == "/v2/health"
             and ("GET", "/v2/health") not in self.routes
         ):
-            # The fake models a current (1.0.0) server: auto-answer the
+            # The fake models a current-release server: auto-answer the
             # per-invocation version check in main().
             self.health_calls.append(
                 {
@@ -76,7 +78,7 @@ class FakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
+                {"ok": True, "version": hub.VERSION, "api_versions": ["v2"]}
             )
         self.calls.append(
             {
@@ -91,6 +93,11 @@ class FakeHub:
             status, body = self.routes[key]
         else:
             status, body = 404, {"error": {"code": "not_found", "message": "no route"}}
+        if method.upper() == "POST" and path.endswith(("/accept", "/redeem")) and 200 <= status < 300 and isinstance(body, dict) and body.get("token"):
+            body = dict(body, token=json.loads(body_bytes)["agent_token"])
+        if method.upper()=="GET" and path=="/v2/me" and status==200 and isinstance(body,dict):
+            body=dict(body)
+            body.setdefault("family_id",headers.get("X-Circle-ID"))
         return status, json.dumps(body)
 
     def bodies_for(self, method, path):
@@ -133,6 +140,8 @@ class E2EETestBase(unittest.TestCase):
         hub.clear_secrets()
 
     def run_cli(self, argv):
+        if "setup" in argv and "--email" not in argv:
+            argv=list(argv)+["--email","tester@example.test"]
         with captured() as (out, err):
             rc = hub.main(argv, transport=self.fake)
         return rc, out.getvalue(), err.getvalue()

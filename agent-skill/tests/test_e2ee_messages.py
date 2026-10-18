@@ -87,7 +87,7 @@ class MsgFakeHub:
         path = parts.path
         method = method.upper()
 
-        # The fake models a current (1.0.0) server: auto-answer the
+        # The fake models a current-release server: auto-answer the
         # per-invocation version check in main(). Recorded separately so
         # command-traffic assertions keep their meaning.
         if method == "GET" and path == "/v2/health":
@@ -100,7 +100,7 @@ class MsgFakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
+                {"ok": True, "version": hub.VERSION, "api_versions": ["v2"]}
             )
 
         self.calls.append(

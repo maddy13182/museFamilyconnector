@@ -29,91 +29,30 @@ test('duplicate circle name (case-insensitive) -> 409 circle_name_taken', async 
   assert.equal(dup.body.error.code, 'circle_name_taken');
 });
 
-test('locked create: same Idempotency-Key twice -> one circle, deduped, fresh code', async () => {
-  const app = makeApp();
-  const { token } = await bootstrapOwner(app, 'Fam A', 'a@t.dev');
-  app.env.SETUP_LOCKED = '1';
-
-  const key = 'create-key-1';
-  const first = await app.call('POST', '/v2/families', {
-token,
-    body: { name: 'Gym', kind: 'general' },
-    headers: { 'idempotency-key': key },
-  });
-  assert.equal(first.status, 201);
-  assert.equal(first.body.deduped, undefined);
-  const fid = first.body.id as string;
-  const code1 = first.body.provisioning_code as string;
-
-  const second = await app.call('POST', '/v2/families', {
-token,
-    body: { name: 'Gym', kind: 'general' },
-    headers: { 'idempotency-key': key },
-  });
-  assert.equal(second.status, 200);
-  assert.equal(second.body.deduped, true);
-  assert.equal(second.body.id, fid);
-  const code2 = second.body.provisioning_code as string;
-  assert.ok(code2 && code2 !== code1, 'dedup must mint a fresh code');
-
-  // Only one circle row exists.
-  const families = await app.call('GET', '/v2/families', { token });
-  assert.equal(families.body.families.filter((f: any) => f.name === 'Gym').length, 1);
-
-  // Both codes redeem (first was never delivered in the failure scenario).
-  for (const code of [code1, code2]) {
-    const red = await app.call(
-      'POST',
-      `/v2/provisioning-codes/${encodeURIComponent(code)}/redeem`,
-      { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
-    );
-    assert.equal(red.status, 201);
-  }
+test('locked create retries return one circle without issuing another credential', async()=>{
+ const app=makeApp();const {token}=await bootstrapOwner(app,'Fam A','a@t.dev');app.env.SETUP_LOCKED='1';
+ const opts={token,body:{name:'Gym',kind:'general'},headers:{'idempotency-key':'same-create'}};
+ const first=await app.call('POST','/v2/families',opts);const second=await app.call('POST','/v2/families',opts);
+ assert.equal(first.status,201);assert.equal(second.status,200);assert.equal(first.body.id,second.body.id);
+ assert.equal(second.body.deduped,true);assert.equal(second.body.provisioning_code,undefined);
+ assert.equal((await app.db.queryOne('SELECT count(*) n FROM agent_tokens'))?.n,1);
+ const members=await app.call('GET','/v2/members',{token,headers:{'X-Circle-ID':first.body.id}});assert.equal(members.status,200);
+ const changed=await app.call('POST','/v2/families',{...opts,body:{name:'Different',kind:'general'}});
+ assert.equal(changed.status,409);assert.equal(changed.body.error.code,'idempotency_conflict');
 });
 
-test('dedup after redeem revokes the orphaned token', async () => {
-  const app = makeApp();
-  const { token } = await bootstrapOwner(app, 'Fam A', 'a@t.dev');
-  app.env.SETUP_LOCKED = '1';
 
-  const key = 'create-key-orphan';
-  const first = await app.call('POST', '/v2/families', {
-token,
-    body: { name: 'Book', kind: 'general' },
-    headers: { 'idempotency-key': key },
-  });
-  const code1 = first.body.provisioning_code as string;
-  // Redeem succeeded but the response was lost (client holds nothing).
-  const red1 = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(code1)}/redeem`,
-    { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
-  );
-  assert.equal(red1.status, 201);
-  const orphanToken = red1.body.token as string;
-
-  // Client retries the create with the same key.
-  const second = await app.call('POST', '/v2/families', {
-token,
-    body: { name: 'Book', kind: 'general' },
-    headers: { 'idempotency-key': key },
-  });
-  assert.equal(second.body.deduped, true);
-
-  // The orphaned token is revoked: it no longer authenticates.
-  const probe = await app.call('GET', '/v2/families', { token: orphanToken });
-  assert.equal(probe.status, 401);
-
-  // The fresh code works.
-  const red2 = await app.call(
-    'POST',
-    `/v2/provisioning-codes/${encodeURIComponent(second.body.provisioning_code)}/redeem`,
-    { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
-  );
-  assert.equal(red2.status, 201);
+test('circle-create retry preserves the original server credential', async()=>{
+ const app=makeApp();const {token}=await bootstrapOwner(app,'Fam A','a@t.dev');app.env.SETUP_LOCKED='1';
+ const opts={token,body:{name:'Book'},headers:{'idempotency-key':'book-create'}};
+ const first=await app.call('POST','/v2/families',opts);const retry=await app.call('POST','/v2/families',opts);
+ assert.equal(first.status,201);assert.equal(retry.status,200);assert.equal(retry.body.id,first.body.id);
+ assert.equal((await app.call('GET','/v2/me',{token,headers:{'X-Circle-ID':first.body.id}})).status,200);
+ assert.equal((await app.db.queryOne('SELECT revoked_at FROM agent_tokens'))?.revoked_at,null);
 });
 
-test('redeem of used code returns member + token_already_issued', async () => {
+
+test('a different credential cannot recover an already enrolled code', async () => {
   const app = makeApp();
   const fam = await app.call('POST', '/v2/families', {
     body: { name: 'F', owner_name: 'M', owner_email: 'm@t.dev' },
@@ -124,9 +63,9 @@ test('redeem of used code returns member + token_already_issued', async () => {
   assert.equal(red1.status, 201);
   const red2 = await app.call('POST', path, { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } });
   assert.equal(red2.status, 409);
-  assert.equal(red2.body.error.code, 'code_used');
-  assert.equal(red2.body.token_already_issued, true);
-  assert.ok(red2.body.member && red2.body.member.id);
+  assert.equal(red2.body.error.code, 'enrollment_conflict');
+  assert.equal(red2.body.token, undefined);
+  assert.equal(red2.body.member, undefined);
 });
 
 test('topic create is idempotent with its client-generated operation ID', async () => {

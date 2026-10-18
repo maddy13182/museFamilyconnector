@@ -19,7 +19,8 @@ import {
   hex,
   setupKeyedFamily,
   addMember,
-  addAgent,
+  memberAgent,
+  addPeer,
   createActiveTopic,
   createE2eeTopic,
   inviteToTopic,
@@ -30,12 +31,12 @@ import {
   readState,
 } from './syncv2_helpers.js';
 
-const postedBodies = new Map<string,string>();
+const postedBodies = new Map<string, string>();
 async function postEntry(app: TestApp, token: string, tid: string, text: string) {
-  const row=await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?',[tid]);
-  const body=text.startsWith('fh1.')?text:wireBody(row!.current_key_id as string);
-  const result=await rawPostEntry(app,token,tid,body);
-  if(result.status===201) postedBodies.set(text,body);
+  const row = await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?', [tid]);
+  const body = text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string);
+  const result = await rawPostEntry(app, token, tid, body);
+  if (result.status === 201) postedBodies.set(text, body);
   return result;
 }
 
@@ -47,11 +48,14 @@ test('journey: three agents exchange 120 messages; all received in order', async
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'JourneyMsg');
   const pm = await addMember(app, famId, owner.token, 'par@j.dev', 'parent', 'Par');
-  const parent = await addAgent(app, owner.token, pm.memberId, 'par-agent', true);
+  const parent = await memberAgent(app, pm.memberId, true);
   const km = await addMember(app, famId, owner.token, 'kid@j.dev', 'kid', 'Kid');
-  const kid = await addAgent(app, owner.token, km.memberId, 'kid-agent', true);
+  const kid = await memberAgent(app, km.memberId, true);
 
-  const tid = await createActiveTopic(app, owner.token, 'big group', [parent.memberId, kid.memberId]);
+  const tid = await createActiveTopic(app, owner.token, 'big group', [
+    parent.memberId,
+    kid.memberId,
+  ]);
   const agents = [owner, parent, kid];
   const N = 120;
   for (let i = 0; i < N; i++) {
@@ -79,14 +83,17 @@ test('journey: three agents exchange 120 messages; all received in order', async
     }
     assert.equal(seen.length, N, `${a.agentLabel} received all ${N}`);
     for (let i = 0; i < N; i++) {
-      assert.equal(seen[i], postedBodies.get(`message ${i} from ${agents[i % agents.length].agentLabel}`));
+      assert.equal(
+        seen[i],
+        postedBodies.get(`message ${i} from ${agents[i % agents.length].agentLabel}`),
+      );
     }
   }
 
   // A fourth, fresh agent syncs: one changed topic. The invite itself
   // appends a member_joined entry, so 120 messages + 1 = 121 new.
   const lm = await addMember(app, famId, owner.token, 'late@j.dev', 'parent', 'Late');
-  const late = await addAgent(app, owner.token, lm.memberId, 'late-agent', true);
+  const late = await memberAgent(app, lm.memberId, true);
   await inviteToTopic(app, owner.token, tid, [late.memberId], 'full');
   const s = await app.call('GET', '/v2/sync/topics', { token: late.token });
   const t = (s.body.topics as any[]).find((x: any) => x.topic_id === tid);
@@ -102,7 +109,7 @@ test('journey: three agents exchange 120 messages; all received in order', async
 test('journey: restart mid-processing loses nothing (read state advances only on ack)', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'JourneyRestart');
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const other = await addPeer(app, owner, 'other-agent');
   const tid = await createActiveTopic(app, owner.token, 'restart topic', [other.memberId]);
   for (let i = 1; i <= 10; i++) await postEntry(app, other.token, tid, `m${i}`);
 
@@ -137,7 +144,11 @@ test('journey: restart mid-processing loses nothing (read state advances only on
   ]);
   assert.equal(await readState(app, owner.memberId, owner.agentLabel, tid), null);
   const s4 = await app.call('GET', '/v2/sync/topics', { token: owner.token });
-  assert.equal((s4.body.topics as any[])[0].new_count, 10, 'read-state loss -> full re-read, no silent loss');
+  assert.equal(
+    (s4.body.topics as any[])[0].new_count,
+    10,
+    'read-state loss -> full re-read, no silent loss',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -177,9 +188,9 @@ test('journey: one human, two circles — no cross-circle access anywhere', asyn
 test('journey: leave-then-join during rotation — messages keep flowing, removed stays out', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'JourneyRot');
-  const mkKeyed = async (email: string, name: string, label: string) => {
+  const mkKeyed = async (email: string, name: string, _label: string) => {
     const m = await addMember(app, famId, owner.token, email, 'parent', name);
-    return addAgent(app, owner.token, m.memberId, label, true);
+    return memberAgent(app, m.memberId, true);
   };
   const bee = await mkKeyed('bee@r.dev', 'Bee', 'bee-agent');
   const cee = await mkKeyed('cee@r.dev', 'Cee', 'cee-agent');
@@ -212,7 +223,11 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
   const k2 = hex(16);
   await stageAll(k2);
   assert.equal(
-    (await app.call('DELETE', `/v2/topics/${tid}/participants/${bee.memberId}`, { token: owner.token })).status,
+    (
+      await app.call('DELETE', `/v2/topics/${tid}/participants/${bee.memberId}`, {
+        token: owner.token,
+      })
+    ).status,
     200,
   );
   const burned = await commit(2, k2);
@@ -221,19 +236,28 @@ test('journey: leave-then-join during rotation — messages keep flowing, remove
 
   const k2b = hex(16); // fresh material, never resealed
   assert.notEqual(k2b, k2);
-  await stageAll(k2b, agents.filter((a) => a.memberId !== bee.memberId));
+  await stageAll(
+    k2b,
+    agents.filter((a) => a.memberId !== bee.memberId),
+  );
   assert.equal((await commit(2, k2b)).status, 200);
   assert.equal((await postEntry(app, owner.token, tid, wireBody(k2b))).status, 201);
   // Bee is out: 403 on reads, and no envelope path back in.
-  assert.equal((await app.call('GET', `/v2/topics/${tid}/history`, { token: bee.token })).status, 403);
+  assert.equal(
+    (await app.call('GET', `/v2/topics/${tid}/history`, { token: bee.token })).status,
+    403,
+  );
   const beeEnv = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: bee.token });
   assert.equal(beeEnv.status, 403);
 
   // --- Join interleaved with rotation: 409 -> seal delta -> recommit.
   const dm = await addMember(app, famId, owner.token, 'dee@r.dev', 'parent', 'Dee');
-  const dee = await addAgent(app, owner.token, dm.memberId, 'dee-agent', true);
+  const dee = await memberAgent(app, dm.memberId, true);
   const k3 = hex(16);
-  await stageAll(k3, agents.filter((a) => a.memberId !== bee.memberId));
+  await stageAll(
+    k3,
+    agents.filter((a) => a.memberId !== bee.memberId),
+  );
   await inviteToTopic(app, owner.token, tid, [dee.memberId], 'full');
   const clash = await commit(3, k3);
   assert.equal(clash.status, 409, 'join interleaved with rotation -> 409');

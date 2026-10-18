@@ -60,13 +60,18 @@ class FakeHub:
 
     def __call__(self, method, url, headers, body_bytes):
         path = urlparse.urlparse(url).path
+        if method.upper()=="GET" and path=="/v2/families" and ("GET",path) not in self.routes and ("GET",path) not in self.seqs:
+            cfg=hub.load_config("default")
+            return 200,json.dumps({"families":[{"id":cfg.get("active_circle_id") or cfg.get("family_id") or "default","name":"Family"}]})
+
+
         if (
             method.upper() == "GET"
             and path == "/v2/health"
             and ("GET", "/v2/health") not in self.routes
             and ("GET", "/v2/health") not in self.seqs
         ):
-            # The fake models a current (1.0.0) server: auto-answer the
+            # The fake models a current-release server: auto-answer the
             # per-invocation version check in main().
             self.health_calls.append(
                 {
@@ -77,7 +82,7 @@ class FakeHub:
                 }
             )
             return 200, json.dumps(
-                {"ok": True, "version": "2.0.0", "api_versions": ["v2"]}
+                {"ok": True, "version": hub.VERSION, "api_versions": ["v2"]}
             )
         self.calls.append(
             {
@@ -94,6 +99,11 @@ class FakeHub:
             status, body = self.routes[key]
         else:
             status, body = 404, {"error": {"code": "not_found", "message": "no route"}}
+        if method.upper() == "POST" and path.endswith(("/accept", "/redeem")) and 200 <= status < 300 and isinstance(body, dict) and body.get("token"):
+            body = dict(body, token=json.loads(body_bytes)["agent_token"])
+        if method.upper()=="GET" and path=="/v2/me" and status==200 and isinstance(body,dict):
+            body=dict(body)
+            body.setdefault("family_id",headers.get("X-Circle-ID"))
         return status, json.dumps(body)
 
     def last_url(self):
@@ -136,6 +146,10 @@ class HubTestBase(unittest.TestCase):
         hub.clear_secrets()
 
     def run_cli(self, argv):
+        if "invite-member" in argv and "--name" not in argv:
+            argv=list(argv)+["--name","Invited person"]
+        if any(command in argv for command in ("setup", "enroll")) and "--email" not in argv:
+            argv = list(argv) + ["--email", "tester@example.test"]
         with captured() as (out, err):
             rc = hub.main(argv, transport=self.fake)
         return rc, out.getvalue(), err.getvalue()
@@ -146,10 +160,17 @@ class HubTestBase(unittest.TestCase):
                 FAKE_TOKEN, blob, "token leaked into CLI output!"
             )
 
+    def enrolled_token(self):
+        for call in reversed(self.fake.calls):
+            body = json.loads(call["body"]) if call["body"] else {}
+            if body.get("agent_token"):
+                return body["agent_token"]
+        self.fail("No enrollment credential was sent")
+
     def seed_config(self, profile="default", **over):
         cfg = {
             "server_url": "https://hub.example",
-            "member": {"id": "m1", "name": "Tester", "role": "parent"},
+            "member": {"id": "m1", "name": "Tester", "role": "parent", "email":"tester@example.test"},
             "agent_label": "test-agent",
             "auth_method": "env",
         }
@@ -380,7 +401,7 @@ class TestRedaction(HubTestBase):
                          "https://hub.example/v2/sync")
 
     def test_save_config_is_0600(self):
-        self.seed_config(circle_tokens={"c1": "fh_XYZ"})
+        self.seed_config()
         mode = stat.S_IMODE(os.stat(hub.config_path("default")).st_mode)
         self.assertEqual(mode, 0o600)
 
@@ -400,7 +421,8 @@ class TestRedaction(HubTestBase):
         self.fake.add("GET", "/v2/sync/topics", 401,
                       {"error": {"code": "auth", "message": "bad token"}})
         rc, out, err = self.run_cli(["sync"])
-        self.assertEqual(rc, 3)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("sync failed for circle",err)
         self.assertTokenAbsent(out, err)
         self.assertIn("Authentication failed", err)
 
@@ -449,7 +471,7 @@ class TestRedaction(HubTestBase):
         new_token = "fh_NEWLYISSUED_999"
         self.fake.add(
             "POST", "/v2/invites/CODE123/accept", 200,
-            {"member": {"id": "m2", "name": "Lakshmi", "role": "parent",
+            {"member": {"id": "m2", "family_id": "c2", "name": "Lakshmi", "role": "parent",
                         "email": "l@example.com"},
              "token": new_token, "token_id": "tok_1"},
         )
@@ -620,7 +642,7 @@ class TestCloudflareAndInvite(HubTestBase):
         self.assertEqual(rc, 0)
         self.assertIn("/v2/families/fam1/invites", self.fake.last_url())
         body = json.loads(self.fake.calls[0]["body"])
-        self.assertEqual(body, {"email": "lakshmi@example.com", "role": "parent"})
+        self.assertEqual(body, {"email": "lakshmi@example.com", "name":"Invited person", "role": "parent"})
         self.assertIn("inv_abc", out)
 
     def test_invite_member_needs_family_id(self):
@@ -678,7 +700,11 @@ class TestCircles(HubTestBase):
         self.seed_config()
         self.fake.add("POST", "/v2/families", 201,
                       {"id": "c333", "name": "Gym", "kind": "general",
-                       "created_at": "t"})
+                       "created_at": "t", "provisioning_code": "fhp_CREATE"})
+        self.fake.add("POST", "/v2/provisioning-codes/fhp_CREATE/redeem", 201,
+                      {"token": "fh_CREATED", "member": {"id": "m3", "family_id": "c333"}})
+        self.fake.add("GET", "/v2/me", 200, {"id": "m3", "family_id": "c333"})
+        self.fake.add("GET","/v2/families",200,{"families":[{"id":"c333","name":"Gym"}]})
         rc, out, _ = self.run_cli(
             ["circle", "create", "--name", "Gym", "--kind", "general"])
         self.assertEqual(rc, 0)
@@ -739,12 +765,11 @@ class TestCircles(HubTestBase):
         self.assertEqual(rc, 1)
         self.assertIn("Multiple circles named", err)
 
-    def test_resolve_prefers_active_over_legacy(self):
+    def test_resolve_prefers_selected_circle_over_registration_circle(self):
         # Active circle wins for resolution; its own token is used (the
         # server binds each token to one family, so the legacy token for
         # c111 could not act on c222).
-        self.seed_config(active_circle_id="c222", family_id="c111",
-                         circle_tokens={"c222": "fh_C222_tok"})
+        self.seed_config(active_circle_id="c222", family_id="c111")
         self.fake.add("POST", "/v2/families/c222/invites", 201,
                       {"invite_code": "inv_x"})
         rc, _out, _ = self.run_cli(
@@ -754,9 +779,9 @@ class TestCircles(HubTestBase):
         self.assertEqual(self.call_paths(),
                          [("POST", "/v2/families/c222/invites")])
         auth = self.fake.calls[0]["headers"]["Authorization"]
-        self.assertEqual(auth, "Bearer fh_C222_tok")
+        self.assertEqual(auth, "Bearer " + FAKE_TOKEN)
 
-    def test_legacy_family_id_fallback(self):
+    def test_registration_circle_initial_selection(self):
         self.seed_config(family_id="c111")  # pre-circles profile
         self.fake.add("POST", "/v2/families/c111/invites", 201,
                       {"invite_code": "inv_y"})
@@ -769,8 +794,7 @@ class TestCircles(HubTestBase):
     def test_circle_override_flag(self):
         # --circle switches target AND token: c222's own token is used,
         # since the legacy c111 token is bound to its own family.
-        self.seed_config(family_id="c111",
-                         circle_tokens={"c222": "fh_C222_tok"})
+        self.seed_config(family_id="c111")
         self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
         self.fake.add("POST", "/v2/families/c222/invites", 201,
                       {"invite_code": "inv_z"})
@@ -784,7 +808,7 @@ class TestCircles(HubTestBase):
         post = [c for c in self.fake.calls
                 if urlparse.urlparse(c["url"]).path.endswith("/invites")][0]
         self.assertEqual(post["headers"]["Authorization"],
-                         "Bearer fh_C222_tok")
+                         "Bearer " + FAKE_TOKEN)
 
     def test_override_no_match_makes_no_post(self):
         self.seed_config(family_id="c111")
@@ -952,8 +976,7 @@ class TestCircleTransfer(HubTestBase):
         self.assertTokenAbsent(out)
 
     def test_transfer_uses_circle_override(self):
-        self.seed_config(family_id="c111",
-                         circle_tokens={"c222": "fh_C222_tok"})
+        self.seed_config(family_id="c111")
         self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
         self.fake.add("POST", "/v2/families/c222/transfer", 201,
                       {"id": "t9", "status": "pending"})
@@ -964,7 +987,7 @@ class TestCircleTransfer(HubTestBase):
                          [("GET", "/v2/families"),
                           ("POST", "/v2/families/c222/transfer")])
         self.assertEqual(self.fake.calls[1]["headers"]["Authorization"],
-                         "Bearer fh_C222_tok")
+                         "Bearer " + FAKE_TOKEN)
 
 
 # ---------------------------------------------------------------------------
@@ -1011,8 +1034,7 @@ class TestCircleRemoveMember(HubTestBase):
         self.assertIn("--member", err)
 
     def test_remove_member_respects_circle_override(self):
-        self.seed_config(family_id="c111",
-                         circle_tokens={"c222": "fh_C222_tok"})
+        self.seed_config(family_id="c111")
         self.fake.add("GET", "/v2/families", 200,
                       {"families": [{"id": "c222", "name": "Friends"}]})
         self.fake.add("DELETE", "/v2/families/c222/members/m9", 200,
@@ -1116,8 +1138,6 @@ class TestServerOwners(HubTestBase):
 
 
 class TestSyncV2(HubTestBase):
-    TOK_A = "fh_CIRCLE_A_token123456"
-    TOK_B = "fh_CIRCLE_B_token789012"
     CIRCLES = [
         {"id": "c111", "name": "Family"},
         {"id": "c222", "name": "Friends"},
@@ -1126,7 +1146,7 @@ class TestSyncV2(HubTestBase):
     def seed_multi(self):
         self.seed_config(
             active_circle_id="c111",
-            circle_tokens={"c111": self.TOK_A, "c222": self.TOK_B},
+
         )
 
     def test_sync_topics_labeled_per_circle(self):
@@ -1149,24 +1169,20 @@ class TestSyncV2(HubTestBase):
         auths = {c["headers"].get("Authorization")
                  for c in self.fake.calls
                  if "/v2/sync/topics" in c["url"]}
-        self.assertEqual(auths, {"Bearer " + self.TOK_A, "Bearer " + self.TOK_B})
+        self.assertEqual(auths, {"Bearer " + FAKE_TOKEN})
+        scopes={c["headers"].get("X-Circle-ID") for c in self.fake.calls if "/v2/sync/topics" in c["url"]}
+        self.assertEqual(scopes,{"c111","c222"})
         self.assertTokenAbsent(out, err)
 
-    def test_sync_deletes_legacy_cursors_without_reading(self):
-        self.seed_multi()
-        self.fake.add("GET", "/v2/families", 200, {"families": self.CIRCLES})
-        self.fake.add("GET", "/v2/sync/topics", 200, {"topics": []})
-        os.makedirs(hub.profile_dir("default"), exist_ok=True)
-        for name in ("cursor", "cursor-c111", "cursor-c222"):
-            with open(os.path.join(hub.profile_dir("default"), name), "w") as fh:
-                fh.write("424242")
-        rc, out, err = self.run_cli(["sync"])
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(json.loads(out), [])
-        for name in ("cursor", "cursor-c111", "cursor-c222"):
-            self.assertFalse(
-                os.path.exists(os.path.join(hub.profile_dir("default"), name)),
-                "legacy cursor %s must be deleted unread" % name)
+    def test_sync_discovers_memberships_from_server_without_cached_circle_tokens(self):
+        self.seed_config()
+        self.fake.add("GET","/v2/families",200,{"families":self.CIRCLES})
+        self.fake.add("GET","/v2/sync/topics",200,{"topics":[]})
+        rc,out,err=self.run_cli(["sync"])
+        self.assertEqual(rc,0,err)
+        requests=[c for c in self.fake.calls if "/v2/sync/topics" in c["url"]]
+        self.assertEqual({r["headers"]["X-Circle-ID"] for r in requests},{"c111","c222"})
+        self.assertEqual({r["headers"]["Authorization"] for r in requests},{"Bearer "+FAKE_TOKEN})
 
     def test_sync_partial_failure_reports_per_circle(self):
         self.seed_multi()
@@ -1262,19 +1278,17 @@ class TestTokenRevoke(HubTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Per-circle tokens (v0.2.0): one token per circle, active-circle auth,
-# legacy fallback, multi-circle sync, dashboard-token
+# One server credential with explicit circle selection, multi-circle sync,
+# membership joining, and human-only dashboard credential export
 # ---------------------------------------------------------------------------
 
 
-class TestCircleTokens(HubTestBase):
-    TOK_A = "fh_CIRCLE_A_token123456"
-    TOK_B = "fh_CIRCLE_B_token789012"
+class TestCircleContext(HubTestBase):
 
     def seed_multi(self, **over):
         cfg = {
             "active_circle_id": "c111",
-            "circle_tokens": {"c111": self.TOK_A, "c222": self.TOK_B},
+
             "circle_members": {
                 "c111": {"id": "m1", "name": "Tester", "role": "owner"},
                 "c222": {"id": "m9", "name": "Tester", "role": "member"},
@@ -1285,60 +1299,27 @@ class TestCircleTokens(HubTestBase):
 
     # -- circle create auto-redeem --------------------------------------
 
-    def test_create_auto_redeem_stores_token_and_activates(self):
+    def test_create_preserves_server_credential_and_activates_membership(self):
         self.seed_config()
-        self.fake.add("POST", "/v2/families", 201,
-                      {"id": "c333", "name": "Gym", "kind": "general",
-                       "created_at": "t",
-                       "provisioning_code": "fhp_NEWCODE123",
-                       "provisioning_expires_at": "t2"})
-        self.fake.add("POST", "/v2/provisioning-codes/fhp_NEWCODE123/redeem",
-                      201,
-                      {"token": "fh_NEWCIRCLE_tok999", "token_id": "tok9",
-                       "member": {"id": "m9", "family_id": "c333",
-                                  "name": "Tester", "role": "owner",
-                                  "email": "t@example.com"}})
-        rc, out, err = self.run_cli(
-            ["circle", "create", "--name", "Gym", "--kind", "general"])
-        self.assertEqual(rc, 0)
-        cfg = hub.load_config("default")
-        self.assertEqual(cfg["circle_tokens"]["c333"], "fh_NEWCIRCLE_tok999")
-        self.assertEqual(cfg["active_circle_id"], "c333")
-        self.assertEqual(cfg["circle_members"]["c333"]["id"], "m9")
-        self.assertIn("now active", out)
-        self.assertIn("c333", out)
-        # token never appears in output...
-        self.assertNotIn("fh_NEWCIRCLE_tok999", out + err)
-        self.assertTokenAbsent(out, err)
-        # ...but IS persisted in the 0600 config
-        with open(hub.config_path("default")) as fh:
-            self.assertIn("fh_NEWCIRCLE_tok999", fh.read())
-        mode = stat.S_IMODE(os.stat(hub.config_path("default")).st_mode)
-        self.assertEqual(mode, 0o600)
-        # redeem used no Authorization header (the code is the credential)
-        redeem = [c for c in self.fake.calls if "redeem" in c["url"]][0]
-        self.assertNotIn("Authorization", redeem["headers"])
+        self.fake.add("POST","/v2/families",201,{"id":"c333","name":"Gym","kind":"general"})
+        self.fake.add("GET","/v2/families",200,{"families":[{"id":"c333","name":"Gym","member_id":"m9","my_role":"owner"}]})
+        rc,out,err=self.run_cli(["circle","create","--name","Gym","--kind","general"])
+        self.assertEqual(rc,0,err)
+        cfg=hub.load_config("default")
+        self.assertEqual(cfg["active_circle_id"],"c333")
+        self.assertEqual(cfg["circle_members"]["c333"]["id"],"m9")
+        self.assertNotIn("circle_tokens",cfg)
+        self.assertFalse(any("redeem" in c["url"] for c in self.fake.calls))
+        self.assertTokenAbsent(out,err)
 
-    def test_create_redeem_mismatch_refuses_to_store(self):
+    def test_create_missing_membership_preserves_pending_operation(self):
         self.seed_config()
-        self.fake.add("POST", "/v2/families", 201,
-                      {"id": "c333", "name": "Gym", "kind": "general",
-                       "created_at": "t",
-                       "provisioning_code": "fhp_NEWCODE123",
-                       "provisioning_expires_at": "t2"})
-        self.fake.add("POST", "/v2/provisioning-codes/fhp_NEWCODE123/redeem",
-                      201,
-                      {"token": "fh_WRONG_tok", "token_id": "tok9",
-                       "member": {"id": "m9", "family_id": "c999",
-                                  "name": "Tester", "role": "owner"}})
-        rc, _out, err = self.run_cli(["circle", "create", "--name", "Gym"])
-        self.assertEqual(rc, 1)
-        self.assertIn("different circle", err)
-        cfg = hub.load_config("default")
-        self.assertNotIn("circle_tokens", cfg)
-        self.assertNotIn("fh_WRONG_tok", err)
-
-    # -- circle join -----------------------------------------------------
+        self.fake.add("POST","/v2/families",201,{"id":"c333","name":"Gym"})
+        self.fake.add("GET","/v2/families",200,{"families":[]})
+        rc,out,err=self.run_cli(["circle","create","--name","Gym"])
+        self.assertEqual(rc,1)
+        self.assertIn("not returned as an active membership",err)
+        self.assertTrue(os.path.exists(os.path.join(hub.profile_dir("default"),"pending-circle-create.json")))
 
     def test_join_with_provisioning_code(self):
         self.seed_config()
@@ -1355,7 +1336,8 @@ class TestCircleTokens(HubTestBase):
         rc, out, err = self.run_cli(["circle", "join", "--code", "fhp_JOIN123"])
         self.assertEqual(rc, 0)
         cfg = hub.load_config("default")
-        self.assertEqual(cfg["circle_tokens"]["c777"], "fh_JOINED_tok111")
+        self.assertEqual(self.enrolled_token(), FAKE_TOKEN)
+        self.assertNotIn("circle_tokens",cfg)
         self.assertEqual(cfg["active_circle_id"], "c777")
         self.assertIn("Book Club", out)
         self.assertIn("now active", out)
@@ -1380,14 +1362,14 @@ class TestCircleTokens(HubTestBase):
         self.assertEqual(body["agent_label"], "test-agent")
         self.assertEqual(len(hub.base64.b64decode(body["agent_public_key"])), 32)
         cfg = hub.load_config("default")
-        self.assertEqual(cfg["circle_tokens"]["c888"], "fh_INVITED_tok222")
+        self.assertEqual(self.enrolled_token(), FAKE_TOKEN)
+        self.assertNotIn("circle_tokens",cfg)
         self.assertEqual(cfg["active_circle_id"], "c888")
         self.assertNotIn("fh_INVITED_tok222", out + err)
 
-    def test_join_redeem_missing_family_id_falls_back_to_families(self):
-        # The token is irreplaceable: if a redeem response ever lacks
-        # family_id again, the CLI must resolve the circle via /v2/families
-        # with the new token — never crash and lose the credential.
+    def test_incomplete_join_preserves_pending_operation_without_guessing_circle(self):
+        # A malformed response is retained privately; do not guess a circle
+        # or discard a credential after the server may have committed.
         self.seed_config()
         self.fake.add("POST", "/v2/invites/fhi_NOFAMID/accept", 201,
                       {"token": "fh_NOFAM_tok333", "token_id": "tokN",
@@ -1398,41 +1380,40 @@ class TestCircleTokens(HubTestBase):
             {"id": "c999", "name": "Fallback Gym", "kind": "general",
              "my_role": "kid"}]})
         rc, out, err = self.run_cli(["circle", "join", "--code", "fhi_NOFAMID"])
-        self.assertEqual(rc, 0)
-        cfg = hub.load_config("default")
-        self.assertEqual(cfg["circle_tokens"]["c999"], "fh_NOFAM_tok333")
-        self.assertEqual(cfg["active_circle_id"], "c999")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("pending enrollment was preserved", err)
+        self.assertTrue(os.path.exists(hub._pending_enrollment("default")))
         self.assertNotIn("fh_NOFAM_tok333", out + err)
 
-    def test_join_invite_code_needs_name_label(self):
+    def test_join_requires_an_existing_server_credential(self):
         os.environ.pop("FAMILY_HUB_TOKEN", None)
         hub.save_config("default", {"server_url": "https://hub.example"})
         rc, _out, err = self.run_cli(["circle", "join", "--code", "fhi_X"])
         self.assertEqual(rc, 1)
-        self.assertIn("--name and --label", err)
+        self.assertIn("No credential", err)
         self.assertEqual(self.fake.calls, [])
 
     # -- per-circle auth --------------------------------------------------
 
-    def test_request_uses_active_circle_token(self):
+    def test_request_sends_active_circle_with_server_credential(self):
         self.seed_multi()  # active c111
         self.fake.add("GET", "/v2/topics", 200, {"topics": []})
         rc, _out, _ = self.run_cli(["topics"])
         self.assertEqual(rc, 0)
         auth = self.fake.calls[0]["headers"]["Authorization"]
-        self.assertEqual(auth, "Bearer " + self.TOK_A)
+        self.assertEqual(auth, "Bearer " + FAKE_TOKEN)
         self.assertTokenAbsent(self.fake.calls[0]["headers"].get("X-X", ""))
 
-    def test_request_falls_back_to_legacy_token(self):
-        self.seed_config(family_id="c111")  # no circle_tokens at all
+    def test_request_uses_registration_circle_context(self):
+        self.seed_config(family_id="c111")
         self.fake.add("GET", "/v2/topics", 200, {"topics": []})
         rc, _out, _ = self.run_cli(["topics"])
         self.assertEqual(rc, 0)
         auth = self.fake.calls[0]["headers"]["Authorization"]
         self.assertEqual(auth, "Bearer " + FAKE_TOKEN)
 
-    def test_circle_override_switches_token(self):
-        self.seed_multi()  # active c111 (TOK_A)
+    def test_circle_override_switches_membership_context(self):
+        self.seed_multi()  # active c111
         self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
         self.fake.add("POST", "/v2/families/c222/invites", 201,
                       {"invite_code": "inv_z"})
@@ -1443,31 +1424,27 @@ class TestCircleTokens(HubTestBase):
         posts = [c for c in self.fake.calls
                  if urlparse.urlparse(c["url"]).path.endswith("/invites")]
         self.assertEqual(len(posts), 1)
-        # the POST went out with circle B's token, not the active circle's
+        # The same credential is used with the selected circle context.
         self.assertEqual(posts[0]["headers"]["Authorization"],
-                         "Bearer " + self.TOK_B)
+                         "Bearer " + FAKE_TOKEN)
 
-    def test_circle_override_tokenless_hints_join(self):
-        self.seed_config(active_circle_id="c111",
-                         circle_tokens={"c111": self.TOK_A})
-        self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
-        rc, _out, err = self.run_cli(
-            ["invite-member", "--circle", "Friends",
-             "--email", "a@example.com", "--role", "kid"])
-        self.assertEqual(rc, 1)
-        self.assertIn("hub circle join --code", err)
+    def test_circle_override_uses_existing_credential_and_explicit_context(self):
+        self.seed_config(active_circle_id="c111")
+        self.fake.add("GET","/v2/families",200,{"families":CIRCLES})
+        self.fake.add("POST","/v2/families/c222/invites",201,{"invite_code":"fhi_test"})
+        rc,out,err=self.run_cli(["invite-member","--circle","Friends","--email","a@example.com","--role","kid"])
+        self.assertEqual(rc,0,err)
+        request=self.fake.calls[-1]
+        self.assertEqual(request["headers"]["X-Circle-ID"],"c222")
+        self.assertEqual(request["headers"]["Authorization"],"Bearer "+FAKE_TOKEN)
 
-    # -- circle use warnings ---------------------------------------------------
-
-    def test_use_warns_when_tokenless(self):
-        self.seed_config(active_circle_id="c111",
-                         circle_tokens={"c111": self.TOK_A})
+    def test_use_requires_only_the_server_credential(self):
+        self.seed_config(active_circle_id="c111")
         self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
         rc, out, err = self.run_cli(["circle", "use", "Friends"])  # c222
         self.assertEqual(rc, 0)
         self.assertEqual(hub.load_config("default")["active_circle_id"], "c222")
-        self.assertIn("no token stored", err)
-        self.assertIn("hub circle join --code", err)
+        self.assertEqual(err, "")
 
     def test_use_no_warning_when_token_present(self):
         self.seed_multi()
@@ -1476,7 +1453,7 @@ class TestCircleTokens(HubTestBase):
         self.assertEqual(rc, 0)
         self.assertNotIn("no token stored", err)
 
-    def test_use_no_warning_for_legacy_bootstrap(self):
+    def test_use_registration_circle_with_server_credential(self):
         # Single-token profile: the bootstrap circle works via fallback.
         self.seed_config(family_id="c111")
         self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
@@ -1492,25 +1469,20 @@ class TestCircleTokens(HubTestBase):
         rc, out, _ = self.run_cli(["dashboard-token", "--circle", "Friends"])
         self.assertEqual(rc, 0)
         self.assertIn("WARNING", out)
-        self.assertIn(self.TOK_B, out)
+        self.assertIn(FAKE_TOKEN, out)
         # warning precedes the token
-        self.assertLess(out.index("WARNING"), out.index(self.TOK_B))
+        self.assertLess(out.index("WARNING"), out.index(FAKE_TOKEN))
 
-    def test_dashboard_token_no_token_stored(self):
-        self.seed_config(active_circle_id="c111",
-                         circle_tokens={"c111": self.TOK_A})
-        self.fake.add("GET", "/v2/families", 200, {"families": CIRCLES})
-        rc, _out, err = self.run_cli(["dashboard-token", "--circle", "Friends"])
-        self.assertEqual(rc, 1)
-        self.assertIn("No token stored", err)
-
-
-# ---------------------------------------------------------------------------
-# Enrollment hardening: F11 (sink validation before redeem, /v2/me gate)
-# and F03 (server origin pinning, https-only, --server override flag).
-# ---------------------------------------------------------------------------
+    def test_dashboard_token_requires_a_server_credential(self):
+        self.seed_config(active_circle_id="c111")
+        os.environ.pop("FAMILY_HUB_TOKEN",None)
+        rc,out,err=self.run_cli(["dashboard-token","--circle","Friends"])
+        self.assertEqual(rc,1)
+        self.assertIn("No credential",err)
 
 
+
+# Enrollment persistence, identity verification, and server-origin boundaries.
 class TestEnrollHardening(HubTestBase):
     def redeem_calls(self):
         return [c for c in self.fake.calls
@@ -1534,7 +1506,7 @@ class TestEnrollHardening(HubTestBase):
     def test_setup_env_verifies_token_via_me_before_success(self):
         new_token = "fh_SETUPME_123"
         self.fake.add("POST", "/v2/invites/OK1/accept", 200,
-                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                      {"member": {"id": "m2", "family_id": "c2", "name": "N", "role": "parent"},
                        "token": new_token, "token_id": "t1"})
         self.fake.add("GET", "/v2/me", 200, {"id": "m2", "name": "N"})
         rc, out, err = self.run_cli([
@@ -1547,13 +1519,13 @@ class TestEnrollHardening(HubTestBase):
         # the /me probe carried the NEW token, and only then did we succeed
         self.assertEqual(len(self.me_calls()), 1)
         self.assertEqual(self.me_calls()[0]["headers"]["Authorization"],
-                         "Bearer " + new_token)
+                         "Bearer " + self.enrolled_token())
         self.assertNotIn(new_token, out + err)
 
-    def test_setup_me_rejected_means_code_consumed(self):
+    def test_setup_rejection_preserves_pending_enrollment(self):
         new_token = "fh_SETUPME_456"
         self.fake.add("POST", "/v2/invites/OK2/accept", 200,
-                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                      {"member": {"id": "m2", "family_id": "c2", "name": "N", "role": "parent"},
                        "token": new_token, "token_id": "t1"})
         self.fake.add("GET", "/v2/me", 401,
                       {"error": {"code": "auth", "message": "bad token"}})
@@ -1562,8 +1534,8 @@ class TestEnrollHardening(HubTestBase):
             "--invite", "OK2", "--name", "N", "--label", "l",
         ])
         self.assertEqual(rc, 3)
-        self.assertIn("consumed", err)
-        self.assertIn("fresh", err)
+        self.assertIn("pending enrollment", err)
+        self.assertIn("diagnostics", err)
         self.assertNotIn("setup complete", out)
         self.assertNotIn(new_token, out + err)
 
@@ -1572,7 +1544,7 @@ class TestEnrollHardening(HubTestBase):
         # so the operator must not burn another code.
         new_token = "fh_SETUPME_789"
         self.fake.add("POST", "/v2/invites/OK5/accept", 200,
-                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                      {"member": {"id": "m2", "family_id": "c2", "name": "N", "role": "parent"},
                        "token": new_token, "token_id": "t1"})
         self.fake.add("GET", "/v2/me", 500,
                       {"error": {"code": "internal", "message": "boom"}})
@@ -1582,7 +1554,7 @@ class TestEnrollHardening(HubTestBase):
         ])
         self.assertEqual(rc, 1)
         self.assertIn("WAS stored", err)
-        self.assertIn("do NOT request a new code", err)
+        self.assertIn("enroll --resume", err)
         self.assertNotIn(new_token, out + err)
 
     def test_setup_file_sink_unwritable_fails_before_redeem(self):
@@ -1600,7 +1572,7 @@ class TestEnrollHardening(HubTestBase):
     def test_setup_file_store_writes_0600_token_file(self):
         new_token = "fh_SETUPFILE_1"
         self.fake.add("POST", "/v2/invites/OK4/accept", 200,
-                      {"member": {"id": "m2", "name": "N", "role": "parent"},
+                      {"member": {"id": "m2", "family_id": "c2", "name": "N", "role": "parent"},
                        "token": new_token, "token_id": "t1"})
         self.fake.add("GET", "/v2/me", 200, {"id": "m2"})
         rc, out, err = self.run_cli([
@@ -1611,7 +1583,7 @@ class TestEnrollHardening(HubTestBase):
         self.assertEqual(rc, 0)
         tokfile = hub.default_token_path("default")
         with open(tokfile) as fh:
-            self.assertEqual(fh.read().strip(), new_token)
+            self.assertEqual(fh.read().strip(), self.enrolled_token())
         mode = stat.S_IMODE(os.stat(tokfile).st_mode)
         self.assertEqual(mode, 0o600)
 
@@ -1648,10 +1620,10 @@ class TestEnrollHardening(HubTestBase):
         self.assertIn("now active", out)
         self.assertEqual(len(self.me_calls()), 1)
         self.assertEqual(self.me_calls()[0]["headers"]["Authorization"],
-                         "Bearer " + new_token)
+                         "Bearer " + self.enrolled_token())
         self.assertNotIn(new_token, out + err)
 
-    def test_join_me_rejected_means_code_consumed(self):
+    def test_join_rejection_preserves_pending_enrollment(self):
         new_token = "fh_JOINME_2"
         self.seed_config()
         self.fake.add("POST", "/v2/provisioning-codes/fhp_JM2/redeem", 201,
@@ -1662,8 +1634,8 @@ class TestEnrollHardening(HubTestBase):
                       {"error": {"code": "forbidden", "message": "nope"}})
         rc, out, err = self.run_cli(["circle", "join", "--code", "fhp_JM2"])
         self.assertEqual(rc, 3)
-        self.assertIn("consumed", err)
-        self.assertIn("fresh", err)
+        self.assertIn("pending enrollment", err)
+        self.assertIn("diagnostics", err)
         self.assertNotIn(new_token, out + err)
 
     def test_join_unwritable_profile_dir_fails_before_redeem(self):

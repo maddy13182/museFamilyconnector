@@ -24,7 +24,7 @@ import {
   hex,
   setupKeyedFamily,
   addMember,
-  addAgent,
+  memberAgent,
   createE2eeTopic,
   createActiveTopic,
   inviteToTopic,
@@ -44,10 +44,13 @@ interface KeyedTopic {
 }
 
 /** E2EE topic with owner+bee as participants, genesis committed (epoch 1). */
-async function setupCommittedTopic(app: TestApp, name: string): Promise<KeyedTopic & { bee: Party }> {
+async function setupCommittedTopic(
+  app: TestApp,
+  name: string,
+): Promise<KeyedTopic & { bee: Party }> {
   const { famId, owner } = await setupKeyedFamily(app, name);
   const m = await addMember(app, famId, owner.token, 'bee@k.dev', 'parent', 'Bee');
-  const bee = await addAgent(app, owner.token, m.memberId, 'bee-agent', true);
+  const bee = await memberAgent(app, m.memberId, true);
   const { tid } = await createE2eeTopic(app, owner.token, {
     participantIds: [bee.memberId],
   });
@@ -59,7 +62,9 @@ async function setupCommittedTopic(app: TestApp, name: string): Promise<KeyedTop
 }
 
 async function epochRows(app: TestApp, tid: string) {
-  return app.db.queryAll(`SELECT * FROM topic_key_epochs WHERE topic_id = ? ORDER BY epoch ASC`, [tid]);
+  return app.db.queryAll(`SELECT * FROM topic_key_epochs WHERE topic_id = ? ORDER BY epoch ASC`, [
+    tid,
+  ]);
 }
 
 async function rotationRequired(app: TestApp, tid: string): Promise<number> {
@@ -183,7 +188,10 @@ test('rotation: epoch 1 -> 2 flips current_key_id and clears rotation_required',
   assert.equal(c.status, 200, `rotation failed: ${JSON.stringify(c.body)}`);
   assert.equal(c.body.epoch, 2);
 
-  const topic = (await app.db.queryOne(`SELECT current_key_id, current_epoch, rotation_required FROM topics WHERE id = ?`, [tid]))!;
+  const topic = (await app.db.queryOne(
+    `SELECT current_key_id, current_epoch, rotation_required FROM topics WHERE id = ?`,
+    [tid],
+  ))!;
   assert.equal(topic['current_key_id'], keyId2);
   assert.notEqual(topic['current_key_id'], epoch1KeyId);
   assert.equal(topic['current_epoch'], 2);
@@ -324,7 +332,14 @@ test('burn: removal interleaved with rotation burns the key (staged rows deleted
   // The removed member never gets the new key: envelope POSTs for them are
   // 400 (not a current participant) and they are 403 on the topic.
   const freshId = hex(16);
-  const envRemoved = await postEnvelope(app, owner.token, tid, bee.memberId, bee.agentLabel, freshId);
+  const envRemoved = await postEnvelope(
+    app,
+    owner.token,
+    tid,
+    bee.memberId,
+    bee.agentLabel,
+    freshId,
+  );
   assert.equal(envRemoved.status, 400);
   const gone = await app.call('GET', `/v2/topics/${tid}/envelopes`, { token: bee.token });
   assert.equal(gone.status, 403);
@@ -355,7 +370,7 @@ test('join during rotation: 409, seal the delta, recommit the SAME key', async (
 
   // ...then Cee joins (with a registered identity key) before the commit.
   const cm = await addMember(app, famId, owner.token, 'cee@k.dev', 'parent', 'Cee');
-  const cee = await addAgent(app, owner.token, cm.memberId, 'cee-agent', true);
+  const cee = await memberAgent(app, cm.memberId, true);
   await inviteToTopic(app, owner.token, tid, [cee.memberId], 'full');
 
   const c = await commitKey(app, owner.token, tid, {
@@ -384,10 +399,6 @@ test('join during rotation: 409, seal the delta, recommit the SAME key', async (
 // ---------------------------------------------------------------------------
 // Force audit + keyless agents
 // ---------------------------------------------------------------------------
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Superseded identity keys
@@ -496,7 +507,11 @@ test('epoch log is append-only: no UPDATE/DELETE path exists', async () => {
   ]) {
     await postEnvelope(app, owner.token, tid, a.memberId, a.agentLabel, keyId2);
   }
-  const c = await commitKey(app, owner.token, tid, { expectedEpoch: 2, keyId: keyId2, commitment: hex(32) });
+  const c = await commitKey(app, owner.token, tid, {
+    expectedEpoch: 2,
+    keyId: keyId2,
+    commitment: hex(32),
+  });
   assert.equal(c.status, 200);
   const after = await epochRows(app, tid);
   assert.equal(after.length, 2);
@@ -512,14 +527,21 @@ test('epoch log: missing commitments fail closed and uniqueness prevents key reu
   const { owner } = await setupKeyedFamily(app, 'EpochRequired');
   const { tid } = await createE2eeTopic(app, owner.token);
   const ts = new Date().toISOString();
-  await assertRejects(app.db.execAtomically([{
-    sql: `INSERT INTO topic_key_epochs(topic_id,epoch,key_id,commitment,recipients,created_at,created_by) VALUES (?,?,?,?,?,?,?)`,
-    params: [tid,1,hex(16),null,'[]',ts,owner.memberId],
-  }]), 'an unverifiable epoch must be rejected');
-  await app.db.execAtomically([{
-    sql: `INSERT INTO topic_key_epochs(topic_id,epoch,key_id,commitment,recipients,created_at,created_by) VALUES (?,?,?,?,?,?,?)`,
-    params: [tid,1,hex(16),hex(32),'[]',ts,owner.memberId],
-  }]);
+  await assertRejects(
+    app.db.execAtomically([
+      {
+        sql: `INSERT INTO topic_key_epochs(topic_id,epoch,key_id,commitment,recipients,created_at,created_by) VALUES (?,?,?,?,?,?,?)`,
+        params: [tid, 1, hex(16), null, '[]', ts, owner.memberId],
+      },
+    ]),
+    'an unverifiable epoch must be rejected',
+  );
+  await app.db.execAtomically([
+    {
+      sql: `INSERT INTO topic_key_epochs(topic_id,epoch,key_id,commitment,recipients,created_at,created_by) VALUES (?,?,?,?,?,?,?)`,
+      params: [tid, 1, hex(16), hex(32), '[]', ts, owner.memberId],
+    },
+  ]);
   const rows = await epochRows(app, tid);
   assert.equal(rows.length, 1);
   // But key_id reuse is still rejected at the DB level (the backstop the

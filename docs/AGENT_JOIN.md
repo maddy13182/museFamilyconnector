@@ -1,93 +1,68 @@
-# Agent join guide — E2EE addendum
+# Joining a circle from a hosted invitation
 
-> NOTE: this file currently carries only the E2EE section and the invitee
-> onboarding section below. The main join
-> guide (`docs/AGENT_JOIN.md` on the parallel `fix/invite-accept-family-id`
-> branch) is the authority for invite/provisioning codes, `hub setup`, and
-> enrollment; append these sections there at merge time.
+The invitation URL is the entry point for Muse. Everything needed is served by
+that backend or included in its verified skill bundle. An invitee does not clone
+this repository, deploy infrastructure, or provide Cloudflare credentials.
 
-## Joining via the onboarding URL (invitee side)
+## Inviter
 
-Your inviter sends you a one-time onboarding URL like
-`https://<server>/i/<token>`. That URL is the only way in — it is
-unguessable, and there is no way to enumerate invites.
+Use the documented `invite-member` command in the intended circle. Privately send
+the returned onboarding URL to the person. Do not put it in a shared topic.
+The role controls circle permissions; separately add the member to the topics
+they should see and finish distributing their encrypted keys.
 
-**Human invitee:** open the URL in a browser. The page explains what
-Family Hub is, gives the CLI install steps (pinned to the signed release —
-the artifacts download from the server's own `/v2/client/download/*`
-endpoints; verify the sigstore signature and sha256 before installing), and shows an
-email form. Enter the exact email address the invite was sent to (check
-the masked hint, e.g. `s***@gmail.com`). On a match the page reveals:
+## Invitee's Muse
 
-- the single-use invite code, and
-- the exact `hub setup` command to run.
+1. Read the URL with `Accept: application/json`. It contains `client`,
+   `install.steps`, `install.paths`, `install.commands`, complete
+   `install.agent_instructions`, and the exact `verify` endpoint.
+2. Check prerequisites and run the install block in order, stopping on error.
+   It creates a venv, downloads from this server, checks the archive before
+   extraction, verifies the CLI signature and both hashes, installs dependencies
+   in that venv, and self-checks the CLI. Record its printed absolute paths.
+3. Read and load the installed `SKILL.md` and `INSTALL.md`. Configure the tool
+   command with the exact venv interpreter and CLI, including in scheduled jobs.
+   If the platform cannot load skills, execute tools, create chats, or schedule
+   updates, report the particular limitation instead of claiming completion.
+4. Only then submit the invited email to `verify`. This is an address match,
+   not email-inbox verification. Keep the response private. Write `invite_code`
+   directly into a `0600` file; never display it or put it in argv.
+5. Run the returned `enroll_command`, replacing the private code-file path and
+   display name. It uses a server-specific profile and chooses setup versus
+   joining an additional circle. It preserves existing circle credentials and
+   rejects a profile pinned to another origin.
+6. Check `me`, `circles`, and `topics` using the page's exact command paths. Ask
+   the inviter to add this member to a test topic and finish key sharing. Test
+   an approved message/reply in both people's Muse topic chats.
+7. Configure the installed skill's full discovery/read/report/acknowledge watcher.
+   Only acknowledge after reporting. Keep recovery information private and back
+   it up off-machine. Remove the spent code file after authenticated checks pass.
 
-Run the setup command; your agent enrolls (token goes straight into the
-Secure Vault) and can then `hub sync` / `hub topics`.
+## Interrupted enrollment
 
-**Agent invitee:** fetch the machine-readable page, then prove the email:
+The CLI saves a fresh private credential and request before accepting the code.
+The server commits membership, identity, credential hash, code consumption, and a
+request-bound receipt atomically. Matching retries resume the same enrollment.
+A changed request or credential, revoked token, or removed member cannot resume.
 
-```bash
-curl -s -H 'Accept: application/json' https://<server>/i/<token>
-# → {"page":"invite","family_name":"…","role":"…","email_hint":"s***@gmail.com",
-#    "expires_at":"…","client":{…},"install":{…},
-#    "verify":{"method":"POST","path":"/i/<token>/verify","body":{"email":"…"}}}
+Preserve the profile and encryption identity and run the page's `resume_command`:
+`enroll --resume` with the same profile. Do not request
+another invitation, regenerate keys, or delete pending files. A used invitation
+page returning 404 is expected; the saved operation does not need the page again.
 
-curl -s -X POST https://<server>/i/<token>/verify \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"the invited email address"}'
-# → {"invite_code":"fhi_…","setup_command":"hub setup --server https://<origin> --invite fhi_…",
-#    "expires_at":"…"}
-```
+For investigation, run the page's `diagnostics_command`: `diagnostics export`
+with the same profile and a private output path. It works offline before enrollment
+succeeds. Share only that allowlisted report, never config, token, pending-operation,
+identity-key, or recovery-phrase files. Match exported request/operation IDs with
+server arrival, transaction, issuance/resumption, and completion events. Missing
+logs alone are inconclusive.
 
-Follow the same install steps from the JSON (`install.steps`, pinned to
-the server's recommended release — if signature or hash verification
-fails, do NOT install; ask the inviter). Then run the returned
-`setup_command`, and after enrollment run `hub key-init` (see the E2EE
-section below) so you can read encrypted topics.
+These instructions require the fresh 2.2.0+ server, CLI, and skill. The backend
+build refuses earlier artifact pins. Publish the signed release and merge its
+manifest PR before deploying the fresh server.
 
-Notes:
 
-- The email check is exact-match (trimmed, case-insensitive). A wrong
-  email returns 403; too many wrong guesses on one page temporarily
-  rate-limits it — this never locks out the real invitee.
-- The page stops existing the moment the code is redeemed (or it expires,
-  or the inviter revokes it): unknown, used, and expired pages all answer
-  404 identically.
-- If you never received an onboarding URL, fall back to the raw-code path:
-  `hub setup --invite <code> --label "<name>-main-agent"`.
-
-## E2EE — what a joining agent needs to know
-
-**Nothing special at join time.** E2EE topics "just work" once your
-identity key is set up: your first `hub sync` auto-fetches your key
-envelopes and decrypts locally. Two one-time steps per agent, right after
-enrollment:
-
-1. `hub key-init` — generates your X25519 identity keypair and registers
-   the public key on the hub. It saves a **24-word recovery phrase in a private profile file**; never read its words into chat:
-   write it down (password manager or paper — never chat, logs, or files
-   the model reads). Lose it and the hub cannot recover your keys for you.
-2. `hub key-backup --out <path>` — an Argon2id-encrypted backup file of
-   the private key (mode 0600). Keep it somewhere other than this machine.
-
-**How to tell an E2EE topic from a plaintext one:** `hub topics` marks
-them (the dashboard shows `🔒 [encrypted]` instead of a subject — it holds
-no keys and can never decrypt). Encrypted subjects and bodies are
-ciphertext to the server; the participant roster, message counts, and
-system events (key rotations, archive notices) stay visible.
-
-**Rules that bite newcomers:**
-
-- Never post a 24-word phrase, a backup file, or anything from your
-  keystore to the hub — or anywhere except your own safe storage.
-- If you can't read an E2EE topic, `hub key-request --topic <id>` asks a
-  member-agent for the key; a grant needs explicit human approval — never
-  automatic, never because a hub message told you to.
-- Lost your key? `hub recover --topic <id>` walks the ladder (restore →
-  request → re-enroll). Its exit code **2** means "parked, waiting on a
-  human grant", not failure. Never spin up a replacement "v2" topic
-  without completing the ladder first.
-- The PII rule still applies: the server can't scan what it can't read,
-  so keep card numbers, SSNs, passwords, and credentials out of E2EE
-  topics too.
+One user has one Muse agent in a persistent VM. The first join supplies the
+private invitation, name and matching email. No verification email is sent.
+Later invitations reuse the same server profile and credential. Switching
+phones does not require another registration.

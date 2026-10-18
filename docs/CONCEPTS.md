@@ -36,46 +36,33 @@ promote other members to owner.
   `id, circle_id, name, email, role`. Your permissions come from this row.
   The same human has a separate member row in each circle they belong to
   (possibly with different roles).
-- **Agent identity**: the tuple `(member_id, agent_label, token)`. One human
-  can have several agents (main agent, phone agent, a script) — each gets its
-  **own** credential and label, e.g. "eve-agent acting for Mahesh".
-  Permissions always come from the member; the label identifies *which*
-  agent acted. Audit entries record `actor_member_id + agent_label +
-  token_id`.
+- **Agent identity**: the user’s single Muse agent running in their VM, with
+  a stable agent ID, public encryption key, generic label and saved server
+  credential. The same identity acts through the user’s circle-specific
+  memberships. Audit entries record the membership, agent and credential IDs.
 
 **Agents act strictly as their member.** An agent can never do what its human
 could not — a kid's agent gets a 403 asking for a parent topic, from the
 server, with no client-side filtering to bypass.
 
-## Tokens: one per circle
+## Users, agents and credentials
 
-The server binds each bearer token to exactly one `(member, circle)`.
-Consequences:
+One email identifies one user on a server, with one Muse agent running in the
+user’s VM. One server credential and encryption identity serve all the user’s
+circle memberships. Removing a membership leaves other circles accessible.
 
-- Your agent keeps **one token per circle** (the CLI stores them in
-  `circle_tokens` in the 0600 profile config; the dashboard keeps a per-circle
-  map in the browser). Commands authenticate with the *active* circle's token.
-- Creating a circle returns a one-time provisioning code; the CLI
-  auto-redeems it so the new circle works immediately.
-- Joining someone else's circle means redeeming an invite/provisioning code
-  for *that* circle (`hub circle join --code`), which mints a token bound to
-  it. Listing circles (`GET /v2/families`) works with any of your tokens —
-  the server scopes the list by your email.
-- Tokens are 256-bit from a CSPRNG. The server stores only
-  `sha256(TOKEN_PEPPER || token)` — a database leak alone yields nothing
-  usable without the pepper, which lives only as a worker secret.
+Every scoped request carries the agent credential and selected `X-Circle-ID`.
+The server authenticates the agent, resolves its user and checks the active
+circle membership and role. Topic operations also require topic participation.
+The CLI stores a server URL and private credential per profile, not one token
+per circle. A later invitation adds membership to the authenticated existing
+user. The private invitation authorizes first registration when the supplied
+email matches; no verification email is sent. Each user has one Muse agent in
+their VM. Later circles reuse its saved credential.
 
-## Auth model in one paragraph
-
-Every request carries `Authorization: Bearer fh_…` (except a tiny public
-surface: health, and the single-use code-redemption endpoints). One
-`resolveToken()` choke point maps the token to `(circle_id, member_id,
-role)`; every data query is scoped to that pair, and topic reads additionally
-require a `topic_participants` row. Unknown or revoked token → 401.
-Authenticated but not a participant → 403, final — the CLI is instructed
-never to work around it. Invite and provisioning codes are single-use,
-expiring, and grant no read access by themselves; they exist to be shared,
-unlike tokens.
+Names are not unique. Discovery returns server-qualified user and membership
+IDs, plus only shared-circle context. Muse must resolve ambiguous recipients
+before sending. See [the identity protocol](IDENTITY_PROTOCOL.md).
 
 ## Encryption — stated honestly
 
@@ -96,9 +83,10 @@ unlike tokens.
 
 After setup you hold three kinds of secrets. Keep this list:
 
-1. **`TOKEN_PEPPER`** — the 256-bit hex you generated. In a password manager,
-   never in git/chat/logs. If it leaks, rotate it — every token in the hub
-   invalidates and everyone re-enrolls (by design).
+1. **`TOKEN_PEPPER`** — generated during deployment and stored as a Worker
+   secret. Preserve the private deployment backup; never put it in git,
+   chat or logs. Do not rotate it during updates: changing it invalidates
+   existing server credentials.
 2. **Your Cloudflare API token** (if you use token-based deploys) — same
    handling as any API credential; rotate from the Cloudflare dashboard.
 3. **Provisioning/invite codes** — short-lived by design (provisioning: 24h;
@@ -107,5 +95,5 @@ After setup you hold three kinds of secrets. Keep this list:
 
 Agent bearer tokens (`fh_…`) are shown **once** at issuance and go straight
 into the agent's Secure Vault (or 0600 file). The one deliberate exception is
-`hub dashboard-token`, which prints a circle's token so you can paste it into
+`hub dashboard-token`, which prints your server credential so you can paste it into
 the dashboard — treat its output like a password.

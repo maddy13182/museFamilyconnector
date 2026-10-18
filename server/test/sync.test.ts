@@ -1,11 +1,11 @@
 // Sync v2 — GET /v2/sync/topics (spec §1.3, §1.4).
 //
-// Covers: per-circle scoping (one call per circle token; cross-family topic
+// Covers: per-circle scoping (one credential, explicit circle selection; cross-family topic
 // ids 404 on topic-scoped endpoints); the history_from_seq visibility floor;
 // ordering (last_activity_ts DESC, topic_id ASC); paging (limit/page_token,
 // has_more, invalid token 400); the bootstrap full re-read (first call seeds
 // read-state rows at acked_seq 0 and reports every visible topic as changed
-// once); key_status (not_e2ee / ok / pending); assigned_to_me; and a
+// once); encrypted key_status (ok / pending); assigned_to_me; and a
 // page-boundary race (changed sets may shift between pages — the client
 // dedupes; the server must stay consistent and never 500).
 import { test } from 'node:test';
@@ -15,7 +15,7 @@ import {
   TestApp,
   setupKeyedFamily,
   addMember,
-  addAgent,
+  addPeer,
   createActiveTopic,
   inviteToTopic,
   postEntry as rawPostEntry,
@@ -23,9 +23,21 @@ import {
   readState,
 } from './syncv2_helpers.js';
 
-async function postEntry(app: TestApp, token: string, tid: string, text: string, extra: Record<string,unknown> = {}) {
+async function postEntry(
+  app: TestApp,
+  token: string,
+  tid: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+) {
   const row = await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?', [tid]);
-  return rawPostEntry(app, token, tid, text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string), extra);
+  return rawPostEntry(
+    app,
+    token,
+    tid,
+    text.startsWith('fh1.') ? text : wireBody(row!.current_key_id as string),
+    extra,
+  );
 }
 
 async function syncTopics(app: TestApp, token: string, qs = '') {
@@ -147,7 +159,7 @@ test('acked_seq reported is max(stored acked_seq, history_from_seq - 1)', async 
 test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SyncOrder');
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const other = await addPeer(app, owner, 'other-agent');
   const t1 = await createActiveTopic(app, owner.token, 't1', [other.memberId]);
   const t2 = await createActiveTopic(app, owner.token, 't2', [other.memberId]);
   const t3 = await createActiveTopic(app, owner.token, 't3', [other.memberId]);
@@ -189,7 +201,7 @@ test('ordering: last_activity_ts DESC, topic_id ASC on ties', async () => {
 test('paging: limit/page_token walk the full changed set; bad token is 400', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SyncPage');
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const other = await addPeer(app, owner, 'other-agent');
   const tids: string[] = [];
   for (let i = 0; i < 5; i++) {
     const tid = await createActiveTopic(app, owner.token, `ptopic ${i}`, [other.memberId]);
@@ -222,7 +234,7 @@ test('paging: limit/page_token walk the full changed set; bad token is 400', asy
 test('page-boundary race: activity between pages never 500s; nothing permanently skipped', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SyncRace');
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const other = await addPeer(app, owner, 'other-agent');
   const tids: string[] = [];
   for (let i = 0; i < 4; i++) {
     const tid = await createActiveTopic(app, owner.token, `rtopic ${i}`, [other.memberId]);
@@ -239,7 +251,11 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
   const extra = await createActiveTopic(app, owner.token, 'rtopic extra', [other.memberId]);
   await postEntry(app, other.token, extra, 'late arrival');
   const token2 = p1.body.next_page_token as string;
-  const p2 = await syncTopics(app, owner.token, `?limit=2&page_token=${encodeURIComponent(token2)}`);
+  const p2 = await syncTopics(
+    app,
+    owner.token,
+    `?limit=2&page_token=${encodeURIComponent(token2)}`,
+  );
   assert.equal(p2.status, 200, 'shifted page 2 must not 500');
   assert.ok(Array.isArray(p2.body.topics), 'page 2 is well-formed');
   // The real guarantee: anything skipped mid-walk is still unacked, so a
@@ -262,7 +278,7 @@ test('page-boundary race: activity between pages never 500s; nothing permanently
 test('bootstrap: first call seeds read state at 0 and reports all visible topics once', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SyncBoot');
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const other = await addPeer(app, owner, 'other-agent');
   const tid = await createActiveTopic(app, owner.token, 'boot topic', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
   await postEntry(app, other.token, tid, 'two');
@@ -275,7 +291,11 @@ test('bootstrap: first call seeds read state at 0 and reports all visible topics
   const t = (s1.body.topics as any[])[0];
   assert.equal(t.new_count, 2, 'bootstrap reports every visible entry as new');
   assert.equal(t.acked_seq, 0);
-  assert.equal(await readState(app, owner.memberId, owner.agentLabel, tid), 0, 'bootstrap seeds the row');
+  assert.equal(
+    await readState(app, owner.memberId, owner.agentLabel, tid),
+    0,
+    'bootstrap seeds the row',
+  );
 
   // Ack everything: the next sync is quiet.
   const hist = await app.call('GET', `/v2/topics/${tid}/history`, { token: owner.token });
@@ -288,38 +308,36 @@ test('bootstrap: first call seeds read state at 0 and reports all visible topics
   assert.deepEqual(s2.body.topics, [], 'nothing changed after a full ack');
 });
 
-test('bootstrap accepts (and ignores) a legacy bootstrap_gseq param', async () => {
+test('unsupported sync filters are rejected before read state is seeded', async () => {
   const app = makeApp();
-  const { owner } = await setupKeyedFamily(app, 'SyncBoot2');
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
-  const tid = await createActiveTopic(app, owner.token, 'boot topic 2', [other.memberId]);
-  await postEntry(app, other.token, tid, 'one');
-  // Legacy cursor value: accepted, validated, deliberately not used for
-  // seeding (spec §1.4 — the CLI deletes cursor files without reading).
-  const s = await syncTopics(app, owner.token, '?bootstrap_gseq=424242');
-  assert.equal(s.status, 200);
-  assert.equal((s.body.topics as any[]).length, 1);
-  assert.equal((s.body.topics as any[])[0].new_count, 1, 'full re-read, not seeded from the cursor');
-  const bad = await syncTopics(app, owner.token, '?bootstrap_gseq=nope');
-  assert.equal(bad.status, 400);
+  const {owner}=await setupKeyedFamily(app,'SyncQuery');
+  const peer=await addPeer(app,owner,'peer');
+  const topic=await createActiveTopic(app,owner.token,'Private',[peer.memberId]);
+  await postEntry(app,peer.token,topic,'Unread');
+  const rejected=await syncTopics(app,owner.token,'?unsupported_filter=1');
+  assert.equal(rejected.status,400);
+  assert.equal(await readState(app,owner.memberId,owner.agentLabel,topic),null);
+  const accepted=await syncTopics(app,owner.token);
+  assert.equal(accepted.status,200);
+  assert.equal(accepted.body.topics[0].new_count,1);
 });
 
 // ---------------------------------------------------------------------------
 // key_status
 // ---------------------------------------------------------------------------
 
-test('key_status: not_e2ee / ok / pending', async () => {
+test('key_status is ok when the participant holds the active encrypted key', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'SyncKeyStatus');
   const kid = await addMember(app, famId, owner.token, 'k@ks.dev', 'kid', 'Kid');
 
-  // Plain topic: not_e2ee. Kid posts so owner sees it as changed.
-  const plain = await createActiveTopic(app, owner.token, 'plain', [kid.memberId]);
-  await postEntry(app, kid.token, plain, 'hi');
+  // Encrypted topic with committed keys; another participant posts.
+  const encrypted = await createActiveTopic(app, owner.token, 'encrypted', [kid.memberId]);
+  await postEntry(app, kid.token, encrypted, 'hi');
 
   const so = await syncTopics(app, owner.token, '?limit=200');
   const byId = new Map((so.body.topics as any[]).map((t: any) => [t.topic_id, t]));
-  assert.equal(byId.get(plain)!.key_status, 'ok');
+  assert.equal(byId.get(encrypted)!.key_status, 'ok');
   // E2EE key_status variants (ok/pending) are covered in e2ee-specific tests.
 });
 
@@ -336,7 +354,13 @@ test('assigned_to_me: true only for open tasks assigned to the caller', async ()
 
   const mk = await app.call('POST', `/v2/topics/${tid}/tasks`, {
     token: owner.token,
-    body: { title: wireBody((await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?',[tid]))!.current_key_id as string), assignee_member_id: kid.memberId },
+    body: {
+      title: wireBody(
+        (await app.db.queryOne('SELECT current_key_id FROM topics WHERE id = ?', [tid]))!
+          .current_key_id as string,
+      ),
+      assignee_member_id: kid.memberId,
+    },
   });
   assert.equal(mk.status, 201);
   const taskId = mk.body.task.id as string;
@@ -364,7 +388,7 @@ test('unchanged topics are omitted; new activity re-lists the topic', async () =
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'SyncChanged');
   // Second member posts; owner syncs. Own posts never flag as changed.
-  const other = await addAgent(app, owner.token, owner.memberId, 'other-agent', true);
+  const other = await addPeer(app, owner, 'other-agent');
   const tid = await createActiveTopic(app, owner.token, 'changed topic', [other.memberId]);
   await postEntry(app, other.token, tid, 'one');
   const s1 = await syncTopics(app, owner.token);

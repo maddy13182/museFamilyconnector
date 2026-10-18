@@ -20,7 +20,7 @@ export function optString(v: unknown, name: string, max: number): string | null 
 }
 
 export function reqEmail(v: unknown, name = 'email'): string {
-  const s = reqString(v, name, 3, 254);
+  const s = reqString(v, name, 3, 254).trim();
   // Pragmatic syntax check (not RFC-complete on purpose).
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) {
     throw new HttpError(400, 'bad_request', `${name} is not a valid email address`);

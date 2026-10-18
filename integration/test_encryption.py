@@ -1,5 +1,6 @@
 """Production CLI + Worker integration. Run after `npm test` in server/."""
 import contextlib
+import http.client
 import base64
 import hashlib
 from unittest import mock
@@ -43,8 +44,11 @@ class EncryptionJourney(unittest.TestCase):
         parsed=urlparse(url)
         response=self.exchange({'method':method,'path':parsed.path+('?' + parsed.query if parsed.query else ''),'headers':headers,'body':body.decode() if body else None})
         return response['status'],response['body']
-    def api(self,method,path,body=None,token=None):
+    def api(self,method,path,body=None,token=None,circle=None):
         headers={'Content-Type':'application/json'}
+        if path.startswith('/v2/families/'):
+            headers['X-Circle-ID']=path.split('/')[3]
+        if circle is not None: headers['X-Circle-ID']=circle
         if token: headers['Authorization']='Bearer '+token
         code,text=self.transport(method,'https://hub.test'+path,headers,json.dumps(body).encode() if body is not None else None)
         return code,json.loads(text)
@@ -57,15 +61,349 @@ class EncryptionJourney(unittest.TestCase):
     def setup_owner(self):
         code,result=self.api('POST','/v2/families',{'name':'Private circle','owner_name':'Owner','owner_email':'owner@example.test'})
         self.assertEqual(code,201)
-        self.cli('owner','setup','--server','https://hub.test','--invite',result['provisioning_code'],'--store','file')
+        self.cli('owner','setup','--server','https://hub.test','--invite',result['provisioning_code'],'--email','owner@example.test','--store','file')
         return self.cli('owner','me')['member']['id']
     def join(self,name,role='parent'):
         owner_token=hub.load_token(hub.load_config('owner'),'owner')[0]
         fam=hub.load_config('owner')['family_id']
-        code,inv=self.api('POST',f'/v2/families/{fam}/invites',{'email':name+'@example.test','role':role},owner_token)
+        code,inv=self.api('POST',f'/v2/families/{fam}/invites',{'email':name+'@example.test','name':name,'role':role},owner_token)
         self.assertEqual(code,201)
-        self.cli(name,'setup','--server','https://hub.test','--invite',inv['invite_code'],'--store','file','--name',name,'--label',name+'-agent')
+        self.cli(name,'setup','--server','https://hub.test','--invite',inv['invite_code'],'--store','file','--name',name,'--email',name+'@example.test','--label',name+'-agent')
         return self.cli(name,'me')['member']['id']
+    def invitation(self, email, family=None):
+        cfg = hub.load_config('owner')
+        family = family or cfg['active_circle_id']
+        token = hub.load_token(cfg, 'owner')[0]
+        status, response = self.api('POST', '/v2/families/' + family + '/invites', {'email':email,'name':'Person','role':'parent'}, token)
+        self.assertEqual(status, 201)
+        return response
+
+    def observed_cli(self, profile, *args):
+        """Capture actual CLI requests and Worker outcomes without mocking auth."""
+        events=[]
+        def recording(method,url,headers,body):
+            status,response=self.transport(method,url,headers,body)
+            events.append({'method':method,'path':urlparse(url).path,
+                           'circle':headers.get('X-Circle-ID'),'status':status,
+                           'response':json.loads(response)})
+            return status,response
+        out,err=io.StringIO(),io.StringIO()
+        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+            rc=hub.main(['--profile',profile,*args],transport=recording)
+        return rc,out.getvalue(),err.getvalue(),events
+
+    def authorization_fixture(self):
+        owner=self.setup_owner()
+        person=self.join('person')
+        circle_a=hub.load_config('person')['active_circle_id']
+        topic_a=self.cli('owner','new-topic','--subject','PRIVATE-A-TOPIC','--with',owner+','+person)['topic']['id']
+        self.cli('owner','post','--topic',topic_a,'--message','PRIVATE-A-CONTENT')
+        self.exchange({'lock_setup':True})
+        self.cli('owner','circle','create','--name','Restricted team','--kind','general')
+        circle_b=hub.load_config('owner')['active_circle_id']
+        invitation=self.invitation('only-b@example.test',circle_b)
+        code=Path(self.temp.name)/'only-b-invite';code.write_text(invitation['invite_code'])
+        self.cli('only-b','enroll','--server','https://hub.test','--code-file',str(code),
+                 '--name','PRIVATE-B-ONLY-MEMBER','--email','only-b@example.test')
+        owner_b=self.cli('owner','me')['member']['id']
+        member_b=self.cli('only-b','me')['member']['id']
+        topic_b=self.cli('owner','new-topic','--subject','PRIVATE-B-TOPIC','--with',owner_b+','+member_b)['topic']['id']
+        self.cli('owner','post','--topic',topic_b,'--message','PRIVATE-B-CONTENT')
+        token=hub.load_token(hub.load_config('person'),'person')[0]
+        state=json.loads(self.exchange({'snapshot':True})['body'])
+        wire=next(entry['body'] for entry in state['entries'] if entry['topic_id']==topic_b)
+        return {'a':circle_a,'b':circle_b,'b_name':'Restricted team','person':person,
+                'topic_a':topic_a,'topic_b':topic_b,'token':token,'wire_b':wire}
+
+    def assert_permission_error(self,status,body,expected,code):
+        self.assertEqual(status,expected,body)
+        self.assertEqual(set(body),{'error'})
+        self.assertEqual(body['error']['code'],code)
+        for private in ['PRIVATE-B-ONLY-MEMBER','PRIVATE-B-TOPIC','PRIVATE-B-CONTENT']:
+            self.assertNotIn(private,json.dumps(body))
+
+    def test_no_credential_cannot_discover_circles_or_rosters_even_with_known_names(self):
+        f=self.authorization_fixture()
+        before=json.loads(self.exchange({'snapshot':True})['body'])['entries']
+        for token in [None,'fh_unknown_credential_which_is_not_registered']:
+            for circle in [None,f['b'],f['b_name']]:
+                for path in ['/v2/families','/v2/discovery/circles','/v2/discovery/people','/v2/members']:
+                    status,body=self.api('GET',path,token=token,circle=circle)
+                    self.assert_permission_error(status,body,401,'unauthorized')
+                status,body=self.api('POST','/v2/topics/'+f['topic_b']+'/entries',
+                    {'kind':'message','body':f['wire_b']},token=token,circle=circle)
+                self.assert_permission_error(status,body,401,'unauthorized')
+        hub.save_config('anonymous',{'server_url':'https://hub.test'})
+        commands=[('circles',),('circles','--json'),('members','--circle',f['b_name']),
+                  ('post','--circle',f['b_name'],'--topic',f['topic_b'],'--message','PRIVATE-DENIED')]
+        for command in commands:
+            rc,out,err,events=self.observed_cli('anonymous',*command)
+            self.assertNotEqual(rc,0,(out,err))
+            if '--json' in command:
+                result=json.loads(out)
+                self.assertFalse(result['complete'])
+                self.assertEqual(result['data']['circles'],[])
+                self.assertEqual(result['errors'][0]['code'],'auth')
+            self.assertFalse(any(e['path']!='/v2/health' for e in events),events)
+            self.assertNotIn('PRIVATE-B-ONLY-MEMBER',out+err)
+        self.assertEqual(json.loads(self.exchange({'snapshot':True})['body'])['entries'],before)
+
+    def test_registered_user_without_active_circles_gets_empty_discovery_and_no_roster_access(self):
+        f=self.authorization_fixture()
+        self.cli('owner','circle','remove-member','--circle',f['a'],'--member',f['person'])
+        before=json.loads(self.exchange({'snapshot':True})['body'])['entries']
+        for path,key in [('/v2/families','families'),('/v2/discovery/circles','circles'),('/v2/discovery/people','people')]:
+            status,body=self.api('GET',path,token=f['token'])
+            self.assertEqual(status,200)
+            self.assertEqual(body.get('data',body)[key],[])
+        listed=self.cli('person','circles','--json')
+        self.assertTrue(listed['complete']);self.assertEqual(listed['data']['circles'],[])
+        self.assertIn('invitation',self.cli('person','circles'))
+        for circle in [None,f['a'],f['b'],f['b_name'],'nonexistent-circle']:
+            status,body=self.api('GET','/v2/members',token=f['token'],circle=circle)
+            self.assert_permission_error(status,body,403,'not_a_member')
+            status,body=self.api('POST','/v2/topics/'+f['topic_b']+'/entries',
+                {'kind':'message','body':f['wire_b']},token=f['token'],circle=circle)
+            self.assert_permission_error(status,body,403,'not_a_member')
+        rc,out,err,events=self.observed_cli('person','members')
+        self.assertEqual(rc,1);self.assertEqual(out,'')
+        self.assertIn('not an active member',err)
+        self.assertTrue(any(e['path']=='/v2/members' and e['status']==403 for e in events))
+        rc,out,err,events=self.observed_cli('person','members','--circle',f['b_name'])
+        self.assertEqual(rc,1);self.assertIn('No circle matches',err)
+        self.assertFalse(any(e['path']=='/v2/members' for e in events))
+        rc,out,err,events=self.observed_cli('person','post','--topic',f['topic_b'],'--message','PRIVATE-DENIED')
+        self.assertEqual(rc,1)
+        self.assertTrue(any(e['path']=='/v2/topics/'+f['topic_b'] and e['status']==403 for e in events))
+        self.assertFalse(any(e['method']=='POST' for e in events))
+        self.assertEqual(json.loads(self.exchange({'snapshot':True})['body'])['entries'],before)
+
+    def test_circle_a_member_cannot_select_circle_b_or_post_using_its_topic_id(self):
+        f=self.authorization_fixture()
+        cfg=Path(hub.config_path('person'));original=cfg.read_bytes()
+        before=json.loads(self.exchange({'snapshot':True})['body'])['entries']
+        circles=self.cli('person','circles','--json')['data']['circles']
+        self.assertEqual([c['circle_id'] for c in circles],[f['a']])
+        people=self.cli('person','people','--query','PRIVATE-B-ONLY-MEMBER')
+        self.assertTrue(people['complete']);self.assertEqual(people['data']['people'],[])
+        for target in [f['b_name'],f['b'],f['b'][:12]]:
+            for command in [('members','--circle',target),
+                            ('post','--circle',target,'--topic',f['topic_b'],'--message','PRIVATE-DENIED')]:
+                rc,out,err,events=self.observed_cli('person',*command)
+                self.assertEqual(rc,1);self.assertIn('No circle matches',err)
+                self.assertFalse(any(e['path']=='/v2/members' or e['path'].startswith('/v2/topics/') for e in events))
+                self.assertFalse(any(e['method']=='POST' for e in events))
+        # A known topic ID without an override is still checked against A.
+        rc,out,err,events=self.observed_cli('person','post','--topic',f['topic_b'],'--message','PRIVATE-DENIED')
+        self.assertEqual(rc,1)
+        self.assertTrue(any(e['path']=='/v2/topics/'+f['topic_b'] and e['circle']==f['a'] and e['status']==404 for e in events))
+        self.assertFalse(any(e['method']=='POST' for e in events))
+        self.assertEqual(cfg.read_bytes(),original)
+        self.assertEqual(self.cli('person','members')['circle_id'],f['a'])
+        # Bypass CLI resolution deliberately: server authorization must stand alone.
+        for circle in [f['b'],f['b_name'],'nonexistent-circle']:
+            status,body=self.api('GET','/v2/members',token=f['token'],circle=circle)
+            self.assert_permission_error(status,body,403,'not_a_member')
+            status,body=self.api('POST','/v2/topics/'+f['topic_b']+'/entries',
+                {'kind':'message','body':f['wire_b']},token=f['token'],circle=circle)
+            self.assert_permission_error(status,body,403,'not_a_member')
+        status,body=self.api('POST','/v2/topics/'+f['topic_b']+'/entries',
+            {'kind':'message','body':f['wire_b']},token=f['token'],circle=f['a'])
+        self.assert_permission_error(status,body,404,'not_found')
+        status,body=self.api('GET','/v2/discovery/people?circle_id='+f['b'],token=f['token'])
+        self.assert_permission_error(status,body,403,'not_a_member')
+        self.assertEqual(json.loads(self.exchange({'snapshot':True})['body'])['entries'],before)
+
+    def test_forged_local_circle_cache_cannot_bypass_server_membership_checks(self):
+        f=self.authorization_fixture()
+        cfg=hub.load_config('person');cfg['active_circle_id']=f['b']
+        cfg.setdefault('circle_members',{})[f['b']]={'id':'forged-member','role':'owner'}
+        hub.save_config('person',cfg)
+        before=json.loads(self.exchange({'snapshot':True})['body'])['entries']
+        for command,path in [(('members',),'/v2/members'),
+                (('post','--topic',f['topic_b'],'--message','PRIVATE-DENIED'),'/v2/topics/'+f['topic_b'])]:
+            rc,out,err,events=self.observed_cli('person',*command)
+            self.assertEqual(rc,1);self.assertEqual(out,'')
+            denied=[e for e in events if e['path']==path]
+            self.assertEqual(len(denied),1)
+            self.assertEqual(denied[0]['circle'],f['b'])
+            self.assert_permission_error(denied[0]['status'],denied[0]['response'],403,'not_a_member')
+            self.assertFalse(any(e['method']=='POST' for e in events))
+        self.assertEqual(json.loads(self.exchange({'snapshot':True})['body'])['entries'],before)
+
+    def test_invited_enrollment_lost_response_resumes_without_new_code(self):
+        self.setup_owner()
+        invitation = self.invitation('person@example.test')
+        code_file = Path(self.temp.name) / 'invite-code'
+        code_file.write_text(invitation['invite_code'])
+        original = self.transport
+        statuses, credentials = [], []
+        def unreliable(method, url, headers, body):
+            result = original(method, url, headers, body)
+            if url.endswith('/accept'):
+                statuses.append(result[0])
+                credentials.append(json.loads(body)['agent_token'])
+                if len(statuses) == 1:
+                    raise http.client.RemoteDisconnected('response interrupted')
+            return result
+        self.transport = unreliable
+        with mock.patch.object(hub.time, 'sleep'):
+            self.cli('person','enroll','--server','https://hub.test','--code-file',str(code_file),'--name','Person','--email','person@example.test')
+        self.assertEqual(statuses,[201,200])
+        self.assertEqual(credentials[0],credentials[1])
+        cfg=hub.load_config('person')
+        self.assertEqual(hub.load_token(cfg,'person')[0],credentials[0])
+        self.assertFalse(Path(hub._pending_enrollment('person')).exists())
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len(snapshot['members']),2)
+        self.assertEqual(len(snapshot['agent_tokens']),2)
+        self.assertEqual(self.cli('person','me')['member']['name'],'Person')
+
+    def test_local_save_failure_resumes_from_private_journal_with_identity_intact(self):
+        self.setup_owner()
+        invitation=self.invitation('person@example.test')
+        code_file=Path(self.temp.name)/'invite-code'
+        code_file.write_text(invitation['invite_code'])
+        write=hub._write_secret_file_0600
+        def fail_credential(path,data,what):
+            if what=='credential':
+                raise OSError('injected credential persistence failure')
+            return write(path,data,what)
+        with mock.patch.object(hub,'_write_secret_file_0600',side_effect=fail_credential):
+            self.cli('person','enroll','--server','https://hub.test','--code-file',str(code_file),'--name','Person','--email','person@example.test',expected=1)
+        journal=Path(hub._pending_enrollment('person'))
+        self.assertTrue(journal.exists())
+        self.assertEqual(journal.stat().st_mode & 0o777,0o600)
+        identity=Path(hub.agent_key_path('person')).read_bytes()
+        report=Path(self.temp.name)/'diagnostics.json'
+        self.cli('person','diagnostics','export','--output',str(report))
+        exported=report.read_text()
+        pending=json.loads(journal.read_text())
+        self.assertNotIn(pending['body']['agent_token'],exported)
+        self.assertNotIn(invitation['invite_code'],exported)
+        self.assertTrue(json.loads(exported)['pending_enrollment'])
+        self.cli('person','enroll','--resume')
+        self.assertEqual(Path(hub.agent_key_path('person')).read_bytes(),identity)
+        self.assertFalse(journal.exists())
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len(snapshot['members']),2)
+        self.assertEqual(len(snapshot['agent_tokens']),2)
+
+    def test_joining_second_circle_preserves_first_credential_and_agent_label(self):
+        self.setup_owner()
+        first=hub.load_config('owner')['active_circle_id']
+        inv=self.invitation('person@example.test',first)
+        code=Path(self.temp.name)/'code'
+        code.write_text(inv['invite_code'])
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person','--email','person@example.test','--label','first-agent')
+        original=hub.load_token(hub.load_config('person'),'person')[0]
+        self.exchange({'lock_setup':True})
+        self.cli('owner','circle','create','--name','Second circle','--kind','general')
+        second=hub.load_config('owner')['active_circle_id']
+        inv=self.invitation('person@example.test',second)
+        code.write_text(inv['invite_code'])
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person','--email','person@example.test','--label','second-agent')
+        cfg=hub.load_config('person')
+        self.assertEqual(hub.load_token(cfg,'person')[0],original)
+        self.assertNotIn('circle_tokens',cfg)
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len([u for u in snapshot['principals'] if u['email']=='person@example.test']),1)
+        self.assertEqual(len([a for a in snapshot['agents'] if a['user_id']==cfg['user']['id']]),1)
+        circles=self.cli('person','circles')
+        self.assertIn('Private circle',circles)
+        self.assertIn('Second circle',circles)
+        # The same server credential and agent identity work for encrypted
+        # messages and tasks in the second circle, with its own member IDs.
+        second_owner=self.cli('owner','me')['member']['id']
+        second_person=self.cli('person','me')['member']['id']
+        topic=self.cli('owner','new-topic','--subject','Hotel plan','--with',second_owner+','+second_person)['topic']['id']
+        self.cli('owner','post','--topic',topic,'--message','PRIVATE-HOTEL-MESSAGE')
+        self.assertIn('PRIVATE-HOTEL-MESSAGE',json.dumps(self.cli('person','read','--topic',topic)))
+        self.cli('person','post','--topic',topic,'--message','PRIVATE-HOTEL-REPLY')
+        task=self.cli('owner','task-new','--topic',topic,'--title','PRIVATE-HOTEL-TASK','--assignee',second_person)['task']['id']
+        self.cli('person','task-done','--topic',topic,'--task',task,'--result','{"done":true}')
+        # Transfer/removal must preserve other circles and require topic rekey.
+        self.cli('owner','circle','transfer','--to',second_person,'--on-complete','remove')
+        self.cli('person','circle','transfer-accept')
+        self.cli('person','post','--circle',second,'--topic',topic,'--message','PRIVATE-BLOCKED',expected=1)
+        self.cli('person','topic-rekey','--circle',second,'--topic',topic)
+        self.cli('person','post','--circle',second,'--topic',topic,'--message','PRIVATE-AFTER-TRANSFER')
+        self.cli('owner','read','--circle',second,'--topic',topic,expected=1)
+        self.cli('person','circle','use',first)
+        self.assertEqual(self.cli('person','me')['member']['family_id'],first)
+        self.assertEqual(hub.load_config('person')['agent_label'],'first-agent')
+        self.cli('person','read','--topic',topic,expected=1)
+        self.cli('owner','circle','use',first)
+        owner_first=self.cli('owner','me')['member']['id']
+        person_first=self.cli('person','me')['member']['id']
+        topic_first=self.cli('owner','new-topic','--subject','Family plan','--with',owner_first+','+person_first)['topic']['id']
+        self.cli('owner','post','--topic',topic_first,'--message','PRIVATE-FAMILY-MESSAGE')
+        self.assertIn('PRIVATE-FAMILY-MESSAGE',json.dumps(self.cli('person','read','--topic',topic_first)))
+
+    def test_first_join_confirms_invited_email_without_email_delivery(self):
+        self.setup_owner()
+        invitation=self.invitation('person@example.test')
+        path=Path(self.temp.name)/'invitation-code';path.write_text(invitation['invite_code'])
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(path),'--name','Person','--email','wrong@example.test',expected=1)
+        identity=Path(hub.profile_dir('person'))/'agent.key'
+        original=identity.read_bytes()
+        self.assertFalse(Path(hub._pending_enrollment('person')).exists())
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len(snapshot['principals']),1)
+        self.assertEqual(len(snapshot['agents']),1)
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(path),'--name','Person','--email','person@example.test')
+        self.assertEqual(identity.read_bytes(),original)
+        cfg=hub.load_config('person')
+        self.assertEqual(cfg['user']['email'],'person@example.test')
+        self.assertEqual(self.cli('person','me')['member']['name'],'Person')
+
+    def test_rejoining_removed_circle_reuses_user_agent_and_server_credential(self):
+        owner=self.setup_owner();member=self.join('person')
+        user=hub.load_config('person')['user']['id']
+        agent=hub.load_config('person')['agent']['id']
+        token=hub.load_token(hub.load_config('person'),'person')[0]
+        topic=self.cli('owner','new-topic','--subject','Before removal','--with',owner+','+member)['topic']['id']
+        self.cli('owner','post','--topic',topic,'--message','PRIVATE-BEFORE-REMOVAL')
+        self.cli('owner','circle','remove-member','--member',member)
+        self.assertEqual(self.cli('person','circles','--json')['data']['circles'],[])
+        inv=self.invitation('person@example.test')
+        code=Path(self.temp.name)/'rejoin-code';code.write_text(inv['invite_code'])
+        self.cli('person','enroll','--server','https://hub.test','--code-file',str(code),'--name','Person')
+        cfg=hub.load_config('person')
+        self.assertEqual(cfg['user']['id'],user)
+        self.assertEqual(cfg['agent']['id'],agent)
+        self.assertEqual(hub.load_token(cfg,'person')[0],token)
+        self.assertNotEqual(self.cli('person','me')['member']['id'],member)
+        self.cli('person','read','--topic',topic,expected=1)
+
+    def test_joined_member_discovers_members_creates_topic_and_threads_replies(self):
+        owner=self.setup_owner()
+        person=self.join('person')
+        outsider=self.join('outsider')
+        kid=self.join('child','kid')
+        circles=self.cli('person','circles','--json')['data']['circles']
+        self.assertEqual(len(circles),1)
+        circle=circles[0]['circle_id']
+        roster=self.cli('person','members','--circle',circle)
+        self.assertEqual(roster['circle_id'],circle)
+        self.assertEqual({m['id'] for m in roster['members']},{owner,person,outsider,kid})
+        self.assertEqual(next(m for m in roster['members'] if m['id']==person)['role'],'parent')
+        topic=self.cli('person','new-topic','--circle',circle,'--subject','PRIVATE-MEMBER-PLAN','--with',person+','+owner)['topic']['id']
+        self.cli('person','post','--circle',circle,'--topic',topic,'--message','PRIVATE-MEMBER-QUESTION')
+        owner_read=self.cli('owner','read','--topic',topic)
+        first=next(e for e in owner_read['entries'] if e.get('body')=='PRIVATE-MEMBER-QUESTION')['seq']
+        self.cli('owner','post','--topic',topic,'--reply-to',str(first),'--message','PRIVATE-OWNER-REPLY')
+        read=self.cli('person','read','--circle',circle,'--topic',topic)
+        reply=next(e for e in read['entries'] if e.get('body')=='PRIVATE-OWNER-REPLY')
+        self.assertEqual(reply['reply_to_seq'],first)
+        self.cli('person','ack','--circle',circle,'--topic',topic,'--seq',str(read['read_through_seq']),'--receipt',read['read_receipt'])
+        self.cli('outsider','read','--topic',topic,expected=1)
+        self.cli('outsider','post','--topic',topic,'--message','PRIVATE-UNAUTHORIZED',expected=1)
+        self.cli('child','new-topic','--subject','PRIVATE-FORBIDDEN','--with',kid+','+owner,expected=1)
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len(snapshot['topics']),1)
+        self.assertNotIn('PRIVATE-',json.dumps(snapshot))
+
     def test_family_tasks_child_history_rotation_and_storage(self):
         owner=self.setup_owner();partner=self.join('partner');child=self.join('child','kid')
         topic=self.cli('owner','new-topic','--subject','PRIVATE-PICKUP-PLAN','--with',owner+','+partner)['topic']['id']
@@ -165,9 +503,9 @@ class EncryptionJourney(unittest.TestCase):
         code, created = self.api('POST','/v2/families',{'name':'Fresh','owner_name':'Owner','owner_email':'owner@example.test'})
         self.assertEqual(code,201)
         with mock.patch.object(hub,'_require_nacl',side_effect=hub.HubError('config','crypto unavailable')):
-            self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--store','file',expected=1)
+            self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--email','owner@example.test','--store','file',expected=1)
         # The same one-use code still works after local prerequisites are fixed.
-        self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--store','file')
+        self.cli('owner','setup','--server','https://hub.test','--invite',created['provisioning_code'],'--email','owner@example.test','--store','file')
         self.assertTrue(self.cli('owner','me')['member']['id'])
 
     def test_tamper_and_missing_local_keys_never_send_plaintext(self):

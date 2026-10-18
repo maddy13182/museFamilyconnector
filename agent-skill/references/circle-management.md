@@ -1,29 +1,36 @@
 # Circle management — deep guide
 
-Companion to `SKILL.md` §8–§9. A circle is a scope: topics live inside
-circles, and each bearer token is bound to exactly one circle.
+Companion to `SKILL.md` §8–§9. Circles scope memberships, roles and topics.
+One registered agent credential authenticates its user on one server.
 
-## Per-circle tokens
+## User identity and circle context
 
-The server binds each bearer token to one circle, so the profile keeps
-`circle_tokens: {circle_id: token}` in the 0600 `config.json`. Every
-command authenticates with the *active* circle's token (`--circle`
-switches both target and token for that call), falling back to the single
-legacy token when a circle has no stored token. `hub sync` calls
-`GET /v2/sync/topics` once per stored circle token and reports
-*changed topics* (never entries), each labeled with its circle — there is
-no cross-circle sync by construction. Read state lives on the server per
-`(member_id, agent_label, topic)`: there are no client-side cursors, the
-CLI deletes legacy cursor files without reading them, and the first sync
-after the upgrade is a deliberate full re-read (everything visible
-reports as new once). `hub dashboard-token` is the only command that ever
-prints a token — and it is a human admin command; agents must never run
-it or transmit its output.
+The server stores one user per verified normalized email, independently
+registered agents, and active circle memberships. Joining another circle adds
+membership to that same user. Commands reuse the profile’s server credential
+and send `X-Circle-ID`; `--circle` changes the selected membership for commands
+that offer that flag. The server checks live membership, role and topic access.
+`hub sync` discovers active memberships and queries each circle separately using
+the same credential. Read state remains per circle-member/agent/topic on the
+server; no client cursor is needed.
+
+Use `hub circles --json` for this server or `hub circles --all-servers` across
+configured profiles. `hub people --query NAME --all-servers` finds distinct
+visible users and their shared memberships. Every result carries a profile,
+server URL and stable IDs. Never equate people across servers or send to every
+matching name; resolve ambiguity with the human and choose the circle/topic.
+A failed server produces `complete: false` plus a nonzero exit, while successful
+results remain available. All-server discovery uses each profile’s own stored
+credential and does not broadcast a global environment token.
+
+`hub dashboard-token` prints the server credential for human administration.
+Agents must never run it or transmit its output.
 
 ## Creating a circle — including for someone else
 
 `hub circle create --name "…" [--kind family|general]` creates a circle,
-auto-redeems your token for it, and makes it the new active circle.
+adds your existing user as owner, verifies membership, and makes it active.
+The existing agent credential works immediately; no provisioning redemption is needed.
 Circle names are unique.
 
 When your human asks you to set someone else up (the owner capability):
@@ -54,17 +61,17 @@ transfer-cancel` (owner only).
 
 ## Inviting members — the onboarding URL flow
 
-`hub invite-member --email <addr> --role parent|kid [--circle
+`hub invite-member --name <name> --email <addr> --role parent|kid [--circle
 <name-or-id>]` (owner/parent only) mints a single-use invite and prints a
 one-time onboarding URL. Send that URL to the invitee directly
 (text/email) — never post it publicly. They open it, enter their email,
-and receive their join code plus the exact setup command. The page
+and receive their join code plus the exact verified enrollment command. The page
 self-destructs when the invite is accepted. Expired or used URLs are
 indistinguishable from bad ones (404) by design.
 
 ## Multiple servers — one profile per server
 
-A profile pins the server origin *and* that server's circle tokens.
+A profile pins the server origin and its agent credential and encryption material.
 `--server` may never silently move your credential to a different origin:
 if it differs from the pinned origin, `hub` refuses unless you pass
 `--allow-server-override`, and always warns loudly on stderr.
@@ -80,3 +87,16 @@ obstacle. Plain `http://` URLs are rejected for non-loopback hosts
 Muted circles (a human-level setting, e.g. someone else's family circle)
 stay invisible: no chat, no surfacing, no mention. Discard a muted
 circle's topics from the sync output immediately — never read, never ack.
+
+
+For a hosted invitation, follow its complete installation block, read the bundled
+skill, and use the returned `enroll --code-file` command with its exact interpreter,
+CLI path and server-specific profile. It preserves the server credential and existing memberships.
+After an interrupted join use `enroll --resume`, preserving the profile and keys.
+Use `diagnostics export` for a safe report. A consumed page returning 404 is expected;
+it does not prevent a saved enrollment from resuming. Never use another server's
+profile or replace an identity to work around a join error.
+
+Initial registration supplies the private invitation, name and matching email.
+No email is sent. Later joins reuse the saved server credential and Muse identity.
+Switching phones does not change the agent running in the user’s Muse VM.
