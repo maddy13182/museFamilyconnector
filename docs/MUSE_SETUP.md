@@ -4,19 +4,29 @@ For an existing Muse user, do the setup work in the environment where Muse can
 run tools. Do not ask the person to learn Wrangler or edit configuration files.
 An invitee joining someone else's hub does not deploy a backend.
 
+## Release prerequisite
+
+This guide describes the current 2.2.0 server, CLI, and skill. Before deployment,
+complete the [release checklist](E2EE_FRESH_DEPLOY.md): publish the signed bundles
+and merge the generated manifest PR. The checked-in manifest must pin real
+2.2.0+ artifacts. If it still pins 2.0.0, stop before provisioning; changing
+version strings or skipping verification does not produce a usable installation.
+
 ## Create a backend
 
 1. Confirm this is a new hub. Get its name, the first circle's name, and the
    owner's display name and email. Check Git, Node.js 22.23.3+, npm and Python
-   3.11+. Server provisioning may run on a computer; the skill must be installed
+   3.12+. Server provisioning may run on a computer; the skill must be installed
    where this person's Muse executes tools.
 2. Help the person create a scoped Cloudflare API token and find their Account
    ID. Bind `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` through secure
    credential input. Never ask for the token in chat. See
    [required permissions](DEPLOY.md#credentials-and-prerequisites).
-3. Ask for the circle name and owner name/email. Each user already has one
-   Muse agent running in their VM. Use the private owner setup code; no email
-   provider or inbox verification is required.
+3. Clone the repository and use the checkout containing the released server and
+   merged artifact manifest. Follow the exact commands in
+   [the deployment guide](DEPLOY.md#one-command-provisions-the-backend), including
+   `cd museFamilyconnector/server` and `npm ci`. Each user has one Muse agent in
+   their VM; no email provider or inbox verification is required.
 4. Save the first-circle details in a private JSON file, then run:
 
    ```sh
@@ -41,12 +51,16 @@ Install the bundle served by this hub, following
 extraction, then signature and CLI hash before executing the CLI. Install its
 Python requirements in a virtual environment. Use that exact CLI path.
 
-Pass the saved provisioning code directly from the private receipt into
-`hub enroll --server DISCOVERED-URL --code-file PRIVATE-CODE-FILE --email OWNER-EMAIL` through its secure prompt;
-[the deployment guide](DEPLOY.md#create-the-first-circle-without-opening-public-registration)
-includes an example. Do not expose it in chat, argv, or shell history. If the user
-is already connected to this server, use `hub circle join` for another circle;
-do not overwrite their profile with setup. Use a separate profile for another server.
+Use the server-specific profile and exact interpreter/CLI paths from the hosted
+onboarding guide. Feed the saved provisioning code from the private receipt into
+`enroll` through its secure stdin prompt, as shown in
+[the deployment guide](DEPLOY.md#create-the-first-circle-without-opening-public-registration).
+Alternatively, write only the code to a private `0600` file and use `--code-file`
+instead of stdin; these are separate input methods. Do not expose it in chat,
+argv, or shell history. For later invitations on this server, use the same
+profile and `enroll`;
+it automatically joins the existing identity to the new circle. Use a separate
+profile for another server.
 
 Read the installed `SKILL.md`, and confirm identity and circle with `hub me` and
 `hub circles`. Preserve the encryption identity. Recovery words stay in private

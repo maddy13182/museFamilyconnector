@@ -7,17 +7,17 @@ Wrangler-file editing is required.
 ## Credentials and prerequisites
 
 Use Linux, macOS, or Windows WSL with Node.js 22.23.3 or newer, npm, Git,
-and Python 3.11 or newer. `npm ci` installs
+and Python 3.12 or newer. `npm ci` installs
 the repository's pinned Wrangler locally; no global installation or browser login
 is needed.
 
 Bind these variables using the environment's secure credential settings:
 
 - `CLOUDFLARE_API_TOKEN`: a Cloudflare **API token**, not the Global API Key.
-  Restrict it to the intended account with **Workers Scripts: Edit**, **D1: Edit**,
-  permissions. The Workers template alone may
-  need D1 permission added. The token must be able to read those resources too.
+  Restrict it to the intended account with **Workers Scripts: Edit** and
+  **D1: Edit** permissions. The Workers template alone may need D1 permission added. The token must be able to read those resources too.
 - `CLOUDFLARE_ACCOUNT_ID`: the Account ID shown in the Cloudflare dashboard.
+
 No email provider or sender domain is needed. Invitees confirm their invited
 email using the private invitation; the server does not send verification emails.
 
@@ -26,18 +26,35 @@ Wrangler and the provisioner inherit it from the environment. It is never stored
 in the deployment directory. A temporary token can be revoked after setup;
 future updates need a valid token for the same account.
 
+## Release prerequisite
+
+Deploy a checkout containing the coordinated 2.2.0 server, CLI, and skill release.
+The maintainer must first publish the signed CLI/skill artifacts and merge the
+release workflow's manifest PR. See the [release checklist](E2EE_FRESH_DEPLOY.md).
+If `server/client-manifest.json` still pins 2.0.0, this checkout is not ready for
+production deployment: the build refuses pins below 2.2.0. Do not bypass that
+check or invent hashes. Invitees receive those pinned bundles from the Worker.
+
 ## One command provisions the backend
 
-Clone this repository, then run:
+Only the Muse deploying the backend needs a repository checkout. Once the
+release prerequisite above is satisfied on `main`, run:
 
 ```sh
+git clone https://github.com/maddy13182/museFamilyconnector.git
 cd museFamilyconnector/server
 npm ci
 npm test
 npm run deploy:hub -- --name YOUR-HUB-NAME
 ```
 
-Choose a unique lowercase Worker name in your account, such as `our-family-hub`.
+If you already have the intended released checkout, skip `git clone` and enter
+its `server` directory. Do not deploy an unmerged feature branch or an older
+checkout whose artifact manifest does not match this server.
+
+Choose a unique Worker name in your account, such as `our-family-hub`: 2–50
+lowercase letters, digits, or hyphens, starting with a letter and ending with a
+letter or digit.
 Names, accounts, database IDs, and URLs are deployment inputs or discovered
 outputs. `server/wrangler.toml` is a portable template, not a live configuration.
 
@@ -74,7 +91,9 @@ an upgrade: that would invalidate existing credentials.
 
 ## Create the first circle without opening public registration
 
-Muse can create a private JSON file containing the human-provided details:
+Run deployment commands from the checkout's `server` directory. Muse creates a
+private `0600` JSON file outside the checkout containing exactly the
+human-provided details:
 
 ```json
 {"name":"Our family","owner_name":"Your name","owner_email":"you@example.com"}
@@ -86,7 +105,9 @@ Then run the same command with that file:
 npm run deploy:hub -- --name YOUR-HUB-NAME --bootstrap-file /PRIVATE/PATH/owner.json
 ```
 
-This can also be supplied on the initial deployment command. The command briefly
+For a new hub, add `--bootstrap-file` to the initial deployment command so one
+run provisions the backend and creates the first circle. If you already ran the
+backend-only command, rerun with the same hub name and this file. The command briefly
 enables bootstrap behind the private `BOOTSTRAP_SECRET`, creates the first circle,
 saves the response directly to `owner-enrollment.json`, and locks setup again.
 An unauthenticated visitor cannot create a circle during that step. The API token
@@ -104,7 +125,7 @@ no repository clone is needed for client instructions. Use its server-specific
 profile for owner enrollment as well. Enroll the owner's
 Muse using the saved provisioning code without displaying it or putting it in
 shell history. For example, a trusted helper can pipe the private code to the
-CLI's secure prompt:
+CLI's secure stdin prompt (omit `--code-file` with this method):
 
 ```python
 import json, subprocess
@@ -116,9 +137,21 @@ subprocess.run(
 )
 ```
 
+The server generates the owner identity from `owner_name` and `owner_email` in
+the bootstrap file; the provisioning-code path does not prompt for another name
+or agent label. Ordinary invite enrollment supplies the invited person's name,
+matching email, and the generic `muse-agent` label.
+
 Use the CLI path installed for this Muse, not a guessed executable from `PATH`.
 Do not print the receipt or recovery words. Keep the existing identity on retries.
-Remove the spent receipt only after successful enrollment. See
+If enrollment is interrupted, keep the same profile and encryption identity and
+run `PYTHON CLI --profile PROFILE enroll --resume` with the hosted guide's actual
+paths. Export `diagnostics export --output PRIVATE-REPORT.json` with that same
+interpreter, CLI, and profile if investigation is needed. Do not run a fresh
+setup or request a replacement invitation for a saved enrollment operation.
+
+Remove the spent receipt only after successful enrollment and authenticated
+`me`/`circles` checks. See
 [the Muse setup guide](MUSE_SETUP.md) for connection and conversation checks.
 
 ## Repeat runs and upgrades
