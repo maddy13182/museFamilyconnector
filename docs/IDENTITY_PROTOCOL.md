@@ -48,6 +48,28 @@ bootstrap, authenticated server-owner circle creation adds membership directly;
 it does not issue another provisioning code. There are no additional-agent,
 device-approval, or email-recovery endpoints.
 
+## Authorization failures
+
+Circle names and IDs select a target; they never grant access. The server
+resolves the bearer credential to its user, then checks that user’s active
+membership before serving a roster or accepting a topic operation. Local profile
+caches and claimed roles are not authorization evidence.
+
+| Situation | API behavior |
+| --- | --- |
+| Missing, unknown or revoked credential | `401 unauthorized`; no circle directory or roster |
+| Registered user with no active memberships | Circle/person discovery returns `200` with empty lists; roster/message requests return `403 not_a_member` |
+| Member of A supplies B’s ID or name as circle context | `403 not_a_member`, including for nonexistent circle IDs; no roster or content |
+| Member of A supplies a B topic ID while selecting A | `404 not_found`; no topic-existence disclosure or message write |
+
+The CLI resolves an explicit `--circle` name/ID against the authenticated user’s
+live membership list. A missing match exits nonzero before requesting that
+circle’s roster or topic. Without an override, a topic ID is checked in the
+selected circle; a denied topic lookup prevents the CLI from sending a post.
+Direct API calls and forged local caches face the same server membership checks.
+No credential means CLI failure before protected requests. Failed access attempts
+leave stored messages unchanged.
+
 ## Discovery wire contract
 
 Authenticated server-scoped operations:

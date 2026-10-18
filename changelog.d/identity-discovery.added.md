@@ -16,3 +16,7 @@ receipt in the same transaction as membership, keys and code consumption. Exact
 retries resume without new credentials; changed requests, revocations and removed
 members fail closed. Remove credential-revocation/reissue workarounds and malformed
 response fallbacks. Require signed 2.2.0+ server, CLI and skill for fresh setup.
+
+Cover anonymous access, registered identities without memberships, cross-circle
+roster/message attempts, and forged local membership caches through real CLI
+and Worker journeys. Empty-circle guidance directs ordinary users to invitations.

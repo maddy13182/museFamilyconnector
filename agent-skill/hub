@@ -4637,7 +4637,7 @@ def cmd_circles(args, transport):
     circles = _profile_circles(ctx)
     active = _active_circle_id(ctx.cfg)
     if not circles:
-        emit("no circles — create one with `hub circle create --name ...`.")
+        emit("no circles — accept an invitation. Server owners can also use `hub circle create --name ...`.")
         return 0
     for c in circles:
         if not isinstance(c, dict):
