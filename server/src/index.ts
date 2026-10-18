@@ -3045,8 +3045,8 @@ async function handleListMembers(db: DbClient, auth: AuthContext): Promise<Respo
   return json({ members: rows.map(publicMember) });
 }
 
-// GET /v2/me — identity bound to the calling token. Lets clients verify
-// which circle a token belongs to before storing it (fail-closed paste flow).
+// GET /v2/me — authenticated user and Muse identity, plus the selected live
+// membership. A server credential is independent of circle selection.
 async function handleGetSelf(db: DbClient, auth: AuthContext): Promise<Response> {
   const row = await db.queryOne(`SELECT * FROM members WHERE id = ? AND family_id = ?`, [
     auth.member_id,
@@ -3644,12 +3644,9 @@ function decodePageToken(v: string | null): number {
  * history_from_seq) with seq > max(acked_seq, history_from_seq - 1), where
  * a missing read-state row counts as acked_seq 0 (all visible unread).
  *
- * Params: `bootstrap_gseq` (first call only), `limit`, `page_token`.
- * Bootstrap decision (spec-ambiguous, documented): the first call carries
- * no cursor and is a deliberate full re-read — every visible topic seeds a
- * read-state row with acked_seq 0 and reports as changed once. `bootstrap_gseq`
- * is validated but does not skip history; only receipt-bound acknowledgements
- * advance the server-side read position.
+ * Params: `limit`, `page_token`; unknown query fields are rejected.
+ * The first call performs a full re-read: visible topics seed read-state
+ * rows with acked_seq 0. Only receipt-bound acknowledgements advance them.
  *
  * Field decisions (spec-ambiguous, documented):
  * - `acked_seq` is the EFFECTIVE read position
@@ -3660,7 +3657,7 @@ function decodePageToken(v: string | null): number {
  *   (actor_member_id + agent_label match) — your own posts never flag a
  *   topic as "changed." Use `hub read` for full history including your own
  *   messages.
- * - `e2ee` is 0/1 (integer), matching the existing topic JSON shape.
+ * - `e2ee` is always 1: every topic is encrypted.
  * - `key_status`: 'ok'
  *   when the caller's agent holds an envelope for the committed current
  *   key (current_epoch >= 1), else 'pending' (epoch 0 or no envelope —
@@ -3673,8 +3670,10 @@ function decodePageToken(v: string | null): number {
  */
 async function handleSyncTopics(db: DbClient, req: Request, auth: AuthContext): Promise<Response> {
   const url = new URL(req.url);
-  // Accepted, validated, intentionally not used for seeding (see above).
-  parseSeqCursor(url.searchParams.get('bootstrap_gseq'));
+  for (const key of url.searchParams.keys()) {
+    if (key !== 'limit' && key !== 'page_token')
+      throw new HttpError(400, 'bad_request', 'Unsupported sync query parameter');
+  }
   const limit = parseLimit(url.searchParams.get('limit'), 50, 200);
   const offset = decodePageToken(url.searchParams.get('page_token'));
 
@@ -4734,9 +4733,8 @@ async function routeRequest(req: Request, db: DbClient, env: Env): Promise<Respo
       );
     }
 
-    // Server ownership control plane (migration 0012): GET/POST
-    // /v2/server/owners, DELETE /v2/server/owners/:principal — server
-    // Topic operations check the selected circle and live membership.
+    // Server ownership control plane: these operations require server-owner
+    // permissions independently of circle roles and selected membership.
     if (path === '/v2/server/owners' && method === 'GET') {
       return await handleListServerOwners(db, auth);
     }

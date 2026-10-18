@@ -1,4 +1,4 @@
-"""Discovery protocol, routing isolation, and enrollment proof persistence."""
+"""Discovery protocol, routing isolation, and private enrollment state."""
 import json
 import os
 from pathlib import Path

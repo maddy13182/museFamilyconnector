@@ -98,10 +98,11 @@ from a different circle remain 404. See [IDENTITY_PROTOCOL.md](IDENTITY_PROTOCOL
 ### 1.4 New endpoints
 
 **`GET /v2/sync/topics`** — changed-topic discovery, per selected circle.
-Params: `bootstrap_gseq` (first call only), `limit`, `page_token`. Returns
+Params: `limit` (default 50, maximum 200), `page_token`. Unknown query
+parameters are rejected before read-state changes. Returns
 per changed topic: `topic_id, circle_id, circle_name, subject, kind, e2ee,
 acked_seq, latest_seq, new_count, last_activity_ts, last_actor,
-key_status (ok|pending|not_e2ee), assigned_to_me`. Changed = visible entry
+key_status (ok|pending), assigned_to_me`. Changed = visible entry
 with `seq > max(acked_seq, history_from_seq - 1)`. Bootstrap: the first call
 sends no cursor — a deliberate full re-read; every visible entry is reported
 as unread once, duplicates handled by the skill's dedupe rule (§3). The CLI

@@ -222,6 +222,34 @@ class EncryptionJourney(unittest.TestCase):
         self.assertNotEqual(self.cli('person','me')['member']['id'],member)
         self.cli('person','read','--topic',topic,expected=1)
 
+    def test_joined_member_discovers_members_creates_topic_and_threads_replies(self):
+        owner=self.setup_owner()
+        person=self.join('person')
+        outsider=self.join('outsider')
+        kid=self.join('child','kid')
+        circles=self.cli('person','circles','--json')['data']['circles']
+        self.assertEqual(len(circles),1)
+        circle=circles[0]['circle_id']
+        roster=self.cli('person','members','--circle',circle)
+        self.assertEqual(roster['circle_id'],circle)
+        self.assertEqual({m['id'] for m in roster['members']},{owner,person,outsider,kid})
+        self.assertEqual(next(m for m in roster['members'] if m['id']==person)['role'],'parent')
+        topic=self.cli('person','new-topic','--circle',circle,'--subject','PRIVATE-MEMBER-PLAN','--with',person+','+owner)['topic']['id']
+        self.cli('person','post','--circle',circle,'--topic',topic,'--message','PRIVATE-MEMBER-QUESTION')
+        owner_read=self.cli('owner','read','--topic',topic)
+        first=next(e for e in owner_read['entries'] if e.get('body')=='PRIVATE-MEMBER-QUESTION')['seq']
+        self.cli('owner','post','--topic',topic,'--reply-to',str(first),'--message','PRIVATE-OWNER-REPLY')
+        read=self.cli('person','read','--circle',circle,'--topic',topic)
+        reply=next(e for e in read['entries'] if e.get('body')=='PRIVATE-OWNER-REPLY')
+        self.assertEqual(reply['reply_to_seq'],first)
+        self.cli('person','ack','--circle',circle,'--topic',topic,'--seq',str(read['read_through_seq']),'--receipt',read['read_receipt'])
+        self.cli('outsider','read','--topic',topic,expected=1)
+        self.cli('outsider','post','--topic',topic,'--message','PRIVATE-UNAUTHORIZED',expected=1)
+        self.cli('child','new-topic','--subject','PRIVATE-FORBIDDEN','--with',kid+','+owner,expected=1)
+        snapshot=json.loads(self.exchange({'snapshot':True})['body'])
+        self.assertEqual(len(snapshot['topics']),1)
+        self.assertNotIn('PRIVATE-',json.dumps(snapshot))
+
     def test_family_tasks_child_history_rotation_and_storage(self):
         owner=self.setup_owner();partner=self.join('partner');child=self.join('child','kid')
         topic=self.cli('owner','new-topic','--subject','PRIVATE-PICKUP-PLAN','--with',owner+','+partner)['topic']['id']

@@ -1411,23 +1411,16 @@ paths:
       summary: Changed-topic discovery (sync v2)
       description: Changed-topic discovery for the selected active circle membership. The CLI uses the same server
         credential with explicit X-Circle-ID for each circle; read positions remain per member/agent/topic. Topic
-        IDs from another circle are rejected.
+        IDs from another circle are rejected. Only limit and page_token query parameters are accepted.
       parameters:
-      - name: bootstrap_gseq
-        in: query
-        required: false
-        schema:
-          type: integer
-          minimum: 0
-        description: First call only; legacy cursor, ignored after bootstrap.
       - name: limit
         in: query
         required: false
         schema:
           type: integer
           minimum: 1
-          maximum: 500
-          default: 100
+          maximum: 200
+          default: 50
       - name: page_token
         in: query
         required: false
@@ -1491,7 +1484,6 @@ paths:
                           enum:
                           - ok
                           - pending
-                          - not_e2ee
                         assigned_to_me:
                           type: boolean
                   versions:

@@ -400,8 +400,8 @@ def scan_pii(text):
     """Return a list of findings like ['possible card number'].
 
     Same patterns as the server (§11): card-like digit runs verified with the
-    Luhn check, and SSN-shaped sequences. Best-effort client side — the
-    server always re-scans and is authoritative.
+    Luhn check, and SSN-shaped sequences. This runs before encryption; the
+    server cannot inspect encrypted content.
     """
     findings = []
     if not text:
@@ -455,14 +455,12 @@ class HubError(Exception):
     def friendly(self):
         hints = {
             "identity_mismatch": "The invitation and authenticated profile belong to different users. Select the intended person's profile; do not replace another user's keys.",
-            "agent_exists": "This label belongs to a different or revoked agent. Use a new label for a new agent; preserve the existing identity.",
             "not_a_member": "This user has no active membership for that operation. Refresh circles and select an authorized circle; a new invitation is needed to rejoin a removed circle.",
             "invite_email_mismatch": "Use the email address that the invitation was issued for; no verification email is sent.",
             "existing_identity": "This email already has its Muse identity on this server. Reuse that profile and saved credential; do not create another agent.",
             "enrollment_state_changed": "Authorization changed before the enrollment transaction committed. Nothing was partially registered. Preserve the pending operation and export diagnostics.",
             "enrollment_conflict": "Enrollment details conflict with an existing operation. Preserve the pending files and export diagnostics before changing anything.",
             "enrollment_identity_changed": "The saved enrollment's encryption identity changed. Preserve the keys and export diagnostics.",
-            "no_memberships": "The user account is retained. Accept a new circle invitation to restore membership.",
             "idempotency_conflict": "This operation key was already used with different details. Inspect the saved operation before retrying.",
             "auth": "Authentication failed (token invalid or revoked). "
             "Check the selected profile and export diagnostics before changing credentials.",
@@ -4183,9 +4181,7 @@ def cmd_post(args, transport):
             data = json.loads(args.data)
         except ValueError:
             raise HubError("bad_request", "--data must be valid JSON.")
-    # One topic-record fetch per post (O(1)): routes E2EE topics to the
-    # encrypting path. The plaintext construction below is byte-identical
-    # to the pre-E2EE behavior.
+    # Fetch topic metadata once, then encrypt content under its current key.
     topic = _fetch_topic_record(ctx.client, args.topic)
     return _cmd_post_e2ee(args, ctx, topic, message, data)
 

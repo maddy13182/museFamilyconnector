@@ -1,13 +1,7 @@
 import { b64 } from './syncv2_helpers.js';
-// Phase D (audit F02): identity principals.
-//
-// Cross-circle negative tests: a member in circle A whose email COLLIDES
-// with circle B's owner email must NOT see B's metadata, must NOT pass the
-// hub-owner check, and must NOT mint credentials for B's members.
-// Plus migration 0005 backfill correctness: distinct emails -> distinct
-// principals; the same email across circles -> one principal (the
-// migration's documented trust assumption, preserving legitimate linking
-// that existed before principals did).
+// Stable user identity and circle discovery. Matching email alone cannot
+// replace a registered Muse credential; authenticated circle creation and
+// later joins preserve the same user and agent across memberships.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeClientApp as makeApp } from './fixture-client.js';
@@ -102,7 +96,7 @@ test('an unauthenticated email collision cannot attach an agent to the existing 
   );
 });
 
-test('verified owner keeps cross-circle visibility via locked creation', async () => {
+test('authenticated owner keeps cross-circle visibility via locked creation', async () => {
   const { app, ownerToken, kidToken, famA, famB } = await lockedSetup();
   const created = await app.call('POST', '/v2/families', {
     token: ownerToken,

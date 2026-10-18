@@ -5,7 +5,7 @@
 // replay (403 — the member/agent/topic binding lives inside the HMAC);
 // cross-topic receipt replay (403); contiguity enforcement (409
 // noncontiguous_ack on gaps and over-acks); idempotent replay (seq <=
-// effective -> no-op success); per-agent isolation (two agents, one member,
+// effective -> no-op success); per-person isolation (separate members and
 // independent acked_seq); 400 on missing/malformed fields; 404 cross-family.
 import { test } from 'node:test';
 import assert from 'node:assert';
