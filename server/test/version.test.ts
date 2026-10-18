@@ -9,6 +9,11 @@ import { makeApp } from './app.js';
 
 const SERVER_VERSION: string = pkg.version;
 
+// Node 22 emits its SQLite experimental warning on a later turn. Let that
+// runtime diagnostic drain before intercepting console output; every captured
+// application line must still parse as structured JSON.
+await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 function captureLogs() {
   const lines: string[] = [];
   const origLog = console.log;
