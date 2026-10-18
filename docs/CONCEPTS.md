@@ -83,9 +83,10 @@ before sending. See [the identity protocol](IDENTITY_PROTOCOL.md).
 
 After setup you hold three kinds of secrets. Keep this list:
 
-1. **`TOKEN_PEPPER`** — the 256-bit hex you generated. In a password manager,
-   never in git/chat/logs. If it leaks, rotate it — every token in the hub
-   invalidates and everyone re-enrolls (by design).
+1. **`TOKEN_PEPPER`** — generated during deployment and stored as a Worker
+   secret. Preserve the private deployment backup; never put it in git,
+   chat or logs. Do not rotate it during updates: changing it invalidates
+   existing server credentials.
 2. **Your Cloudflare API token** (if you use token-based deploys) — same
    handling as any API credential; rotate from the Cloudflare dashboard.
 3. **Provisioning/invite codes** — short-lived by design (provisioning: 24h;

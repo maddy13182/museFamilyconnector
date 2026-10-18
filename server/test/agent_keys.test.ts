@@ -1,10 +1,8 @@
 // E2EE Phase 1 — key infrastructure tests.
 //
-// Covers: key storage on redeem (with/without public key), 400 on
-// malformed keys (wrong length, bad base64) without burning the code,
-// the key directory's circle-scoped access control, rotation marking the
-// old key superseded (never deleted), and plaintext redeem staying
-// byte-identical to before.
+// Covers mandatory identity enrollment, malformed-key rejection without
+// consuming the setup code, circle-scoped key directories and authenticated
+// key rotation that preserves historical directory rows.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { makeApp } from './app.js';
