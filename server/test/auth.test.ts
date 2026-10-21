@@ -14,7 +14,7 @@ async function bootstrap() {
     body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' },
   });
   assert.equal(red.status, 201);
-  return { app, token: red.body.token as string, tokenId: red.body.token_id as string };
+  return { app, token: red.body.token as string, tokenId: red.body.token_id as string, memberId: red.body.member.id as string };
 }
 
 test('valid token authenticates; unknown/missing token -> 401', async () => {
@@ -77,10 +77,10 @@ test('non-owner cannot revoke another member token', async () => {
 });
 
 test('revoked Muse credential is rejected on every protected operation', async () => {
-  const { app, token, tokenId } = await bootstrap();
+  const { app, token, tokenId, memberId } = await bootstrap();
   const topic = await app.call('POST', '/v2/topics', {
     token,
-    body: { subject: 'Private', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'Private', kind: 'group', participant_member_ids: [memberId] },
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id;

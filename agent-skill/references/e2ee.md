@@ -36,6 +36,13 @@ through the platform's secret store. The host must be trusted.
 `hub new-topic --subject "..." --with <ids>` creates and activates encryption
 as one command. `hub spawn` does the same with an independent child key, then
 posts the approved briefing encrypted for the child participants only.
+
+**Audience is explicit, never defaulted.** A group topic requires `--with`
+(one or more member IDs, or your own ID for a solo topic) or
+`--parents-only` (all owners/parents). The server rejects a group-topic
+create with an empty participant list (400) instead of silently making a
+creator-only topic. Circle membership alone never grants topic visibility:
+only the participant list does, and only participants get key envelopes.
 Keys and an encrypted pending operation are saved before network writes.
 Retry the same command after interruption: it resumes the same topic instead
 of creating another. `hub topic-rekey --topic <id>` can also complete a pending

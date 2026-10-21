@@ -73,8 +73,8 @@ async function addMember(
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
 }
 
-async function makeTopic(app: TestApp, token: string, _e2ee: number): Promise<string> {
-  const r = await app.call('POST', '/v2/topics', {token,body:{topic_id:hex(16),subject:wireBody(hex(16)),kind:'group',participant_member_ids:[]}});
+async function makeTopic(app: TestApp, token: string, ownerId: string, _e2ee: number): Promise<string> {
+  const r = await app.call('POST', '/v2/topics', {token,body:{topic_id:hex(16),subject:wireBody(hex(16)),kind:'group',participant_member_ids:[ownerId]}});
   assert.equal(r.status,201);
   return r.body.topic.id;
 }
@@ -86,8 +86,8 @@ async function makeTopic(app: TestApp, token: string, _e2ee: number): Promise<st
 test('entries POST: topic_archived accepts only typed successor metadata', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'RecFam1');
-  const tid = await makeTopic(app, owner.token, 1);
-  const successor = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
+  const successor = await makeTopic(app, owner.token, owner.memberId, 1);
 
   const res = await app.call('POST', `/v2/topics/${tid}/entries`, {
     token: owner.token,
@@ -121,7 +121,7 @@ test('entries POST: topic_archived accepts only typed successor metadata', async
 test('entries POST: topic_archived requires participation (403 otherwise)', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RecFam2');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
   const outsider = await addMember(app, famId, owner.token, 'out@r.dev', 'parent', 'Outsider');
 
   const res = await app.call('POST', `/v2/topics/${tid}/entries`, {

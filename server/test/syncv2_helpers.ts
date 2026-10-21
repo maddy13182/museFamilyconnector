@@ -122,13 +122,22 @@ export async function createE2eeTopic(
   token: string,
   opts: { participantIds?: string[]; subject?: string; initialKeyId?: string } = {},
 ): Promise<{ status: number; body: any; tid: string }> {
+  // Test helper: callers that name nobody mean "creator-only topic". The
+  // server now rejects an empty participant list, so resolve the creator's
+  // own ID explicitly (the production rule: no silent default audience).
+  let participantIds = opts.participantIds ?? [];
+  if (participantIds.length === 0) {
+    const me = await app.call('GET', '/v2/me', { token });
+    assert.equal(me.status, 200);
+    participantIds = [me.body.id as string];
+  }
   const res = await app.call('POST', '/v2/topics', {
     token,
     body: {
       topic_id: hex(16),
       subject: opts.subject ?? wireBody(opts.initialKeyId ?? hex(16)),
       kind: 'group',
-      participant_member_ids: opts.participantIds ?? [],
+      participant_member_ids: participantIds,
     },
   });
   assert.equal(res.status, 201);

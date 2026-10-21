@@ -19,7 +19,7 @@ test('v2 refuses an unmigrated database and every older API major', async () => 
 
 test('topic creation requires encrypted subject and rejects every legacy mode flag', async () => {
   const app=makeApp(); const {owner}=await setupKeyedFamily(app,'Required');
-  const base={topic_id:hex(16),subject:wireBody(hex(16)),kind:'group',participant_member_ids:[]};
+  const base={topic_id:hex(16),subject:wireBody(hex(16)),kind:'group',participant_member_ids:[owner.memberId]};
   for (const extra of [{subject:'readable subject'},{e2ee:0},{e2ee:1},{initial_key_id:hex(16)},{briefing:'private'}]) {
     const res=await app.call('POST','/v2/topics',{token:owner.token,body:{...base,...extra}});
     assert.equal(res.status,400,JSON.stringify(extra));

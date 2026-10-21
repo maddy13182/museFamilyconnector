@@ -77,8 +77,8 @@ async function addMember(
   return { token: acc.body.token as string, memberId: acc.body.member.id as string };
 }
 
-async function makeTopic(app: TestApp, token: string, _e2ee: number): Promise<string> {
-  const r = await app.call('POST', '/v2/topics', {token,body:{topic_id:hex(16),subject:wireBody(hex(16)),kind:'group',participant_member_ids:[]}});
+async function makeTopic(app: TestApp, token: string, ownerId: string, _e2ee: number): Promise<string> {
+  const r = await app.call('POST', '/v2/topics', {token,body:{topic_id:hex(16),subject:wireBody(hex(16)),kind:'group',participant_member_ids:[ownerId]}});
   assert.equal(r.status,201);
   return r.body.topic.id;
 }
@@ -102,7 +102,7 @@ async function envelopeBody(over: Record<string, unknown>): Promise<Record<strin
 test('remove participant: non-participant caller is 403; unknown topic is 404', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam1');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
   const outsider = await addMember(app, famId, owner.token, 'out@r.dev', 'parent', 'Outsider');
 
   const res = await app.call('DELETE', `/v2/topics/${tid}/participants/${owner.memberId}`, {
@@ -119,7 +119,7 @@ test('remove participant: non-participant caller is 403; unknown topic is 404', 
 test('remove participant: kid role cannot remove (same 403 rule as invite)', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam2');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
   const kid = await addMember(app, famId, owner.token, 'kid@r.dev', 'kid', 'Kiddo');
   const parent = await addMember(app, famId, owner.token, 'par@r.dev', 'parent', 'Par');
   await inviteToTopic(app, owner.token, tid, [kid.memberId, parent.memberId]);
@@ -141,7 +141,7 @@ test('remove participant: kid role cannot remove (same 403 rule as invite)', asy
 test('remove participant: 400 when the target is not a participant', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam3');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
   const outsider = await addMember(app, famId, owner.token, 'out2@r.dev', 'parent', 'Outsider2');
 
   const res = await app.call('DELETE', `/v2/topics/${tid}/participants/${outsider.memberId}`, {
@@ -153,7 +153,7 @@ test('remove participant: 400 when the target is not a participant', async () =>
 test('remove participant: cannot remove the last participant', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'RekeyFam4');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
 
   const res = await app.call('DELETE', `/v2/topics/${tid}/participants/${owner.memberId}`, {
     token: owner.token,
@@ -164,7 +164,7 @@ test('remove participant: cannot remove the last participant', async () => {
 test('remove participant: row removed, member_left entry appended, removed member gets 403 after', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam5');
-  const tid = await makeTopic(app, owner.token, 0); // plaintext topic: removal is membership-only
+  const tid = await makeTopic(app, owner.token, owner.memberId, 0); // plaintext topic: removal is membership-only
   const bee = await addMember(app, famId, owner.token, 'bee@r.dev', 'parent', 'Bee');
   await inviteToTopic(app, owner.token, tid, [bee.memberId]);
 
@@ -197,7 +197,7 @@ test('remove participant: row removed, member_left entry appended, removed membe
 test('remove participant: self-leave wording differs from removal', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam6');
-  const tid = await makeTopic(app, owner.token, 0);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 0);
   const bee = await addMember(app, famId, owner.token, 'bee2@r.dev', 'parent', 'BeeTwo');
   await inviteToTopic(app, owner.token, tid, [bee.memberId]);
 
@@ -215,7 +215,7 @@ test('remove participant: self-leave wording differs from removal', async () => 
 test('envelope POST for a removed member is 400 (target must be a current participant)', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam7');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
   const bee = await addMember(app, famId, owner.token, 'bee3@r.dev', 'parent', 'BeeThree');
   await inviteToTopic(app, owner.token, tid, [bee.memberId]);
 
@@ -240,7 +240,7 @@ test('envelope POST for a removed member is 400 (target must be a current partic
 test('entries POST: key_rotated / key_request / pending_key_distribution reject client-supplied free text', async () => {
   const app = makeApp();
   const { owner } = await setupKeyedFamily(app, 'RekeyFam8');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
 
   for (const kind of ['key_rotated', 'key_request', 'pending_key_distribution']) {
     const res = await app.call('POST', `/v2/topics/${tid}/entries`, {
@@ -267,7 +267,7 @@ test('entries POST: key_rotated / key_request / pending_key_distribution reject 
 test('entries POST: system kinds require participation (403 otherwise)', async () => {
   const app = makeApp();
   const { famId, owner } = await setupKeyedFamily(app, 'RekeyFam9');
-  const tid = await makeTopic(app, owner.token, 1);
+  const tid = await makeTopic(app, owner.token, owner.memberId, 1);
   const outsider = await addMember(app, famId, owner.token, 'out3@r.dev', 'parent', 'Outsider3');
 
   const res = await app.call('POST', `/v2/topics/${tid}/entries`, {

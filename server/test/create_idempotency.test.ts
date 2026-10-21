@@ -16,7 +16,7 @@ async function bootstrapOwner(app: ReturnType<typeof makeApp>, name: string, ema
     { body: { agent_public_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=' } },
   );
   assert.equal(red.status, 201);
-  return { famId: fam.body.family.id as string, token: red.body.token as string };
+  return { famId: fam.body.family.id as string, token: red.body.token as string, memberId: red.body.member.id as string };
 }
 
 test('duplicate circle name (case-insensitive) -> 409 circle_name_taken', async () => {
@@ -70,9 +70,9 @@ test('a different credential cannot recover an already enrolled code', async () 
 
 test('topic create is idempotent with its client-generated operation ID', async () => {
   const app = makeApp();
-  const { token } = await bootstrapOwner(app, 'Fam A', 'a@t.dev');
+  const { token, memberId } = await bootstrapOwner(app, 'Fam A', 'a@t.dev');
   const key = 'topic-key-1';
-  const payload = {topic_id:'a'.repeat(32),subject:'fh1.'+'b'.repeat(32)+'.'+'c'.repeat(32)+'.'+b64(40),kind:'group',participant_member_ids:[]};
+  const payload = {topic_id:'a'.repeat(32),subject:'fh1.'+'b'.repeat(32)+'.'+'c'.repeat(32)+'.'+b64(40),kind:'group',participant_member_ids:[memberId]};
   const mk = () =>
     app.rawCall('POST', '/v2/topics', {
 token,
