@@ -339,6 +339,45 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
   principal holds the owner role in at least one circle. Agents learn from
   `hub me` whether they may create circles (`POST /v1/families` while setup
   is locked) instead of discovering it via a 403.
+- Server: new owner-only `DELETE /v1/families/:fid/members/:mid` endpoint soft-removes a member from a circle — sets `removed_at`, revokes every agent token of the member, drops their topic participation (E2EE topics they were in get `rotation_required`), and cancels pending ownership transfers involving them. You cannot remove yourself (use the ownership transfer to step off) and the last owner cannot be removed. Removed members fail closed at auth, disappear from listings, and free their email for re-invite — the recovery path for orphan members whose credential was never persisted.
+- CLI: new `hub circle remove-member --member <id> [--circle <name-or-id>]` command.
+Provision a per-account Cloudflare backend with a pinned Wrangler, dynamically
+created D1 binding, private generated deployment state and secrets, protected
+first-circle bootstrap, and verified deployment URL. Repeat runs preserve the
+same resources and keys; CI updates discover an explicitly selected existing
+Worker's binding. Remove personal identifiers and manual configuration steps
+from deployment instructions. Add correlated, private server/CLI enrollment
+diagnostics so response, retry, persistence and verification failures can be
+identified without exposing credentials or conversation content.
+Introduce identity protocol 1 in server/CLI/skill 2.2.0: one invitation-registered user
+and Muse agent per server, live circle memberships and
+server-side circle/person discovery. Add bounded, structured discovery across
+configured servers, explicit request-local circle context, private invitation
+registration and matching-email confirmation, and hosted installation
+instructions. Preserve topic/member IDs, encrypted messaging/tasks and key
+history boundaries. Remove per-circle credential aggregation and enrollment
+reissue workarounds. New installations require a fresh database. No email provider is needed.
+Published signed 2.2.0 artifacts must be pinned before server deployment.
+Serve a complete venv-based invitation workflow from the hosted server, including
+signature/hash verification, exact Python/CLI paths, skill loading, profile-safe
+enrollment, post-join conversation checks, and an offline diagnostics exporter.
+Persist a private client credential before enrollment and register a request-bound
+receipt in the same transaction as membership, keys and code consumption. Exact
+retries resume without new credentials; changed requests, revocations and removed
+members fail closed. Remove credential-revocation/reissue workarounds and malformed
+response fallbacks. Require signed 2.2.0+ server, CLI and skill for fresh setup.
+Cover anonymous access, registered identities without memberships, cross-circle
+roster/message attempts, and forged local membership caches through real CLI
+and Worker journeys. Empty-circle guidance directs ordinary users to invitations.
+- Server: explicit server ownership, split from circle ownership. Circle creation (POST /v1/families while SETUP_LOCKED=1) now requires an explicit row in the new `server_owners` table instead of "owns any circle" — a circle owner can manage their own circle but can no longer create circles. Fresh spin-up seeds the bootstrap operator into `server_owners` in the same atomic batch as the principal/family/member rows, so a new server always has an owner with no gap. Existing deployments backfill every principal holding an owner role (zero behavior change at deploy time).
+- Server: new control-plane API, server-owner only — `GET /v1/server/owners` (list), `POST /v1/server/owners` (promote by `principal_id` or `member_id`; idempotent), `DELETE /v1/server/owners/:principal` (demote; refuses to remove the last server owner so the table can never be emptied through the API).
+- CLI: new `hub server owners|promote|demote` command group for the control plane.
+Documented the watcher pipeline split in SKILL.md §2: on platforms where the
+scheduled job runs as a background worker without chat tools, the worker
+runs sync/read and hands the main agent a prepared package (what to post,
+where, plus the ack command); the main agent posts to the side chat and
+acks. The "never ack before the report is posted" invariant is what forces
+this ordering. Skill 1.1.0 → 1.2.0.
 ### Changed
 - Server: the client version gate rejection is now HTTP **426 (Upgrade Required)** with code `client_too_old` (was 400); the plain-language upgrade message is unchanged. Gate exemptions now also cover `GET /v1/client/download/*` alongside `/v1/health` and `/v1/client/latest`.
 - Server: the Release CLI workflow no longer pushes `server/client-manifest.json` straight to `main` (branch protection rejects that push, GH006) — it now opens a PR (`release/manifest-cli-v<x.y.z>`) for owner merge; merging it triggers one no-op release run (no loop).
@@ -375,7 +414,8 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
   removing a member after a staged (uncommitted) key exists burns the
   staged key — writes pause until a fresh key is committed, so a removed
   party never receives future messages.
-
+- Server: group topic creation now requires an explicit participant list (`participant_member_ids` with at least one member ID, or `parents_only`). An empty list is rejected with 400 instead of silently creating a creator-only topic that no other member could see. An explicit list containing only the creator remains a valid solo topic.
+- Skill: topic creation now states the audience rule explicitly — circle membership does not grant topic visibility; a topic can contain one (solo, own ID), many (listed IDs), all owners/parents (`--parents-only`), or all circle members (every ID from `hub members`) — and documents the envelope-key model: one random topic key per topic, sealed per participant agent to its registered public key, with messages encrypted under that topic key.
 ### Removed
 - Server: deleted six endpoints with zero clients (clean break, no
   deprecation window): `GET /v1/sync` (superseded by `/v1/sync/topics`),
@@ -385,6 +425,16 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 - Server: `POST /v1/auth/revoke` is kept — emergency credential
   revocation is security-critical and gets a CLI command (`hub
   token-revoke`) plus a runbook entry instead of being deleted.
+Protocol 2 makes topic encryption mandatory across server, CLI and Muse skill.
+Removes plaintext topics, API v1, the legacy subject cipher and forced partial key
+activation. Enrollment registers identities before topic use; creation and child
+briefings resume safely after interruption. Subjects rotate atomically with keys;
+content writes are guarded at the database transaction. From-join history grants
+exclude older keys, and removal rotates for remaining participants. Recipient
+identity changes require explicit verification. Recovery words remain in private
+files, and enrollment always persists credentials locally before verification.
+Requires a fresh database and coordinated signed CLI/skill 2.0.0 releases. Existing
+development data is preserved separately; no automatic conversion or deletion.
 ### Fixed
 - Server: `GET /v1/health` now reports the server's actual release version
   (read from `server/package.json` at build time) instead of a stale
@@ -484,6 +534,23 @@ Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
   `initial_key_id` and does the topic-bound subject PATCH two-step;
   identity-key backup restore clamps Argon2 `opslimit`/`memlimit` from the
   backup file (loud error on violation, never an OOM crash).
+Fixed `hub members` to output the circle context: now returns
+`{circle_id, circle_name, members}` instead of a bare member list.
+Previously it was unclear which circle the members belonged to
+(Prem's feedback). CLI 1.1.0 → 1.1.1.
+Fixed `GET /v1/sync/topics` to exclude the requesting agent's own
+entries from `new_count`. Previously, an agent's own posts would flag
+topics as "changed", causing wasteful sync→read cycles to discover
+"oh, that was me". The server now filters by (actor_member_id,
+agent_label) match. `hub read` still returns full history including
+own messages for context. Server 1.2.0 → 1.2.1.
+Fixed a gap in the watcher pipeline docs (skill 1.2.0): they covered the
+incoming flow (worker detects → main agent posts) but not the outgoing
+flow. Added: when the main agent creates a topic directly via `hub
+new-topic` or `hub spawn`, it must create the side chat and update the
+topic→chat mapping in the same step — the worker will never see it as
+"changed" since own posts don't trigger the loop. Skill 1.2.0 → 1.2.1.
+Repackaged skill bundle (v1.2.2) embedding CLI 1.1.1. The v1.2.1 bundle contained hub 1.1.0, which failed the bundle-client's embedded-hub invariant after the manifest pinned CLI 1.1.1. No doc changes; binary-only refresh.
 ## [0.2.0] - 2026-10-10
 
 ### Added
