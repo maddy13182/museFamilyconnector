@@ -3135,11 +3135,25 @@ async function createEncryptedTopic(
       );
     }
   }
-  // Group topics may pass an empty list: the creator is auto-added below.
+  // Group topics require an explicit participant list. An empty list used to
+  // silently create a creator-only topic, which let an agent post a message
+  // (e.g. a welcome) that no other member could ever see: circle membership
+  // does not make a topic visible, only topic participation does. Reject the
+  // omission instead of guessing, so the caller must name the audience.
+  // An explicit list containing only the creator is still a valid solo
+  // topic; --parents-only is the explicit "all owners/parents" choice.
   // Direct topics still require exactly 2 participants (checked after).
   let ids = reqIdArray(body['participant_member_ids'], 'participant_member_ids', 20, 0);
 
   const members = await requireFamilyMembers(db, auth, ids);
+
+  if (kind === 'group' && !parentsOnly && ids.length === 0) {
+    throw new HttpError(
+      400,
+      'bad_request',
+      'Group topics require at least one explicit participant: pass participant_member_ids with at least one member ID (your own ID for a solo topic), or set parents_only to include all owners/parents.',
+    );
+  }
 
   if (kind === 'direct') {
     if (ids.length !== 2 || !ids.includes(auth.member_id)) {

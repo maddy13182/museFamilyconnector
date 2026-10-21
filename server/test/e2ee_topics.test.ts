@@ -108,6 +108,42 @@ async function createTopic(
 // Topic creation with e2ee
 // ---------------------------------------------------------------------------
 
+test('Group topic creation requires an explicit participant list (no silent creator-only default)', async () => {
+  const app = makeApp();
+  const { owner } = await setupKeyedFamily(app, 'ExplicitAudienceFam');
+
+  // Empty list without --parents-only: rejected, nothing created.
+  const empty = await createTopic(app, owner.token, {
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
+    kind: 'group',
+    participant_member_ids: [],
+  });
+  assert.equal(empty.status, 400);
+  assert.match(String(empty.body.error.message), /at least one explicit participant/);
+  const n0 = await app.db.queryOne(`SELECT COUNT(*) AS c FROM topics`, []);
+  assert.equal(n0!['c'], 0);
+
+  // Explicit solo topic (own ID listed) is still valid.
+  const solo = await createTopic(app, owner.token, {
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
+    kind: 'group',
+    participant_member_ids: [owner.memberId],
+  });
+  assert.equal(solo.status, 201);
+
+  // --parents-only with an empty list is an explicit audience choice, valid.
+  const parentsOnly = await createTopic(app, owner.token, {
+    topic_id: hex(16),
+    subject: wireBody(hex(16)),
+    kind: 'group',
+    participant_member_ids: [],
+    parents_only: true,
+  });
+  assert.equal(parentsOnly.status, 201);
+});
+
 test('Topic creation without a registered creator key is 400 with key-init guidance', async () => {
   const app = makeApp();
   const fam = await app.call('POST', '/v2/families', {
@@ -127,7 +163,7 @@ test('Topic creation without a registered creator key is 400 with key-init guida
     topic_id: hex(16),
     subject: wireBody(hex(16)),
     kind: 'group',
-    participant_member_ids: [],
+    participant_member_ids: [red.body.member.id],
   });
   assert.equal(res.status, 400);
   assert.match(String(res.body.error.message), /hub key-init/);
@@ -144,7 +180,7 @@ test('Topic creation with a registered key creates the topic; subject stored opa
     topic_id: hex(16),
     subject: ciphertextSubject,
     kind: 'group',
-    participant_member_ids: [],
+    participant_member_ids: [owner.memberId],
   });
   assert.equal(res.status, 201);
   assert.equal(res.body.topic.e2ee, 1);
@@ -176,7 +212,7 @@ test('envelope POST: non-participant caller is 403; unknown topic is 404', async
     topic_id: hex(16),
     subject: wireBody(hex(16)),
     kind: 'group',
-    participant_member_ids: [],
+    participant_member_ids: [owner.memberId],
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -279,7 +315,7 @@ test('envelope POST: malformed key_id / envelope / member fields are 400', async
     topic_id: hex(16),
     subject: wireBody(hex(16)),
     kind: 'group',
-    participant_member_ids: [],
+    participant_member_ids: [owner.memberId],
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;
@@ -309,7 +345,7 @@ test('envelope POST: re-POST of the same (topic, member, label, key_id) is idemp
     topic_id: hex(16),
     subject: wireBody(hex(16)),
     kind: 'group',
-    participant_member_ids: [],
+    participant_member_ids: [owner.memberId],
   });
   assert.equal(topic.status, 201);
   const tid = topic.body.topic.id as string;

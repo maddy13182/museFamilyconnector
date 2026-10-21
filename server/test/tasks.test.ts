@@ -5,7 +5,7 @@ import assert from 'node:assert';
 import { makeClientApp as makeApp } from './fixture-client.js';
 import type { TestClientApp as TestApp } from './fixture-client.js';
 
-async function setup(): Promise<{ app: TestApp; token: string; topicId: string; kidToken: string; kidId: string }> {
+async function setup(): Promise<{ app: TestApp; token: string; topicId: string; kidToken: string; kidId: string; ownerId: string }> {
   const app = makeApp();
   const fam = await app.call('POST', '/v2/families', {
     body: { name: 'F', owner_name: 'Mahesh', owner_email: 'm@t.dev' },
@@ -33,7 +33,7 @@ async function setup(): Promise<{ app: TestApp; token: string; topicId: string; 
     body: { subject: 'Trip', kind: 'group', participant_member_ids: [meId, kidId] },
   });
   assert.equal(topic.status, 201);
-  return { app, token, topicId: topic.body.topic.id as string, kidToken, kidId };
+  return { app, token, topicId: topic.body.topic.id as string, kidToken, kidId, ownerId: meId };
 }
 
 test('done with open subtasks is rejected (409); works after subtasks close', async () => {
@@ -70,7 +70,7 @@ test('done with open subtasks is rejected (409); works after subtasks close', as
 });
 
 test('assignee must participate in the topic; parent task must be in-topic', async () => {
-  const { app, token, topicId } = await setup();
+  const { app, token, topicId, ownerId } = await setup();
   const bad = await app.call('POST', `/v2/topics/${topicId}/tasks`, {
     token,
     body: { title: 'X', assignee_member_id: 'no-such-member' },
@@ -79,7 +79,7 @@ test('assignee must participate in the topic; parent task must be in-topic', asy
 
   const other = await app.call('POST', '/v2/topics', {
     token,
-    body: { subject: 'Other', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'Other', kind: 'group', participant_member_ids: [ownerId] },
   });
   const otherTask = await app.call('POST', `/v2/topics/${other.body.topic.id}/tasks`, {
     token,

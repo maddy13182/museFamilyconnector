@@ -15,9 +15,10 @@ test('same Idempotency-Key twice -> one entry, deduped:true, same gseq', async (
     { body: { agent_public_key: b64(32) } },
   );
   const token = red.body.token as string;
+  const ownerId = red.body.member.id as string;
   const topic = await app.call('POST', '/v2/topics', {
     token,
-    body: { subject: 'T', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'T', kind: 'group', participant_member_ids: [ownerId] },
   });
   const tid = topic.body.topic.id as string;
 
@@ -54,9 +55,10 @@ test('different keys create different entries', async () => {
     { body: { agent_public_key: b64(32) } },
   );
   const token = red.body.token as string;
+  const ownerId = red.body.member.id as string;
   const topic = await app.call('POST', '/v2/topics', {
     token,
-    body: { subject: 'T', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'T', kind: 'group', participant_member_ids: [ownerId] },
   });
   const tid = topic.body.topic.id as string;
   for (const k of ['k1', 'k2']) {

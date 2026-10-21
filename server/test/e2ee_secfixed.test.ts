@@ -75,10 +75,10 @@ async function addMember(
 }
 
 async function createE2eeTopic(app: TestApp, token: string, keyId: string): Promise<{status:number;body:any}> {
- const made=await app.call('POST','/v2/topics',{token,body:{topic_id:hex(16),subject:wireBody(keyId),kind:'group',participant_member_ids:[]}});
+ const me=await app.call('GET','/v2/me',{token});
+ const made=await app.call('POST','/v2/topics',{token,body:{topic_id:hex(16),subject:wireBody(keyId),kind:'group',participant_member_ids:[me.body.id]}});
  if(made.status!==201)return made;
  const tid=made.body.topic.id;
- const me=await app.call('GET','/v2/me',{token});
  await app.call('POST',`/v2/topics/${tid}/envelopes`,{token,body:{member_id:me.body.id,agent_label:me.body.agent_label,key_id:keyId,envelope:b64(96)}});
  const commit=await app.call('POST',`/v2/topics/${tid}/keys/commit`,{token,body:{expected_epoch:1,key_id:keyId,commitment:hex(32),subject:wireBody(keyId)}});
  assert.equal(commit.status,200);

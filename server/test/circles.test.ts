@@ -207,7 +207,7 @@ test('new family is fully usable: redeem code, invite, topic round-trip', async 
   // Topic round-trip in the new family: create, post, read back.
   const topic = await app.call('POST', '/v2/topics', {
     token: newToken, headers:{'X-Circle-ID':newFamId},
-    body: { subject: 'Leg day', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'Leg day', kind: 'group', participant_member_ids: [invited.body.member.id] },
   });
   assert.equal(topic.status, 201);
   const topicId = topic.body.topic.id as string;

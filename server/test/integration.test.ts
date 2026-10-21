@@ -286,10 +286,10 @@ test('7. task delegation round-trip with structured result', async () => {
 });
 
 test('9. Plaintext PII posts rejected before storage', async () => {
-  const { app, ownerToken } = ctx;
+  const { app, ownerToken, ownerId } = ctx;
   const t = await app.call('POST', '/v2/topics', {
     token: ownerToken,
-    body: { subject: 'pii', kind: 'group', participant_member_ids: [] },
+    body: { subject: 'pii', kind: 'group', participant_member_ids: [ownerId] },
   });
   const tid = t.body.topic.id as string;
   const card = await app.rawCall('POST', `/v2/topics/${tid}/entries`, {
