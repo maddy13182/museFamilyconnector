@@ -16,6 +16,6 @@
   "devDependencies": {
     "libsodium-wrappers-sumo": "0.8.4",
     "typescript": "7.0.2",
-    "wrangler": "4.149.0"
+    "wrangler": "4.151.3"
   }
 }
